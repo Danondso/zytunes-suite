@@ -1,0 +1,8 @@
+{
+    "scripts": {
+        "setup": "cargo build && cd aft && mkdir -p build && cd build && cmake .. -DBUILD_QT_UI=OFF -DBUILD_MTPZ=ON -DBUILD_FUSE=OFF && make aft-mtp-cli",
+        "run": "cargo test",
+        "archive": "cargo clean && rm -rf aft/build"
+    },
+    "runScriptMode": "nonconcurrent"
+}

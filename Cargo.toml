@@ -1,0 +1,10 @@
+[package]
+name = "zytunes"
+version = "0.2.0"
+edition = "2021"
+description = "A CLI tool for syncing music to a Microsoft Zune 30 on macOS"
+
+[dependencies]
+rusb = "0.9"
+quick-xml = "0.37"
+percent-encoding = "2"

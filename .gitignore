@@ -1,0 +1,28 @@
+/target
+/aft/build
+
+# Claude Code
+.claude/
+
+# Music files (test artifacts, copyrighted content)
+*.mp3
+*.flac
+*.m4a
+*.wma
+*.aac
+*.ogg
+*.wav
+*.opus
+*.alac
+*.aiff
+
+# MTPZ keys (sensitive)
+.mtpz-data
+
+# macOS
+.DS_Store
+
+# Editor
+*.swp
+*.swo
+*~
