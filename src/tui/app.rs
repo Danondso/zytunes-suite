@@ -1,6 +1,7 @@
 use std::sync::mpsc;
 use std::time::Instant;
 
+use throbber_widgets_tui::ThrobberState;
 use zytunes::library::{ItunesLibrary, Track};
 use zytunes::mtp::parse::DeviceEntry;
 
@@ -90,7 +91,7 @@ pub struct App {
     pub sync_status: SyncStatus,
     pub sync_current_track: String,
     pub sync_log: Vec<String>,
-    pub spinner_tick: usize,
+    pub throbber_state: ThrobberState,
     pub should_quit: bool,
     pub show_help: bool,
     pub show_keys: bool,
@@ -98,6 +99,7 @@ pub struct App {
     pub search_query: String,
     pub toast_message: Option<(String, Instant, bool)>, // (msg, time, is_error)
     pub library_path: Option<String>,
+    pub loading_library: bool,
 }
 
 #[derive(Clone)]
@@ -151,7 +153,7 @@ impl App {
             sync_status: SyncStatus::Idle,
             sync_current_track: String::new(),
             sync_log: Vec::new(),
-            spinner_tick: 0,
+            throbber_state: ThrobberState::default(),
             should_quit: false,
             show_help: false,
             show_keys: true,
@@ -159,16 +161,10 @@ impl App {
             search_query: String::new(),
             toast_message: None,
             library_path: None,
+            loading_library: false,
         }
     }
 
-    pub fn load_library(&mut self, path: &str) -> Result<(), String> {
-        let lib = ItunesLibrary::parse(path)?;
-        self.library_path = Some(path.to_string());
-        self.library = Some(lib);
-        self.refresh_sidebar();
-        Ok(())
-    }
 
     pub fn refresh_sidebar(&mut self) {
         let lib = match &self.library {
@@ -455,6 +451,18 @@ impl App {
 
     pub fn handle_bg_event(&mut self, event: BgEvent) {
         match event {
+            BgEvent::LibraryLoaded(result) => {
+                self.loading_library = false;
+                match result {
+                    Ok(lib) => {
+                        self.library = Some(lib);
+                        self.refresh_sidebar();
+                    }
+                    Err(e) => {
+                        self.set_toast(format!("Library: {}", e), true);
+                    }
+                }
+            }
             BgEvent::DeviceDetected(info) => {
                 self.device_name = Some(info.name);
                 self.device_firmware = info.firmware_version;
@@ -537,7 +545,7 @@ impl App {
     }
 
     pub fn tick(&mut self) {
-        self.spinner_tick = self.spinner_tick.wrapping_add(1);
+        self.throbber_state.calc_next();
 
         // Auto-dismiss toast after 5 seconds.
         if let Some((_, time, _)) = &self.toast_message {
@@ -545,11 +553,6 @@ impl App {
                 self.toast_message = None;
             }
         }
-    }
-
-    pub fn spinner_frame(&self) -> &'static str {
-        const FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-        FRAMES[(self.spinner_tick / 3) % FRAMES.len()]
     }
 
     pub fn track_count(&self) -> usize {
@@ -679,37 +682,15 @@ impl App {
                 }
             }
             Panel::Albums => Panel::TrackList,
-            Panel::TrackList => {
-                if self.device_status == DeviceStatus::Connected {
-                    Panel::Device
-                } else if !self.sync_queue.is_empty() {
-                    Panel::SyncQueue
-                } else {
-                    Panel::Library
-                }
-            }
-            Panel::Device => {
-                if !self.sync_queue.is_empty() {
-                    Panel::SyncQueue
-                } else {
-                    Panel::Library
-                }
-            }
+            Panel::TrackList => Panel::Device,
+            Panel::Device => Panel::SyncQueue,
             Panel::SyncQueue => Panel::Library,
         };
     }
 
     pub fn cycle_panel_back(&mut self) {
         self.active_panel = match self.active_panel {
-            Panel::Library => {
-                if !self.sync_queue.is_empty() {
-                    Panel::SyncQueue
-                } else if self.device_status == DeviceStatus::Connected {
-                    Panel::Device
-                } else {
-                    Panel::TrackList
-                }
-            }
+            Panel::Library => Panel::SyncQueue,
             Panel::Albums => Panel::Library,
             Panel::TrackList => {
                 if self.has_album_browser() {
@@ -719,13 +700,7 @@ impl App {
                 }
             }
             Panel::Device => Panel::TrackList,
-            Panel::SyncQueue => {
-                if self.device_status == DeviceStatus::Connected {
-                    Panel::Device
-                } else {
-                    Panel::TrackList
-                }
-            }
+            Panel::SyncQueue => Panel::Device,
         };
     }
 }
@@ -754,6 +729,18 @@ fn tracks_to_info(tracks: Vec<&Track>) -> Vec<TrackInfo> {
         .collect()
 }
 
+pub fn format_with_commas(n: usize) -> String {
+    let s = n.to_string();
+    let mut result = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            result.push(',');
+        }
+        result.push(c);
+    }
+    result
+}
+
 pub fn format_duration(ms: u64) -> String {
     let total_secs = ms / 1000;
     let mins = total_secs / 60;
@@ -764,6 +751,16 @@ pub fn format_duration(ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_with_commas_cases() {
+        assert_eq!(format_with_commas(0), "0");
+        assert_eq!(format_with_commas(5), "5");
+        assert_eq!(format_with_commas(999), "999");
+        assert_eq!(format_with_commas(1000), "1,000");
+        assert_eq!(format_with_commas(12345), "12,345");
+        assert_eq!(format_with_commas(1_000_000), "1,000,000");
+    }
 
     #[test]
     fn format_duration_cases() {
@@ -785,14 +782,11 @@ mod tests {
     }
 
     #[test]
-    fn spinner_frame_cycles() {
+    fn throbber_state_advances() {
         let mut app = App::new();
-        let first = app.spinner_frame().to_string();
-        // Advance past one frame (3 ticks per frame).
-        for _ in 0..3 {
-            app.tick();
-        }
-        let second = app.spinner_frame().to_string();
+        let first = app.throbber_state.index();
+        app.tick();
+        let second = app.throbber_state.index();
         assert_ne!(first, second);
     }
 
@@ -814,7 +808,11 @@ mod tests {
         assert_eq!(app.active_panel, Panel::Library);
         app.cycle_panel(); // Library -> TrackList (no albums)
         assert_eq!(app.active_panel, Panel::TrackList);
-        app.cycle_panel(); // TrackList -> Library (no device, no queue)
+        app.cycle_panel(); // TrackList -> Device
+        assert_eq!(app.active_panel, Panel::Device);
+        app.cycle_panel(); // Device -> SyncQueue
+        assert_eq!(app.active_panel, Panel::SyncQueue);
+        app.cycle_panel(); // SyncQueue -> Library
         assert_eq!(app.active_panel, Panel::Library);
     }
 

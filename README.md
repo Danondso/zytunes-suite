@@ -18,6 +18,7 @@ A Rust CLI tool for syncing music to a Microsoft Zune 30 from macOS.
 - **Auto-transcoding** — non-native formats (FLAC, OGG, WAV, M4A, OPUS, ALAC, AIFF) are transcoded to MP3 via ffmpeg with album art resized to 200x200 (Zune 30 constraint)
 - **Library browsing** — `library [xml] [query]` browses/searches an iTunes Library.xml
 - **Library caching** — vendored `aft-mtp-cli` fork caches the device's artist/album library to `~/.aft-library-cache`, eliminating the ~5 min load time on subsequent sessions. Cache auto-updates on imports; use `zune-refresh` to force a full reload
+- **Interactive TUI** — `zytunes-tui` launches a terminal UI (ratatui) for browsing your iTunes library, connecting to the device, managing a sync queue, and monitoring sync progress. Library parsing runs in the background on startup
 
 ## What's planned
 
@@ -174,6 +175,12 @@ src/
     session.rs       — MTP session management and operations
     mtpz.rs          — MTPZ handshake (keys, crypto, authentication)
   library.rs         — iTunes Library.xml parser (tracks, playlists, artists)
+  tui/
+    main.rs          — TUI entry point (zytunes-tui binary)
+    app.rs           — application state, panel navigation, event handling
+    ui.rs            — ratatui widget rendering (layout, panels, overlays)
+    background.rs    — background worker thread (device I/O, sync, library loading)
+    theme.rs         — color and style definitions
 ```
 
 ## Reference libraries

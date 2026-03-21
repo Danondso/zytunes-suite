@@ -154,7 +154,6 @@ fn parse_itunes_xml<R: BufRead>(reader: R) -> Result<ItunesLibrary, String> {
     let mut pl_name = String::new();
     let mut pl_track_ids: Vec<u64> = Vec::new();
     let mut pl_item_key = String::new();
-    let mut track_count = 0u32;
 
     loop {
         buf.clear();
@@ -191,10 +190,6 @@ fn parse_itunes_xml<R: BufRead>(reader: R) -> Result<ItunesLibrary, String> {
                     match section {
                         Section::TrackEntry if dict_depth == 3 => {
                             if let Some(track) = build_track(&track_fields) {
-                                track_count += 1;
-                                if track_count.is_multiple_of(10000) {
-                                    eprint!("\r  Parsed {} tracks...    ", track_count);
-                                }
                                 library.tracks.insert(track.id, track);
                             }
                             section = Section::Tracks;
@@ -278,10 +273,6 @@ fn parse_itunes_xml<R: BufRead>(reader: R) -> Result<ItunesLibrary, String> {
             }
             _ => {}
         }
-    }
-
-    if track_count > 0 {
-        eprint!("\r{}\r", " ".repeat(40));
     }
 
     Ok(library)

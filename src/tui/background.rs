@@ -9,6 +9,7 @@ use zytunes::{make_transcode_temp_dir, needs_transcoding, transcode_to_mp3};
 
 /// Commands sent from the main TUI thread to the background worker.
 pub enum BgCommand {
+    LoadLibrary(String),
     Connect,
     LoadDeviceTracks,
     Disconnect,
@@ -48,6 +49,7 @@ pub struct StorageInfo {
 
 /// Events sent from the background worker back to the TUI.
 pub enum BgEvent {
+    LibraryLoaded(Result<zytunes::library::ItunesLibrary, String>),
     DeviceDetected(DeviceInfo),
     SessionReady(Option<StorageInfo>),
     SessionFailed(String),
@@ -81,6 +83,10 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
 
         while let Ok(cmd) = cmd_rx.recv() {
             match cmd {
+                BgCommand::LoadLibrary(path) => {
+                    let result = zytunes::library::ItunesLibrary::parse(&path);
+                    let _ = event_tx.send(BgEvent::LibraryLoaded(result));
+                }
                 BgCommand::Connect => {
                     // Detect device first via USB.
                     let _ = event_tx.send(BgEvent::SyncMessage(
@@ -360,6 +366,19 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                             failed,
                             skipped,
                         });
+
+                        // Reload device tracks so the count is accurate.
+                        let _ = event_tx.send(BgEvent::LoadingDeviceTracks);
+                        match s.collect_all_tracks("/Music") {
+                            Ok(tracks) => {
+                                let _ = event_tx.send(BgEvent::DeviceTracksLoaded(tracks));
+                            }
+                            Err(e) => {
+                                let _ = event_tx.send(BgEvent::Error(
+                                    format!("Failed to reload tracks: {}", e),
+                                ));
+                            }
+                        }
                     } else {
                         let _ = event_tx.send(BgEvent::Error("No active session".into()));
                     }

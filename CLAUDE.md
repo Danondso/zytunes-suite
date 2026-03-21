@@ -9,7 +9,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 cargo build                   # Debug build
 cargo build --release         # Release build
 cargo check                   # Fast type-check without building
-cargo run -- <command>        # Run with arguments (ls, push, rm, sync, library, help)
+cargo run -- <command>        # Run CLI with arguments (ls, push, rm, sync, library, help)
+cargo run --bin zytunes-tui   # Run interactive TUI
 cargo test                    # Run tests (42 unit + integration tests)
 cargo fmt                     # Format code
 cargo clippy                  # Lint
@@ -27,6 +28,8 @@ make aft-mtp-cli              # Binary output: aft/build/cli/aft-mtp-cli
 A Rust CLI tool for syncing music to a Microsoft Zune 30 from macOS. Detects the Zune over USB, authenticates via MTPZ (encrypted MTP), and manages music files on the device.
 
 CLI commands: `ls [path]`, `push <files...>`, `rm <paths...>`, `sync <type> <name>`, `library [xml] [query]`, `help`.
+
+**TUI** (`zytunes-tui`): Interactive terminal UI for browsing the iTunes library, connecting to the device, managing a sync queue, and monitoring sync progress. Library parsing runs asynchronously on a background thread at startup.
 
 ## Architecture
 
@@ -46,6 +49,11 @@ CLI commands: `ls [path]`, `push <files...>`, `rm <paths...>`, `sync <type> <nam
 - `mtp_native/` — Preserved pure-Rust MTP/MTPZ implementation (works except data-out on macOS). Not actively used but kept for a future IOKit backend
 - `library.rs` — iTunes Library.xml plist parser. Fully integrated — used by `sync` and `library` commands
 - `main.rs` — CLI entry point, `run()` dispatcher, `cmd_sync`/`cmd_push`/`cmd_rm`/`cmd_ls`/`cmd_library` commands, `sync_to_device()` engine, transcoding via ffmpeg
+- `tui/main.rs` — TUI entry point (`zytunes-tui` binary), event loop, terminal setup/teardown
+- `tui/app.rs` — TUI application state (`App`), panel navigation, background event handling
+- `tui/background.rs` — background worker thread: device detection, MTP session, sync execution, library loading
+- `tui/ui.rs` — ratatui rendering: layout (3-column with device left panel), startup screen, Zune ASCII art, panels, overlays
+- `tui/theme.rs` — color and style constants
 
 **Configuration:** iTunes library path defaults to `~/Music/Music/Library.xml`. Override with `ZYTUNES_LIBRARY` env var or `--library <path>` flag.
 

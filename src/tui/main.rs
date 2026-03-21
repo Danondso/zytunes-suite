@@ -38,18 +38,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create app state.
     let mut app = App::new();
-
-    // Try to load library (non-fatal if it fails).
-    match app.load_library(library_path) {
-        Ok(()) => {}
-        Err(e) => {
-            app.set_toast(format!("Library: {}", e), true);
-        }
-    }
+    app.loading_library = true;
+    app.library_path = Some(library_path.to_string());
 
     // Set up background worker.
     let (event_tx, event_rx) = mpsc::channel();
     let cmd_tx = background::spawn(event_tx);
+
+    // Kick off async library load.
+    let _ = cmd_tx.send(BgCommand::LoadLibrary(library_path.to_string()));
 
     // Main event loop.
     let result = run_loop(&mut terminal, &mut app, &cmd_tx, &event_rx);

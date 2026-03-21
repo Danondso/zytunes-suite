@@ -5,89 +5,78 @@ use ratatui::widgets::{
     Block, Borders, Cell, Clear, Gauge, List, ListItem, Paragraph, Row, Table, Wrap,
 };
 use ratatui::Frame;
+use throbber_widgets_tui::{Throbber, ThrobberState, WhichUse, BRAILLE_ONE};
 
-use crate::app::{format_duration, App, DeviceStatus, Panel, SidebarMode, SortColumn, SyncStatus};
+use crate::app::{format_duration, format_with_commas, App, DeviceStatus, Panel, SidebarMode, SortColumn, SyncStatus};
 use crate::theme;
+
+fn throbber_symbol(state: &ThrobberState) -> String {
+    Throbber::default()
+        .throbber_set(BRAILLE_ONE)
+        .use_type(WhichUse::Spin)
+        .to_symbol_span(state)
+        .content
+        .trim()
+        .to_string()
+}
 
 pub fn draw(f: &mut Frame, app: &App) {
     let size = f.area();
 
-    // Optional keys panel on the right.
+    if app.loading_library {
+        draw_startup(f, app, size);
+        return;
+    }
+
+    // Outer horizontal: device left | middle content | keys right
     let keys_width = if app.show_keys { 24 } else { 0 };
     let outer = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(40), Constraint::Length(keys_width)])
+        .constraints([
+            Constraint::Length(26),
+            Constraint::Min(40),
+            Constraint::Length(keys_width),
+        ])
         .split(size);
 
-    let content_area = outer[0];
+    // Left column: device info + sync queue + log
+    draw_device_left_panel(f, app, outer[0]);
 
-    // Main vertical layout: top area + bottom bar + footer
-    let has_queue = !app.sync_queue.is_empty()
-        || matches!(app.sync_status, SyncStatus::Running { .. })
-        || matches!(app.sync_status, SyncStatus::Complete { .. })
-        || !app.sync_log.is_empty();
-    let bottom_height = if has_queue { 8 } else { 0 };
-
-    let main_chunks = Layout::default()
+    // Middle: browser area + footer
+    let middle = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(10),                      // top area (library + tracks + device)
-            Constraint::Length(bottom_height as u16), // sync queue
-            Constraint::Length(3),                    // footer
-        ])
-        .split(content_area);
+        .constraints([Constraint::Min(8), Constraint::Length(3)])
+        .split(outer[1]);
 
-    // Top area: split into sidebar + main content vertically,
-    // then main content into tracks + device horizontally.
-    let has_device = app.device_status != DeviceStatus::Disconnected;
-    let device_height = if has_device { 8 } else { 3 };
-
-    let top_vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(8), Constraint::Length(device_height)])
-        .split(main_chunks[0]);
-
-    let top_horizontal = if app.has_album_browser() {
-        // 3-column layout: sidebar | albums | tracks
+    // Browser columns: sidebar | optional albums | tracks
+    let browser = if app.has_album_browser() {
         Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Length(28),
-                Constraint::Length(36),
-                Constraint::Min(24),
+                Constraint::Length(24),
+                Constraint::Length(30),
+                Constraint::Min(20),
             ])
-            .split(top_vertical[0])
+            .split(middle[0])
     } else {
-        // 2-column layout: sidebar | tracks
         Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Length(28), Constraint::Min(30)])
-            .split(top_vertical[0])
+            .split(middle[0])
     };
 
-    // Draw panels.
-    draw_sidebar(f, app, top_horizontal[0]);
+    draw_sidebar(f, app, browser[0]);
     if app.has_album_browser() {
-        draw_album_browser(f, app, top_horizontal[1]);
-        draw_track_list(f, app, top_horizontal[2]);
+        draw_album_browser(f, app, browser[1]);
+        draw_track_list(f, app, browser[2]);
     } else {
-        draw_track_list(f, app, top_horizontal[1]);
-    }
-    draw_device_panel(f, app, top_vertical[1]);
-
-    if has_queue {
-        let bottom_cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(75), Constraint::Percentage(25)])
-            .split(main_chunks[1]);
-        draw_sync_queue(f, app, bottom_cols[0]);
-        draw_sync_log(f, app, bottom_cols[1]);
+        draw_track_list(f, app, browser[1]);
     }
 
-    draw_footer(f, app, main_chunks[2]);
+    draw_footer(f, app, middle[1]);
 
     if app.show_keys {
-        draw_keys_panel(f, app, outer[1]);
+        draw_keys_panel(f, app, outer[2]);
     }
 
     // Toast overlay.
@@ -104,6 +93,47 @@ pub fn draw(f: &mut Frame, app: &App) {
     if app.search_active {
         draw_search_overlay(f, app);
     }
+}
+
+fn draw_startup(f: &mut Frame, app: &App, area: Rect) {
+    let symbol = throbber_symbol(&app.throbber_state);
+
+    let path_display = app
+        .library_path
+        .as_deref()
+        .unwrap_or("Library.xml");
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled("zytunes", Style::default().add_modifier(Modifier::BOLD))),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(format!(" {} ", symbol), theme::dim()),
+            Span::raw("Parsing library..."),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(path_display, theme::dim())),
+    ];
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::dim())
+        .title(" Starting ")
+        .title_alignment(Alignment::Center);
+
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .alignment(Alignment::Center);
+
+    // Center the panel: 40 wide, 10 tall
+    let w = 40u16.min(area.width);
+    let h = 10u16.min(area.height);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let centered = Rect::new(x, y, w, h);
+
+    f.render_widget(Clear, centered);
+    f.render_widget(paragraph, centered);
 }
 
 fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
@@ -480,7 +510,23 @@ fn draw_track_table(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(table, inner);
 }
 
-fn draw_device_panel(f: &mut Frame, app: &App, area: Rect) {
+fn draw_device_left_panel(f: &mut Frame, app: &App, area: Rect) {
+    // Split left column into 3 vertical sections: device info, sync queue, log.
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(40),
+            Constraint::Percentage(30),
+            Constraint::Percentage(30),
+        ])
+        .split(area);
+
+    draw_device_info(f, app, sections[0]);
+    draw_sync_queue(f, app, sections[1]);
+    draw_sync_log(f, app, sections[2]);
+}
+
+fn draw_device_info(f: &mut Frame, app: &App, area: Rect) {
     let is_active = app.active_panel == Panel::Device;
     let border_style = if is_active {
         Style::default().fg(theme::SELECTION_BG)
@@ -488,150 +534,129 @@ fn draw_device_panel(f: &mut Frame, app: &App, area: Rect) {
         theme::border()
     };
 
-    let spinner = app.spinner_frame();
     let title = match app.device_status {
-        DeviceStatus::Disconnected => " Device [c: connect] ".to_string(),
-        DeviceStatus::Detecting => format!(" Device — {} Detecting... ", spinner),
-        DeviceStatus::Connecting => format!(" Device — {} Connecting... ", spinner),
+        DeviceStatus::Disconnected => " Device [c] ".to_string(),
+        DeviceStatus::Detecting | DeviceStatus::Connecting => " Device ".to_string(),
         DeviceStatus::Connected => {
             let name = app.device_name.as_deref().unwrap_or("Zune");
-            if app.device_loading_tracks {
-                format!(" {} — {} Loading tracks... ", spinner, name)
-            } else {
-                format!(" {} — {} tracks ", name, app.device_tracks.len())
-            }
+            format!(" {} ", name)
         }
     };
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
-        .title(title);
+        .title(title)
+        .title_alignment(Alignment::Center);
 
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     match app.device_status {
         DeviceStatus::Disconnected => {
-            let p =
-                Paragraph::new("No device connected. Press 'c' to connect.").style(theme::dim());
+            let p = Paragraph::new("No device.\nPress 'c' to connect.").style(theme::dim());
             f.render_widget(p, inner);
         }
-        DeviceStatus::Detecting | DeviceStatus::Connecting => {}
+        DeviceStatus::Detecting | DeviceStatus::Connecting => {
+            let symbol = throbber_symbol(&app.throbber_state);
+            let p = Paragraph::new(format!(" {} Please wait...", symbol)).style(theme::dim());
+            f.render_widget(p, inner);
+        }
         DeviceStatus::Connected => {
-            draw_device_connected(f, app, inner);
+            draw_device_info_connected(f, app, inner);
         }
     }
 }
 
-fn draw_device_connected(f: &mut Frame, app: &App, area: Rect) {
-    let zune_art = [
-        "  ┌─────────┐  ",
-        "  │  ┌───┐  │  ",
-        "  │  │ Z │  │  ",
-        "  │  └───┘  │  ",
-        "  │   (●)   │  ",
-        "  └─────────┘  ",
-    ];
+fn draw_device_info_connected(f: &mut Frame, app: &App, area: Rect) {
+    let is_syncing = matches!(app.sync_status, SyncStatus::Running { .. });
+    let is_busy = app.device_loading_tracks;
 
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(18),
-            Constraint::Min(20),
-            Constraint::Min(24),
-        ])
-        .split(area);
+    // Screen content: two lines inside the screen area.
+    let (screen_line1, screen_line2) = if is_syncing {
+        let symbol = throbber_symbol(&app.throbber_state);
+        (symbol, "Syncing...".to_string())
+    } else if is_busy {
+        let symbol = throbber_symbol(&app.throbber_state);
+        (symbol, "Loading...".to_string())
+    } else {
+        let count = app.device_tracks.len();
+        let formatted = format_with_commas(count);
+        (formatted, "tracks".to_string())
+    };
 
-    // ASCII art.
-    let art_lines: Vec<Line> = zune_art
-        .iter()
-        .map(|l| Line::from(Span::styled(*l, theme::dim())))
-        .collect();
-    let art = Paragraph::new(art_lines);
-    f.render_widget(art, chunks[0]);
+    let zune_art = build_zune_art(&screen_line1, &screen_line2);
 
-    // Device info (left column).
-    let name = app.device_name.as_deref().unwrap_or("Zune 30");
-    let mut info: Vec<Line> = vec![Line::from(Span::styled(
-        name,
-        Style::default().add_modifier(Modifier::BOLD),
-    ))];
+    let mut lines: Vec<Line> = Vec::new();
 
+    // Zune ASCII art (centered).
+    for l in &zune_art {
+        lines.push(
+            Line::from(Span::styled(l.as_str(), theme::dim())).alignment(Alignment::Center),
+        );
+    }
+
+    // Device info lines below art.
     if let Some(ref fw) = app.device_firmware {
-        info.push(Line::from(vec![
-            Span::styled("FW: ", theme::dim()),
+        lines.push(Line::from(vec![
+            Span::styled(" FW: ", theme::dim()),
             Span::raw(fw.as_str()),
         ]));
     }
-
     if let Some(ref mfr) = app.device_manufacturer {
-        info.push(Line::from(vec![
-            Span::styled("Mfr: ", theme::dim()),
+        lines.push(Line::from(vec![
+            Span::styled(" Mfr: ", theme::dim()),
             Span::raw(mfr.as_str()),
         ]));
     }
-
     if let Some(ref mode) = app.device_usb_mode {
-        info.push(Line::from(vec![
-            Span::styled("USB: ", theme::dim()),
+        lines.push(Line::from(vec![
+            Span::styled(" USB: ", theme::dim()),
             Span::raw(mode.as_str()),
         ]));
     }
-
     if let Some(ref serial) = app.device_serial {
-        let display = if serial.len() > 12 {
-            format!("{}...", &serial[..12])
+        let display = if serial.chars().count() > 12 {
+            format!("{}...", serial.chars().take(12).collect::<String>())
         } else {
             serial.clone()
         };
-        info.push(Line::from(vec![
-            Span::styled("S/N: ", theme::dim()),
+        lines.push(Line::from(vec![
+            Span::styled(" S/N: ", theme::dim()),
             Span::raw(display),
         ]));
     }
 
-    let info_p = Paragraph::new(info);
-    f.render_widget(info_p, chunks[1]);
-
-    // Storage + tracks info (right column).
-    let track_count = app.device_tracks.len();
-    let mut right_info: Vec<Line> = Vec::new();
-
-    if app.device_loading_tracks {
-        right_info.push(Line::from(Span::styled("Loading tracks...", theme::dim())));
-    } else {
-        right_info.push(Line::from(format!("{} tracks on device", track_count)));
-    }
-
+    // Storage info.
     if let Some(ref storage) = app.device_storage {
         let total_gb = storage.total_bytes as f64 / 1_073_741_824.0;
         let free_gb = storage.free_bytes as f64 / 1_073_741_824.0;
         let used_gb = storage.used_bytes as f64 / 1_073_741_824.0;
-        right_info.push(Line::from(format!(
-            "{:.1} GB / {:.1} GB ({:.1} GB free)",
+        lines.push(Line::from(""));
+        lines.push(Line::from(format!(
+            " {:.1}/{:.1} GB ({:.1} free)",
             used_gb, total_gb, free_gb
         )));
-        // Simple text gauge.
-        let bar_width = 20usize;
+        let bar_width = 16usize;
         let filled = (bar_width as f64 * storage.used_percent as f64 / 100.0) as usize;
         let empty = bar_width.saturating_sub(filled);
-        right_info.push(Line::from(vec![
-            Span::raw("["),
+        lines.push(Line::from(vec![
+            Span::raw(" ["),
             Span::styled("=".repeat(filled), Style::default().fg(theme::PROGRESS_BAR)),
             Span::styled(" ".repeat(empty), Style::default().fg(theme::PROGRESS_BG)),
             Span::raw(format!("] {}%", storage.used_percent)),
         ]));
     }
 
-    right_info.push(Line::from(""));
-    right_info.push(Line::from(Span::styled(
-        "r: refresh | d: disconnect",
-        theme::dim(),
-    )));
+    if !app.device_loading_tracks {
+        lines.push(Line::from(format!(
+            " {} tracks on device",
+            app.device_tracks.len()
+        )));
+    }
 
-    let right_p = Paragraph::new(right_info);
-    f.render_widget(right_p, chunks[2]);
+    let p = Paragraph::new(lines);
+    f.render_widget(p, area);
 }
 
 fn draw_sync_queue(f: &mut Frame, app: &App, area: Rect) {
@@ -738,7 +763,7 @@ fn draw_sync_queue(f: &mut Frame, app: &App, area: Rect) {
                 let list = List::new(items);
                 f.render_widget(list, chunks[0]);
 
-                let hints = "Enter/S: sync | d: remove | C: clear";
+                let hints = "S:sync d:rm C:clr";
                 f.render_widget(Paragraph::new(hints).style(theme::dim()), chunks[1]);
             }
         }
@@ -892,46 +917,30 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(block, area);
 
     let left = format!(" {} tracks", app.track_count());
-    let center = match app.device_status {
-        DeviceStatus::Disconnected => "No device".to_string(),
-        DeviceStatus::Detecting => "Detecting...".to_string(),
-        DeviceStatus::Connecting => "Connecting...".to_string(),
-        DeviceStatus::Connected => {
-            let name = app.device_name.as_deref().unwrap_or("Zune");
-            format!("Connected: {}", name)
-        }
-    };
-    let right = "h:keys | Tab:panels | c:connect | a:add | S:sync | q:quit | ?:help";
+    let right = "Tab:panels | a:add | S:sync | q:quit | ?:help";
 
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(16),
-            Constraint::Min(20),
-            Constraint::Length(right.len() as u16 + 1),
-        ])
+        .constraints([Constraint::Length(16), Constraint::Min(20)])
         .split(inner);
 
     f.render_widget(Paragraph::new(left).style(theme::footer()), chunks[0]);
     f.render_widget(
-        Paragraph::new(center)
-            .alignment(Alignment::Center)
-            .style(theme::footer()),
-        chunks[1],
-    );
-    f.render_widget(
         Paragraph::new(format!("{} ", right))
             .alignment(Alignment::Right)
             .style(theme::footer()),
-        chunks[2],
+        chunks[1],
     );
 }
 
 fn draw_toast(f: &mut Frame, msg: &str, is_error: bool) {
     let area = f.area();
+    if area.width < 8 || area.height < 3 {
+        return;
+    }
     let width = (msg.len() as u16 + 4).min(area.width - 4);
     let x = (area.width.saturating_sub(width)) / 2;
-    let y = area.height.saturating_sub(5);
+    let y = (area.height.saturating_sub(3)) / 2;
     let rect = Rect::new(x, y, width, 3);
 
     f.render_widget(Clear, rect);
@@ -1151,5 +1160,160 @@ fn truncate(s: &str, max: usize) -> String {
         chars[..max - 1].iter().collect::<String>() + "…"
     } else {
         chars[..max].iter().collect()
+    }
+}
+
+/// Pad/center a string to exactly `w` chars.
+fn center_pad(s: &str, w: usize) -> String {
+    let len = s.chars().count();
+    if len >= w {
+        s.chars().take(w).collect()
+    } else {
+        let left = (w - len) / 2;
+        let right = w - len - left;
+        format!("{}{}{}", " ".repeat(left), s, " ".repeat(right))
+    }
+}
+
+/// Build the Zune ASCII art lines with the given screen content.
+fn build_zune_art(screen_line1: &str, screen_line2: &str) -> Vec<String> {
+    let screen_w = 12;
+    let line1 = center_pad(screen_line1, screen_w);
+    let line2 = center_pad(screen_line2, screen_w);
+
+    vec![
+        " ╭──────────────────╮ ".to_string(),
+        " │  ┌────────────┐  │ ".to_string(),
+        format!(" │  │{}│  │ ", line1),
+        format!(" │  │{}│  │ ", line2),
+        " │  └────────────┘  │ ".to_string(),
+        " │                  │ ".to_string(),
+        " │  |<  ╭────╮  >|  │ ".to_string(),
+        " │      │    │      │ ".to_string(),
+        " │      ╰────╯      │ ".to_string(),
+        " ╰──────────────────╯ ".to_string(),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zune_art_connected_track_count() {
+        let art = build_zune_art("4,455", "tracks");
+        let expected = vec![
+            " ╭──────────────────╮ ",
+            " │  ┌────────────┐  │ ",
+            " │  │   4,455    │  │ ",
+            " │  │   tracks   │  │ ",
+            " │  └────────────┘  │ ",
+            " │                  │ ",
+            " │  |<  ╭────╮  >|  │ ",
+            " │      │    │      │ ",
+            " │      ╰────╯      │ ",
+            " ╰──────────────────╯ ",
+        ];
+        assert_eq!(art, expected);
+    }
+
+    #[test]
+    fn zune_art_loading_state() {
+        let art = build_zune_art("*", "Loading...");
+        let expected = vec![
+            " ╭──────────────────╮ ",
+            " │  ┌────────────┐  │ ",
+            " │  │     *      │  │ ",
+            " │  │ Loading... │  │ ",
+            " │  └────────────┘  │ ",
+            " │                  │ ",
+            " │  |<  ╭────╮  >|  │ ",
+            " │      │    │      │ ",
+            " │      ╰────╯      │ ",
+            " ╰──────────────────╯ ",
+        ];
+        assert_eq!(art, expected);
+    }
+
+    #[test]
+    fn zune_art_zero_tracks() {
+        let art = build_zune_art("0", "tracks");
+        let expected = vec![
+            " ╭──────────────────╮ ",
+            " │  ┌────────────┐  │ ",
+            " │  │     0      │  │ ",
+            " │  │   tracks   │  │ ",
+            " │  └────────────┘  │ ",
+            " │                  │ ",
+            " │  |<  ╭────╮  >|  │ ",
+            " │      │    │      │ ",
+            " │      ╰────╯      │ ",
+            " ╰──────────────────╯ ",
+        ];
+        assert_eq!(art, expected);
+    }
+
+    #[test]
+    fn zune_art_large_track_count() {
+        let art = build_zune_art("12,345", "tracks");
+        let expected = vec![
+            " ╭──────────────────╮ ",
+            " │  ┌────────────┐  │ ",
+            " │  │   12,345   │  │ ",
+            " │  │   tracks   │  │ ",
+            " │  └────────────┘  │ ",
+            " │                  │ ",
+            " │  |<  ╭────╮  >|  │ ",
+            " │      │    │      │ ",
+            " │      ╰────╯      │ ",
+            " ╰──────────────────╯ ",
+        ];
+        assert_eq!(art, expected);
+    }
+
+    #[test]
+    fn zune_art_overflow_truncates() {
+        let art = build_zune_art("1234567890ABC", "tracks");
+        let expected = vec![
+            " ╭──────────────────╮ ",
+            " │  ┌────────────┐  │ ",
+            " │  │1234567890AB│  │ ",
+            " │  │   tracks   │  │ ",
+            " │  └────────────┘  │ ",
+            " │                  │ ",
+            " │  |<  ╭────╮  >|  │ ",
+            " │      │    │      │ ",
+            " │      ╰────╯      │ ",
+            " ╰──────────────────╯ ",
+        ];
+        assert_eq!(art, expected);
+    }
+
+    #[test]
+    fn zune_art_syncing_state() {
+        let art = build_zune_art("*", "Syncing...");
+        let expected = vec![
+            " ╭──────────────────╮ ",
+            " │  ┌────────────┐  │ ",
+            " │  │     *      │  │ ",
+            " │  │ Syncing... │  │ ",
+            " │  └────────────┘  │ ",
+            " │                  │ ",
+            " │  |<  ╭────╮  >|  │ ",
+            " │      │    │      │ ",
+            " │      ╰────╯      │ ",
+            " ╰──────────────────╯ ",
+        ];
+        assert_eq!(art, expected);
+    }
+
+    #[test]
+    fn center_pad_cases() {
+        assert_eq!(center_pad("hi", 6), "  hi  ");
+        assert_eq!(center_pad("abc", 5), " abc ");
+        assert_eq!(center_pad("ab", 5), " ab  "); // odd remainder: extra space on right
+        assert_eq!(center_pad("toolong", 4), "tool"); // truncated
+        assert_eq!(center_pad("exact", 5), "exact");
+        assert_eq!(center_pad("", 4), "    ");
     }
 }
