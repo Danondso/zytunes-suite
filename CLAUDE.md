@@ -59,7 +59,7 @@ CLI commands: `ls [path]`, `push <files...>`, `rm <paths...>`, `sync <type> <nam
 
 **External tool dependencies:** `ffmpeg`/`ffprobe` (transcoding), `libusb` (via rusb). `aft-mtp-cli` is vendored in `aft/`.
 
-**Transcoding:** Non-native formats (FLAC, OGG, WAV, M4A, OPUS, ALAC, AIFF) are automatically transcoded to MP3 via ffmpeg. Album art is resized to 200x200 JPEG (Zune 30 rejects larger art with error `0xa803`).
+**Transcoding:** Non-native formats (FLAC, OGG, WAV, M4A, OPUS, ALAC, AIFF) are automatically transcoded to MP3 via ffmpeg. Native formats (MP3, WMA, AAC) skip transcoding entirely. Album art is resized to 200x200 JPEG (Zune 30 rejects larger art with error `0xa803`).
 
 ## Zune 30 Constraints
 

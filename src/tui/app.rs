@@ -437,7 +437,11 @@ impl App {
     }
 
     pub fn execute_sync(&mut self, cmd_tx: &mpsc::Sender<BgCommand>) {
-        if self.sync_queue.is_empty() || self.device_status != DeviceStatus::Connected {
+        if self.sync_queue.is_empty() {
+            return;
+        }
+        if self.device_status != DeviceStatus::Connected {
+            self.set_toast("Connect a device before syncing".into(), true);
             return;
         }
         self.sync_log.clear();

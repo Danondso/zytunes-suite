@@ -16,12 +16,14 @@ A Rust CLI tool for syncing music to a Microsoft Zune 30 from macOS.
 - **iTunes library sync** — `sync <type> <name>` syncs tracks from an iTunes Library.xml by artist, album, playlist, or track name. Detects duplicates already on device and skips them
 - **Playlist creation** — `sync playlist <name>` imports tracks and creates the playlist on the device
 - **Auto-transcoding** — non-native formats (FLAC, OGG, WAV, M4A, OPUS, ALAC, AIFF) are transcoded to MP3 via ffmpeg with album art resized to 200x200 (Zune 30 constraint)
+- **MP3 passthrough** — native formats (MP3, WMA, AAC) skip transcoding entirely
 - **Library browsing** — `library [xml] [query]` browses/searches an iTunes Library.xml
 - **Library caching** — vendored `aft-mtp-cli` fork caches the device's artist/album library to `~/.aft-library-cache`, eliminating the ~5 min load time on subsequent sessions. Cache auto-updates on imports; use `zune-refresh` to force a full reload
-- **Interactive TUI** — `zytunes-tui` launches a terminal UI (ratatui) for browsing your iTunes library, connecting to the device, managing a sync queue, and monitoring sync progress. Library parsing runs in the background on startup
+- **Interactive TUI** — `zytunes-tui` launches a terminal UI (ratatui) for browsing your iTunes library, connecting to the device, managing a sync queue, and monitoring sync progress. Library parsing runs in the background on startup. TUI displays sync status on the Zune ASCII art screen including loading spinner, track count, syncing spinner, and queue count
 
 ## What's planned
 
+- **Device content view** — browse and manage tracks on the device from the TUI, with indicators for tracks already on device, searchable device library, and support for removing items from the device via the queue
 - **Dump command** — `dump` to pull all music off a Zune to a local directory
 
 ## Setup
