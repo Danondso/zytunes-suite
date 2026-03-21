@@ -4,6 +4,11 @@
 
 - **Sync engine** — diff local music directory against device contents, push new tracks, optionally remove deleted ones
 - **MP3 passthrough** — skip transcoding for files already in Zune-native formats (MP3, WMA). Currently all non-native formats are transcoded.
+- Adding syncing status to the zune ascii art
+  - loading spinner should be on the screen
+  - once loaded, show track count on the screen (3333 tracks)
+  - show a syncing spinner when the queue is processing
+  - show updated queue count
 
 ## Future
 
