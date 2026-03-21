@@ -9,17 +9,19 @@ use std::time::{Duration, Instant};
 /// aft-mtp-cli prepends cursor-movement codes (e.g. \x1b[1A\x1b[2K) to output lines.
 fn strip_ansi(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
-    let mut chars = s.chars();
+    let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\x1b' {
             // Skip \x1b[...X sequences (where X is a letter).
-            if chars.next() == Some('[') {
+            if chars.peek() == Some(&'[') {
+                chars.next(); // consume '['
                 for c in chars.by_ref() {
                     if c.is_ascii_alphabetic() {
                         break;
                     }
                 }
             }
+            // Non-CSI escape: just drop the ESC, keep the next char.
         } else {
             result.push(c);
         }
@@ -85,9 +87,40 @@ pub struct AftSession {
     child: Child,
     stdin: ChildStdin,
     reader: BufReader<ChildStdout>,
+    log_tx: Option<std::sync::mpsc::Sender<String>>,
 }
 
 impl AftSession {
+    /// Set a channel for log messages. When set, all progress and status
+    /// messages are sent through this channel instead of printing to stderr.
+    pub fn set_log_sender(&mut self, tx: std::sync::mpsc::Sender<String>) {
+        self.log_tx = Some(tx);
+    }
+
+    /// Log a message — sends to channel if set, otherwise prints to stderr.
+    fn log(&self, msg: &str) {
+        if let Some(ref tx) = self.log_tx {
+            let clean = msg.trim_start_matches('\r').trim();
+            if !clean.is_empty() {
+                let _ = tx.send(clean.to_string());
+            }
+        } else {
+            eprint!("{}", msg);
+        }
+    }
+
+    /// Log a message with a newline.
+    fn logln(&self, msg: &str) {
+        if let Some(ref tx) = self.log_tx {
+            let clean = msg.trim_start_matches('\r').trim();
+            if !clean.is_empty() {
+                let _ = tx.send(clean.to_string());
+            }
+        } else {
+            eprintln!("{}", msg);
+        }
+    }
+
     /// Find the aft-mtp-cli binary.
     fn find_binary() -> Result<PathBuf, String> {
         // 1. AFT_MTP_CLI env var.
@@ -156,6 +189,8 @@ impl AftSession {
 
         #[cfg(unix)]
         if let Err(warning) = check_mtpz_permissions(&mtpz_path) {
+            // Logged after session is constructed so log_tx can be used.
+            // For now just print — this runs before the TUI takes over.
             eprintln!("Warning: {warning}");
         }
 
@@ -178,11 +213,7 @@ impl AftSession {
         if let Some(stderr) = child.stderr.take() {
             std::thread::spawn(move || {
                 let reader = BufReader::new(stderr);
-                for line in reader.lines().map_while(Result::ok) {
-                    if !line.is_empty() {
-                        eprintln!("  [aft] {}", line);
-                    }
-                }
+                for _line in reader.lines().map_while(Result::ok) {}
             });
         }
 
@@ -190,6 +221,7 @@ impl AftSession {
             child,
             stdin,
             reader,
+            log_tx: None,
         };
 
         // Wait for startup. aft-mtp-cli prints device/storage info (no `:done` marker).
@@ -202,6 +234,18 @@ impl AftSession {
         }
 
         Ok(session)
+    }
+
+    /// Query MTP device info: manufacturer, model, firmware version, serial number.
+    /// Returns raw lines from the `device-info` command.
+    pub fn device_info(&mut self) -> Result<Vec<String>, String> {
+        self.send("device-info")
+    }
+
+    /// Query storage info for a given storage path/id.
+    /// Returns a line like: "used 12345678 (45%), free 15000000 bytes of 27345678"
+    pub fn storage_info(&mut self, storage: &str) -> Result<Vec<String>, String> {
+        self.send(&format!("storage-info {}", aft_quote(storage)))
     }
 
     /// Send a command and collect output lines until `:done`.
@@ -288,7 +332,7 @@ impl AftSession {
                             let pct = (transferred as f64 / total as f64 * 100.0) as u32;
                             let mb = transferred as f64 / 1_048_576.0;
                             let total_mb = total as f64 / 1_048_576.0;
-                            eprint!("\r  Uploading: {:.1}/{:.1} MB ({}%)    ", mb, total_mb, pct);
+                            self.log(&format!("\r  Uploading: {:.1}/{:.1} MB ({}%)    ", mb, total_mb, pct));
                         } else if line.starts_with("album:")
                             || line.starts_with("getting ")
                             || line.starts_with("artists ")
@@ -297,7 +341,7 @@ impl AftSession {
                             || line.starts_with("device ")
                             || line.starts_with("abstract ")
                         {
-                            eprint!("\r  {}    ", &line[..line.len().min(70)]);
+                            self.log(&format!("\r  {}    ", &line[..line.len().min(70)]));
                         }
                     }
                     lines.push(line.to_string());
@@ -343,7 +387,7 @@ impl DeviceSession for AftSession {
                     let line = strip_ansi(raw);
                     let line = line.trim();
                     if line == ":done" {
-                        eprint!("\r{}\r", " ".repeat(60)); // clear progress line
+                        self.log(&format!("\r{}\r", " ".repeat(60)));
                         return track_id.ok_or_else(|| {
                             "import succeeded but no track-id received".to_string()
                         });
@@ -353,17 +397,17 @@ impl DeviceSession for AftSession {
                     } else if line.starts_with("album:") {
                         album_count += 1;
                         if album_count.is_multiple_of(10) || album_count <= 5 {
-                            eprint!("\r  Loading library: {} albums indexed...    ", album_count);
+                            self.log(&format!("  Loading library: {} albums indexed...", album_count));
                         }
                     } else if line.starts_with("getting ") {
-                        eprint!("\r  {}...                              ", line);
+                        self.log(&format!("  {}...", line));
                     } else if let Some((transferred, total)) = parse_progress(line) {
                         let pct = (transferred as f64 / total as f64 * 100.0) as u32;
                         let mb = transferred as f64 / 1_048_576.0;
                         let total_mb = total as f64 / 1_048_576.0;
-                        eprint!("\r  Uploading: {:.1}/{:.1} MB ({}%)    ", mb, total_mb, pct);
+                        self.log(&format!("  Uploading: {:.1}/{:.1} MB ({}%)", mb, total_mb, pct));
                     } else if line.contains("error:") {
-                        eprintln!("\n  {}", line);
+                        self.logln(&format!("  {}", line));
                         return Err(line.to_string());
                     } else if line.starts_with("device ")
                         || line.starts_with("abstract ")
@@ -371,10 +415,7 @@ impl DeviceSession for AftSession {
                         || line.starts_with("albums ")
                         || line.starts_with("music ")
                     {
-                        eprint!(
-                            "\r  {}                                ",
-                            &line[..line.len().min(55)]
-                        );
+                        self.log(&format!("  {}", &line[..line.len().min(55)]));
                     }
                 }
                 Err(e) => return Err(format!("Read: {e}")),
@@ -417,7 +458,7 @@ impl DeviceSession for AftSession {
                     let lines = self.send(&format!("rm-id {id}"))?;
                     for line in &lines {
                         if line.contains("error") {
-                            eprintln!("  Warning: rm-id {id}: {line}");
+                            self.logln(&format!("  Warning: rm-id {id}: {line}"));
                         }
                     }
                 }
@@ -492,6 +533,7 @@ impl AftSession {
             child,
             stdin,
             reader,
+            log_tx: None,
         }
     }
 }
@@ -506,6 +548,10 @@ mod tests {
         assert_eq!(strip_ansi("Hello World"), "Hello World");
         assert_eq!(strip_ansi("\x1b[1A\x1b[2KHello"), "Hello");
         assert_eq!(strip_ansi("\x1b[1Afoo\x1b[2Kbar\x1b[0m"), "foobar");
+        // Non-CSI escape: ESC not followed by '[' should only drop ESC.
+        assert_eq!(strip_ansi("\x1bXHello"), "XHello");
+        // Bare ESC at end of string.
+        assert_eq!(strip_ansi("foo\x1b"), "foo");
     }
 
     #[test]

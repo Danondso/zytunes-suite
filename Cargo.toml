@@ -1,6 +1,6 @@
 [package]
 name = "zytunes"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "A CLI tool for syncing music to a Microsoft Zune 30 on macOS"
 
@@ -8,3 +8,13 @@ description = "A CLI tool for syncing music to a Microsoft Zune 30 on macOS"
 rusb = "0.9"
 quick-xml = "0.37"
 percent-encoding = "2"
+ratatui = "0.29"
+crossterm = "0.28"
+
+[[bin]]
+name = "zytunes"
+path = "src/main.rs"
+
+[[bin]]
+name = "zytunes-tui"
+path = "src/tui/main.rs"

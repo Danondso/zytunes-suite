@@ -19,6 +19,9 @@ pub struct ZuneDevice {
     pub vendor_id: u16,
     pub product_id: u16,
     pub product_name: Option<String>,
+    pub firmware_version: Option<String>,
+    pub serial_number: Option<String>,
+    pub usb_mode: Option<String>,
 }
 
 impl fmt::Display for ZuneDevice {
@@ -54,17 +57,34 @@ impl ZuneDevice {
             let product_id = desc.product_id();
 
             // Check if this is a known Zune product ID.
-            if ZUNE_PRODUCT_IDS.iter().any(|(pid, _)| *pid == product_id) {
+            if let Some((_, mode_label)) =
+                ZUNE_PRODUCT_IDS.iter().find(|(pid, _)| *pid == product_id)
+            {
                 let handle = device.open();
                 let product_name = handle
                     .as_ref()
                     .ok()
                     .and_then(|h| h.read_product_string_ascii(&desc).ok());
+                let serial_number = handle
+                    .as_ref()
+                    .ok()
+                    .and_then(|h| h.read_serial_number_string_ascii(&desc).ok());
+
+                // bcdDevice encodes firmware version as BCD (e.g. 0x0310 = 3.10).
+                let bcd = desc.device_version();
+                let firmware_version = Some(format!(
+                    "{}.{:02}",
+                    bcd.major(),
+                    bcd.minor() * 10 + bcd.sub_minor()
+                ));
 
                 return Ok(ZuneDevice {
                     vendor_id: MICROSOFT_VENDOR_ID,
                     product_id,
                     product_name,
+                    firmware_version,
+                    serial_number,
+                    usb_mode: Some(mode_label.to_string()),
                 });
             }
 
@@ -128,6 +148,9 @@ mod tests {
             vendor_id: 0x045e,
             product_id: 0x0710,
             product_name: None,
+            firmware_version: None,
+            serial_number: None,
+            usb_mode: None,
         };
         assert_eq!(format!("{}", device), "Zune vid=0x045e pid=0x0710");
 
