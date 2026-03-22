@@ -1,59 +1,324 @@
 use ratatui::style::{Color, Modifier, Style};
 
-// iTunes 2004 color palette
-pub const SIDEBAR_BG: Color = Color::Rgb(225, 228, 232);
-pub const SIDEBAR_TEXT: Color = Color::Rgb(30, 30, 30);
-pub const SELECTION_BG: Color = Color::Rgb(56, 117, 215);
-pub const SELECTION_TEXT: Color = Color::White;
-pub const MAIN_BG: Color = Color::Rgb(255, 255, 255);
-pub const ALT_ROW_BG: Color = Color::Rgb(237, 243, 254);
-pub const BORDER: Color = Color::Rgb(180, 180, 180);
-pub const FOOTER_BG: Color = Color::Rgb(200, 203, 207);
-pub const FOOTER_TEXT: Color = Color::Rgb(40, 40, 40);
-pub const HEADER_TEXT: Color = Color::Rgb(80, 80, 80);
-pub const DIM_TEXT: Color = Color::Rgb(140, 140, 140);
-pub const ERROR_TEXT: Color = Color::Rgb(200, 50, 50);
-pub const SUCCESS_TEXT: Color = Color::Rgb(50, 160, 50);
-pub const PROGRESS_BAR: Color = Color::Rgb(56, 117, 215);
-pub const PROGRESS_BG: Color = Color::Rgb(220, 220, 220);
-
-pub fn selected() -> Style {
-    Style::default()
-        .bg(SELECTION_BG)
-        .fg(SELECTION_TEXT)
-        .add_modifier(Modifier::BOLD)
+pub struct Theme {
+    pub name: &'static str,
+    pub sidebar_bg: Color,
+    pub sidebar_text: Color,
+    pub selection_bg: Color,
+    pub selection_text: Color,
+    pub main_bg: Color,
+    pub alt_row_bg: Color,
+    pub border: Color,
+    pub footer_bg: Color,
+    pub footer_text: Color,
+    pub header_text: Color,
+    pub dim_text: Color,
+    pub error_text: Color,
+    pub success_text: Color,
+    pub progress_bar: Color,
+    pub progress_bg: Color,
 }
 
-pub fn sidebar_item() -> Style {
-    Style::default().fg(SIDEBAR_TEXT)
+impl Theme {
+    pub fn selected(&self) -> Style {
+        Style::default()
+            .bg(self.selection_bg)
+            .fg(self.selection_text)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn sidebar_item(&self) -> Style {
+        Style::default().fg(self.sidebar_text)
+    }
+
+    pub fn sidebar_item_selected(&self) -> Style {
+        self.selected()
+    }
+
+    pub fn header(&self) -> Style {
+        Style::default()
+            .fg(self.header_text)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn dim(&self) -> Style {
+        Style::default().fg(self.dim_text)
+    }
+
+    pub fn footer(&self) -> Style {
+        Style::default().bg(self.footer_bg).fg(self.footer_text)
+    }
+
+    pub fn border(&self) -> Style {
+        Style::default().fg(self.border)
+    }
+
+    pub fn error(&self) -> Style {
+        Style::default().fg(self.error_text)
+    }
+
+    pub fn success(&self) -> Style {
+        Style::default().fg(self.success_text)
+    }
 }
 
-pub fn sidebar_item_selected() -> Style {
-    selected()
+// -- Built-in theme presets --
+
+pub const THEMES: &[Theme] = &[
+    ITUNES_2004,
+    GRUVBOX_DARK,
+    GRUVBOX_LIGHT,
+    EVERFOREST_DARK,
+    EVERFOREST_LIGHT,
+    MIAMI_NIGHTS,
+    IBM_MAINFRAME,
+    WINDOWS_95,
+    SYSTEM_7,
+    BIOS,
+    RED_SANDS,
+];
+
+pub const ITUNES_2004: Theme = Theme {
+    name: "iTunes 2004",
+    sidebar_bg: Color::Rgb(225, 228, 232),
+    sidebar_text: Color::Rgb(30, 30, 30),
+    selection_bg: Color::Rgb(56, 117, 215),
+    selection_text: Color::White,
+    main_bg: Color::Rgb(255, 255, 255),
+    alt_row_bg: Color::Rgb(237, 243, 254),
+    border: Color::Rgb(180, 180, 180),
+    footer_bg: Color::Rgb(200, 203, 207),
+    footer_text: Color::Rgb(40, 40, 40),
+    header_text: Color::Rgb(80, 80, 80),
+    dim_text: Color::Rgb(140, 140, 140),
+    error_text: Color::Rgb(200, 50, 50),
+    success_text: Color::Rgb(50, 160, 50),
+    progress_bar: Color::Rgb(56, 117, 215),
+    progress_bg: Color::Rgb(220, 220, 220),
+};
+
+pub const GRUVBOX_DARK: Theme = Theme {
+    name: "Gruvbox Dark",
+    sidebar_bg: Color::Rgb(50, 48, 47),
+    sidebar_text: Color::Rgb(235, 219, 178),
+    selection_bg: Color::Rgb(214, 93, 14),
+    selection_text: Color::Rgb(40, 40, 40),
+    main_bg: Color::Rgb(40, 40, 40),
+    alt_row_bg: Color::Rgb(60, 56, 54),
+    border: Color::Rgb(102, 92, 84),
+    footer_bg: Color::Rgb(50, 48, 47),
+    footer_text: Color::Rgb(189, 174, 147),
+    header_text: Color::Rgb(168, 153, 132),
+    dim_text: Color::Rgb(124, 111, 100),
+    error_text: Color::Rgb(204, 36, 29),
+    success_text: Color::Rgb(152, 151, 26),
+    progress_bar: Color::Rgb(214, 93, 14),
+    progress_bg: Color::Rgb(60, 56, 54),
+};
+
+pub const GRUVBOX_LIGHT: Theme = Theme {
+    name: "Gruvbox Light",
+    sidebar_bg: Color::Rgb(242, 229, 188),
+    sidebar_text: Color::Rgb(60, 56, 54),
+    selection_bg: Color::Rgb(175, 58, 3),
+    selection_text: Color::Rgb(251, 241, 199),
+    main_bg: Color::Rgb(251, 241, 199),
+    alt_row_bg: Color::Rgb(235, 219, 178),
+    border: Color::Rgb(168, 153, 132),
+    footer_bg: Color::Rgb(213, 196, 161),
+    footer_text: Color::Rgb(60, 56, 54),
+    header_text: Color::Rgb(102, 92, 84),
+    dim_text: Color::Rgb(146, 131, 116),
+    error_text: Color::Rgb(157, 0, 6),
+    success_text: Color::Rgb(121, 116, 14),
+    progress_bar: Color::Rgb(175, 58, 3),
+    progress_bg: Color::Rgb(213, 196, 161),
+};
+
+pub const EVERFOREST_DARK: Theme = Theme {
+    name: "Everforest Dark",
+    sidebar_bg: Color::Rgb(45, 53, 59),
+    sidebar_text: Color::Rgb(211, 198, 170),
+    selection_bg: Color::Rgb(167, 192, 128),
+    selection_text: Color::Rgb(45, 53, 59),
+    main_bg: Color::Rgb(39, 46, 51),
+    alt_row_bg: Color::Rgb(52, 61, 68),
+    border: Color::Rgb(78, 90, 97),
+    footer_bg: Color::Rgb(45, 53, 59),
+    footer_text: Color::Rgb(167, 192, 128),
+    header_text: Color::Rgb(135, 144, 130),
+    dim_text: Color::Rgb(90, 101, 99),
+    error_text: Color::Rgb(230, 126, 128),
+    success_text: Color::Rgb(167, 192, 128),
+    progress_bar: Color::Rgb(167, 192, 128),
+    progress_bg: Color::Rgb(52, 61, 68),
+};
+
+pub const EVERFOREST_LIGHT: Theme = Theme {
+    name: "Everforest Light",
+    sidebar_bg: Color::Rgb(239, 239, 225),
+    sidebar_text: Color::Rgb(92, 106, 114),
+    selection_bg: Color::Rgb(141, 161, 1),
+    selection_text: Color::Rgb(253, 246, 227),
+    main_bg: Color::Rgb(253, 246, 227),
+    alt_row_bg: Color::Rgb(239, 239, 225),
+    border: Color::Rgb(186, 189, 175),
+    footer_bg: Color::Rgb(221, 222, 208),
+    footer_text: Color::Rgb(92, 106, 114),
+    header_text: Color::Rgb(130, 140, 130),
+    dim_text: Color::Rgb(160, 166, 152),
+    error_text: Color::Rgb(241, 104, 100),
+    success_text: Color::Rgb(141, 161, 1),
+    progress_bar: Color::Rgb(141, 161, 1),
+    progress_bg: Color::Rgb(221, 222, 208),
+};
+
+pub const MIAMI_NIGHTS: Theme = Theme {
+    name: "Miami Nights",
+    sidebar_bg: Color::Rgb(22, 22, 38),
+    sidebar_text: Color::Rgb(226, 183, 234),
+    selection_bg: Color::Rgb(233, 69, 96),
+    selection_text: Color::Rgb(255, 255, 255),
+    main_bg: Color::Rgb(26, 26, 46),
+    alt_row_bg: Color::Rgb(32, 32, 58),
+    border: Color::Rgb(80, 60, 120),
+    footer_bg: Color::Rgb(15, 52, 96),
+    footer_text: Color::Rgb(120, 220, 232),
+    header_text: Color::Rgb(120, 220, 232),
+    dim_text: Color::Rgb(90, 80, 130),
+    error_text: Color::Rgb(255, 80, 80),
+    success_text: Color::Rgb(80, 255, 180),
+    progress_bar: Color::Rgb(233, 69, 96),
+    progress_bg: Color::Rgb(32, 32, 58),
+};
+
+pub const IBM_MAINFRAME: Theme = Theme {
+    name: "IBM Mainframe",
+    sidebar_bg: Color::Rgb(0, 0, 0),
+    sidebar_text: Color::Rgb(51, 255, 51),
+    selection_bg: Color::Rgb(51, 255, 51),
+    selection_text: Color::Rgb(0, 0, 0),
+    main_bg: Color::Rgb(0, 0, 0),
+    alt_row_bg: Color::Rgb(10, 20, 10),
+    border: Color::Rgb(0, 130, 0),
+    footer_bg: Color::Rgb(0, 40, 0),
+    footer_text: Color::Rgb(51, 255, 51),
+    header_text: Color::Rgb(0, 200, 0),
+    dim_text: Color::Rgb(0, 100, 0),
+    error_text: Color::Rgb(255, 80, 80),
+    success_text: Color::Rgb(51, 255, 51),
+    progress_bar: Color::Rgb(51, 255, 51),
+    progress_bg: Color::Rgb(0, 40, 0),
+};
+
+pub const WINDOWS_95: Theme = Theme {
+    name: "Windows 95",
+    sidebar_bg: Color::Rgb(192, 192, 192),
+    sidebar_text: Color::Rgb(0, 0, 0),
+    selection_bg: Color::Rgb(0, 0, 128),
+    selection_text: Color::Rgb(255, 255, 255),
+    main_bg: Color::Rgb(255, 255, 255),
+    alt_row_bg: Color::Rgb(224, 224, 224),
+    border: Color::Rgb(128, 128, 128),
+    footer_bg: Color::Rgb(192, 192, 192),
+    footer_text: Color::Rgb(0, 0, 0),
+    header_text: Color::Rgb(0, 0, 128),
+    dim_text: Color::Rgb(128, 128, 128),
+    error_text: Color::Rgb(255, 0, 0),
+    success_text: Color::Rgb(0, 128, 0),
+    progress_bar: Color::Rgb(0, 0, 128),
+    progress_bg: Color::Rgb(192, 192, 192),
+};
+
+pub const SYSTEM_7: Theme = Theme {
+    name: "System 7",
+    sidebar_bg: Color::Rgb(221, 221, 221),
+    sidebar_text: Color::Rgb(0, 0, 0),
+    selection_bg: Color::Rgb(0, 0, 0),
+    selection_text: Color::Rgb(255, 255, 255),
+    main_bg: Color::Rgb(255, 255, 255),
+    alt_row_bg: Color::Rgb(238, 238, 238),
+    border: Color::Rgb(0, 0, 0),
+    footer_bg: Color::Rgb(204, 204, 204),
+    footer_text: Color::Rgb(0, 0, 0),
+    header_text: Color::Rgb(68, 68, 68),
+    dim_text: Color::Rgb(136, 136, 136),
+    error_text: Color::Rgb(200, 0, 0),
+    success_text: Color::Rgb(0, 128, 0),
+    progress_bar: Color::Rgb(0, 0, 0),
+    progress_bg: Color::Rgb(204, 204, 204),
+};
+
+pub const BIOS: Theme = Theme {
+    name: "BIOS",
+    sidebar_bg: Color::Rgb(0, 0, 170),
+    sidebar_text: Color::Rgb(170, 170, 170),
+    selection_bg: Color::Rgb(170, 170, 170),
+    selection_text: Color::Rgb(0, 0, 170),
+    main_bg: Color::Rgb(0, 0, 170),
+    alt_row_bg: Color::Rgb(0, 0, 140),
+    border: Color::Rgb(85, 85, 255),
+    footer_bg: Color::Rgb(0, 0, 100),
+    footer_text: Color::Rgb(255, 255, 85),
+    header_text: Color::Rgb(255, 255, 255),
+    dim_text: Color::Rgb(85, 85, 255),
+    error_text: Color::Rgb(255, 85, 85),
+    success_text: Color::Rgb(85, 255, 85),
+    progress_bar: Color::Rgb(255, 255, 85),
+    progress_bg: Color::Rgb(0, 0, 100),
+};
+
+pub const RED_SANDS: Theme = Theme {
+    name: "Red Sands",
+    sidebar_bg: Color::Rgb(88, 26, 16),
+    sidebar_text: Color::Rgb(212, 196, 168),
+    selection_bg: Color::Rgb(210, 163, 58),
+    selection_text: Color::Rgb(52, 12, 8),
+    main_bg: Color::Rgb(122, 37, 24),
+    alt_row_bg: Color::Rgb(105, 32, 20),
+    border: Color::Rgb(160, 90, 60),
+    footer_bg: Color::Rgb(72, 20, 12),
+    footer_text: Color::Rgb(212, 196, 168),
+    header_text: Color::Rgb(230, 200, 160),
+    dim_text: Color::Rgb(140, 90, 70),
+    error_text: Color::Rgb(255, 100, 80),
+    success_text: Color::Rgb(180, 210, 90),
+    progress_bar: Color::Rgb(210, 163, 58),
+    progress_bg: Color::Rgb(88, 26, 16),
+};
+
+/// Find a theme index by name (case-insensitive). Returns 0 (default) if not found.
+pub fn find_theme_index(name: &str) -> usize {
+    THEMES
+        .iter()
+        .position(|t| t.name.eq_ignore_ascii_case(name))
+        .unwrap_or(0)
 }
 
-pub fn header() -> Style {
-    Style::default()
-        .fg(HEADER_TEXT)
-        .add_modifier(Modifier::BOLD)
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-pub fn dim() -> Style {
-    Style::default().fg(DIM_TEXT)
-}
+    #[test]
+    fn find_theme_by_name() {
+        assert_eq!(find_theme_index("Gruvbox Dark"), 1);
+        assert_eq!(find_theme_index("gruvbox dark"), 1);
+        assert_eq!(find_theme_index("nonexistent"), 0);
+    }
 
-pub fn footer() -> Style {
-    Style::default().bg(FOOTER_BG).fg(FOOTER_TEXT)
-}
-
-pub fn border() -> Style {
-    Style::default().fg(BORDER)
-}
-
-pub fn error() -> Style {
-    Style::default().fg(ERROR_TEXT)
-}
-
-pub fn success() -> Style {
-    Style::default().fg(SUCCESS_TEXT)
+    #[test]
+    fn all_themes_have_unique_names() {
+        for (i, t) in THEMES.iter().enumerate() {
+            for (j, u) in THEMES.iter().enumerate() {
+                if i != j {
+                    assert_ne!(
+                        t.name.to_lowercase(),
+                        u.name.to_lowercase(),
+                        "Duplicate theme name: {}",
+                        t.name
+                    );
+                }
+            }
+        }
+    }
 }

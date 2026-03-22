@@ -2,7 +2,7 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Cell, Clear, Gauge, List, ListItem, Paragraph, Row, Table, Wrap,
+    Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, Wrap,
 };
 use ratatui::Frame;
 use throbber_widgets_tui::{Throbber, ThrobberState, WhichUse, BRAILLE_ONE};
@@ -33,7 +33,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     let outer = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(26),
+            Constraint::Length(36),
             Constraint::Min(40),
             Constraint::Length(keys_width),
         ])
@@ -81,12 +81,17 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     // Toast overlay.
     if let Some((ref msg, _, is_error)) = app.toast_message {
-        draw_toast(f, msg, is_error);
+        draw_toast(f, app, msg, is_error);
     }
 
     // Help overlay.
     if app.show_help {
-        draw_help_overlay(f);
+        draw_help_overlay(f, app);
+    }
+
+    // Theme picker overlay.
+    if app.show_theme_picker {
+        draw_theme_picker(f, app);
     }
 
     // Search overlay.
@@ -96,6 +101,7 @@ pub fn draw(f: &mut Frame, app: &App) {
 }
 
 fn draw_startup(f: &mut Frame, app: &App, area: Rect) {
+    let t = app.theme();
     let symbol = throbber_symbol(&app.throbber_state);
 
     let path_display = app
@@ -108,16 +114,16 @@ fn draw_startup(f: &mut Frame, app: &App, area: Rect) {
         Line::from(Span::styled("zytunes", Style::default().add_modifier(Modifier::BOLD))),
         Line::from(""),
         Line::from(vec![
-            Span::styled(format!(" {} ", symbol), theme::dim()),
+            Span::styled(format!(" {} ", symbol), t.dim()),
             Span::raw("Parsing library..."),
         ]),
         Line::from(""),
-        Line::from(Span::styled(path_display, theme::dim())),
+        Line::from(Span::styled(path_display, t.dim())),
     ];
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(theme::dim())
+        .border_style(t.dim())
         .title(" Starting ")
         .title_alignment(Alignment::Center);
 
@@ -137,6 +143,7 @@ fn draw_startup(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
+    let t = app.theme();
     let is_active = app.active_panel == Panel::Library;
     let mode_label = match app.sidebar_mode {
         SidebarMode::Artists => "Artists",
@@ -150,15 +157,15 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
 
     let title = format!(" {}{} ", browse_prefix, mode_label);
     let border_style = if is_active {
-        Style::default().fg(theme::SELECTION_BG)
+        Style::default().fg(t.selection_bg)
     } else {
-        theme::border()
+        t.border()
     };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
         .title(title)
-        .style(Style::default().bg(theme::SIDEBAR_BG));
+        .style(Style::default().bg(t.sidebar_bg));
 
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -182,7 +189,7 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
                 }
             }
         };
-        let p = Paragraph::new(msg).style(theme::dim());
+        let p = Paragraph::new(msg).style(t.dim());
         f.render_widget(p, inner);
         return;
     }
@@ -202,9 +209,9 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
         .take(visible_height)
         .map(|(i, name)| {
             let style = if i == app.sidebar_selected {
-                theme::sidebar_item_selected()
+                t.sidebar_item_selected()
             } else {
-                theme::sidebar_item()
+                t.sidebar_item()
             };
             let prefix = if i == app.sidebar_selected {
                 "> "
@@ -225,6 +232,7 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_album_browser(f: &mut Frame, app: &App, area: Rect) {
+    let t = app.theme();
     let is_active = app.active_panel == Panel::Albums;
     let artist = app
         .sidebar_items
@@ -236,21 +244,21 @@ fn draw_album_browser(f: &mut Frame, app: &App, area: Rect) {
         truncate(&artist, area.width.saturating_sub(4) as usize)
     );
     let border_style = if is_active {
-        Style::default().fg(theme::SELECTION_BG)
+        Style::default().fg(t.selection_bg)
     } else {
-        theme::border()
+        t.border()
     };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
         .title(title)
-        .style(Style::default().bg(theme::SIDEBAR_BG));
+        .style(Style::default().bg(t.sidebar_bg));
 
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     if app.album_list.is_empty() {
-        let p = Paragraph::new("No albums").style(theme::dim());
+        let p = Paragraph::new("No albums").style(t.dim());
         f.render_widget(p, inner);
         return;
     }
@@ -267,9 +275,9 @@ fn draw_album_browser(f: &mut Frame, app: &App, area: Rect) {
         .map(|(i, album)| {
             let is_selected = i == app.album_selected;
             let style = if is_selected {
-                theme::sidebar_item_selected()
+                t.sidebar_item_selected()
             } else {
-                theme::sidebar_item()
+                t.sidebar_item()
             };
             let prefix = if is_selected { "> " } else { "  " };
             let meta = match album.year {
@@ -302,11 +310,12 @@ fn draw_track_list(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_album_detail(f: &mut Frame, app: &App, area: Rect) {
+    let t = app.theme();
     let is_active = app.active_panel == Panel::TrackList;
     let border_style = if is_active {
-        Style::default().fg(theme::SELECTION_BG)
+        Style::default().fg(t.selection_bg)
     } else {
-        theme::border()
+        t.border()
     };
 
     let album = app.album_list.get(app.album_selected);
@@ -321,7 +330,7 @@ fn draw_album_detail(f: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(border_style)
         .title(title)
-        .style(Style::default().bg(theme::MAIN_BG));
+        .style(Style::default().bg(t.main_bg));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -345,7 +354,7 @@ fn draw_album_detail(f: &mut Frame, app: &App, area: Rect) {
 
     // Zip disk ASCII art by mga — https://www.asciiart.eu/art/324546af3173c962
     // Album/artist/track info embedded into the disk body and label.
-    let art_lines = build_zip_art(album_name, album_artist, &year_str, track_count, &dur_str);
+    let art_lines = build_zip_art(app, album_name, album_artist, &year_str, track_count, &dur_str);
 
     // Side-by-side: zip art on the left, track listing on the right.
     let cols = Layout::default()
@@ -360,8 +369,9 @@ fn draw_album_detail(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_album_track_list(f: &mut Frame, app: &App, area: Rect) {
+    let t = app.theme();
     if app.track_list.is_empty() {
-        let p = Paragraph::new("  No tracks").style(theme::dim());
+        let p = Paragraph::new("  No tracks").style(t.dim());
         f.render_widget(p, area);
         return;
     }
@@ -379,16 +389,16 @@ fn draw_album_track_list(f: &mut Frame, app: &App, area: Rect) {
         .map(|(i, track)| {
             let is_selected = i == app.track_selected && is_active;
             let bg = if is_selected {
-                theme::SELECTION_BG
+                t.selection_bg
             } else if i % 2 == 0 {
-                theme::MAIN_BG
+                t.main_bg
             } else {
-                theme::ALT_ROW_BG
+                t.alt_row_bg
             };
             let fg = if is_selected {
-                theme::SELECTION_TEXT
+                t.selection_text
             } else {
-                theme::SIDEBAR_TEXT
+                t.sidebar_text
             };
 
             let num = track
@@ -417,18 +427,19 @@ fn draw_album_track_list(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_track_table(f: &mut Frame, app: &App, area: Rect) {
+    let t = app.theme();
     let is_active = app.active_panel == Panel::TrackList;
     let title = format!(" Tracks ({}) ", app.track_list.len());
     let border_style = if is_active {
-        Style::default().fg(theme::SELECTION_BG)
+        Style::default().fg(t.selection_bg)
     } else {
-        theme::border()
+        t.border()
     };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
         .title(title)
-        .style(Style::default().bg(theme::MAIN_BG));
+        .style(Style::default().bg(t.main_bg));
 
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -439,7 +450,7 @@ fn draw_track_table(f: &mut Frame, app: &App, area: Rect) {
         } else {
             "Select an item from the sidebar"
         };
-        let p = Paragraph::new(msg).style(theme::dim());
+        let p = Paragraph::new(msg).style(t.dim());
         f.render_widget(p, inner);
         return;
     }
@@ -465,7 +476,7 @@ fn draw_track_table(f: &mut Frame, app: &App, area: Rect) {
         Cell::from(format!("Dur{}", sort_indicator(SortColumn::Duration))),
         Cell::from(format!("Fmt{}", sort_indicator(SortColumn::Format))),
     ];
-    let header = Row::new(header_cells).style(theme::header()).height(1);
+    let header = Row::new(header_cells).style(t.header()).height(1);
 
     let visible_height = inner.height.saturating_sub(1) as usize; // minus header
     let scroll = compute_scroll(app.track_selected, visible_height, app.track_list.len());
@@ -478,16 +489,16 @@ fn draw_track_table(f: &mut Frame, app: &App, area: Rect) {
         .take(visible_height)
         .map(|(i, track)| {
             let bg = if i == app.track_selected {
-                theme::SELECTION_BG
+                t.selection_bg
             } else if i % 2 == 0 {
-                theme::MAIN_BG
+                t.main_bg
             } else {
-                theme::ALT_ROW_BG
+                t.alt_row_bg
             };
             let fg = if i == app.track_selected {
-                theme::SELECTION_TEXT
+                t.selection_text
             } else {
-                theme::SIDEBAR_TEXT
+                t.sidebar_text
             };
 
             let num = track
@@ -544,11 +555,12 @@ fn draw_device_left_panel(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_device_info(f: &mut Frame, app: &App, area: Rect) {
+    let t = app.theme();
     let is_active = app.active_panel == Panel::Device;
     let border_style = if is_active {
-        Style::default().fg(theme::SELECTION_BG)
+        Style::default().fg(t.selection_bg)
     } else {
-        theme::border()
+        t.border()
     };
 
     let title = match app.device_status {
@@ -571,12 +583,12 @@ fn draw_device_info(f: &mut Frame, app: &App, area: Rect) {
 
     match app.device_status {
         DeviceStatus::Disconnected => {
-            let p = Paragraph::new("No device.\nPress 'c' to connect.").style(theme::dim());
+            let p = Paragraph::new("No device.\nPress 'c' to connect.").style(t.dim());
             f.render_widget(p, inner);
         }
         DeviceStatus::Detecting | DeviceStatus::Connecting => {
             let symbol = throbber_symbol(&app.throbber_state);
-            let p = Paragraph::new(format!(" {} Please wait...", symbol)).style(theme::dim());
+            let p = Paragraph::new(format!(" {} Please wait...", symbol)).style(t.dim());
             f.render_widget(p, inner);
         }
         DeviceStatus::Connected => {
@@ -586,6 +598,7 @@ fn draw_device_info(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_device_info_connected(f: &mut Frame, app: &App, area: Rect) {
+    let t = app.theme();
     let is_syncing = matches!(app.sync_status, SyncStatus::Running { .. });
     let is_busy = app.device_loading_tracks;
 
@@ -609,26 +622,26 @@ fn draw_device_info_connected(f: &mut Frame, app: &App, area: Rect) {
     // Zune ASCII art (centered).
     for l in &zune_art {
         lines.push(
-            Line::from(Span::styled(l.as_str(), theme::dim())).alignment(Alignment::Center),
+            Line::from(Span::styled(l.as_str(), t.dim())).alignment(Alignment::Center),
         );
     }
 
     // Device info lines below art.
     if let Some(ref fw) = app.device_firmware {
         lines.push(Line::from(vec![
-            Span::styled(" FW: ", theme::dim()),
+            Span::styled(" FW: ", t.dim()),
             Span::raw(fw.as_str()),
         ]));
     }
     if let Some(ref mfr) = app.device_manufacturer {
         lines.push(Line::from(vec![
-            Span::styled(" Mfr: ", theme::dim()),
+            Span::styled(" Mfr: ", t.dim()),
             Span::raw(mfr.as_str()),
         ]));
     }
     if let Some(ref mode) = app.device_usb_mode {
         lines.push(Line::from(vec![
-            Span::styled(" USB: ", theme::dim()),
+            Span::styled(" USB: ", t.dim()),
             Span::raw(mode.as_str()),
         ]));
     }
@@ -639,7 +652,7 @@ fn draw_device_info_connected(f: &mut Frame, app: &App, area: Rect) {
             serial.clone()
         };
         lines.push(Line::from(vec![
-            Span::styled(" S/N: ", theme::dim()),
+            Span::styled(" S/N: ", t.dim()),
             Span::raw(display),
         ]));
     }
@@ -654,13 +667,13 @@ fn draw_device_info_connected(f: &mut Frame, app: &App, area: Rect) {
             " {:.1}/{:.1} GB ({:.1} free)",
             used_gb, total_gb, free_gb
         )));
-        let bar_width = 16usize;
+        let bar_width = 26usize;
         let filled = (bar_width as f64 * storage.used_percent as f64 / 100.0) as usize;
         let empty = bar_width.saturating_sub(filled);
         lines.push(Line::from(vec![
             Span::raw(" ["),
-            Span::styled("=".repeat(filled), Style::default().fg(theme::PROGRESS_BAR)),
-            Span::styled(" ".repeat(empty), Style::default().fg(theme::PROGRESS_BG)),
+            Span::styled("=".repeat(filled), Style::default().fg(t.progress_bar)),
+            Span::styled(" ".repeat(empty), Style::default().fg(t.progress_bg)),
             Span::raw(format!("] {}%", storage.used_percent)),
         ]));
     }
@@ -677,21 +690,18 @@ fn draw_device_info_connected(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_sync_queue(f: &mut Frame, app: &App, area: Rect) {
+    let t = app.theme();
     let is_active = app.active_panel == Panel::SyncQueue;
     let border_style = if is_active {
-        Style::default().fg(theme::SELECTION_BG)
+        Style::default().fg(t.selection_bg)
     } else {
-        theme::border()
+        t.border()
     };
 
     match app.sync_status {
         SyncStatus::Running { current, total } => {
-            let pct = if total > 0 {
-                (current as f64 / total as f64 * 100.0) as u16
-            } else {
-                0
-            };
-            let title = format!(" Syncing [{}/{}] ", current, total);
+            let symbol = throbber_symbol(&app.throbber_state);
+            let title = format!(" {} {}/{} ", symbol, current, total);
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_style(border_style)
@@ -701,31 +711,14 @@ fn draw_sync_queue(f: &mut Frame, app: &App, area: Rect) {
 
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(1),
-                    Constraint::Length(1),
-                    Constraint::Length(1),
-                    Constraint::Min(0),
-                ])
+                .constraints([Constraint::Length(1), Constraint::Min(0)])
                 .split(inner);
 
-            let status_line = format!(
-                "[{}/{}] Uploading: {}",
-                current, total, app.sync_current_track
+            let status_line = format!(" {}", app.sync_current_track);
+            f.render_widget(
+                Paragraph::new(status_line).style(Style::default().fg(t.sidebar_text)),
+                chunks[0],
             );
-            f.render_widget(Paragraph::new(status_line), chunks[0]);
-
-            let gauge = Gauge::default()
-                .gauge_style(
-                    Style::default()
-                        .fg(theme::PROGRESS_BAR)
-                        .bg(theme::PROGRESS_BG),
-                )
-                .percent(pct)
-                .label(format!("{}%", pct));
-            f.render_widget(gauge, chunks[1]);
-
-            f.render_widget(Paragraph::new("Esc: cancel").style(theme::dim()), chunks[2]);
         }
         SyncStatus::Complete {
             success, failed, ..
@@ -748,13 +741,13 @@ fn draw_sync_queue(f: &mut Frame, app: &App, area: Rect) {
                 .borders(Borders::ALL)
                 .border_style(border_style)
                 .title(title)
-                .style(Style::default().bg(theme::MAIN_BG));
+                .style(Style::default().bg(t.main_bg));
             let inner = block.inner(area);
             f.render_widget(block, area);
 
             if app.sync_queue.is_empty() {
                 let p =
-                    Paragraph::new("Queue is empty. Press 'a' to add tracks.").style(theme::dim());
+                    Paragraph::new("Queue is empty. Press 'a' to add tracks.").style(t.dim());
                 f.render_widget(p, inner);
             } else {
                 let items: Vec<ListItem> = app
@@ -763,9 +756,9 @@ fn draw_sync_queue(f: &mut Frame, app: &App, area: Rect) {
                     .enumerate()
                     .map(|(i, q)| {
                         let style = if i == app.queue_selected && is_active {
-                            theme::sidebar_item_selected()
+                            t.sidebar_item_selected()
                         } else {
-                            Style::default().fg(theme::SIDEBAR_TEXT).bg(theme::MAIN_BG)
+                            Style::default().fg(t.sidebar_text).bg(t.main_bg)
                         };
                         ListItem::new(format!("  {} ({} tracks)", q.label, q.tracks.len()))
                             .style(style)
@@ -781,23 +774,24 @@ fn draw_sync_queue(f: &mut Frame, app: &App, area: Rect) {
                 f.render_widget(list, chunks[0]);
 
                 let hints = "S:sync d:rm C:clr";
-                f.render_widget(Paragraph::new(hints).style(theme::dim()), chunks[1]);
+                f.render_widget(Paragraph::new(hints).style(t.dim()), chunks[1]);
             }
         }
     }
 }
 
 fn draw_sync_log(f: &mut Frame, app: &App, area: Rect) {
+    let t = app.theme();
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(theme::border())
+        .border_style(t.border())
         .title(" Log ")
-        .style(Style::default().bg(theme::MAIN_BG));
+        .style(Style::default().bg(t.main_bg));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     if app.sync_log.is_empty() {
-        let p = Paragraph::new("No messages yet.").style(theme::dim());
+        let p = Paragraph::new("No messages yet.").style(t.dim());
         f.render_widget(p, inner);
         return;
     }
@@ -809,11 +803,11 @@ fn draw_sync_log(f: &mut Frame, app: &App, area: Rect) {
         .iter()
         .map(|msg| {
             let style = if msg.contains("FAILED") {
-                Style::default().fg(theme::ERROR_TEXT)
+                Style::default().fg(t.error_text)
             } else if msg.starts_with("  OK") || msg.contains("Done:") {
-                Style::default().fg(theme::SUCCESS_TEXT)
+                Style::default().fg(t.success_text)
             } else {
-                Style::default().fg(theme::SIDEBAR_TEXT)
+                Style::default().fg(t.sidebar_text)
             };
             Line::from(Span::styled(msg.as_str(), style))
         })
@@ -824,11 +818,12 @@ fn draw_sync_log(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_keys_panel(f: &mut Frame, app: &App, area: Rect) {
+    let t = app.theme();
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(theme::border())
+        .border_style(t.border())
         .title(" Keys [h] ")
-        .style(Style::default().bg(theme::SIDEBAR_BG));
+        .style(Style::default().bg(t.sidebar_bg));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -844,17 +839,18 @@ fn draw_keys_panel(f: &mut Frame, app: &App, area: Rect) {
         ("1/2/3", "Art/Alb/Plist"),
         ("4", "Sync queue"),
         ("v", "Lib/Device view"),
+        ("t", "Theme picker"),
         ("/", "Search"),
         ("c", "Connect"),
     ];
     lines.push(Line::from(Span::styled(
         " Global",
         Style::default()
-            .fg(theme::HEADER_TEXT)
+            .fg(t.header_text)
             .add_modifier(Modifier::BOLD),
     )));
     for (key, desc) in &global {
-        lines.push(key_line(key, desc));
+        lines.push(key_line(app, key, desc));
     }
 
     lines.push(Line::from(""));
@@ -909,34 +905,36 @@ fn draw_keys_panel(f: &mut Frame, app: &App, area: Rect) {
     lines.push(Line::from(Span::styled(
         section,
         Style::default()
-            .fg(theme::HEADER_TEXT)
+            .fg(t.header_text)
             .add_modifier(Modifier::BOLD),
     )));
     for (key, desc) in &keys {
-        lines.push(key_line(key, desc));
+        lines.push(key_line(app, key, desc));
     }
 
     let p = Paragraph::new(lines);
     f.render_widget(p, inner);
 }
 
-fn key_line<'a>(key: &'a str, desc: &'a str) -> Line<'a> {
+fn key_line<'a>(app: &App, key: &'a str, desc: &'a str) -> Line<'a> {
+    let t = app.theme();
     Line::from(vec![
         Span::styled(
             format!(" {:>6} ", key),
             Style::default()
-                .fg(theme::SELECTION_BG)
+                .fg(t.selection_bg)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(desc, Style::default().fg(theme::SIDEBAR_TEXT)),
+        Span::styled(desc, Style::default().fg(t.sidebar_text)),
     ])
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
+    let t = app.theme();
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(theme::border())
-        .style(theme::footer());
+        .border_style(t.border())
+        .style(t.footer());
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -955,16 +953,17 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         .constraints([Constraint::Length(16), Constraint::Min(20)])
         .split(inner);
 
-    f.render_widget(Paragraph::new(left).style(theme::footer()), chunks[0]);
+    f.render_widget(Paragraph::new(left).style(t.footer()), chunks[0]);
     f.render_widget(
         Paragraph::new(format!("{} ", right))
             .alignment(Alignment::Right)
-            .style(theme::footer()),
+            .style(t.footer()),
         chunks[1],
     );
 }
 
-fn draw_toast(f: &mut Frame, msg: &str, is_error: bool) {
+fn draw_toast(f: &mut Frame, app: &App, msg: &str, is_error: bool) {
+    let t = app.theme();
     let area = f.area();
     if area.width < 8 || area.height < 3 {
         return;
@@ -977,9 +976,9 @@ fn draw_toast(f: &mut Frame, msg: &str, is_error: bool) {
     f.render_widget(Clear, rect);
 
     let style = if is_error {
-        theme::error()
+        t.error()
     } else {
-        theme::success()
+        t.success()
     };
     let block = Block::default().borders(Borders::ALL).border_style(style);
     let p = Paragraph::new(format!(" {} ", msg))
@@ -988,10 +987,11 @@ fn draw_toast(f: &mut Frame, msg: &str, is_error: bool) {
     f.render_widget(p, rect);
 }
 
-fn draw_help_overlay(f: &mut Frame) {
+fn draw_help_overlay(f: &mut Frame, app: &App) {
+    let t = app.theme();
     let area = f.area();
     let width = 50u16.min(area.width - 4);
-    let height = 28u16.min(area.height - 4);
+    let height = 30u16.min(area.height - 4);
     let x = (area.width.saturating_sub(width)) / 2;
     let y = (area.height.saturating_sub(height)) / 2;
     let rect = Rect::new(x, y, width, height);
@@ -1006,6 +1006,7 @@ fn draw_help_overlay(f: &mut Frame) {
         "  Enter       Select / expand",
         "  1/2/3       Artists / Albums / Playlists",
         "  v           Toggle Library / Device view",
+        "  t           Theme picker",
         "",
         "  Library",
         "  /           Search sidebar",
@@ -1034,7 +1035,7 @@ fn draw_help_overlay(f: &mut Frame) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::SELECTION_BG))
+        .border_style(Style::default().fg(t.selection_bg))
         .title(" Help — press Esc to close ");
     let p = Paragraph::new(lines)
         .block(block)
@@ -1042,7 +1043,46 @@ fn draw_help_overlay(f: &mut Frame) {
     f.render_widget(p, rect);
 }
 
+fn draw_theme_picker(f: &mut Frame, app: &App) {
+    let t = app.theme();
+    let area = f.area();
+    let theme_count = theme::THEMES.len();
+    let width = 30u16.min(area.width.saturating_sub(4));
+    let height = (theme_count as u16 + 2).min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(width)) / 2;
+    let y = (area.height.saturating_sub(height)) / 2;
+    let rect = Rect::new(x, y, width, height);
+
+    f.render_widget(Clear, rect);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(t.selection_bg))
+        .title(" Theme [t] ")
+        .style(Style::default().bg(t.sidebar_bg));
+
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let items: Vec<ListItem> = theme::THEMES
+        .iter()
+        .enumerate()
+        .map(|(i, theme_entry)| {
+            let style = if i == app.theme_picker_index {
+                t.selected()
+            } else {
+                Style::default().fg(t.sidebar_text).bg(t.sidebar_bg)
+            };
+            ListItem::new(format!("  {}", theme_entry.name)).style(style)
+        })
+        .collect();
+
+    let list = List::new(items);
+    f.render_widget(list, inner);
+}
+
 fn draw_search_overlay(f: &mut Frame, app: &App) {
+    let t = app.theme();
     let area = f.area();
     let width = 40u16.min(area.width - 4);
     let x = (area.width.saturating_sub(width)) / 2;
@@ -1053,7 +1093,7 @@ fn draw_search_overlay(f: &mut Frame, app: &App) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::SELECTION_BG))
+        .border_style(Style::default().fg(t.selection_bg))
         .title(" Search ");
     let p = Paragraph::new(format!(" {}_", app.search_query)).block(block);
     f.render_widget(p, rect);
@@ -1075,17 +1115,19 @@ fn compute_scroll(selected: usize, visible: usize, total: usize) -> usize {
 /// Build zip disk ASCII art with album info embedded.
 /// Art by mga — https://www.asciiart.eu/art/324546af3173c962
 fn build_zip_art<'a>(
+    app: &App,
     album: &'a str,
     artist: &'a str,
     year: &'a str,
     track_count: usize,
     duration: &'a str,
 ) -> Vec<Line<'a>> {
-    let dim = Style::default().fg(theme::DIM_TEXT);
+    let t = app.theme();
+    let dim = Style::default().fg(t.dim_text);
     let bold = Style::default()
-        .fg(theme::SIDEBAR_TEXT)
+        .fg(t.sidebar_text)
         .add_modifier(Modifier::BOLD);
-    let info = Style::default().fg(theme::HEADER_TEXT);
+    let info = Style::default().fg(t.header_text);
 
     // Pad or truncate a string to exactly `w` chars.
     let pad = |s: &str, w: usize| -> String {
@@ -1100,33 +1142,63 @@ fn build_zip_art<'a>(
 
     // Body lines (upper area) — artist and album name.
     let body_w = 18; // width inside `:  | ` and ` |  :`
-    let artist_padded = pad(artist, body_w);
 
-    // Word-wrap album name across two lines (line 2 + mga line).
-    let album_chars: Vec<char> = album.chars().collect();
-    let (album_line1, album_line2) = if album_chars.len() <= body_w {
-        (pad(album, body_w), None)
-    } else {
-        // Find a word break point near body_w.
-        let break_at = album[..album.char_indices()
-            .take(body_w)
-            .last()
-            .map(|(i, c)| i + c.len_utf8())
-            .unwrap_or(body_w)]
-            .rfind(' ')
-            .unwrap_or(body_w.min(album.len()));
-        let first = pad(&album[..break_at], body_w);
-        let rest = album[break_at..].trim_start();
-        // Second line shares space with "mga" — 14 chars for text, then " mga "
-        let rest_w = 13;
-        let second = format!("{} mga ", pad(rest, rest_w));
-        (first, Some(second))
+    // Word-wrap helper: split text at a word boundary near `width`.
+    let word_wrap = |text: &str, width: usize| -> (String, Option<String>) {
+        let chars: Vec<char> = text.chars().collect();
+        if chars.len() <= width {
+            (pad(text, width), None)
+        } else {
+            let byte_end = text
+                .char_indices()
+                .take(width)
+                .last()
+                .map(|(i, c)| i + c.len_utf8())
+                .unwrap_or(width);
+            let break_at = text[..byte_end]
+                .rfind(' ')
+                .unwrap_or(width.min(text.len()));
+            let first = pad(&text[..break_at], width);
+            let rest = text[break_at..].trim_start().to_string();
+            (first, Some(rest))
+        }
     };
 
-    // mga line: either shows album overflow or just the attribution.
-    let mga_line = match album_line2 {
-        Some(ref wrapped) => wrapped.clone(),
-        None => "              mga  ".to_string(),
+    // Wrap artist across lines 1-2.
+    let (artist_line1, artist_line2) = word_wrap(artist, body_w);
+
+    // Wrap album — if artist used 2 lines, album only gets the mga line.
+    let (album_line1, album_line2) = if artist_line2.is_some() {
+        // Artist took 2 lines, album gets 1 line (line 3), no mga overflow.
+        (pad(&truncate(album, body_w), body_w), None)
+    } else {
+        word_wrap(album, body_w)
+    };
+
+    // Line 2: artist overflow or album line 1.
+    let line2_text = match &artist_line2 {
+        Some(rest) => pad(&truncate(rest, body_w), body_w),
+        None => album_line1.clone(),
+    };
+    let line2_style = if artist_line2.is_some() { bold } else { info };
+
+    // Line 3 (mga line): album (if artist wrapped), album overflow, or just mga.
+    let mga_line = if artist_line2.is_some() {
+        // Artist wrapped — line 3 shows the album name.
+        album_line1
+    } else {
+        match album_line2 {
+            Some(ref rest) => {
+                let rest_w = 13;
+                format!("{} mga ", pad(rest, rest_w))
+            }
+            None => pad("              mga", body_w),
+        }
+    };
+    let mga_style = if artist_line2.is_some() || album_line2.is_some() {
+        info
+    } else {
+        dim
     };
 
     // Label lines (lower bracket area) — year, tracks, duration.
@@ -1143,23 +1215,23 @@ fn build_zip_art<'a>(
     vec![
         Line::from(Span::styled(r#" .-|:"""":""""""'''"""":|-.  "#, dim)),
         Line::from(Span::styled(r#" :  |'----'-------------'|  : "#, dim)),
-        // Artist name in disk body
+        // Artist name line 1
         Line::from(vec![
             Span::styled(" :  | ", dim),
-            Span::styled(artist_padded, bold),
+            Span::styled(artist_line1, bold),
             Span::styled(" |  : ", dim),
         ]),
-        // Album name line 1
+        // Line 2: artist overflow or album
         Line::from(vec![
             Span::styled(" :  | ", dim),
-            Span::styled(album_line1, info),
+            Span::styled(line2_text, line2_style),
             Span::styled(" |  : ", dim),
         ]),
-        // Album name overflow / mga attribution
+        // Line 3: album (if artist wrapped), album overflow, or mga
         Line::from(vec![
             Span::styled(" :  | ", dim),
-            Span::styled(mga_line, if album_line2.is_some() { info } else { dim }),
-            Span::styled("|  : ", dim),
+            Span::styled(mga_line, mga_style),
+            Span::styled(" |  : ", dim),
         ]),
         Line::from(Span::styled(r#" :  | .----------------. |  : "#, dim)),
         Line::from(Span::styled(r#" :  |[ zip:          [i]]|  : "#, dim)),
@@ -1193,7 +1265,7 @@ fn truncate(s: &str, max: usize) -> String {
     if chars.len() <= max {
         s.to_string()
     } else if max > 1 {
-        chars[..max - 1].iter().collect::<String>() + "…"
+        chars[..max - 1].iter().collect::<String>() + "\u{2026}"
     } else {
         chars[..max].iter().collect()
     }
@@ -1218,16 +1290,16 @@ fn build_zune_art(screen_line1: &str, screen_line2: &str) -> Vec<String> {
     let line2 = center_pad(screen_line2, screen_w);
 
     vec![
-        " ╭──────────────────╮ ".to_string(),
-        " │  ┌────────────┐  │ ".to_string(),
-        format!(" │  │{}│  │ ", line1),
-        format!(" │  │{}│  │ ", line2),
-        " │  └────────────┘  │ ".to_string(),
-        " │                  │ ".to_string(),
-        " │  |<  ╭────╮  >|  │ ".to_string(),
-        " │      │    │      │ ".to_string(),
-        " │      ╰────╯      │ ".to_string(),
-        " ╰──────────────────╯ ".to_string(),
+        " \u{256d}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256e} ".to_string(),
+        " \u{2502}  \u{250c}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2510}  \u{2502} ".to_string(),
+        format!(" \u{2502}  \u{2502}{}\u{2502}  \u{2502} ", line1),
+        format!(" \u{2502}  \u{2502}{}\u{2502}  \u{2502} ", line2),
+        " \u{2502}  \u{2514}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2518}  \u{2502} ".to_string(),
+        " \u{2502}                  \u{2502} ".to_string(),
+        " \u{2502}  |<  \u{256d}\u{2500}\u{2500}\u{2500}\u{2500}\u{256e}  >|  \u{2502} ".to_string(),
+        " \u{2502}      \u{2502}    \u{2502}      \u{2502} ".to_string(),
+        " \u{2502}      \u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{256f}      \u{2502} ".to_string(),
+        " \u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256f} ".to_string(),
     ]
 }
 
@@ -1239,16 +1311,16 @@ mod tests {
     fn zune_art_connected_track_count() {
         let art = build_zune_art("4,455", "tracks");
         let expected = vec![
-            " ╭──────────────────╮ ",
-            " │  ┌────────────┐  │ ",
-            " │  │   4,455    │  │ ",
-            " │  │   tracks   │  │ ",
-            " │  └────────────┘  │ ",
-            " │                  │ ",
-            " │  |<  ╭────╮  >|  │ ",
-            " │      │    │      │ ",
-            " │      ╰────╯      │ ",
-            " ╰──────────────────╯ ",
+            " \u{256d}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256e} ",
+            " \u{2502}  \u{250c}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2510}  \u{2502} ",
+            " \u{2502}  \u{2502}   4,455    \u{2502}  \u{2502} ",
+            " \u{2502}  \u{2502}   tracks   \u{2502}  \u{2502} ",
+            " \u{2502}  \u{2514}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2518}  \u{2502} ",
+            " \u{2502}                  \u{2502} ",
+            " \u{2502}  |<  \u{256d}\u{2500}\u{2500}\u{2500}\u{2500}\u{256e}  >|  \u{2502} ",
+            " \u{2502}      \u{2502}    \u{2502}      \u{2502} ",
+            " \u{2502}      \u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{256f}      \u{2502} ",
+            " \u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256f} ",
         ];
         assert_eq!(art, expected);
     }
@@ -1257,16 +1329,16 @@ mod tests {
     fn zune_art_loading_state() {
         let art = build_zune_art("*", "Loading...");
         let expected = vec![
-            " ╭──────────────────╮ ",
-            " │  ┌────────────┐  │ ",
-            " │  │     *      │  │ ",
-            " │  │ Loading... │  │ ",
-            " │  └────────────┘  │ ",
-            " │                  │ ",
-            " │  |<  ╭────╮  >|  │ ",
-            " │      │    │      │ ",
-            " │      ╰────╯      │ ",
-            " ╰──────────────────╯ ",
+            " \u{256d}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256e} ",
+            " \u{2502}  \u{250c}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2510}  \u{2502} ",
+            " \u{2502}  \u{2502}     *      \u{2502}  \u{2502} ",
+            " \u{2502}  \u{2502} Loading... \u{2502}  \u{2502} ",
+            " \u{2502}  \u{2514}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2518}  \u{2502} ",
+            " \u{2502}                  \u{2502} ",
+            " \u{2502}  |<  \u{256d}\u{2500}\u{2500}\u{2500}\u{2500}\u{256e}  >|  \u{2502} ",
+            " \u{2502}      \u{2502}    \u{2502}      \u{2502} ",
+            " \u{2502}      \u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{256f}      \u{2502} ",
+            " \u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256f} ",
         ];
         assert_eq!(art, expected);
     }
@@ -1275,16 +1347,16 @@ mod tests {
     fn zune_art_zero_tracks() {
         let art = build_zune_art("0", "tracks");
         let expected = vec![
-            " ╭──────────────────╮ ",
-            " │  ┌────────────┐  │ ",
-            " │  │     0      │  │ ",
-            " │  │   tracks   │  │ ",
-            " │  └────────────┘  │ ",
-            " │                  │ ",
-            " │  |<  ╭────╮  >|  │ ",
-            " │      │    │      │ ",
-            " │      ╰────╯      │ ",
-            " ╰──────────────────╯ ",
+            " \u{256d}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256e} ",
+            " \u{2502}  \u{250c}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2510}  \u{2502} ",
+            " \u{2502}  \u{2502}     0      \u{2502}  \u{2502} ",
+            " \u{2502}  \u{2502}   tracks   \u{2502}  \u{2502} ",
+            " \u{2502}  \u{2514}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2518}  \u{2502} ",
+            " \u{2502}                  \u{2502} ",
+            " \u{2502}  |<  \u{256d}\u{2500}\u{2500}\u{2500}\u{2500}\u{256e}  >|  \u{2502} ",
+            " \u{2502}      \u{2502}    \u{2502}      \u{2502} ",
+            " \u{2502}      \u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{256f}      \u{2502} ",
+            " \u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256f} ",
         ];
         assert_eq!(art, expected);
     }
@@ -1293,16 +1365,16 @@ mod tests {
     fn zune_art_large_track_count() {
         let art = build_zune_art("12,345", "tracks");
         let expected = vec![
-            " ╭──────────────────╮ ",
-            " │  ┌────────────┐  │ ",
-            " │  │   12,345   │  │ ",
-            " │  │   tracks   │  │ ",
-            " │  └────────────┘  │ ",
-            " │                  │ ",
-            " │  |<  ╭────╮  >|  │ ",
-            " │      │    │      │ ",
-            " │      ╰────╯      │ ",
-            " ╰──────────────────╯ ",
+            " \u{256d}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256e} ",
+            " \u{2502}  \u{250c}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2510}  \u{2502} ",
+            " \u{2502}  \u{2502}   12,345   \u{2502}  \u{2502} ",
+            " \u{2502}  \u{2502}   tracks   \u{2502}  \u{2502} ",
+            " \u{2502}  \u{2514}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2518}  \u{2502} ",
+            " \u{2502}                  \u{2502} ",
+            " \u{2502}  |<  \u{256d}\u{2500}\u{2500}\u{2500}\u{2500}\u{256e}  >|  \u{2502} ",
+            " \u{2502}      \u{2502}    \u{2502}      \u{2502} ",
+            " \u{2502}      \u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{256f}      \u{2502} ",
+            " \u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256f} ",
         ];
         assert_eq!(art, expected);
     }
@@ -1311,16 +1383,16 @@ mod tests {
     fn zune_art_overflow_truncates() {
         let art = build_zune_art("1234567890ABC", "tracks");
         let expected = vec![
-            " ╭──────────────────╮ ",
-            " │  ┌────────────┐  │ ",
-            " │  │1234567890AB│  │ ",
-            " │  │   tracks   │  │ ",
-            " │  └────────────┘  │ ",
-            " │                  │ ",
-            " │  |<  ╭────╮  >|  │ ",
-            " │      │    │      │ ",
-            " │      ╰────╯      │ ",
-            " ╰──────────────────╯ ",
+            " \u{256d}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256e} ",
+            " \u{2502}  \u{250c}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2510}  \u{2502} ",
+            " \u{2502}  \u{2502}1234567890AB\u{2502}  \u{2502} ",
+            " \u{2502}  \u{2502}   tracks   \u{2502}  \u{2502} ",
+            " \u{2502}  \u{2514}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2518}  \u{2502} ",
+            " \u{2502}                  \u{2502} ",
+            " \u{2502}  |<  \u{256d}\u{2500}\u{2500}\u{2500}\u{2500}\u{256e}  >|  \u{2502} ",
+            " \u{2502}      \u{2502}    \u{2502}      \u{2502} ",
+            " \u{2502}      \u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{256f}      \u{2502} ",
+            " \u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256f} ",
         ];
         assert_eq!(art, expected);
     }
@@ -1329,16 +1401,16 @@ mod tests {
     fn zune_art_syncing_state() {
         let art = build_zune_art("*", "Syncing...");
         let expected = vec![
-            " ╭──────────────────╮ ",
-            " │  ┌────────────┐  │ ",
-            " │  │     *      │  │ ",
-            " │  │ Syncing... │  │ ",
-            " │  └────────────┘  │ ",
-            " │                  │ ",
-            " │  |<  ╭────╮  >|  │ ",
-            " │      │    │      │ ",
-            " │      ╰────╯      │ ",
-            " ╰──────────────────╯ ",
+            " \u{256d}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256e} ",
+            " \u{2502}  \u{250c}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2510}  \u{2502} ",
+            " \u{2502}  \u{2502}     *      \u{2502}  \u{2502} ",
+            " \u{2502}  \u{2502} Syncing... \u{2502}  \u{2502} ",
+            " \u{2502}  \u{2514}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2518}  \u{2502} ",
+            " \u{2502}                  \u{2502} ",
+            " \u{2502}  |<  \u{256d}\u{2500}\u{2500}\u{2500}\u{2500}\u{256e}  >|  \u{2502} ",
+            " \u{2502}      \u{2502}    \u{2502}      \u{2502} ",
+            " \u{2502}      \u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{256f}      \u{2502} ",
+            " \u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256f} ",
         ];
         assert_eq!(art, expected);
     }

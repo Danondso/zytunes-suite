@@ -22,6 +22,7 @@ A Rust CLI tool for syncing music to a Microsoft Zune 30 from macOS.
 - **Interactive TUI** — `zytunes-tui` launches a terminal UI (ratatui) for browsing your iTunes library, connecting to the device, managing a sync queue, and monitoring sync progress. Library parsing runs in the background on startup. TUI displays sync status on the Zune ASCII art screen including loading spinner, track count, syncing spinner, and queue count
 - **Device content browsing** — the TUI can browse tracks on the connected Zune organized by artist/album, toggled with `v`. The device library is indexed from the device's Music directory structure (`Artist/Album/Track`)
 - **Device track removal** — in device view mode, `a`/`A` removes selected tracks, albums, or artists from the device. Progress is shown during removal and the device track list auto-refreshes afterward
+- **Theming** — the TUI includes 11 built-in color themes (iTunes 2004, Gruvbox Dark/Light, Everforest Dark/Light, Miami Nights, IBM Mainframe, Windows 95, System 7, BIOS, Red Sands). Press `t` to open the theme picker. Selected theme is persisted to `~/.config/zytunes/config.toml`
 
 ## What's planned
 
@@ -183,7 +184,8 @@ src/
     app.rs           — application state, panel navigation, event handling
     ui.rs            — ratatui widget rendering (layout, panels, overlays)
     background.rs    — background worker thread (device I/O, sync, removal, library loading)
-    theme.rs         — color and style definitions
+    theme.rs         — theme struct and built-in theme presets
+    config.rs        — TOML config file loading/saving (~/.config/zytunes/config.toml)
 ```
 
 ## Reference libraries

@@ -1,5 +1,6 @@
 mod app;
 mod background;
+mod config;
 mod theme;
 mod ui;
 
@@ -40,6 +41,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut app = App::new();
     app.loading_library = true;
     app.library_path = Some(library_path.to_string());
+
+    // Load config and apply theme.
+    let cfg = config::load();
+    if let Some(ref theme_name) = cfg.theme {
+        app.theme_index = theme::find_theme_index(theme_name);
+    }
 
     // Set up background worker.
     let (event_tx, event_rx) = mpsc::channel();
@@ -105,6 +112,18 @@ fn run_loop(
                     continue;
                 }
 
+                // Handle theme picker.
+                if app.show_theme_picker {
+                    match key.code {
+                        KeyCode::Esc => app.theme_picker_cancel(),
+                        KeyCode::Enter => app.theme_picker_confirm(),
+                        KeyCode::Up => app.theme_picker_move(-1),
+                        KeyCode::Down => app.theme_picker_move(1),
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 // Handle help overlay.
                 if app.show_help {
                     match key.code {
@@ -137,16 +156,19 @@ fn run_loop(
                         app.cycle_panel_back();
                     }
                     KeyCode::Char('1') => {
+                        app.save_sidebar_pos();
                         app.sidebar_mode = SidebarMode::Artists;
                         app.refresh_sidebar();
                         app.active_panel = Panel::Library;
                     }
                     KeyCode::Char('2') => {
+                        app.save_sidebar_pos();
                         app.sidebar_mode = SidebarMode::Albums;
                         app.refresh_sidebar();
                         app.active_panel = Panel::Library;
                     }
                     KeyCode::Char('3') => {
+                        app.save_sidebar_pos();
                         app.sidebar_mode = SidebarMode::Playlists;
                         app.refresh_sidebar();
                         app.active_panel = Panel::Library;
@@ -155,6 +177,9 @@ fn run_loop(
                         if !app.sync_queue.is_empty() {
                             app.active_panel = Panel::SyncQueue;
                         }
+                    }
+                    KeyCode::Char('t') => {
+                        app.open_theme_picker();
                     }
                     KeyCode::Char('v') => {
                         if app.browse_mode == BrowseMode::Device

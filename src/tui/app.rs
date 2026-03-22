@@ -7,6 +7,7 @@ use zytunes::library::{ItunesLibrary, Track};
 use zytunes::mtp::parse::DeviceEntry;
 
 use crate::background::{BgCommand, BgEvent, StorageInfo, SyncItem};
+use crate::theme::{Theme, THEMES};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Panel {
@@ -87,6 +88,8 @@ pub struct App {
     pub sidebar_items: Vec<String>,
     pub sidebar_selected: usize,
     pub sidebar_scroll: usize,
+    /// Per-mode saved selection positions: [Artists, Albums, Playlists] x [Library, Device]
+    saved_sidebar_pos: [[usize; 3]; 2],
     pub album_list: Vec<AlbumInfo>,
     pub album_selected: usize,
     pub track_list: Vec<TrackInfo>,
@@ -123,6 +126,10 @@ pub struct App {
     pub toast_message: Option<(String, Instant, bool)>, // (msg, time, is_error)
     pub library_path: Option<String>,
     pub loading_library: bool,
+    pub theme_index: usize,
+    pub show_theme_picker: bool,
+    pub theme_picker_index: usize,
+    pub theme_before_picker: usize,
 }
 
 #[derive(Clone)]
@@ -153,6 +160,7 @@ impl App {
             sidebar_items: Vec::new(),
             sidebar_selected: 0,
             sidebar_scroll: 0,
+            saved_sidebar_pos: [[0; 3]; 2],
             album_list: Vec::new(),
             album_selected: 0,
             track_list: Vec::new(),
@@ -189,9 +197,43 @@ impl App {
             toast_message: None,
             library_path: None,
             loading_library: false,
+            theme_index: 0,
+            show_theme_picker: false,
+            theme_picker_index: 0,
+            theme_before_picker: 0,
         }
     }
 
+
+    pub fn theme(&self) -> &'static Theme {
+        &THEMES[self.theme_index.min(THEMES.len() - 1)]
+    }
+
+    pub fn open_theme_picker(&mut self) {
+        self.theme_before_picker = self.theme_index;
+        self.theme_picker_index = self.theme_index;
+        self.show_theme_picker = true;
+    }
+
+    pub fn theme_picker_move(&mut self, delta: isize) {
+        let len = THEMES.len();
+        self.theme_picker_index = (self.theme_picker_index as isize + delta).rem_euclid(len as isize) as usize;
+        self.theme_index = self.theme_picker_index;
+    }
+
+    pub fn theme_picker_confirm(&mut self) {
+        self.show_theme_picker = false;
+        // Save to config.
+        let config = crate::config::Config {
+            theme: Some(self.theme().name.to_string()),
+        };
+        crate::config::save(&config);
+    }
+
+    pub fn theme_picker_cancel(&mut self) {
+        self.theme_index = self.theme_before_picker;
+        self.show_theme_picker = false;
+    }
 
     pub fn build_device_index(&mut self) {
         self.device_artists.clear();
@@ -272,6 +314,7 @@ impl App {
     }
 
     pub fn toggle_browse_mode(&mut self) {
+        self.save_sidebar_pos();
         self.browse_mode = match self.browse_mode {
             BrowseMode::Library => BrowseMode::Device,
             BrowseMode::Device => BrowseMode::Library,
@@ -366,6 +409,40 @@ impl App {
         }
     }
 
+    fn sidebar_mode_index(&self) -> usize {
+        match self.sidebar_mode {
+            SidebarMode::Artists => 0,
+            SidebarMode::Albums => 1,
+            SidebarMode::Playlists => 2,
+        }
+    }
+
+    fn browse_mode_index(&self) -> usize {
+        match self.browse_mode {
+            BrowseMode::Library => 0,
+            BrowseMode::Device => 1,
+        }
+    }
+
+    /// Save the current sidebar selection for the active mode.
+    pub fn save_sidebar_pos(&mut self) {
+        let b = self.browse_mode_index();
+        let m = self.sidebar_mode_index();
+        self.saved_sidebar_pos[b][m] = self.sidebar_selected;
+    }
+
+    /// Restore the saved sidebar selection for the active mode, clamped to list bounds.
+    fn restore_sidebar_pos(&mut self) {
+        let b = self.browse_mode_index();
+        let m = self.sidebar_mode_index();
+        let saved = self.saved_sidebar_pos[b][m];
+        if self.sidebar_items.is_empty() {
+            self.sidebar_selected = 0;
+        } else {
+            self.sidebar_selected = saved.min(self.sidebar_items.len() - 1);
+        }
+    }
+
     pub fn refresh_sidebar(&mut self) {
         match self.browse_mode {
             BrowseMode::Library => {
@@ -417,7 +494,7 @@ impl App {
                 .retain(|item| item.to_lowercase().contains(&q));
         }
 
-        self.sidebar_selected = 0;
+        self.restore_sidebar_pos();
         self.sidebar_scroll = 0;
         self.album_list.clear();
         self.track_list.clear();
@@ -664,7 +741,7 @@ impl App {
                     location: loc.clone(),
                 };
                 self.sync_queue.push(QueuedItem {
-                    label: format!("{} - {}", track.artist, track.name),
+                    label: format!("{} - {} - {}", track.artist, track.album, track.name),
                     tracks: vec![item],
                 });
                 self.set_toast(format!("Added \"{}\" to queue", track.name), false);
@@ -879,6 +956,7 @@ impl App {
             Panel::Library => {
                 if self.sidebar_selected > 0 {
                     self.sidebar_selected -= 1;
+                    self.save_sidebar_pos();
                 }
             }
             Panel::Albums => {
@@ -910,6 +988,7 @@ impl App {
             Panel::Library => {
                 if self.sidebar_selected + 1 < self.sidebar_items.len() {
                     self.sidebar_selected += 1;
+                    self.save_sidebar_pos();
                 }
             }
             Panel::Albums => {
@@ -945,11 +1024,13 @@ impl App {
         for i in (self.sidebar_selected + 1)..self.sidebar_items.len() {
             if first_char_upper(&self.sidebar_items[i]) != current_char {
                 self.sidebar_selected = i;
+                self.save_sidebar_pos();
                 return;
             }
         }
         // Wrap to top if at the end.
         self.sidebar_selected = 0;
+        self.save_sidebar_pos();
     }
 
     /// Jump backward to the previous letter group in the sidebar.
@@ -958,27 +1039,25 @@ impl App {
             return;
         }
         if self.sidebar_selected == 0 {
-            // Wrap to last item.
             self.sidebar_selected = self.sidebar_items.len() - 1;
+            self.save_sidebar_pos();
             return;
         }
         let current_char = first_char_upper(&self.sidebar_items[self.sidebar_selected]);
-        // First, go to the start of the current letter group.
         let mut i = self.sidebar_selected;
         while i > 0 && first_char_upper(&self.sidebar_items[i - 1]) == current_char {
             i -= 1;
         }
         if i > 0 {
-            // Jump to start of previous letter group.
             let prev_char = first_char_upper(&self.sidebar_items[i - 1]);
             while i > 0 && first_char_upper(&self.sidebar_items[i - 1]) == prev_char {
                 i -= 1;
             }
             self.sidebar_selected = i;
         } else {
-            // Already at the first group, wrap to last.
             self.sidebar_selected = self.sidebar_items.len() - 1;
         }
+        self.save_sidebar_pos();
     }
 
     pub fn cycle_panel(&mut self) {

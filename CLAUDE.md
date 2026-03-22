@@ -29,7 +29,7 @@ A Rust CLI tool for syncing music to a Microsoft Zune 30 from macOS. Detects the
 
 CLI commands: `ls [path]`, `push <files...>`, `rm <paths...>`, `sync <type> <name>`, `library [xml] [query]`, `help`.
 
-**TUI** (`zytunes-tui`): Interactive terminal UI for browsing the iTunes library and device content, connecting to the device, managing a sync queue, removing tracks from the device, and monitoring sync progress. Library parsing runs asynchronously on a background thread at startup. The TUI supports two browse modes: Library (iTunes) and Device (Zune), toggled with `v`.
+**TUI** (`zytunes-tui`): Interactive terminal UI for browsing the iTunes library and device content, connecting to the device, managing a sync queue, removing tracks from the device, and monitoring sync progress. Library parsing runs asynchronously on a background thread at startup. The TUI supports two browse modes: Library (iTunes) and Device (Zune), toggled with `v`. Theme picker accessible with `t`.
 
 ## Architecture
 
@@ -50,12 +50,13 @@ CLI commands: `ls [path]`, `push <files...>`, `rm <paths...>`, `sync <type> <nam
 - `library.rs` — iTunes Library.xml plist parser. Fully integrated — used by `sync` and `library` commands
 - `main.rs` — CLI entry point, `run()` dispatcher, `cmd_sync`/`cmd_push`/`cmd_rm`/`cmd_ls`/`cmd_library` commands, `sync_to_device()` engine, transcoding via ffmpeg
 - `tui/main.rs` — TUI entry point (`zytunes-tui` binary), event loop, terminal setup/teardown
-- `tui/app.rs` — TUI application state (`App`), panel navigation, background event handling. Supports two browse modes (`BrowseMode::Library` and `BrowseMode::Device`). Device mode builds an in-memory index of device tracks organized by artist/album from the `Music/{Artist}/{Album}/{Track}` path structure. Handles device track removal path collection for selected items
+- `tui/app.rs` — TUI application state (`App`), panel navigation, background event handling. Supports two browse modes (`BrowseMode::Library` and `BrowseMode::Device`). Device mode builds an in-memory index of device tracks organized by artist/album from the `Music/{Artist}/{Album}/{Track}` path structure. Handles device track removal path collection for selected items. Saves/restores sidebar selection positions per browse mode and sidebar mode
 - `tui/background.rs` — background worker thread: device detection, MTP session, sync execution, device track removal, library loading
-- `tui/ui.rs` — ratatui rendering: layout (3-column with device left panel), startup screen, Zune ASCII art, panels, overlays. Context-sensitive key labels change between Library and Device browse modes
-- `tui/theme.rs` — color and style constants
+- `tui/ui.rs` — ratatui rendering: layout (3-column with device left panel), startup screen, Zune ASCII art, panels, overlays (help, search, theme picker). Context-sensitive key labels change between Library and Device browse modes. All rendering uses the active `Theme` from app state
+- `tui/theme.rs` — `Theme` struct with color/style fields and 11 built-in presets (iTunes 2004, Gruvbox Dark/Light, Everforest Dark/Light, Miami Nights, IBM Mainframe, Windows 95, System 7, BIOS, Red Sands). `find_theme_index()` for name-based lookup
+- `tui/config.rs` — TOML config file at `~/.config/zytunes/config.toml` (serde + toml). Currently stores selected theme name
 
-**Configuration:** iTunes library path defaults to `~/Music/Music/Library.xml`. Override with `ZYTUNES_LIBRARY` env var or `--library <path>` flag.
+**Configuration:** iTunes library path defaults to `~/Music/Music/Library.xml`. Override with `ZYTUNES_LIBRARY` env var or `--library <path>` flag. TUI config (theme selection) is stored in `~/.config/zytunes/config.toml`.
 
 **External tool dependencies:** `ffmpeg`/`ffprobe` (transcoding), `libusb` (via rusb). `aft-mtp-cli` is vendored in `aft/`.
 
