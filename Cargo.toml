@@ -1,6 +1,6 @@
 [package]
 name = "zytunes"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "A CLI tool for syncing music to a Microsoft Zune 30 on macOS"
 

@@ -20,10 +20,11 @@ A Rust CLI tool for syncing music to a Microsoft Zune 30 from macOS.
 - **Library browsing** — `library [xml] [query]` browses/searches an iTunes Library.xml
 - **Library caching** — vendored `aft-mtp-cli` fork caches the device's artist/album library to `~/.aft-library-cache`, eliminating the ~5 min load time on subsequent sessions. Cache auto-updates on imports; use `zune-refresh` to force a full reload
 - **Interactive TUI** — `zytunes-tui` launches a terminal UI (ratatui) for browsing your iTunes library, connecting to the device, managing a sync queue, and monitoring sync progress. Library parsing runs in the background on startup. TUI displays sync status on the Zune ASCII art screen including loading spinner, track count, syncing spinner, and queue count
+- **Device content browsing** — the TUI can browse tracks on the connected Zune organized by artist/album, toggled with `v`. The device library is indexed from the device's Music directory structure (`Artist/Album/Track`)
+- **Device track removal** — in device view mode, `a`/`A` removes selected tracks, albums, or artists from the device. Progress is shown during removal and the device track list auto-refreshes afterward
 
 ## What's planned
 
-- **Device content view** — browse and manage tracks on the device from the TUI, with indicators for tracks already on device, searchable device library, and support for removing items from the device via the queue
 - **Dump command** — `dump` to pull all music off a Zune to a local directory
 
 ## Setup
@@ -181,7 +182,7 @@ src/
     main.rs          — TUI entry point (zytunes-tui binary)
     app.rs           — application state, panel navigation, event handling
     ui.rs            — ratatui widget rendering (layout, panels, overlays)
-    background.rs    — background worker thread (device I/O, sync, library loading)
+    background.rs    — background worker thread (device I/O, sync, removal, library loading)
     theme.rs         — color and style definitions
 ```
 

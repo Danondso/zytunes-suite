@@ -29,7 +29,7 @@ A Rust CLI tool for syncing music to a Microsoft Zune 30 from macOS. Detects the
 
 CLI commands: `ls [path]`, `push <files...>`, `rm <paths...>`, `sync <type> <name>`, `library [xml] [query]`, `help`.
 
-**TUI** (`zytunes-tui`): Interactive terminal UI for browsing the iTunes library, connecting to the device, managing a sync queue, and monitoring sync progress. Library parsing runs asynchronously on a background thread at startup.
+**TUI** (`zytunes-tui`): Interactive terminal UI for browsing the iTunes library and device content, connecting to the device, managing a sync queue, removing tracks from the device, and monitoring sync progress. Library parsing runs asynchronously on a background thread at startup. The TUI supports two browse modes: Library (iTunes) and Device (Zune), toggled with `v`.
 
 ## Architecture
 
@@ -44,15 +44,15 @@ CLI commands: `ls [path]`, `push <files...>`, `rm <paths...>`, `sync <type> <nam
 **Key modules:**
 - `device.rs` — USB scanning via rusb, identifies Zune by VID `0x045e`
 - `mtp/mod.rs` — `DeviceSession` trait abstracting device operations (ls, zune_import, rm, collect_all_tracks, create_playlist) for testability
-- `mtp/aft.rs` — `AftSession` implements `DeviceSession`: spawns and communicates with aft-mtp-cli subprocess. Uses `aft_quote()` to sanitize all user-controlled strings sent to the subprocess. Binary discovery: `AFT_MTP_CLI` env var → `aft/build/cli/aft-mtp-cli` → PATH → `/tmp/aft/build/cli/aft-mtp-cli`
+- `mtp/aft.rs` — `AftSession` implements `DeviceSession`: spawns and communicates with aft-mtp-cli subprocess via channel-based I/O (stdout and stderr each read by dedicated threads, lines delivered via `mpsc` channels). Monitors stderr for error lines that aft-mtp-cli emits without a `:done` marker on stdout. Uses `aft_quote()` to sanitize all user-controlled strings sent to the subprocess. `collect_all_tracks` returns an empty list for non-existent paths (e.g., fresh devices). Binary discovery: `AFT_MTP_CLI` env var → `aft/build/cli/aft-mtp-cli` → PATH → `/tmp/aft/build/cli/aft-mtp-cli`
 - `mtp/parse.rs` — Parses aft-mtp-cli text output into `DeviceEntry` structs
 - `mtp_native/` — Preserved pure-Rust MTP/MTPZ implementation (works except data-out on macOS). Not actively used but kept for a future IOKit backend
 - `library.rs` — iTunes Library.xml plist parser. Fully integrated — used by `sync` and `library` commands
 - `main.rs` — CLI entry point, `run()` dispatcher, `cmd_sync`/`cmd_push`/`cmd_rm`/`cmd_ls`/`cmd_library` commands, `sync_to_device()` engine, transcoding via ffmpeg
 - `tui/main.rs` — TUI entry point (`zytunes-tui` binary), event loop, terminal setup/teardown
-- `tui/app.rs` — TUI application state (`App`), panel navigation, background event handling
-- `tui/background.rs` — background worker thread: device detection, MTP session, sync execution, library loading
-- `tui/ui.rs` — ratatui rendering: layout (3-column with device left panel), startup screen, Zune ASCII art, panels, overlays
+- `tui/app.rs` — TUI application state (`App`), panel navigation, background event handling. Supports two browse modes (`BrowseMode::Library` and `BrowseMode::Device`). Device mode builds an in-memory index of device tracks organized by artist/album from the `Music/{Artist}/{Album}/{Track}` path structure. Handles device track removal path collection for selected items
+- `tui/background.rs` — background worker thread: device detection, MTP session, sync execution, device track removal, library loading
+- `tui/ui.rs` — ratatui rendering: layout (3-column with device left panel), startup screen, Zune ASCII art, panels, overlays. Context-sensitive key labels change between Library and Device browse modes
 - `tui/theme.rs` — color and style constants
 
 **Configuration:** iTunes library path defaults to `~/Music/Music/Library.xml`. Override with `ZYTUNES_LIBRARY` env var or `--library <path>` flag.

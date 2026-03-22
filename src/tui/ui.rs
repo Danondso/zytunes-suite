@@ -7,7 +7,7 @@ use ratatui::widgets::{
 use ratatui::Frame;
 use throbber_widgets_tui::{Throbber, ThrobberState, WhichUse, BRAILLE_ONE};
 
-use crate::app::{format_duration, format_with_commas, App, DeviceStatus, Panel, SidebarMode, SortColumn, SyncStatus};
+use crate::app::{format_duration, format_with_commas, App, BrowseMode, DeviceStatus, Panel, SidebarMode, SortColumn, SyncStatus};
 use crate::theme;
 
 fn throbber_symbol(state: &ThrobberState) -> String {
@@ -143,8 +143,12 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
         SidebarMode::Albums => "Albums",
         SidebarMode::Playlists => "Playlists",
     };
+    let browse_prefix = match app.browse_mode {
+        BrowseMode::Library => "",
+        BrowseMode::Device => "Zune: ",
+    };
 
-    let title = format!(" {} ", mode_label);
+    let title = format!(" {}{} ", browse_prefix, mode_label);
     let border_style = if is_active {
         Style::default().fg(theme::SELECTION_BG)
     } else {
@@ -160,10 +164,23 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(block, area);
 
     if app.sidebar_items.is_empty() {
-        let msg = if app.library.is_none() {
-            "No library loaded"
-        } else {
-            "(empty)"
+        let msg = match app.browse_mode {
+            BrowseMode::Library => {
+                if app.library.is_none() {
+                    "No library loaded"
+                } else {
+                    "(empty)"
+                }
+            }
+            BrowseMode::Device => {
+                if app.device_tracks.is_empty() {
+                    "No tracks on device"
+                } else if app.sidebar_mode == SidebarMode::Playlists {
+                    "Playlists not available\nin device view"
+                } else {
+                    "(empty)"
+                }
+            }
         };
         let p = Paragraph::new(msg).style(theme::dim());
         f.render_widget(p, inner);
@@ -826,6 +843,7 @@ fn draw_keys_panel(f: &mut Frame, app: &App, area: Rect) {
         ("S-Tab", "Prev panel"),
         ("1/2/3", "Art/Alb/Plist"),
         ("4", "Sync queue"),
+        ("v", "Lib/Device view"),
         ("/", "Search"),
         ("c", "Connect"),
     ];
@@ -842,14 +860,20 @@ fn draw_keys_panel(f: &mut Frame, app: &App, area: Rect) {
     lines.push(Line::from(""));
 
     // Context-sensitive keys.
+    let is_device_mode = app.browse_mode == BrowseMode::Device;
+    let add_label = if is_device_mode { "Remove" } else { "Add to queue" };
+    let add_track_label = if is_device_mode { "Remove track" } else { "Add track" };
+    let add_all_label = if is_device_mode { "Remove all" } else { "Add all" };
+    let add_album_label = if is_device_mode { "Remove album" } else { "Add album" };
+
     let (section, keys): (&str, Vec<(&str, &str)>) = match app.active_panel {
         Panel::Library => (
-            " Library",
+            if is_device_mode { " Zune Library" } else { " Library" },
             vec![
                 ("\u{2191}\u{2193}", "Navigate"),
-                ("\u{2190}\u{2192}", "Skip A→B→C"),
+                ("\u{2190}\u{2192}", "Skip A\u{2192}B\u{2192}C"),
                 ("Enter", "Select"),
-                ("a", "Add to queue"),
+                ("a", add_label),
             ],
         ),
         Panel::Albums => (
@@ -857,7 +881,7 @@ fn draw_keys_panel(f: &mut Frame, app: &App, area: Rect) {
             vec![
                 ("\u{2191}\u{2193}", "Navigate"),
                 ("Enter", "View tracks"),
-                ("a", "Add album"),
+                ("a", add_album_label),
             ],
         ),
         Panel::TrackList => (
@@ -865,8 +889,8 @@ fn draw_keys_panel(f: &mut Frame, app: &App, area: Rect) {
             vec![
                 ("\u{2191}\u{2193}", "Navigate"),
                 ("s", "Cycle sort"),
-                ("a", "Add track"),
-                ("A", "Add all"),
+                ("a", add_track_label),
+                ("A", add_all_label),
             ],
         ),
         Panel::Device => (" Device", vec![("r", "Refresh"), ("d", "Disconnect")]),
@@ -916,8 +940,15 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let left = format!(" {} tracks", app.track_count());
-    let right = "Tab:panels | a:add | S:sync | q:quit | ?:help";
+    let left = match app.browse_mode {
+        BrowseMode::Library => format!(" {} tracks", app.track_count()),
+        BrowseMode::Device => format!(" {} on device", app.device_tracks.len()),
+    };
+    let right = if app.browse_mode == BrowseMode::Device {
+        "v:library | a:remove | q:quit | ?:help"
+    } else {
+        "v:device | a:add | S:sync | q:quit | ?:help"
+    };
 
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -960,7 +991,7 @@ fn draw_toast(f: &mut Frame, msg: &str, is_error: bool) {
 fn draw_help_overlay(f: &mut Frame) {
     let area = f.area();
     let width = 50u16.min(area.width - 4);
-    let height = 22u16.min(area.height - 4);
+    let height = 28u16.min(area.height - 4);
     let x = (area.width.saturating_sub(width)) / 2;
     let y = (area.height.saturating_sub(height)) / 2;
     let rect = Rect::new(x, y, width, height);
@@ -974,6 +1005,7 @@ fn draw_help_overlay(f: &mut Frame) {
         "  Up/Down     Navigate items",
         "  Enter       Select / expand",
         "  1/2/3       Artists / Albums / Playlists",
+        "  v           Toggle Library / Device view",
         "",
         "  Library",
         "  /           Search sidebar",
@@ -986,6 +1018,10 @@ fn draw_help_overlay(f: &mut Frame) {
         "  S / Enter   Execute sync",
         "  d           Remove from queue",
         "  C           Clear queue",
+        "",
+        "  Device view",
+        "  a           Remove track from device",
+        "  A           Remove all visible tracks",
         "",
         "  Device",
         "  c           Connect to Zune",

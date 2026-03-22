@@ -15,7 +15,7 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
-use app::{App, DeviceStatus, Panel, SidebarMode, SyncStatus};
+use app::{App, BrowseMode, DeviceStatus, Panel, SidebarMode, SyncStatus};
 use background::BgCommand;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -156,6 +156,15 @@ fn run_loop(
                             app.active_panel = Panel::SyncQueue;
                         }
                     }
+                    KeyCode::Char('v') => {
+                        if app.browse_mode == BrowseMode::Device
+                            || app.device_status == DeviceStatus::Connected
+                        {
+                            app.toggle_browse_mode();
+                        } else {
+                            app.set_toast("Connect a device first".into(), true);
+                        }
+                    }
                     KeyCode::Char('c') => {
                         if app.device_status == DeviceStatus::Disconnected {
                             app.device_status = DeviceStatus::Detecting;
@@ -171,6 +180,7 @@ fn run_loop(
                             app.device_status = DeviceStatus::Disconnected;
                             app.device_name = None;
                             app.device_tracks.clear();
+                            app.clear_device_index();
                             app.set_toast("Disconnected".into(), false);
                         }
                         _ => {}
@@ -225,21 +235,28 @@ fn run_loop(
                             app.execute_sync(cmd_tx);
                         }
                     }
-                    KeyCode::Char('a') => match app.active_panel {
-                        Panel::TrackList => {
-                            app.add_selected_track_to_queue();
+                    KeyCode::Char('a') => {
+                        if app.browse_mode == BrowseMode::Device {
+                            send_device_removal(app, cmd_tx);
+                        } else {
+                            match app.active_panel {
+                                Panel::TrackList => {
+                                    app.add_selected_track_to_queue();
+                                }
+                                Panel::Library => {
+                                    app.add_sidebar_item_to_queue();
+                                }
+                                Panel::Albums => {
+                                    app.add_all_visible_to_queue();
+                                }
+                                _ => {}
+                            }
                         }
-                        Panel::Library => {
-                            app.add_sidebar_item_to_queue();
-                        }
-                        Panel::Albums => {
-                            // Add all tracks from selected album to queue.
-                            app.add_all_visible_to_queue();
-                        }
-                        _ => {}
-                    },
+                    }
                     KeyCode::Char('A') => {
-                        if app.active_panel == Panel::TrackList {
+                        if app.browse_mode == BrowseMode::Device {
+                            send_device_removal(app, cmd_tx);
+                        } else if app.active_panel == Panel::TrackList {
                             app.add_all_visible_to_queue();
                         }
                     }
@@ -272,4 +289,18 @@ fn run_loop(
     }
 
     Ok(())
+}
+
+fn send_device_removal(app: &mut App, cmd_tx: &mpsc::Sender<BgCommand>) {
+    let paths = app.collect_device_removal_paths();
+    if paths.is_empty() {
+        app.set_toast("Nothing to remove".into(), true);
+    } else {
+        let count = paths.len();
+        app.set_toast(
+            format!("Removing {} track(s) from device...", count),
+            false,
+        );
+        let _ = cmd_tx.send(BgCommand::RemoveFromDevice(paths));
+    }
 }

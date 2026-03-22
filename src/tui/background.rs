@@ -14,6 +14,7 @@ pub enum BgCommand {
     LoadDeviceTracks,
     Disconnect,
     ExecuteSyncQueue(Vec<SyncItem>),
+    RemoveFromDevice(Vec<String>),
     CancelSync,
 }
 
@@ -71,6 +72,15 @@ pub enum BgEvent {
         success: usize,
         failed: usize,
         skipped: usize,
+    },
+    RemoveProgress {
+        current: usize,
+        total: usize,
+        name: String,
+    },
+    RemoveComplete {
+        success: usize,
+        failed: usize,
     },
 }
 
@@ -251,6 +261,62 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                 BgCommand::CancelSync => {
                     // Handled inline during sync execution via try_recv.
                 }
+                BgCommand::RemoveFromDevice(paths) => {
+                    if let Some(ref mut s) = session {
+                        let total = paths.len();
+                        let mut success = 0usize;
+                        let mut failed = 0usize;
+
+                        let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                            "Removing {} tracks from device...",
+                            total
+                        )));
+
+                        for (i, path) in paths.iter().enumerate() {
+                            // Check for cancel.
+                            if let Ok(BgCommand::CancelSync) = cmd_rx.try_recv() {
+                                let _ = event_tx.send(BgEvent::SyncMessage(
+                                    "Removal cancelled".into(),
+                                ));
+                                break;
+                            }
+
+                            let name = path.rsplit('/').next().unwrap_or(path).to_string();
+                            let _ = event_tx.send(BgEvent::RemoveProgress {
+                                current: i + 1,
+                                total,
+                                name: name.clone(),
+                            });
+
+                            match s.rm(path) {
+                                Ok(()) => {
+                                    success += 1;
+                                    let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                                        "[{}/{}] Removed \"{}\"",
+                                        i + 1, total, name
+                                    )));
+                                }
+                                Err(e) => {
+                                    failed += 1;
+                                    let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                                        "[{}/{}] Failed to remove \"{}\": {}",
+                                        i + 1, total, name, e
+                                    )));
+                                }
+                            }
+                        }
+
+                        let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                            "Removal done: {} removed, {} failed",
+                            success, failed
+                        )));
+                        let _ = event_tx.send(BgEvent::RemoveComplete { success, failed });
+
+                        reload_device_tracks(s, &event_tx);
+                    } else {
+                        let _ = event_tx.send(BgEvent::Error("No active session".into()));
+                    }
+                }
                 BgCommand::ExecuteSyncQueue(items) => {
                     if let Some(ref mut s) = session {
                         let total = items.len();
@@ -367,18 +433,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                             skipped,
                         });
 
-                        // Reload device tracks so the count is accurate.
-                        let _ = event_tx.send(BgEvent::LoadingDeviceTracks);
-                        match s.collect_all_tracks("/Music") {
-                            Ok(tracks) => {
-                                let _ = event_tx.send(BgEvent::DeviceTracksLoaded(tracks));
-                            }
-                            Err(e) => {
-                                let _ = event_tx.send(BgEvent::Error(
-                                    format!("Failed to reload tracks: {}", e),
-                                ));
-                            }
-                        }
+                        reload_device_tracks(s, &event_tx);
                     } else {
                         let _ = event_tx.send(BgEvent::Error("No active session".into()));
                     }
@@ -388,6 +443,24 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
     });
 
     cmd_tx
+}
+
+/// Reload device tracks and send the result back to the TUI.
+fn reload_device_tracks(
+    session: &mut AftSession,
+    event_tx: &mpsc::Sender<BgEvent>,
+) {
+    let _ = event_tx.send(BgEvent::LoadingDeviceTracks);
+    match session.collect_all_tracks("/Music") {
+        Ok(tracks) => {
+            let _ = event_tx.send(BgEvent::DeviceTracksLoaded(tracks));
+        }
+        Err(e) => {
+            let _ = event_tx.send(BgEvent::Error(
+                format!("Failed to reload tracks: {}", e),
+            ));
+        }
+    }
 }
 
 /// Query storage info from the first storage on the device.

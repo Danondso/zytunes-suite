@@ -2,7 +2,7 @@ use crate::mtp::parse::{self, DeviceEntry};
 use crate::mtp::DeviceSession;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// Strip ANSI escape codes from a string.
@@ -81,13 +81,39 @@ fn mtpz_data_path() -> Result<PathBuf, String> {
     Ok(PathBuf::from(home).join(".mtpz-data"))
 }
 
+/// Spawn a thread that reads lines from a pipe and sends them through a channel.
+fn spawn_line_reader(pipe: std::process::ChildStdout) -> std::sync::mpsc::Receiver<String> {
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(pipe);
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            match reader.read_line(&mut buf) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let line = buf.trim_end_matches('\n').trim_end_matches('\r').to_string();
+                    if tx.send(line).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    rx
+}
+
 /// An MTP session backed by aft-mtp-cli subprocess.
 /// Handles MTPZ authentication automatically on connect.
 pub struct AftSession {
     child: Child,
     stdin: ChildStdin,
-    reader: BufReader<ChildStdout>,
+    /// Receives lines from the stdout reader thread.
+    stdout_rx: std::sync::mpsc::Receiver<String>,
     log_tx: Option<std::sync::mpsc::Sender<String>>,
+    /// Receives error lines from stderr reader thread.
+    stderr_rx: std::sync::mpsc::Receiver<String>,
 }
 
 impl AftSession {
@@ -207,21 +233,27 @@ impl AftSession {
 
         let stdin = child.stdin.take().ok_or("No stdin pipe")?;
         let stdout = child.stdout.take().ok_or("No stdout pipe")?;
-        let reader = BufReader::new(stdout);
+        let stdout_rx = spawn_line_reader(stdout);
 
-        // Drain stderr in a background thread to prevent pipe deadlock.
+        // Capture stderr in a background thread. Error lines are forwarded
+        // so read_until_done can detect command failures that only report
+        // on stderr (e.g. "error: could not find Music in path").
+        let (stderr_tx, stderr_rx) = std::sync::mpsc::channel::<String>();
         if let Some(stderr) = child.stderr.take() {
             std::thread::spawn(move || {
                 let reader = BufReader::new(stderr);
-                for _line in reader.lines().map_while(Result::ok) {}
+                for line in reader.lines().map_while(Result::ok) {
+                    let _ = stderr_tx.send(line);
+                }
             });
         }
 
         let mut session = AftSession {
             child,
             stdin,
-            reader,
+            stdout_rx,
             log_tx: None,
+            stderr_rx,
         };
 
         // Wait for startup. aft-mtp-cli prints device/storage info (no `:done` marker).
@@ -270,24 +302,29 @@ impl AftSession {
     fn read_until_startup(&mut self, timeout: Duration) -> Result<Vec<String>, String> {
         let start = Instant::now();
         let mut lines = Vec::new();
-        let mut buf = String::new();
 
         loop {
-            if start.elapsed() > timeout {
+            let remaining = timeout
+                .checked_sub(start.elapsed())
+                .unwrap_or(Duration::ZERO);
+            if remaining.is_zero() {
                 return Err("Timeout waiting for aft-mtp-cli startup".to_string());
             }
-            buf.clear();
-            match self.reader.read_line(&mut buf) {
-                Ok(0) => return Err("aft-mtp-cli exited during startup".to_string()),
-                Ok(_) => {
-                    let raw = buf.trim_end_matches('\n').trim_end_matches('\r');
-                    let line = strip_ansi(raw);
+
+            match self.stdout_rx.recv_timeout(remaining) {
+                Ok(raw) => {
+                    let line = strip_ansi(&raw);
                     lines.push(line.to_string());
                     if line.contains("selected storage") {
                         return Ok(lines);
                     }
                 }
-                Err(e) => return Err(format!("Read from aft-mtp-cli: {e}")),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    return Err("Timeout waiting for aft-mtp-cli startup".to_string());
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("aft-mtp-cli exited during startup".to_string());
+                }
             }
         }
     }
@@ -298,6 +335,8 @@ impl AftSession {
     }
 
     /// Read lines until `:done`, optionally printing progress to stderr.
+    /// Also monitors stderr for error lines from aft-mtp-cli (which sends
+    /// some errors to stderr without a `:done` marker on stdout).
     fn read_until_done_inner(
         &mut self,
         timeout: Duration,
@@ -305,34 +344,49 @@ impl AftSession {
     ) -> Result<Vec<String>, String> {
         let start = Instant::now();
         let mut lines = Vec::new();
-        let mut buf = String::new();
 
         loop {
-            if start.elapsed() > timeout {
+            // Check stderr for error lines first.
+            while let Ok(err_line) = self.stderr_rx.try_recv() {
+                if err_line.contains("error:") {
+                    return Err(err_line);
+                }
+                // Forward non-error stderr lines (warnings, debug) to the log.
+                self.logln(&err_line);
+            }
+
+            let remaining = timeout
+                .checked_sub(start.elapsed())
+                .unwrap_or(Duration::ZERO);
+            if remaining.is_zero() {
                 return Err(format!(
                     "Timeout waiting for aft-mtp-cli response ({}s)",
                     timeout.as_secs()
                 ));
             }
 
-            buf.clear();
-            match self.reader.read_line(&mut buf) {
-                Ok(0) => {
-                    return Err("aft-mtp-cli process exited unexpectedly".to_string());
-                }
-                Ok(_) => {
-                    let raw = buf.trim_end_matches('\n').trim_end_matches('\r');
-                    let line = strip_ansi(raw);
+            // Wait for next stdout line with a short timeout so we can
+            // re-check stderr periodically.
+            let poll_dur = remaining.min(Duration::from_millis(200));
+            match self.stdout_rx.recv_timeout(poll_dur) {
+                Ok(raw) => {
+                    let line = strip_ansi(&raw);
                     let line = line.trim();
                     if line == ":done" {
                         return Ok(lines);
+                    }
+                    if line.starts_with("error:") {
+                        return Err(line.to_string());
                     }
                     if verbose {
                         if let Some((transferred, total)) = parse_progress(line) {
                             let pct = (transferred as f64 / total as f64 * 100.0) as u32;
                             let mb = transferred as f64 / 1_048_576.0;
                             let total_mb = total as f64 / 1_048_576.0;
-                            self.log(&format!("\r  Uploading: {:.1}/{:.1} MB ({}%)    ", mb, total_mb, pct));
+                            self.log(&format!(
+                                "\r  Uploading: {:.1}/{:.1} MB ({}%)    ",
+                                mb, total_mb, pct
+                            ));
                         } else if line.starts_with("album:")
                             || line.starts_with("getting ")
                             || line.starts_with("artists ")
@@ -341,13 +395,20 @@ impl AftSession {
                             || line.starts_with("device ")
                             || line.starts_with("abstract ")
                         {
-                            self.log(&format!("\r  {}    ", &line[..line.len().min(70)]));
+                            self.log(&format!(
+                                "\r  {}    ",
+                                &line[..line.len().min(70)]
+                            ));
                         }
                     }
                     lines.push(line.to_string());
                 }
-                Err(e) => {
-                    return Err(format!("Read from aft-mtp-cli: {e}"));
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    // No stdout data yet — loop back to check stderr and timeout.
+                    continue;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("aft-mtp-cli process exited unexpectedly".to_string());
                 }
             }
         }
@@ -371,20 +432,35 @@ impl DeviceSession for AftSession {
 
         let timeout = Duration::from_secs(900); // 15 min — library load is very slow
         let start = Instant::now();
-        let mut buf = String::new();
         let mut album_count = 0u32;
         let mut track_id: Option<u64> = None;
 
         loop {
-            if start.elapsed() > timeout {
+            // Check stderr for errors.
+            while let Ok(err_line) = self.stderr_rx.try_recv() {
+                if err_line.contains("error:") {
+                    self.logln(&format!("  {}", err_line));
+                    return Err(err_line);
+                }
+                // Forward non-error stderr lines (warnings, debug) to the log.
+                self.logln(&err_line);
+            }
+
+            let remaining = timeout
+                .checked_sub(start.elapsed())
+                .unwrap_or(Duration::ZERO);
+            if remaining.is_zero() {
                 return Err("zune-import timed out (15 min)".to_string());
             }
-            buf.clear();
-            match self.reader.read_line(&mut buf) {
-                Ok(0) => return Err("aft-mtp-cli exited during import".to_string()),
-                Ok(_) => {
-                    let raw = buf.trim();
-                    let line = strip_ansi(raw);
+
+            let poll_dur = remaining.min(Duration::from_millis(200));
+            match self.stdout_rx.recv_timeout(poll_dur) {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("aft-mtp-cli exited during import".to_string());
+                }
+                Ok(raw) => {
+                    let line = strip_ansi(&raw);
                     let line = line.trim();
                     if line == ":done" {
                         self.log(&format!("\r{}\r", " ".repeat(60)));
@@ -397,7 +473,10 @@ impl DeviceSession for AftSession {
                     } else if line.starts_with("album:") {
                         album_count += 1;
                         if album_count.is_multiple_of(10) || album_count <= 5 {
-                            self.log(&format!("  Loading library: {} albums indexed...", album_count));
+                            self.log(&format!(
+                                "  Loading library: {} albums indexed...",
+                                album_count
+                            ));
                         }
                     } else if line.starts_with("getting ") {
                         self.log(&format!("  {}...", line));
@@ -405,7 +484,10 @@ impl DeviceSession for AftSession {
                         let pct = (transferred as f64 / total as f64 * 100.0) as u32;
                         let mb = transferred as f64 / 1_048_576.0;
                         let total_mb = total as f64 / 1_048_576.0;
-                        self.log(&format!("  Uploading: {:.1}/{:.1} MB ({}%)", mb, total_mb, pct));
+                        self.log(&format!(
+                            "  Uploading: {:.1}/{:.1} MB ({}%)",
+                            mb, total_mb, pct
+                        ));
                     } else if line.contains("error:") {
                         self.logln(&format!("  {}", line));
                         return Err(line.to_string());
@@ -418,7 +500,6 @@ impl DeviceSession for AftSession {
                         self.log(&format!("  {}", &line[..line.len().min(55)]));
                     }
                 }
-                Err(e) => return Err(format!("Read: {e}")),
             }
         }
     }
@@ -478,13 +559,22 @@ impl DeviceSession for AftSession {
     }
 
     /// Collect all non-directory entries under a path, recursively.
+    /// Returns an empty list if the path does not exist on the device.
     fn collect_all_tracks(&mut self, path: &str) -> Result<Vec<DeviceEntry>, String> {
-        let lines = self.send_with_timeout(
+        match self.send_with_timeout(
             &format!("lsext-r {}", aft_quote(path)),
             Duration::from_secs(120),
-        )?;
-        let entries = parse::parse_lsext(&lines);
-        Ok(entries.into_iter().filter(|e| !e.is_dir()).collect())
+        ) {
+            Ok(lines) => {
+                let entries = parse::parse_lsext(&lines);
+                Ok(entries.into_iter().filter(|e| !e.is_dir()).collect())
+            }
+            Err(e) if e.contains("could not find") => {
+                // Path doesn't exist on device (e.g., fresh/empty device).
+                Ok(Vec::new())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Create a playlist on the device with the given track object IDs.
@@ -528,12 +618,14 @@ impl AftSession {
     fn from_child(mut child: Child) -> Self {
         let stdin = child.stdin.take().expect("child must have stdin");
         let stdout = child.stdout.take().expect("child must have stdout");
-        let reader = BufReader::new(stdout);
+        let stdout_rx = spawn_line_reader(stdout);
+        let (_stderr_tx, stderr_rx) = std::sync::mpsc::channel::<String>();
         AftSession {
             child,
             stdin,
-            reader,
+            stdout_rx,
             log_tx: None,
+            stderr_rx,
         }
     }
 }
