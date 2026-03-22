@@ -79,7 +79,7 @@ You can also pass `--library <path>` to the `sync` and `library` commands.
 ./install.sh
 ```
 
-This builds a release binary and installs it to `/usr/local/bin/zytunes`. To uninstall:
+This builds a release binary and installs both `zytunes` (CLI) and `zytunes-tui` (interactive TUI) to `/usr/local/bin/`. To uninstall:
 
 ```
 ./uninstall.sh

@@ -14,8 +14,8 @@ cargo run --bin zytunes-tui   # Run interactive TUI
 cargo test                    # Run tests (42 unit + integration tests)
 cargo fmt                     # Format code
 cargo clippy                  # Lint
-./install.sh                  # Build release + install to /usr/local/bin/zytunes
-./uninstall.sh                # Remove from /usr/local/bin
+./install.sh                  # Build release + install both zytunes and zytunes-tui to /usr/local/bin
+./uninstall.sh                # Remove both zytunes and zytunes-tui from /usr/local/bin
 
 # C++ (aft-mtp-cli, vendored in aft/)
 cd aft && mkdir -p build && cd build

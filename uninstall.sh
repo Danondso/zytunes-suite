@@ -1,13 +1,19 @@
 #!/bin/bash
 set -e
 
-INSTALL_PATH="/usr/local/bin/zytunes"
+INSTALL_DIR="/usr/local/bin"
+removed=0
 
-if [ ! -f "$INSTALL_PATH" ]; then
-    echo "zytunes is not installed at $INSTALL_PATH"
-    exit 0
+for bin in zytunes zytunes-tui; do
+    if [ -f "$INSTALL_DIR/$bin" ]; then
+        echo "Removing $INSTALL_DIR/$bin..."
+        sudo rm "$INSTALL_DIR/$bin"
+        removed=1
+    fi
+done
+
+if [ "$removed" -eq 0 ]; then
+    echo "zytunes is not installed at $INSTALL_DIR"
+else
+    echo "Done. zytunes has been uninstalled."
 fi
-
-echo "Removing $INSTALL_PATH..."
-sudo rm "$INSTALL_PATH"
-echo "Done. zytunes has been uninstalled."
