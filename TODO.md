@@ -10,11 +10,9 @@
 
 - **Native IOKit USB backend** — replace libusb with Apple's native IOKit for direct MTP/MTPZ communication (eliminates aft-mtp-cli dependency). See README Architecture section for the libusb/IOKit gap details.
 - **Configurable transcode quality** — currently hardcoded to `-q:a 2` (~190kbps VBR). Add CLI flag for bitrate/quality.
-- **Theming** — customize and use themes
-  - Implement common popular ones like miami nights, gruvbox, everforest, etc
-  - Include a way to set config for themes
-    - Make a TUI for this
-    - Add vintage themes like IBM mainframe, win 3.1/win 95/98 BIOS, system 6-9, macintosh color
+- **Theming (remaining)** — additional theme features
+  - Custom user-defined themes via config file
+  - Theme preview screenshots in docs
 - **Player Support**
   - play / pause / queue / scrubber if possible
   - player TUI with soundbar effect (do research to find a visualizer for this)
@@ -35,4 +33,5 @@
 - **Disable sync until device connected** — `execute_sync()` guards against syncing when no device is present.
 - **Batch import performance** — vendored aft-mtp-cli fork caches the device library to `~/.aft-library-cache`, avoiding the ~5 min full reload over USB 1.1.
 - **Proper rm for special characters** — `aft_quote()` escapes quotes, strips newlines, and wraps paths for safe subprocess communication.
+- **Theming** — 11 built-in theme presets (iTunes 2004, Gruvbox Dark/Light, Everforest Dark/Light, Miami Nights, IBM Mainframe, Windows 95, System 7, BIOS, Red Sands). Live preview picker (`t` key). Config persisted to `~/.config/zytunes/config.toml`.
 - **Album art on import** — the Zune 30 rejects embedded art larger than ~200x200px (`InvalidObjectPropValue 0xa803`). Fixed by resizing art to 200x200 JPEG during transcoding.

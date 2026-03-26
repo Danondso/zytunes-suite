@@ -60,6 +60,12 @@ namespace mtp { namespace usb
 		do
 		{
 			r = inputStream->Read(buffer.data(), buffer.size());
+			if (getenv("AFT_USB_DEBUG")) {
+				fprintf(stderr, "  AFT WRITE %zu bytes:", r);
+				for (size_t i = 0; i < r && i < 80; i++) fprintf(stderr, " %02x", buffer[i]);
+				if (r > 80) fprintf(stderr, "...");
+				fprintf(stderr, "\n");
+			}
 			USB_CALL((*interface)->WritePipe(interface, ep->GetRefIndex(), buffer.data(), r));
 		}
 		while(r == transferSize);
@@ -76,6 +82,12 @@ namespace mtp { namespace usb
 			UInt32 readBytes = buffer.size();
 			USB_CALL((*interface)->ReadPipe(interface, ep->GetRefIndex(), buffer.data(), &readBytes));
 			r = outputStream->Write(buffer.data(), readBytes);
+			if (getenv("AFT_USB_DEBUG")) {
+				fprintf(stderr, "  AFT READ  %u bytes:", readBytes);
+				for (UInt32 i = 0; i < readBytes && i < 80; i++) fprintf(stderr, " %02x", buffer[i]);
+				if (readBytes > 80) fprintf(stderr, "...");
+				fprintf(stderr, "\n");
+			}
 		}
 		while(r == transferSize);
 	}

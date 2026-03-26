@@ -61,7 +61,6 @@ pub enum SyncStatus {
     Complete {
         success: usize,
         failed: usize,
-        skipped: usize,
     },
 }
 
@@ -894,12 +893,10 @@ impl App {
             BgEvent::SyncComplete {
                 success,
                 failed,
-                skipped,
             } => {
                 self.sync_status = SyncStatus::Complete {
                     success,
                     failed,
-                    skipped,
                 };
                 self.sync_queue.clear();
                 self.queue_selected = 0;

@@ -401,9 +401,13 @@ namespace mtp
 		//HexDump("device response", response);
 		ByteArray cmacKey = _keys->VerifyResponse(response, challenge);
 		debug("validated MTPZ device response...");
-		//HexDump("cmac key", cmacKey);
+		fprintf(stderr, "CMAC KEY (%zu bytes):", cmacKey.size());
+		for (size_t i = 0; i < cmacKey.size(); i++) fprintf(stderr, " %02x", cmacKey[i]);
+		fprintf(stderr, "\n");
 		ByteArray signature = _keys->SignResponse(cmacKey);
-		//HexDump("signature", signature);
+		fprintf(stderr, "SIGNATURE (%zu bytes):", signature.size());
+		for (size_t i = 0; i < signature.size(); i++) fprintf(stderr, " %02x", signature[i]);
+		fprintf(stderr, "\n");
 		_session->GenericOperation(OperationCode::SendWMDRMPDAppRequest, signature);
 		debug("authentication finished, enabling secure session...");
 		u32 cmac[4];

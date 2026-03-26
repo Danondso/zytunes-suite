@@ -1,8 +1,12 @@
+[workspace]
+members = [".", "zune-mtp"]
+
 [package]
 name = "zytunes"
 version = "0.5.0"
 edition = "2021"
 description = "A CLI tool for syncing music to a Microsoft Zune 30 on macOS"
+license = "MIT"
 
 [dependencies]
 rusb = "0.9"
@@ -13,6 +17,8 @@ crossterm = "0.28"
 throbber-widgets-tui = "0.11.0"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+zune-mtp = { path = "zune-mtp" }
+id3 = "1"
 
 [[bin]]
 name = "zytunes"

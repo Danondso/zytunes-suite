@@ -24,6 +24,20 @@ pub struct ZuneDevice {
     pub usb_mode: Option<String>,
 }
 
+/// Identify Zune model from total storage capacity in bytes.
+pub fn zune_model_from_storage(total_bytes: u64) -> &'static str {
+    let gb = total_bytes / 1_000_000_000;
+    match gb {
+        0..=5 => "Zune 4",
+        6..=12 => "Zune 8",
+        13..=20 => "Zune 16",
+        21..=40 => "Zune 30",
+        41..=100 => "Zune 80",
+        101..=140 => "Zune 120",
+        _ => "Zune",
+    }
+}
+
 impl fmt::Display for ZuneDevice {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -141,6 +155,17 @@ impl std::error::Error for ZuneDetectError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zune_model_from_storage_known_sizes() {
+        assert_eq!(zune_model_from_storage(4_000_000_000), "Zune 4");
+        assert_eq!(zune_model_from_storage(8_000_000_000), "Zune 8");
+        assert_eq!(zune_model_from_storage(16_000_000_000), "Zune 16");
+        assert_eq!(zune_model_from_storage(30_000_000_000), "Zune 30");
+        assert_eq!(zune_model_from_storage(80_000_000_000), "Zune 80");
+        assert_eq!(zune_model_from_storage(120_000_000_000), "Zune 120");
+        assert_eq!(zune_model_from_storage(200_000_000_000), "Zune");
+    }
 
     #[test]
     fn display_formatting() {

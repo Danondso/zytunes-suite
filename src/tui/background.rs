@@ -3,6 +3,7 @@ use std::thread;
 
 use zytunes::device::ZuneDevice;
 use zytunes::mtp::aft::AftSession;
+use zytunes::mtp::native::NativeSession;
 use zytunes::mtp::parse::DeviceEntry;
 use zytunes::mtp::DeviceSession;
 use zytunes::{make_transcode_temp_dir, needs_transcoding, transcode_to_mp3};
@@ -37,6 +38,7 @@ pub struct DeviceInfo {
     pub usb_mode: Option<String>,
     pub manufacturer: Option<String>,
     pub model: Option<String>,
+    #[allow(dead_code)]
     pub mtp_version: Option<String>,
 }
 
@@ -71,7 +73,6 @@ pub enum BgEvent {
     SyncComplete {
         success: usize,
         failed: usize,
-        skipped: usize,
     },
     RemoveProgress {
         current: usize,
@@ -89,7 +90,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
     let (cmd_tx, cmd_rx) = mpsc::channel::<BgCommand>();
 
     thread::spawn(move || {
-        let mut session: Option<AftSession> = None;
+        let mut session: Option<Box<dyn DeviceSession>> = None;
 
         while let Ok(cmd) = cmd_rx.recv() {
             match cmd {
@@ -132,66 +133,91 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                     };
                     let _ = event_tx.send(BgEvent::DeviceDetected(device_info));
 
-                    // Open MTP session.
+                    // Try native IOKit backend first, fall back to aft-mtp-cli.
                     let _ = event_tx.send(BgEvent::SyncMessage(
                         "MTPZ handshake...".into(),
                     ));
-                    match AftSession::open() {
-                        Ok(mut s) => {
-                            // Bridge aft-mtp-cli log messages into the TUI log panel.
-                            let log_event_tx = event_tx.clone();
-                            let (log_tx, log_rx) = mpsc::channel::<String>();
-                            s.set_log_sender(log_tx);
-                            thread::spawn(move || {
-                                while let Ok(msg) = log_rx.recv() {
-                                    let _ = log_event_tx.send(BgEvent::SyncMessage(msg));
-                                }
-                            });
 
+                    // Try native IOKit backend first, fall back to aft-mtp-cli.
+                    let native_log_tx = event_tx.clone();
+                    let native_log = move |msg: &str| {
+                        let _ = native_log_tx.send(BgEvent::SyncMessage(msg.to_string()));
+                    };
+                    let connect_result: Result<Box<dyn DeviceSession>, String> =
+                        match NativeSession::open(zune.product_id, &native_log) {
+                            Ok(mut s) => {
+                                // Query storage for model detection before boxing.
+                                if let Ok((total, free)) = s.get_storage_info() {
+                                    let model =
+                                        zytunes::device::zune_model_from_storage(total);
+                                    let used = total.saturating_sub(free);
+                                    let pct = if total > 0 {
+                                        (used * 100 / total) as u8
+                                    } else {
+                                        0
+                                    };
+                                    let _ = event_tx.send(BgEvent::DeviceDetected(
+                                        DeviceInfo {
+                                            name: model.to_string(),
+                                            firmware_version: zune
+                                                .firmware_version
+                                                .clone(),
+                                            serial_number: zune
+                                                .serial_number
+                                                .clone(),
+                                            usb_mode: zune.usb_mode.clone(),
+                                            manufacturer: Some(
+                                                "Microsoft".to_string(),
+                                            ),
+                                            model: Some(model.to_string()),
+                                            mtp_version: None,
+                                        },
+                                    ));
+                                    let _ = event_tx.send(BgEvent::SessionReady(
+                                        Some(StorageInfo {
+                                            total_bytes: total,
+                                            free_bytes: free,
+                                            used_bytes: used,
+                                            used_percent: pct,
+                                        }),
+                                    ));
+                                }
+
+                                wire_log_sender(&mut s, &event_tx);
+                                let _ = event_tx.send(BgEvent::SyncMessage(
+                                    "Connected via native IOKit backend".into(),
+                                ));
+                                Ok(Box::new(s))
+                            }
+                            Err(native_err) => {
+                                let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                                    "Native backend failed: {}",
+                                    native_err
+                                )));
+                                let _ = event_tx.send(BgEvent::SyncMessage(
+                                    "Falling back to aft-mtp-cli...".into(),
+                                ));
+                                match AftSession::open() {
+                                    Ok(mut s) => {
+                                        wire_log_sender(&mut s, &event_tx);
+                                        let _ = event_tx.send(BgEvent::SyncMessage(
+                                            "Connected via aft-mtp-cli fallback".into(),
+                                        ));
+                                        let _ = event_tx.send(BgEvent::SessionReady(None));
+                                        Ok(Box::new(s))
+                                    }
+                                    Err(aft_err) => Err(aft_err),
+                                }
+                            }
+                        };
+
+                    match connect_result {
+                        Ok(s) => {
                             let _ = event_tx.send(BgEvent::SyncMessage(
                                 "Session established".into(),
                             ));
 
-                            // Query storage info from the MTP session.
-                            let storage = query_storage_info(&mut s);
-                            if let Some(ref st) = storage {
-                                let total_gb = st.total_bytes as f64 / 1_073_741_824.0;
-                                let free_gb = st.free_bytes as f64 / 1_073_741_824.0;
-                                let _ = event_tx.send(BgEvent::SyncMessage(format!(
-                                    "Storage: {:.1} GB free of {:.1} GB",
-                                    free_gb, total_gb
-                                )));
-                            }
-
-                            // Query MTP-level device info to enrich what we got from USB.
-                            if let Ok(lines) = s.device_info() {
-                                let mut mtp_info = DeviceInfo {
-                                    name: zune.product_name.unwrap_or_else(|| "Zune".to_string()),
-                                    firmware_version: zune.firmware_version,
-                                    serial_number: zune.serial_number,
-                                    usb_mode: zune.usb_mode,
-                                    manufacturer: lines.first().cloned(),
-                                    model: lines.get(1).cloned(),
-                                    mtp_version: lines.get(2).cloned(),
-                                };
-                                // Prefer MTP firmware version if available.
-                                if let Some(ref ver) = mtp_info.mtp_version {
-                                    if !ver.is_empty() {
-                                        mtp_info.firmware_version = Some(ver.clone());
-                                    }
-                                }
-                                // Prefer MTP serial if available.
-                                if let Some(ref serial) = lines.get(3) {
-                                    if !serial.is_empty() {
-                                        mtp_info.serial_number = Some(serial.to_string());
-                                    }
-                                }
-                                // Re-send with enriched info.
-                                let _ = event_tx.send(BgEvent::DeviceDetected(mtp_info));
-                            }
-
                             session = Some(s);
-                            let _ = event_tx.send(BgEvent::SessionReady(storage));
 
                             // Auto-load device tracks after connection.
                             let _ = event_tx.send(BgEvent::SyncMessage(
@@ -205,7 +231,8 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                             "Loaded {} tracks from device",
                                             tracks.len()
                                         )));
-                                        let _ = event_tx.send(BgEvent::DeviceTracksLoaded(tracks));
+                                        let _ =
+                                            event_tx.send(BgEvent::DeviceTracksLoaded(tracks));
                                     }
                                     Err(e) => {
                                         let _ = event_tx.send(BgEvent::SyncMessage(format!(
@@ -312,7 +339,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                         )));
                         let _ = event_tx.send(BgEvent::RemoveComplete { success, failed });
 
-                        reload_device_tracks(s, &event_tx);
+                        reload_device_tracks(s.as_mut(), &event_tx);
                     } else {
                         let _ = event_tx.send(BgEvent::Error("No active session".into()));
                     }
@@ -322,7 +349,6 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                         let total = items.len();
                         let mut success = 0usize;
                         let mut failed = 0usize;
-                        let skipped = 0usize;
 
                         let temp_dir = make_transcode_temp_dir();
                         let _ = std::fs::create_dir_all(&temp_dir);
@@ -430,10 +456,9 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                         let _ = event_tx.send(BgEvent::SyncComplete {
                             success,
                             failed,
-                            skipped,
                         });
 
-                        reload_device_tracks(s, &event_tx);
+                        reload_device_tracks(s.as_mut(), &event_tx);
                     } else {
                         let _ = event_tx.send(BgEvent::Error("No active session".into()));
                     }
@@ -445,9 +470,37 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
     cmd_tx
 }
 
+/// Wire up a log-sender channel: creates a channel, calls set_log_sender on the
+/// session, and spawns a forwarding thread that relays log messages as BgEvent::SyncMessage.
+fn wire_log_sender(
+    session: &mut dyn std::any::Any,
+    event_tx: &mpsc::Sender<BgEvent>,
+) {
+    // We need to handle both session types that have set_log_sender.
+    if let Some(s) = session.downcast_mut::<NativeSession>() {
+        let log_event_tx = event_tx.clone();
+        let (log_tx, log_rx) = mpsc::channel::<String>();
+        s.set_log_sender(log_tx);
+        thread::spawn(move || {
+            while let Ok(msg) = log_rx.recv() {
+                let _ = log_event_tx.send(BgEvent::SyncMessage(msg));
+            }
+        });
+    } else if let Some(s) = session.downcast_mut::<AftSession>() {
+        let log_event_tx = event_tx.clone();
+        let (log_tx, log_rx) = mpsc::channel::<String>();
+        s.set_log_sender(log_tx);
+        thread::spawn(move || {
+            while let Ok(msg) = log_rx.recv() {
+                let _ = log_event_tx.send(BgEvent::SyncMessage(msg));
+            }
+        });
+    }
+}
+
 /// Reload device tracks and send the result back to the TUI.
 fn reload_device_tracks(
-    session: &mut AftSession,
+    session: &mut dyn DeviceSession,
     event_tx: &mpsc::Sender<BgEvent>,
 ) {
     let _ = event_tx.send(BgEvent::LoadingDeviceTracks);
@@ -464,6 +517,8 @@ fn reload_device_tracks(
 }
 
 /// Query storage info from the first storage on the device.
+/// Currently unused — reserved for the aft-mtp-cli fallback path.
+#[allow(dead_code)]
 fn query_storage_info(session: &mut AftSession) -> Option<StorageInfo> {
     // List storages first to get a valid storage ID.
     let lines = session.send("storage-list").ok()?;
@@ -488,6 +543,9 @@ fn query_storage_info(session: &mut AftSession) -> Option<StorageInfo> {
     None
 }
 
+/// Parse a storage info line from aft-mtp-cli output.
+/// Currently unused — reserved for the aft-mtp-cli fallback path (used by query_storage_info).
+#[allow(dead_code)]
 fn parse_storage_line(line: &str) -> Option<StorageInfo> {
     // "used 12345678 (45%), free 15000000 bytes of 27345678"
     let parts: Vec<&str> = line.split_whitespace().collect();

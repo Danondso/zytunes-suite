@@ -5,13 +5,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build & Development Commands
 
 ```bash
-# Rust (zytunes)
-cargo build                   # Debug build
+# Rust (zytunes workspace)
+cargo build                   # Debug build (all workspace crates)
 cargo build --release         # Release build
 cargo check                   # Fast type-check without building
 cargo run -- <command>        # Run CLI with arguments (ls, push, rm, sync, library, help)
 cargo run --bin zytunes-tui   # Run interactive TUI
-cargo test                    # Run tests (42 unit + integration tests)
+cargo test                    # Run tests (all workspace crates)
+cargo test -p zune-mtp        # Run zune-mtp crate tests only
 cargo fmt                     # Format code
 cargo clippy                  # Lint
 ./install.sh                  # Build release + install both zytunes and zytunes-tui to /usr/local/bin
@@ -33,32 +34,44 @@ CLI commands: `ls [path]`, `push <files...>`, `rm <paths...>`, `sync <type> <nam
 
 ## Architecture
 
-**Two-layer USB strategy:** `rusb` handles device detection (descriptor reads only), while `aft-mtp-cli` (a subprocess) handles all MTP/MTPZ communication. This split exists because libusb's macOS backend fails on data-out USB operations that the Zune's MTPZ handshake requires — IOKit (used by aft-mtp-cli) works.
+**Workspace layout:** The project is a Cargo workspace with two members: the root `zytunes` crate and the `zune-mtp` library crate.
+
+**Two-layer USB strategy with native backend:** `rusb` handles device detection (descriptor reads only). For MTP/MTPZ communication, the TUI tries the native `zune-mtp` backend first (direct IOKit FFI) and falls back to `aft-mtp-cli` (a subprocess) if it fails. This split exists because libusb's macOS backend fails on data-out USB operations that the Zune's MTPZ handshake requires — IOKit works.
+
+**Native IOKit backend (`zune-mtp/`):** A workspace crate providing direct MTP/MTPZ communication via Apple's IOKit framework:
+- `transport.rs` — IOKit USB transport: device discovery via `IOServiceMatching` with vendor/product ID filtering, interface claiming, bulk pipe endpoint discovery, read/write operations via `IOUSBInterfaceInterface` COM-like vtables. Debug logging via `IOKIT_USB_DEBUG` env var
+- `container.rs` — MTP/PTP container format: building command/data containers, parsing response headers, operation and response code enums. Operation codes: `EnableTrustedFilesOperations` = `0x9214`, `DisableTrustedFilesOperations` = `0x9215`
+- `session.rs` — MTP session management: OpenSession, GetDeviceInfo, GetStorageIDs, GetStorageInfo, GetObjectHandles, GetObjectInfo, SendObjectInfo/SendObject, DeleteObject, SetDevicePropValue (MTP string properties), GetObjectPropsSupported, GetObjectPropList, SetObjectPropValue, SendObjectPropList, GetObjectReferences, SetObjectReferences. Data-out operations send header and payload as separate bulk writes (Microsoft/Zune requirement). Includes MTP string and ObjectInfo dataset parsing
+- `mtpz.rs` — Full MTPZ authentication: sets SessionInitiatorVersionInfo (`0xD406`) before handshake, RSA-1024 raw signing, PSS-like certificate message generation, AES-128-CBC decryption, CMAC key extraction from device response, session confirmation with data-only fallback, EnableTrustedFilesOperations
+- `proplist.rs` — MTP ObjectPropList builder for SendObjectPropList (0x9808): constructs binary property list payloads with string, u16, and u32 property types. Property constants for object filename, name, artist, track, genre, artist ID, date authored, and representative sample data
+- `iokit_ffi.rs` — Raw FFI: IOUSBDeviceInterface and IOUSBInterfaceInterface vtable structs, CoreFoundation helpers (CFString, CFUUID, CFNumber), IOKit service matching functions
 
 **Vendored aft-mtp-cli fork:** `aft/` contains a fork of [android-file-transfer-linux](https://github.com/whoozle/android-file-transfer-linux) (LGPL-2.1) with library caching. The upstream CLI has no caching — every `zune-init` loads the entire artist/album library from the device over USB 1.1 (~5 min). The fork adds:
 - `Library::SaveCache()` / `TryLoadFromCache()` — serializes the artist/album maps to `~/.aft-library-cache` (text format, keyed by device serial)
 - Auto-save on mutations (CreateArtist, CreateAlbum, AddTrack)
 - `zune-refresh` CLI command to clear cache and reload from device
-- Modified files: `aft/mtp/metadata/Library.h`, `aft/mtp/metadata/Library.cpp`, `aft/cli/Session.h`, `aft/cli/Session.cpp`
+- Debug USB tracing via `AFT_USB_DEBUG` env var (logs read/write hex to stderr)
+- Modified files: `aft/mtp/metadata/Library.h`, `aft/mtp/metadata/Library.cpp`, `aft/cli/Session.h`, `aft/cli/Session.cpp`, `aft/mtp/backend/darwin/usb/Device.cpp`, `aft/mtp/mtpz/TrustedApp.cpp`
 
 **Key modules:**
 - `device.rs` — USB scanning via rusb, identifies Zune by VID `0x045e`
 - `mtp/mod.rs` — `DeviceSession` trait abstracting device operations (ls, zune_import, rm, collect_all_tracks, create_playlist) for testability
 - `mtp/aft.rs` — `AftSession` implements `DeviceSession`: spawns and communicates with aft-mtp-cli subprocess via channel-based I/O (stdout and stderr each read by dedicated threads, lines delivered via `mpsc` channels). Monitors stderr for error lines that aft-mtp-cli emits without a `:done` marker on stdout. Uses `aft_quote()` to sanitize all user-controlled strings sent to the subprocess. `collect_all_tracks` returns an empty list for non-existent paths (e.g., fresh devices). Binary discovery: `AFT_MTP_CLI` env var → `aft/build/cli/aft-mtp-cli` → PATH → `/tmp/aft/build/cli/aft-mtp-cli`
+- `mtp/native.rs` — `NativeSession` implements `DeviceSession` using `zune-mtp`: opens IOKit USB transport, performs MTPZ handshake, provides ls/import/rm/collect_all_tracks. Playlist creation not yet supported. Resolves device paths by walking object handles
 - `mtp/parse.rs` — Parses aft-mtp-cli text output into `DeviceEntry` structs
-- `mtp_native/` — Preserved pure-Rust MTP/MTPZ implementation (works except data-out on macOS). Not actively used but kept for a future IOKit backend
+- `mtp_native/` — Earlier pure-Rust MTP/MTPZ implementation built on rusb (works except data-out on macOS). Preserved for reference, superseded by `zune-mtp`
 - `library.rs` — iTunes Library.xml plist parser. Fully integrated — used by `sync` and `library` commands
 - `main.rs` — CLI entry point, `run()` dispatcher, `cmd_sync`/`cmd_push`/`cmd_rm`/`cmd_ls`/`cmd_library` commands, `sync_to_device()` engine, transcoding via ffmpeg
 - `tui/main.rs` — TUI entry point (`zytunes-tui` binary), event loop, terminal setup/teardown
 - `tui/app.rs` — TUI application state (`App`), panel navigation, background event handling. Supports two browse modes (`BrowseMode::Library` and `BrowseMode::Device`). Device mode builds an in-memory index of device tracks organized by artist/album from the `Music/{Artist}/{Album}/{Track}` path structure. Handles device track removal path collection for selected items. Saves/restores sidebar selection positions per browse mode and sidebar mode
-- `tui/background.rs` — background worker thread: device detection, MTP session, sync execution, device track removal, library loading
+- `tui/background.rs` — background worker thread: device detection, MTP session (tries NativeSession first, falls back to AftSession), sync execution, device track removal, library loading
 - `tui/ui.rs` — ratatui rendering: layout (3-column with device left panel), startup screen, Zune ASCII art, panels, overlays (help, search, theme picker). Context-sensitive key labels change between Library and Device browse modes. All rendering uses the active `Theme` from app state
 - `tui/theme.rs` — `Theme` struct with color/style fields and 11 built-in presets (iTunes 2004, Gruvbox Dark/Light, Everforest Dark/Light, Miami Nights, IBM Mainframe, Windows 95, System 7, BIOS, Red Sands). `find_theme_index()` for name-based lookup
 - `tui/config.rs` — TOML config file at `~/.config/zytunes/config.toml` (serde + toml). Currently stores selected theme name
 
 **Configuration:** iTunes library path defaults to `~/Music/Music/Library.xml`. Override with `ZYTUNES_LIBRARY` env var or `--library <path>` flag. TUI config (theme selection) is stored in `~/.config/zytunes/config.toml`.
 
-**External tool dependencies:** `ffmpeg`/`ffprobe` (transcoding), `libusb` (via rusb). `aft-mtp-cli` is vendored in `aft/`.
+**External tool dependencies:** `ffmpeg`/`ffprobe` (transcoding), `libusb` (via rusb). `aft-mtp-cli` is vendored in `aft/` (used as fallback when native IOKit backend fails).
 
 **Transcoding:** Non-native formats (FLAC, OGG, WAV, M4A, OPUS, ALAC, AIFF) are automatically transcoded to MP3 via ffmpeg. Native formats (MP3, WMA, AAC) skip transcoding entirely. Album art is resized to 200x200 JPEG (Zune 30 rejects larger art with error `0xa803`).
 
@@ -67,4 +80,7 @@ CLI commands: `ls [path]`, `push <files...>`, `rm <paths...>`, `sync <type> <nam
 - Only accepts MP3, WMA, AAC formats
 - MTPZ keys must exist at `~/.mtpz-data`
 - Device auto-opens MTP session on USB connect (OpenSession returns `0x201d` — this is normal)
+- GetDeviceInfo is not supported by the Zune (returns `0x2006`) — skip it and go straight to OpenSession
+- MTPZ handshake requires SessionInitiatorVersionInfo (`0xD406`) to be set before beginning authentication
+- Data-out MTP operations require separate bulk writes for the container header and payload (Microsoft/Zune requirement)
 - Special characters in device paths: mitigated by `aft_quote()` which escapes `"`, strips newlines, and wraps in double quotes before sending to aft-mtp-cli

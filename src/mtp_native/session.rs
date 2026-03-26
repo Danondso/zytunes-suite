@@ -112,7 +112,6 @@ impl MtpSession {
     pub fn execute_data_out(
         &mut self,
         code: OperationCode,
-        _params: &[u32],
         payload: &[u8],
     ) -> Result<u16, String> {
         let tid = self.next_transaction();
@@ -139,7 +138,7 @@ impl MtpSession {
         code: OperationCode,
         data: &[u8],
     ) -> Result<(), String> {
-        let resp_code = self.execute_data_out(code, &[], data)?;
+        let resp_code = self.execute_data_out(code, data)?;
         if resp_code != ResponseCode::Ok as u16 {
             return Err(format!("Operation 0x{:04x} failed: 0x{:04x}", code as u16, resp_code));
         }

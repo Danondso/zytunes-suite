@@ -1,7 +1,9 @@
 pub mod aft;
+pub mod native;
 pub mod parse;
 
 pub use aft::AftSession;
+pub use native::NativeSession;
 use parse::DeviceEntry;
 
 /// Trait abstracting device session operations for testability.
