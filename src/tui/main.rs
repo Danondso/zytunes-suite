@@ -1,4 +1,6 @@
+mod anim;
 mod app;
+mod audio;
 mod background;
 mod config;
 mod theme;
@@ -20,15 +22,27 @@ use app::{App, BrowseMode, DeviceStatus, Panel, SidebarMode, SyncStatus};
 use background::BgCommand;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Suppress panics from background threads (rodio/symphonia can panic on
+    // unsupported files). Only silence non-main threads to preserve useful panics.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let is_main = std::thread::current().name() == Some("main");
+        if is_main {
+            default_hook(info);
+        }
+        // Silently ignore panics from unnamed threads (rodio, symphonia)
+    }));
+
     let args: Vec<String> = std::env::args().collect();
 
     // Parse --library flag.
+    let default = zytunes::library_xml_path();
     let library_path = args
         .iter()
         .position(|a| a == "--library")
         .and_then(|i| args.get(i + 1))
         .map(|s| s.as_str())
-        .unwrap_or(zytunes::DEFAULT_LIBRARY_XML);
+        .unwrap_or(&default);
 
     // Set up terminal.
     enable_raw_mode()?;
@@ -52,11 +66,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (event_tx, event_rx) = mpsc::channel();
     let cmd_tx = background::spawn(event_tx);
 
+    // Set up audio thread.
+    let (audio_event_tx, audio_event_rx) = mpsc::channel();
+    let audio_cmd_tx = audio::spawn(audio_event_tx);
+
     // Kick off async library load.
     let _ = cmd_tx.send(BgCommand::LoadLibrary(library_path.to_string()));
 
     // Main event loop.
-    let result = run_loop(&mut terminal, &mut app, &cmd_tx, &event_rx);
+    let result = run_loop(&mut terminal, &mut app, &cmd_tx, &event_rx, &audio_cmd_tx, &audio_event_rx);
 
     // Restore terminal.
     disable_raw_mode()?;
@@ -75,6 +93,8 @@ fn run_loop(
     app: &mut App,
     cmd_tx: &mpsc::Sender<BgCommand>,
     event_rx: &mpsc::Receiver<background::BgEvent>,
+    audio_tx: &mpsc::Sender<audio::AudioCommand>,
+    audio_rx: &mpsc::Receiver<audio::AudioEvent>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         terminal.draw(|f| ui::draw(f, app))?;
@@ -82,6 +102,16 @@ fn run_loop(
         // Process background events.
         while let Ok(ev) = event_rx.try_recv() {
             app.handle_bg_event(ev);
+        }
+
+        // Process audio events.
+        while let Ok(ev) = audio_rx.try_recv() {
+            app.handle_audio_event(ev, audio_tx);
+        }
+
+        // Query playback position periodically.
+        if app.now_playing.is_some() && app.anim_frame.is_multiple_of(4) {
+            let _ = audio_tx.send(audio::AudioCommand::QueryPosition);
         }
 
         // Poll for keyboard events with 50ms timeout.
@@ -97,7 +127,7 @@ fn run_loop(
                         }
                         KeyCode::Enter => {
                             app.search_active = false;
-                            // Keep filtered results.
+                            app.active_panel = Panel::Library;
                         }
                         KeyCode::Backspace => {
                             app.search_query.pop();
@@ -193,6 +223,7 @@ fn run_loop(
                     KeyCode::Char('c') => {
                         if app.device_status == DeviceStatus::Disconnected {
                             app.device_status = DeviceStatus::Detecting;
+                            app.connection_anim_start = Some(app.anim_frame);
                             let _ = cmd_tx.send(BgCommand::Connect);
                         }
                     }
@@ -228,6 +259,25 @@ fn run_loop(
                     KeyCode::Left => {
                         app.skip_back();
                     }
+                    KeyCode::Char(' ') => {
+                        app.toggle_playback(audio_tx);
+                    }
+                    KeyCode::Char('<') | KeyCode::Char(',') => {
+                        if app.now_playing.is_some() {
+                            let _ = audio_tx.send(audio::AudioCommand::Scrub { delta_ms: -5000 });
+                        }
+                    }
+                    KeyCode::Char('>') | KeyCode::Char('.') => {
+                        if app.now_playing.is_some() {
+                            let _ = audio_tx.send(audio::AudioCommand::Scrub { delta_ms: 5000 });
+                        }
+                    }
+                    KeyCode::Char('n') => {
+                        app.next_track(audio_tx);
+                    }
+                    KeyCode::Char('p') => {
+                        app.prev_track(audio_tx);
+                    }
                     KeyCode::Enter => match app.active_panel {
                         Panel::Library => {
                             app.select_sidebar_item();
@@ -239,6 +289,9 @@ fn run_loop(
                         }
                         Panel::Albums => {
                             app.active_panel = Panel::TrackList;
+                        }
+                        Panel::TrackList => {
+                            app.play_selected_track(audio_tx);
                         }
                         Panel::SyncQueue => {
                             app.execute_sync(cmd_tx);
@@ -309,6 +362,7 @@ fn run_loop(
         app.tick();
 
         if app.should_quit {
+            app.stop_playback(audio_tx);
             break;
         }
     }

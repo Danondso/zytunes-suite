@@ -5,14 +5,15 @@ use ratatui::widgets::{
     Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, Wrap,
 };
 use ratatui::Frame;
-use throbber_widgets_tui::{Throbber, ThrobberState, WhichUse, BRAILLE_ONE};
+use throbber_widgets_tui::{Throbber, ThrobberState, WhichUse};
 
-use crate::app::{format_duration, format_with_commas, App, BrowseMode, DeviceStatus, Panel, SidebarMode, SortColumn, SyncStatus};
+use crate::anim;
+use crate::app::{format_duration, format_with_commas, App, BrowseMode, DeviceStatus, NowPlaying, Panel, PlaybackState, SidebarMode, SortColumn, SyncStatus};
 use crate::theme;
 
-fn throbber_symbol(state: &ThrobberState) -> String {
+fn throbber_symbol(state: &ThrobberState, theme_index: usize) -> String {
     Throbber::default()
-        .throbber_set(BRAILLE_ONE)
+        .throbber_set(anim::spinner_set_for_theme(theme_index))
         .use_type(WhichUse::Spin)
         .to_symbol_span(state)
         .content
@@ -42,11 +43,23 @@ pub fn draw(f: &mut Frame, app: &App) {
     // Left column: device info + sync queue + log
     draw_device_left_panel(f, app, outer[0]);
 
-    // Middle: browser area + footer
-    let middle = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(8), Constraint::Length(3)])
-        .split(outer[1]);
+    // Middle: browser area + optional now-playing + footer
+    let has_player = app.now_playing.is_some();
+    let middle = if has_player {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(8),
+                Constraint::Length(9),
+                Constraint::Length(3),
+            ])
+            .split(outer[1])
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(8), Constraint::Length(3)])
+            .split(outer[1])
+    };
 
     // Browser columns: sidebar | optional albums | tracks
     let browser = if app.has_album_browser() {
@@ -73,7 +86,11 @@ pub fn draw(f: &mut Frame, app: &App) {
         draw_track_list(f, app, browser[1]);
     }
 
-    draw_footer(f, app, middle[1]);
+    if let Some(ref np) = app.now_playing {
+        draw_now_playing(f, app, np, middle[1]);
+    }
+    let footer_idx = if has_player { 2 } else { 1 };
+    draw_footer(f, app, middle[footer_idx]);
 
     if app.show_keys {
         draw_keys_panel(f, app, outer[2]);
@@ -102,19 +119,22 @@ pub fn draw(f: &mut Frame, app: &App) {
 
 fn draw_startup(f: &mut Frame, app: &App, area: Rect) {
     let t = app.theme();
-    let symbol = throbber_symbol(&app.throbber_state);
+    let symbol = throbber_symbol(&app.throbber_state, app.theme_index);
+    let pulse = anim::pulse_color(t.accent_color(), app.anim_frame, 40);
 
     let path_display = app
         .library_path
         .as_deref()
         .unwrap_or("Library.xml");
 
+    let revealed = anim::typing_reveal("zytunes", app.anim_frame);
+
     let lines = vec![
         Line::from(""),
-        Line::from(Span::styled("zytunes", Style::default().add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled(revealed, Style::default().add_modifier(Modifier::BOLD))),
         Line::from(""),
         Line::from(vec![
-            Span::styled(format!(" {} ", symbol), t.dim()),
+            Span::styled(format!(" {} ", symbol), Style::default().fg(pulse)),
             Span::raw("Parsing library..."),
         ]),
         Line::from(""),
@@ -587,8 +607,18 @@ fn draw_device_info(f: &mut Frame, app: &App, area: Rect) {
             f.render_widget(p, inner);
         }
         DeviceStatus::Detecting | DeviceStatus::Connecting => {
-            let symbol = throbber_symbol(&app.throbber_state);
-            let p = Paragraph::new(format!(" {} Please wait...", symbol)).style(t.dim());
+            let conn_frame = app
+                .connection_anim_start
+                .map(|start| app.anim_frame.wrapping_sub(start))
+                .unwrap_or(0);
+            let (screen1, screen2) = anim::connection_screen_lines(conn_frame);
+            let zune_art = build_zune_art(screen1, screen2);
+            let pulse = anim::pulse_color(t.accent_color(), app.anim_frame, 40);
+            let art_lines: Vec<Line> = zune_art
+                .iter()
+                .map(|l| Line::from(Span::styled(l.as_str(), Style::default().fg(pulse))).alignment(Alignment::Center))
+                .collect();
+            let p = Paragraph::new(art_lines);
             f.render_widget(p, inner);
         }
         DeviceStatus::Connected => {
@@ -604,10 +634,10 @@ fn draw_device_info_connected(f: &mut Frame, app: &App, area: Rect) {
 
     // Screen content: two lines inside the screen area.
     let (screen_line1, screen_line2) = if is_syncing {
-        let symbol = throbber_symbol(&app.throbber_state);
+        let symbol = throbber_symbol(&app.throbber_state, app.theme_index);
         (symbol, "Syncing...".to_string())
     } else if is_busy {
-        let symbol = throbber_symbol(&app.throbber_state);
+        let symbol = throbber_symbol(&app.throbber_state, app.theme_index);
         (symbol, "Loading...".to_string())
     } else {
         let count = app.device_tracks.len();
@@ -617,12 +647,18 @@ fn draw_device_info_connected(f: &mut Frame, app: &App, area: Rect) {
 
     let zune_art = build_zune_art(&screen_line1, &screen_line2);
 
+    let art_color = if is_syncing || is_busy {
+        anim::pulse_color(t.accent_color(), app.anim_frame, 40)
+    } else {
+        t.dim_text
+    };
+
     let mut lines: Vec<Line> = Vec::new();
 
     // Zune ASCII art (centered).
     for l in &zune_art {
         lines.push(
-            Line::from(Span::styled(l.as_str(), t.dim())).alignment(Alignment::Center),
+            Line::from(Span::styled(l.as_str(), Style::default().fg(art_color))).alignment(Alignment::Center),
         );
     }
 
@@ -670,12 +706,18 @@ fn draw_device_info_connected(f: &mut Frame, app: &App, area: Rect) {
         let bar_width = 26usize;
         let filled = (bar_width as f64 * storage.used_percent as f64 / 100.0) as usize;
         let empty = bar_width.saturating_sub(filled);
-        lines.push(Line::from(vec![
-            Span::raw(" ["),
-            Span::styled("=".repeat(filled), Style::default().fg(t.progress_bar)),
-            Span::styled(" ".repeat(empty), Style::default().fg(t.progress_bg)),
-            Span::raw(format!("] {}%", storage.used_percent)),
-        ]));
+        let bar_chars = anim::progress_bar_with_shine(filled, empty, app.anim_frame);
+        let shine_color = anim::pulse_color(t.progress_bar, app.anim_frame, 20);
+        let mut bar_spans = vec![Span::raw(" [")];
+        for (ch, is_shine) in &bar_chars {
+            let color = if *is_shine { shine_color } else if *ch == '=' { t.progress_bar } else { t.progress_bg };
+            bar_spans.push(Span::styled(
+                ch.to_string(),
+                Style::default().fg(color),
+            ));
+        }
+        bar_spans.push(Span::raw(format!("] {}%", storage.used_percent)));
+        lines.push(Line::from(bar_spans));
     }
 
     if !app.device_loading_tracks {
@@ -700,7 +742,7 @@ fn draw_sync_queue(f: &mut Frame, app: &App, area: Rect) {
 
     match app.sync_status {
         SyncStatus::Running { current, total } => {
-            let symbol = throbber_symbol(&app.throbber_state);
+            let symbol = throbber_symbol(&app.throbber_state, app.theme_index);
             let title = format!(" {} {}/{} ", symbol, current, total);
             let block = Block::default()
                 .borders(Borders::ALL)
@@ -714,16 +756,17 @@ fn draw_sync_queue(f: &mut Frame, app: &App, area: Rect) {
                 .constraints([Constraint::Length(1), Constraint::Min(0)])
                 .split(inner);
 
+            let track_color = anim::pulse_color(t.sidebar_text, app.anim_frame, 40);
             let status_line = format!(" {}", app.sync_current_track);
             f.render_widget(
-                Paragraph::new(status_line).style(Style::default().fg(t.sidebar_text)),
+                Paragraph::new(status_line).style(Style::default().fg(track_color)),
                 chunks[0],
             );
         }
         SyncStatus::Complete {
             success, failed, ..
         } => {
-            let title = format!(" Sync Complete — {} done, {} failed ", success, failed);
+            let title = format!(" Done {}/{} fail ", success, failed);
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_style(border_style)
@@ -733,7 +776,7 @@ fn draw_sync_queue(f: &mut Frame, app: &App, area: Rect) {
         SyncStatus::Idle => {
             let total_tracks = app.total_queue_tracks();
             let title = format!(
-                " Sync Queue — {} item(s), {} track(s) ",
+                " Queue {} / {} trk ",
                 app.sync_queue.len(),
                 total_tracks
             );
@@ -747,7 +790,7 @@ fn draw_sync_queue(f: &mut Frame, app: &App, area: Rect) {
 
             if app.sync_queue.is_empty() {
                 let p =
-                    Paragraph::new("Queue is empty. Press 'a' to add tracks.").style(t.dim());
+                    Paragraph::new("Press 'a' to add.").style(t.dim());
                 f.render_widget(p, inner);
             } else {
                 let items: Vec<ListItem> = app
@@ -927,6 +970,150 @@ fn key_line<'a>(app: &App, key: &'a str, desc: &'a str) -> Line<'a> {
         ),
         Span::styled(desc, Style::default().fg(t.sidebar_text)),
     ])
+}
+
+fn draw_now_playing(f: &mut Frame, app: &App, np: &NowPlaying, area: Rect) {
+    let t = app.theme();
+    let skin = anim::player_skin(app.theme_index);
+
+    let state_icon = match np.state {
+        PlaybackState::Playing => skin.play,
+        PlaybackState::Paused => skin.pause,
+        PlaybackState::Stopped => skin.play,
+    };
+
+    let border_color = if np.state == PlaybackState::Playing {
+        anim::pulse_color(t.accent_color(), app.anim_frame, 40)
+    } else {
+        t.border
+    };
+
+    // Horizontal split: info + controls (left) | art panel (right)
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(20), Constraint::Length(18)])
+        .split(area);
+
+    // --- Left: track info + controls ---
+    let title = format!(" {} Now Playing ", state_icon);
+    let info_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color))
+        .title(title)
+        .style(Style::default().bg(t.main_bg));
+    let info_inner = info_block.inner(cols[0]);
+    f.render_widget(info_block, cols[0]);
+
+    // --- Right: art sub-panel ---
+    let art_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color))
+        .style(Style::default().bg(t.main_bg));
+    let art_inner = art_block.inner(cols[1]);
+    f.render_widget(art_block, cols[1]);
+
+    let art_frame = np.paused_frame.unwrap_or(app.anim_frame);
+    let art_lines = (skin.art_fn)(true, art_frame);
+    let art_color = if np.state == PlaybackState::Playing {
+        anim::pulse_color(t.accent_color(), app.anim_frame, 40)
+    } else {
+        t.accent_color()
+    };
+    let inner_w = art_inner.width as usize;
+    let art_text: Vec<Line> = art_lines
+        .iter()
+        .map(|l| {
+            let pad = inner_w.saturating_sub(l.len());
+            let left = pad / 2;
+            let right = pad - left;
+            let padded = format!("{}{}{}", " ".repeat(left), l, " ".repeat(right));
+            Line::from(Span::styled(padded, Style::default().fg(art_color)))
+        })
+        .collect();
+    f.render_widget(Paragraph::new(art_text), art_inner);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // track name
+            Constraint::Length(1), // artist — album
+            Constraint::Length(1), // controls
+            Constraint::Length(1), // progress bar
+            Constraint::Length(1), // time + hints
+            Constraint::Min(0),   // absorb extra
+        ])
+        .split(info_inner);
+
+    // Track name
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!(" {}", &np.track_name),
+            Style::default()
+                .fg(t.sidebar_text)
+                .add_modifier(Modifier::BOLD),
+        ))),
+        rows[0],
+    );
+
+    // Artist — Album
+    f.render_widget(
+        Paragraph::new(format!(" {} — {}", &np.artist, &np.album)).style(t.dim()),
+        rows[1],
+    );
+
+    // Controls
+    let controls = format!("{} {} {}", skin.prev, state_icon, skin.next);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            controls,
+            Style::default().fg(t.sidebar_text).add_modifier(Modifier::BOLD),
+        )))
+        .alignment(Alignment::Center),
+        rows[2],
+    );
+
+    // Progress bar
+    let bar_width = rows[3].width.saturating_sub(4) as usize;
+    let progress_ratio = if np.duration_ms > 0 {
+        (np.elapsed_ms as f64 / np.duration_ms as f64).min(1.0)
+    } else {
+        0.0
+    };
+    let filled = (bar_width as f64 * progress_ratio) as usize;
+    let empty = bar_width.saturating_sub(filled);
+
+    let mut bar_spans = vec![Span::raw("  ")];
+    if np.state == PlaybackState::Playing {
+        let shine = anim::shine_offset(app.anim_frame, bar_width);
+        for i in 0..filled {
+            let is_shine = shine.is_some_and(|sp| i >= sp.saturating_sub(1) && i <= sp + 1);
+            let color = if is_shine {
+                anim::pulse_color(t.progress_bar, app.anim_frame, 30)
+            } else {
+                t.progress_bar
+            };
+            bar_spans.push(Span::styled(
+                skin.bar_filled.to_string(),
+                Style::default().fg(color),
+            ));
+        }
+    } else {
+        bar_spans.push(Span::styled(
+            std::iter::repeat_n(skin.bar_filled, filled).collect::<String>(),
+            Style::default().fg(t.progress_bar),
+        ));
+    }
+    bar_spans.push(Span::styled(
+        std::iter::repeat_n(skin.bar_empty, empty).collect::<String>(),
+        Style::default().fg(t.progress_bg),
+    ));
+    f.render_widget(Paragraph::new(Line::from(bar_spans)), rows[3]);
+
+    // Time + hints
+    let elapsed_str = format_duration(np.elapsed_ms);
+    let total_str = format_duration(np.duration_ms);
+    let time_line = format!("  {} / {}  </>:scrub  n/p:skip", elapsed_str, total_str);
+    f.render_widget(Paragraph::new(time_line).style(t.dim()), rows[4]);
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {

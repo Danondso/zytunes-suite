@@ -1,8 +1,8 @@
 use zytunes::library::ItunesLibrary;
 use zytunes::mtp::DeviceSession;
 use zytunes::{
-    collect_music_files, connect, find_matching_tracks, make_transcode_temp_dir, needs_transcoding,
-    sync_to_device, transcode_and_import, DEFAULT_LIBRARY_XML,
+    collect_music_files, connect, find_matching_tracks, library_xml_path,
+    make_transcode_temp_dir, needs_transcoding, sync_to_device, transcode_and_import,
 };
 
 use std::collections::HashMap;
@@ -35,10 +35,11 @@ fn run(args: &[String]) -> Result<(), String> {
             cmd_rm(&args[2..])
         }
         "library" => {
+            let default = library_xml_path();
             let xml_path = args
                 .get(2)
                 .map(|s| s.as_str())
-                .unwrap_or("/Volumes/Music/Library.xml");
+                .unwrap_or(&default);
             cmd_library(xml_path, args.get(3).map(|s| s.as_str()))
         }
         "sync" => {
@@ -183,12 +184,13 @@ fn cmd_sync(args: &[String]) -> Result<(), String> {
     let name = &args[1];
 
     // Check for --library flag.
+    let default = library_xml_path();
     let xml_path = args
         .iter()
         .position(|a| a == "--library")
         .and_then(|i| args.get(i + 1))
         .map(|s| s.as_str())
-        .unwrap_or(DEFAULT_LIBRARY_XML);
+        .unwrap_or(&default);
 
     // Parse iTunes library.
     println!("Loading iTunes library...");

@@ -60,6 +60,11 @@ impl Theme {
     pub fn success(&self) -> Style {
         Style::default().fg(self.success_text)
     }
+
+    /// The most "active" accent color for the theme, used for pulse animations.
+    pub fn accent_color(&self) -> Color {
+        self.progress_bar
+    }
 }
 
 // -- Built-in theme presets --

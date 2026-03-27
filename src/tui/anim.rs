@@ -1,0 +1,743 @@
+use ratatui::style::Color;
+use throbber_widgets_tui::symbols::throbber::Set;
+use throbber_widgets_tui::{
+    ASCII, BLACK_CIRCLE, BRAILLE_EIGHT, BRAILLE_ONE, BRAILLE_SIX, BRAILLE_SIX_DOUBLE, OGHAM_A,
+    OGHAM_B, QUADRANT_BLOCK, VERTICAL_BLOCK, WHITE_SQUARE,
+};
+
+/// Returns the theme-appropriate spinner set for the given theme index.
+pub fn spinner_set_for_theme(theme_index: usize) -> Set {
+    match theme_index {
+        0 => BRAILLE_EIGHT,       // iTunes 2004 — smooth Apple-era feel
+        1 => BRAILLE_SIX_DOUBLE,  // Gruvbox Dark — warm, dense dots
+        2 => BRAILLE_SIX,         // Gruvbox Light — lighter variant
+        3 => OGHAM_A,             // Everforest Dark — organic strokes
+        4 => OGHAM_B,             // Everforest Light — same family, lighter
+        5 => BLACK_CIRCLE,        // Miami Nights — ◑◒◐◓ moon phases
+        6 => VERTICAL_BLOCK,      // IBM Mainframe — ▁▂▃▄▅▆▇█ block chars
+        7 => WHITE_SQUARE,        // Windows 95 — ◳◲◱◰ chunky squares
+        8 => QUADRANT_BLOCK,      // System 7 — ▝▗▖▘ pixel-art era
+        9 => ASCII,               // BIOS — |/-\ classic
+        10 => BRAILLE_ONE,        // Red Sands — minimal desert
+        _ => BRAILLE_ONE,         // fallback
+    }
+}
+
+// Precomputed sine table for 40 steps over [0, 2*pi].
+// Values mapped to [0.0, 1.0] via (sin(x) + 1) / 2.
+const SINE_TABLE: [f32; 40] = [
+    0.500, 0.578, 0.655, 0.727, 0.794, 0.854, 0.905, 0.946, 0.976, 0.994, 1.000, 0.994, 0.976,
+    0.946, 0.905, 0.854, 0.794, 0.727, 0.655, 0.578, 0.500, 0.422, 0.345, 0.273, 0.206, 0.146,
+    0.095, 0.054, 0.024, 0.006, 0.000, 0.006, 0.024, 0.054, 0.095, 0.146, 0.206, 0.273, 0.345,
+    0.422,
+];
+
+/// Returns a color that pulses between dim (40% brightness) and full brightness.
+/// `period` is in frames (e.g. 40 frames = 2 seconds at 20fps).
+pub fn pulse_color(base: Color, frame: usize, period: usize) -> Color {
+    if let Color::Rgb(r, g, b) = base {
+        let period = period.max(1);
+        let idx = (frame % period) * 40 / period;
+        let t = SINE_TABLE[idx.min(39)];
+        // Oscillate brightness between 0.7 and 1.0 (subtle glow, no white flash)
+        let m = 0.7 + 0.3 * t;
+        Color::Rgb(
+            (r as f32 * m) as u8,
+            (g as f32 * m) as u8,
+            (b as f32 * m) as u8,
+        )
+    } else {
+        base
+    }
+}
+
+/// Returns the position of a 3-char "shine" highlight sweeping across a bar.
+/// Sweeps across the full `total_width`, not just the filled portion.
+/// Returns `None` if total_width is 0.
+pub fn shine_offset(frame: usize, total_width: usize) -> Option<usize> {
+    if total_width == 0 {
+        return None;
+    }
+    // Sweep speed: advance 1 position every 2 frames (~10 chars/sec at 20fps)
+    // Sweep across the full bar width so it looks like continuous motion
+    let cycle = total_width + 3;
+    let pos = (frame / 2) % cycle;
+    Some(pos)
+}
+
+/// Builds a progress bar string with a sweeping shine highlight.
+/// Returns (bar_string, shine_positions) where shine chars use a brighter style.
+pub fn progress_bar_with_shine(filled: usize, empty: usize, frame: usize) -> Vec<(char, bool)> {
+    let total = filled + empty;
+    let shine_pos = shine_offset(frame, total);
+
+    (0..total)
+        .map(|i| {
+            if i < filled {
+                let is_shine = shine_pos.is_some_and(|sp| {
+                    i >= sp.saturating_sub(1) && i <= sp + 1
+                });
+                ('=', is_shine)
+            } else {
+                (' ', false)
+            }
+        })
+        .collect()
+}
+
+/// Returns a slice of `text` revealed character-by-character over time.
+/// At 20fps, reveals ~2 chars per frame for a snappy typewriter effect.
+pub fn typing_reveal(text: &str, elapsed_frames: usize) -> &str {
+    // Reveal 1 char every 2 frames (10 chars/sec at 20fps)
+    let chars_to_show = elapsed_frames / 2;
+    if chars_to_show >= text.len() {
+        return text;
+    }
+    // Find the byte boundary for the nth character
+    let mut boundary = 0;
+    for (i, (idx, _)) in text.char_indices().enumerate() {
+        if i >= chars_to_show {
+            boundary = idx;
+            break;
+        }
+    }
+    &text[..boundary]
+}
+
+/// Returns two screen lines for the Zune ASCII art during connection.
+/// Each line must be <=12 chars. Frame counter starts at 0 when connection begins.
+pub fn connection_screen_lines(frame: usize) -> (&'static str, &'static str) {
+    // Each stage lasts ~1 second (20 frames at 20fps)
+    let stage = frame / 20;
+    let sub = frame % 20;
+
+    match stage {
+        0 => {
+            // Scanning with animated dots
+            let dots = match (sub / 5) % 4 {
+                0 => "Scanning",
+                1 => "Scanning.",
+                2 => "Scanning..",
+                _ => "Scanning...",
+            };
+            (dots, "")
+        }
+        1 => {
+            let dots = match (sub / 5) % 4 {
+                0 => "Found",
+                1 => "Found.",
+                2 => "Found..",
+                _ => "Found...",
+            };
+            (dots, "Zune 30")
+        }
+        2 => {
+            let dots = match (sub / 5) % 4 {
+                0 => "MTPZ",
+                1 => "MTPZ.",
+                2 => "MTPZ..",
+                _ => "MTPZ...",
+            };
+            (dots, "Handshake")
+        }
+        _ => {
+            let dots = match (sub / 5) % 4 {
+                0 => "Ready",
+                1 => "Ready.",
+                2 => "Ready..",
+                _ => "Ready...",
+            };
+            (dots, "Connecting")
+        }
+    }
+}
+
+/// Theme-specific player skin for the Now Playing panel.
+pub struct PlayerSkin {
+    pub play: &'static str,
+    pub pause: &'static str,
+    pub next: &'static str,
+    pub prev: &'static str,
+    pub bar_filled: char,
+    pub bar_empty: char,
+    /// Returns ASCII art lines for the player. `playing` and `frame` drive animations.
+    pub art_fn: fn(playing: bool, frame: usize) -> Vec<&'static str>,
+}
+
+pub fn player_skin(theme_index: usize) -> &'static PlayerSkin {
+    match theme_index {
+        0 => &SKIN_ITUNES,
+        1 => &SKIN_GRUVBOX_DARK,
+        2 => &SKIN_GRUVBOX_LIGHT,
+        3 => &SKIN_EVERFOREST_DARK,
+        4 => &SKIN_EVERFOREST_LIGHT,
+        5 => &SKIN_MIAMI,
+        6 => &SKIN_IBM,
+        7 => &SKIN_WIN95,
+        8 => &SKIN_SYSTEM7,
+        9 => &SKIN_BIOS,
+        10 => &SKIN_RED_SANDS,
+        _ => &SKIN_ITUNES,
+    }
+}
+
+// All art: exactly 5 lines, each exactly 14 chars wide.
+// Consistent width prevents centering jitter.
+
+// --- iTunes 2004: spinning CD ---
+fn art_itunes(_playing: bool, frame: usize) -> Vec<&'static str> {
+    let p = (frame / 4) % 4;
+    match p {
+        0 => vec![
+            " .--=====--. ",
+            " | .---=-. | ",
+            " | |  O  | | ",
+            " | `---=-' | ",
+            " `--=====--' ",
+        ],
+        1 => vec![
+            " .--=====--. ",
+            " | .--+--. | ",
+            " | |  O  | | ",
+            " | `--+--' | ",
+            " `--=====--' ",
+        ],
+        2 => vec![
+            " .--=====--. ",
+            " | .--*--. | ",
+            " | |  O  | | ",
+            " | `--*--' | ",
+            " `--=====--' ",
+        ],
+        _ => vec![
+            " .--=====--. ",
+            " | .--~--. | ",
+            " | |  O  | | ",
+            " | `--~--' | ",
+            " `--=====--' ",
+        ],
+    }
+}
+static SKIN_ITUNES: PlayerSkin = PlayerSkin {
+    play: "▶", pause: "❚❚", next: "▷▷", prev: "◁◁",
+    bar_filled: '━', bar_empty: '─',
+    art_fn: art_itunes,
+};
+
+// --- Gruvbox Dark: bouncing EQ bars ---
+fn art_gruvbox_dark(_playing: bool, frame: usize) -> Vec<&'static str> {
+    let p = (frame / 3) % 4;
+    match p {
+        0 => vec![
+            " █       █   ",
+            " █ █   █ █   ",
+            " █ █ █ █ █   ",
+            " █ █ █ █ █   ",
+            " █ █ █ █ █   ",
+        ],
+        1 => vec![
+            "   █   █     ",
+            " █ █   █ █   ",
+            " █ █   █ █   ",
+            " █ █ █ █ █   ",
+            " █ █ █ █ █   ",
+        ],
+        2 => vec![
+            "     █       ",
+            "   █ █ █     ",
+            " █ █ █ █ █   ",
+            " █ █ █ █ █   ",
+            " █ █ █ █ █   ",
+        ],
+        _ => vec![
+            "   █   █     ",
+            " █ █ █ █ █   ",
+            " █ █ █ █ █   ",
+            " █ █ █ █ █   ",
+            " █ █ █ █ █   ",
+        ],
+    }
+}
+static SKIN_GRUVBOX_DARK: PlayerSkin = PlayerSkin {
+    play: "►", pause: "▪", next: "▸▸", prev: "◂◂",
+    bar_filled: '●', bar_empty: '○',
+    art_fn: art_gruvbox_dark,
+};
+
+// --- Gruvbox Light: same EQ bars ---
+fn art_gruvbox_light(_p: bool, f: usize) -> Vec<&'static str> {
+    art_gruvbox_dark(_p, f)
+}
+static SKIN_GRUVBOX_LIGHT: PlayerSkin = PlayerSkin {
+    play: "►", pause: "■", next: "▸▸", prev: "◂◂",
+    bar_filled: '◆', bar_empty: '◇',
+    art_fn: art_gruvbox_light,
+};
+
+// --- Everforest Dark: waveform ---
+fn art_everforest_dark(_playing: bool, frame: usize) -> Vec<&'static str> {
+    let p = (frame / 3) % 4;
+    match p {
+        0 => vec![
+            "              ",
+            " ~   ~   ~   ~",
+            "  ~ ~ ~ ~ ~ ~ ",
+            "   ~   ~   ~  ",
+            "              ",
+        ],
+        1 => vec![
+            "              ",
+            "~ ~   ~   ~   ",
+            " ~ ~ ~ ~ ~ ~  ",
+            "    ~   ~   ~ ",
+            "              ",
+        ],
+        2 => vec![
+            "              ",
+            "  ~ ~   ~   ~ ",
+            " ~ ~ ~ ~ ~ ~  ",
+            "~   ~   ~   ~ ",
+            "              ",
+        ],
+        _ => vec![
+            "              ",
+            "   ~ ~   ~   ~",
+            "  ~ ~ ~ ~ ~ ~ ",
+            " ~   ~   ~    ",
+            "              ",
+        ],
+    }
+}
+static SKIN_EVERFOREST_DARK: PlayerSkin = PlayerSkin {
+    play: "▶", pause: "||", next: "▷▷", prev: "◁◁",
+    bar_filled: '▓', bar_empty: '░',
+    art_fn: art_everforest_dark,
+};
+
+// --- Everforest Light: same waveform ---
+fn art_everforest_light(_p: bool, f: usize) -> Vec<&'static str> {
+    art_everforest_dark(_p, f)
+}
+static SKIN_EVERFOREST_LIGHT: PlayerSkin = PlayerSkin {
+    play: "▶", pause: "||", next: "▷▷", prev: "◁◁",
+    bar_filled: '▓', bar_empty: '░',
+    art_fn: art_everforest_light,
+};
+
+// --- Miami Nights: turntable with tone arm ---
+fn art_miami(_playing: bool, frame: usize) -> Vec<&'static str> {
+    let p = (frame / 3) % 4;
+    match p {
+        0 => vec![
+            " .----------.",
+            " | .---.  O |",
+            " | | + | /  |",
+            " | `---'    |",
+            " `----------'",
+        ],
+        1 => vec![
+            " .----------.",
+            " | .---. O  |",
+            " | | + |/   |",
+            " | `---'    |",
+            " `----------'",
+        ],
+        2 => vec![
+            " .----------.",
+            " | .---.O   |",
+            " | | + /    |",
+            " | `---'    |",
+            " `----------'",
+        ],
+        _ => vec![
+            " .----------.",
+            " | .---. O  |",
+            " | | + |\\   |",
+            " | `---'    |",
+            " `----------'",
+        ],
+    }
+}
+static SKIN_MIAMI: PlayerSkin = PlayerSkin {
+    play: "▶", pause: "||", next: "▷▷", prev: "◁◁",
+    bar_filled: '█', bar_empty: '░',
+    art_fn: art_miami,
+};
+
+// --- IBM Mainframe: cassette reels ---
+fn art_ibm(_playing: bool, frame: usize) -> Vec<&'static str> {
+    let p = (frame / 3) % 4;
+    match p {
+        0 => vec![
+            " +-----------+",
+            " | /--\\ /--\\ |",
+            " | |  | |  | |",
+            " | \\--/ \\--/ |",
+            " +===+======+=",
+        ],
+        1 => vec![
+            " +-----------+",
+            " | /--\\ /--\\ |",
+            " | |- | | -| |",
+            " | \\--/ \\--/ |",
+            " +=+========+=",
+        ],
+        2 => vec![
+            " +-----------+",
+            " | /--\\ /--\\ |",
+            " | |  | |  | |",
+            " | \\--/ \\--/ |",
+            " +=+=======+=+",
+        ],
+        _ => vec![
+            " +-----------+",
+            " | /--\\ /--\\ |",
+            " | | -| |- | |",
+            " | \\--/ \\--/ |",
+            " +==+======+=+",
+        ],
+    }
+}
+static SKIN_IBM: PlayerSkin = PlayerSkin {
+    play: "►", pause: "[]", next: ">>", prev: "<<",
+    bar_filled: '▓', bar_empty: '░',
+    art_fn: art_ibm,
+};
+
+// --- Windows 95: bouncing note ---
+fn art_win95(_playing: bool, frame: usize) -> Vec<&'static str> {
+    let p = (frame / 5) % 4;
+    match p {
+        0 => vec![
+            " +-----------+",
+            " | d         |",
+            " |           |",
+            " |           |",
+            " +-----------+",
+        ],
+        1 => vec![
+            " +-----------+",
+            " |           |",
+            " |     d     |",
+            " |           |",
+            " +-----------+",
+        ],
+        2 => vec![
+            " +-----------+",
+            " |           |",
+            " |           |",
+            " |        d  |",
+            " +-----------+",
+        ],
+        _ => vec![
+            " +-----------+",
+            " |           |",
+            " |  d        |",
+            " |           |",
+            " +-----------+",
+        ],
+    }
+}
+static SKIN_WIN95: PlayerSkin = PlayerSkin {
+    play: "|>", pause: "||", next: ">>|", prev: "|<<",
+    bar_filled: '█', bar_empty: '░',
+    art_fn: art_win95,
+};
+
+// --- System 7: pulsing speaker ---
+fn art_system7(_playing: bool, frame: usize) -> Vec<&'static str> {
+    let p = (frame / 4) % 3;
+    match p {
+        0 => vec![
+            "              ",
+            "   |\\         ",
+            "   | \\  )     ",
+            "   | /        ",
+            "   |/         ",
+        ],
+        1 => vec![
+            "              ",
+            "   |\\         ",
+            "   | \\ ) )    ",
+            "   | /        ",
+            "   |/         ",
+        ],
+        _ => vec![
+            "              ",
+            "   |\\         ",
+            "   | \\ ) ) )  ",
+            "   | /        ",
+            "   |/         ",
+        ],
+    }
+}
+static SKIN_SYSTEM7: PlayerSkin = PlayerSkin {
+    play: "▶", pause: "■", next: "▷▷", prev: "◁◁",
+    bar_filled: '█', bar_empty: '·',
+    art_fn: art_system7,
+};
+
+// --- BIOS: spinning pipe ---
+fn art_bios(_playing: bool, frame: usize) -> Vec<&'static str> {
+    let p = (frame / 4) % 4;
+    match p {
+        0 => vec![
+            "              ",
+            "  PLAYING...  ",
+            "              ",
+            "      |       ",
+            "              ",
+        ],
+        1 => vec![
+            "              ",
+            "  PLAYING...  ",
+            "              ",
+            "      /       ",
+            "              ",
+        ],
+        2 => vec![
+            "              ",
+            "  PLAYING...  ",
+            "              ",
+            "      -       ",
+            "              ",
+        ],
+        _ => vec![
+            "              ",
+            "  PLAYING...  ",
+            "              ",
+            "      \\       ",
+            "              ",
+        ],
+    }
+}
+static SKIN_BIOS: PlayerSkin = PlayerSkin {
+    play: "|>", pause: "||", next: ">>|", prev: "|<<",
+    bar_filled: '=', bar_empty: '-',
+    art_fn: art_bios,
+};
+
+// --- Red Sands: moon phases ---
+fn art_red_sands(_playing: bool, frame: usize) -> Vec<&'static str> {
+    let p = (frame / 10) % 8;
+    match p {
+        0 => vec![
+            "   .----.     ",
+            "  /      \\    ",
+            " |        |   ",
+            "  \\      /    ",
+            "   `----'     ",
+        ],
+        1 => vec![
+            "   .----.     ",
+            "  / |    \\    ",
+            " |  |     |   ",
+            "  \\ |    /    ",
+            "   `----'     ",
+        ],
+        2 => vec![
+            "   .----.     ",
+            "  /###   \\    ",
+            " |###     |   ",
+            "  \\###   /    ",
+            "   `----'     ",
+        ],
+        3 => vec![
+            "   .----.     ",
+            "  /#####.\\    ",
+            " |######.|   ",
+            "  \\#####./    ",
+            "   `----'     ",
+        ],
+        4 => vec![
+            "   .----.     ",
+            "  /######\\    ",
+            " |########|   ",
+            "  \\######/    ",
+            "   `----'     ",
+        ],
+        5 => vec![
+            "   .----.     ",
+            "  /.#####\\    ",
+            " |.######|   ",
+            "  \\.#####/    ",
+            "   `----'     ",
+        ],
+        6 => vec![
+            "   .----.     ",
+            "  /   ###\\    ",
+            " |     ###|   ",
+            "  \\   ###/    ",
+            "   `----'     ",
+        ],
+        _ => vec![
+            "   .----.     ",
+            "  /    | \\    ",
+            " |     |  |   ",
+            "  \\    | /    ",
+            "   `----'     ",
+        ],
+    }
+}
+static SKIN_RED_SANDS: PlayerSkin = PlayerSkin {
+    play: "▸", pause: "◾", next: "▸▸", prev: "◂◂",
+    bar_filled: '▬', bar_empty: '·',
+    art_fn: art_red_sands,
+};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spinner_set_for_all_themes() {
+        for i in 0..11 {
+            let set = spinner_set_for_theme(i);
+            assert!(
+                !set.symbols.is_empty(),
+                "Theme {} returned empty spinner set",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn spinner_set_fallback() {
+        let set = spinner_set_for_theme(999);
+        assert!(!set.symbols.is_empty());
+    }
+
+    #[test]
+    fn pulse_color_stays_in_range() {
+        let base = Color::Rgb(200, 150, 100);
+        for frame in 0..100 {
+            if let Color::Rgb(r, g, b) = pulse_color(base, frame, 40) {
+                assert!(r <= 200, "r={} exceeded base at frame {}", r, frame);
+                assert!(g <= 150, "g={} exceeded base at frame {}", g, frame);
+                assert!(b <= 100, "b={} exceeded base at frame {}", b, frame);
+            } else {
+                panic!("Expected Rgb color");
+            }
+        }
+    }
+
+    #[test]
+    fn pulse_color_is_periodic() {
+        let base = Color::Rgb(200, 150, 100);
+        let c0 = pulse_color(base, 0, 40);
+        let c40 = pulse_color(base, 40, 40);
+        assert_eq!(c0, c40);
+    }
+
+    #[test]
+    fn pulse_color_non_rgb_passthrough() {
+        let c = pulse_color(Color::White, 5, 40);
+        assert_eq!(c, Color::White);
+    }
+
+    #[test]
+    fn typing_reveal_progression() {
+        let text = "zytunes";
+        assert_eq!(typing_reveal(text, 0), "");
+        assert_eq!(typing_reveal(text, 2), "z");
+        assert_eq!(typing_reveal(text, 4), "zy");
+    }
+
+    #[test]
+    fn typing_reveal_complete() {
+        let text = "zytunes";
+        assert_eq!(typing_reveal(text, 100), "zytunes");
+    }
+
+    #[test]
+    fn shine_offset_wraps() {
+        let bar_width = 10;
+        let mut positions = Vec::new();
+        for frame in 0..100 {
+            if let Some(pos) = shine_offset(frame, bar_width) {
+                positions.push(pos);
+            }
+        }
+        // Should wrap around — we should see values < bar_width appear more than once
+        assert!(positions.len() > bar_width);
+    }
+
+    #[test]
+    fn shine_offset_zero_width() {
+        assert_eq!(shine_offset(5, 0), None);
+    }
+
+    #[test]
+    fn connection_screen_lines_fit_width() {
+        for frame in 0..100 {
+            let (line1, line2) = connection_screen_lines(frame);
+            assert!(
+                line1.len() <= 12,
+                "line1 '{}' exceeds 12 chars at frame {}",
+                line1,
+                frame
+            );
+            assert!(
+                line2.len() <= 12,
+                "line2 '{}' exceeds 12 chars at frame {}",
+                line2,
+                frame
+            );
+        }
+    }
+
+    #[test]
+    fn connection_screen_stages_progress() {
+        let (l1_0, _) = connection_screen_lines(0);
+        let (l1_20, _) = connection_screen_lines(20);
+        let (l1_40, _) = connection_screen_lines(40);
+        // Each stage should have different content
+        assert!(l1_0.starts_with("Scanning"));
+        assert!(l1_20.starts_with("Found"));
+        assert!(l1_40.starts_with("MTPZ"));
+    }
+
+    #[test]
+    fn progress_bar_correct_length() {
+        let bar = progress_bar_with_shine(10, 5, 0);
+        assert_eq!(bar.len(), 15);
+        // First 10 should be filled ('='), last 5 should be empty (' ')
+        for (i, &(ch, _)) in bar.iter().enumerate() {
+            if i < 10 {
+                assert_eq!(ch, '=');
+            } else {
+                assert_eq!(ch, ' ');
+            }
+        }
+    }
+
+    #[test]
+    fn player_skin_for_all_themes() {
+        for i in 0..11 {
+            let skin = player_skin(i);
+            assert!(!skin.play.is_empty(), "Theme {} has empty play symbol", i);
+            assert!(!skin.pause.is_empty(), "Theme {} has empty pause symbol", i);
+            let art_playing = (skin.art_fn)(true, 0);
+            let art_paused = (skin.art_fn)(false, 0);
+            assert!(!art_playing.is_empty(), "Theme {} has empty playing art", i);
+            assert!(!art_paused.is_empty(), "Theme {} has empty paused art", i);
+        }
+    }
+
+    #[test]
+    fn player_skin_animation_frames() {
+        // Miami and IBM have animated art — verify they produce different frames
+        let miami = player_skin(5);
+        let frames: Vec<_> = (0..20).map(|f| (miami.art_fn)(true, f)).collect();
+        // Should have at least 2 distinct frames
+        let unique: std::collections::HashSet<String> =
+            frames.iter().map(|f| format!("{:?}", f)).collect();
+        assert!(unique.len() >= 2, "Miami should have animated frames");
+
+        let ibm = player_skin(6);
+        let frames: Vec<_> = (0..20).map(|f| (ibm.art_fn)(true, f)).collect();
+        let unique: std::collections::HashSet<String> =
+            frames.iter().map(|f| format!("{:?}", f)).collect();
+        assert!(unique.len() >= 2, "IBM should have animated frames");
+    }
+}

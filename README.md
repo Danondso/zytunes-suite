@@ -25,6 +25,111 @@ A Rust CLI tool for syncing music to a Microsoft Zune 30 from macOS.
 - **Theming** — the TUI includes 11 built-in color themes (iTunes 2004, Gruvbox Dark/Light, Everforest Dark/Light, Miami Nights, IBM Mainframe, Windows 95, System 7, BIOS, Red Sands). Press `t` to open the theme picker. Selected theme is persisted to `~/.config/zytunes/config.toml`
 - **Native IOKit USB backend** — the `zune-mtp` crate provides direct MTP/MTPZ communication via Apple's IOKit framework, bypassing libusb. The TUI tries this backend first and falls back to `aft-mtp-cli` if it fails. Playlist creation is not yet supported in the native backend
 
+## Interactive TUI
+
+<!-- TODO: add screenshot or GIF here -->
+
+Launch the interactive terminal UI:
+
+```
+zytunes-tui
+# or: cargo run --bin zytunes-tui
+# with a custom library: zytunes-tui --library /path/to/Library.xml
+```
+
+### Layout
+
+```
+┌──────────────────┬──────────────────────────────────┬──────────────┐
+│  Device          │  Sidebar  │  Albums  │  Tracks   │  Keys        │
+│  (Zune art,      │  (artists │  (per    │  (table   │  (context-   │
+│   storage info)  │   albums  │  artist) │   or album│   sensitive  │
+│                  │   or      │          │   detail  │   reference) │
+├──────────────────┤   lists)  │          │   view)   │              │
+│  Sync Queue      │           │          │           │              │
+│                  │           │          │           │              │
+├──────────────────┤           │          │           │              │
+│  Log             ├──────────────────────────────────┤              │
+│                  │  Footer (track count + hints)    │              │
+└──────────────────┴──────────────────────────────────┴──────────────┘
+```
+
+- **Left column**: Device info with Zune ASCII art and storage bar, sync queue, and log
+- **Center**: 3-panel browser — sidebar, album list (when applicable), and track list
+- **Right column**: Context-sensitive keybinding reference (toggle with `h`)
+
+### Browse modes
+
+- **Library mode** (default) — browse your iTunes library by Artists (`1`), Albums (`2`), or Playlists (`3`)
+- **Device mode** — browse tracks on the connected Zune, organized by Artist/Album from the device filesystem. Toggle with `v`
+
+The album detail view shows a ZIP disk ASCII art with album metadata (artist, album, year, track count, duration) alongside the track table.
+
+### Keybindings
+
+**Navigation**
+
+| Key | Action |
+|-----|--------|
+| `Tab` / `Shift+Tab` | Cycle between panels |
+| `Up` / `Down` | Navigate lists |
+| `Left` / `Right` | Skip to next letter group in sidebar |
+| `Enter` | Select / expand |
+| `1` / `2` / `3` | Switch to Artists / Albums / Playlists |
+| `4` | Jump to sync queue |
+
+**Library & Browsing**
+
+| Key | Action |
+|-----|--------|
+| `/` | Search sidebar (live filter, `Esc` to cancel) |
+| `s` | Cycle sort column (track list) |
+| `a` | Add selection to sync queue (library) / remove from device (device mode) |
+| `A` | Add all visible tracks / remove all visible |
+| `v` | Toggle Library / Device browse mode |
+
+**Device**
+
+| Key | Action |
+|-----|--------|
+| `c` | Connect to Zune (USB detect + MTPZ handshake) |
+| `r` | Refresh device track list |
+| `d` | Disconnect |
+
+**Sync**
+
+| Key | Action |
+|-----|--------|
+| `S` or `Enter` (in queue) | Start sync |
+| `d` (in queue) | Remove selected item |
+| `C` | Clear entire queue |
+| `Esc` | Cancel running sync |
+
+**General**
+
+| Key | Action |
+|-----|--------|
+| `q` | Quit |
+| `?` | Full help overlay |
+| `h` | Toggle keybinding panel |
+| `t` | Theme picker |
+
+### Themes
+
+11 built-in themes, selectable with `t`:
+
+iTunes 2004, Gruvbox Dark, Gruvbox Light, Everforest Dark, Everforest Light, Miami Nights, IBM Mainframe, Windows 95, System 7, BIOS, Red Sands
+
+Selected theme is persisted to `~/.config/zytunes/config.toml`.
+
+### Sync workflow
+
+1. Browse your iTunes library and press `a` to add artists, albums, playlists, or individual tracks to the sync queue
+2. Press `c` to connect to the Zune (auto-detects via USB, performs MTPZ handshake)
+3. Press `S` or switch to the queue and press `Enter` to start syncing
+4. Non-native formats are auto-transcoded to MP3, album art resized to 200x200
+5. Progress and results appear in the log panel; device track list auto-refreshes on completion
+
 ## What's planned
 
 - **Dump command** — `dump` to pull all music off a Zune to a local directory
@@ -244,3 +349,7 @@ src/
 - [libmtp](https://github.com/libmtp/libmtp) — open-source MTP library with some Zune-specific code paths
 - [OpenZDK](https://github.com/ZuneRedux/openZDK-quick-start-kit) — community effort to reverse-engineer Zune internals (Zune HD focused)
 - [USB MTP spec](https://www.usb.org/document-library/media-transfer-protocol-v11-spec-and-mtp-v11-adopters-agreement) — the official MTP 1.1 specification
+
+## License
+
+MIT — see [LICENSE](LICENSE). Third-party notices in [THIRD_PARTY.md](THIRD_PARTY.md).

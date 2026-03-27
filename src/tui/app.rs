@@ -6,6 +6,7 @@ use throbber_widgets_tui::ThrobberState;
 use zytunes::library::{ItunesLibrary, Track};
 use zytunes::mtp::parse::DeviceEntry;
 
+use crate::audio::{AudioCommand, AudioEvent};
 use crate::background::{BgCommand, BgEvent, StorageInfo, SyncItem};
 use crate::theme::{Theme, THEMES};
 
@@ -74,6 +75,27 @@ pub enum SortColumn {
     Format,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PlaybackState {
+    #[allow(dead_code)]
+    Stopped,
+    Playing,
+    Paused,
+}
+
+pub struct NowPlaying {
+    pub track_name: String,
+    pub artist: String,
+    pub album: String,
+    pub duration_ms: u64,
+    pub elapsed_ms: u64,
+    pub state: PlaybackState,
+    pub track_index: usize,
+    pub playlist: Vec<TrackInfo>,
+    /// Frame at which playback was paused (freezes animation).
+    pub paused_frame: Option<usize>,
+}
+
 #[derive(Clone)]
 pub struct QueuedItem {
     pub label: String,
@@ -117,6 +139,9 @@ pub struct App {
     pub sync_current_track: String,
     pub sync_log: Vec<String>,
     pub throbber_state: ThrobberState,
+    pub anim_frame: usize,
+    pub connection_anim_start: Option<usize>,
+    pub now_playing: Option<NowPlaying>,
     pub should_quit: bool,
     pub show_help: bool,
     pub show_keys: bool,
@@ -188,6 +213,9 @@ impl App {
             sync_current_track: String::new(),
             sync_log: Vec::new(),
             throbber_state: ThrobberState::default(),
+            anim_frame: 0,
+            connection_anim_start: None,
+            now_playing: None,
             should_quit: false,
             show_help: false,
             show_keys: true,
@@ -232,6 +260,137 @@ impl App {
     pub fn theme_picker_cancel(&mut self) {
         self.theme_index = self.theme_before_picker;
         self.show_theme_picker = false;
+    }
+
+    // -- Playback controls --
+
+    pub fn play_selected_track(&mut self, audio_tx: &mpsc::Sender<AudioCommand>) {
+        if self.track_list.is_empty() {
+            return;
+        }
+        let index = self.track_selected.min(self.track_list.len() - 1);
+        let track = &self.track_list[index];
+        let path = match &track.location {
+            Some(p) => p.clone(),
+            None => {
+                self.set_toast("No file path for this track".into(), true);
+                return;
+            }
+        };
+        let _ = audio_tx.send(AudioCommand::Play { path });
+        self.now_playing = Some(NowPlaying {
+            track_name: track.name.clone(),
+            artist: track.artist.clone(),
+            album: track.album.clone(),
+            duration_ms: track.duration_ms.unwrap_or(0),
+            elapsed_ms: 0,
+            state: PlaybackState::Playing,
+            track_index: index,
+            playlist: self.track_list.clone(),
+            paused_frame: None,
+        });
+    }
+
+    pub fn toggle_playback(&mut self, audio_tx: &mpsc::Sender<AudioCommand>) {
+        match &self.now_playing {
+            Some(np) if np.state == PlaybackState::Playing => {
+                let _ = audio_tx.send(AudioCommand::Pause);
+                if let Some(ref mut np) = self.now_playing {
+                    np.state = PlaybackState::Paused;
+                    np.paused_frame = Some(self.anim_frame);
+                }
+            }
+            Some(np) if np.state == PlaybackState::Paused => {
+                let _ = audio_tx.send(AudioCommand::Resume);
+                if let Some(ref mut np) = self.now_playing {
+                    np.state = PlaybackState::Playing;
+                    np.paused_frame = None;
+                }
+            }
+            _ => {
+                self.play_selected_track(audio_tx);
+            }
+        }
+    }
+
+    pub fn next_track(&mut self, audio_tx: &mpsc::Sender<AudioCommand>) {
+        if let Some(ref np) = self.now_playing {
+            let next_idx = np.track_index + 1;
+            let playlist = np.playlist.clone();
+            if next_idx < playlist.len() {
+                self.play_from_playlist(next_idx, &playlist, audio_tx);
+            } else {
+                // End of playlist
+                let _ = audio_tx.send(AudioCommand::Stop);
+                self.now_playing = None;
+            }
+        }
+    }
+
+    pub fn prev_track(&mut self, audio_tx: &mpsc::Sender<AudioCommand>) {
+        if let Some(ref np) = self.now_playing {
+            let playlist = np.playlist.clone();
+            if np.elapsed_ms > 3000 || np.track_index == 0 {
+                // Restart current track
+                self.play_from_playlist(np.track_index, &playlist, audio_tx);
+            } else {
+                self.play_from_playlist(np.track_index - 1, &playlist, audio_tx);
+            }
+        }
+    }
+
+    pub fn stop_playback(&mut self, audio_tx: &mpsc::Sender<AudioCommand>) {
+        let _ = audio_tx.send(AudioCommand::Stop);
+        self.now_playing = None;
+    }
+
+    fn play_from_playlist(
+        &mut self,
+        index: usize,
+        playlist: &[TrackInfo],
+        audio_tx: &mpsc::Sender<AudioCommand>,
+    ) {
+        let track = &playlist[index];
+        let path = match &track.location {
+            Some(p) => p.clone(),
+            None => {
+                self.set_toast("No file path for this track".into(), true);
+                return;
+            }
+        };
+        let _ = audio_tx.send(AudioCommand::Play { path });
+        self.now_playing = Some(NowPlaying {
+            track_name: track.name.clone(),
+            artist: track.artist.clone(),
+            album: track.album.clone(),
+            duration_ms: track.duration_ms.unwrap_or(0),
+            elapsed_ms: 0,
+            state: PlaybackState::Playing,
+            track_index: index,
+            playlist: playlist.to_vec(),
+            paused_frame: None,
+        });
+    }
+
+    pub fn handle_audio_event(
+        &mut self,
+        event: AudioEvent,
+        audio_tx: &mpsc::Sender<AudioCommand>,
+    ) {
+        match event {
+            AudioEvent::Position { elapsed_ms } => {
+                if let Some(ref mut np) = self.now_playing {
+                    np.elapsed_ms = elapsed_ms;
+                }
+            }
+            AudioEvent::TrackEnded => {
+                self.next_track(audio_tx);
+            }
+            AudioEvent::PlaybackError(msg) => {
+                self.now_playing = None;
+                self.set_toast(format!("Playback: {}", msg), true);
+            }
+        }
     }
 
     pub fn build_device_index(&mut self) {
@@ -840,11 +999,13 @@ impl App {
             }
             BgEvent::SessionReady(storage) => {
                 self.device_status = DeviceStatus::Connected;
+                self.connection_anim_start = None;
                 self.device_storage = storage;
                 self.set_toast("Device connected".into(), false);
             }
             BgEvent::SessionFailed(e) => {
                 self.device_status = DeviceStatus::Disconnected;
+                self.connection_anim_start = None;
                 self.set_toast(format!("Connection failed: {}", e), true);
             }
             BgEvent::LoadingDeviceTracks => {
@@ -929,6 +1090,7 @@ impl App {
 
     pub fn tick(&mut self) {
         self.throbber_state.calc_next();
+        self.anim_frame = self.anim_frame.wrapping_add(1);
 
         // Auto-dismiss toast after 5 seconds.
         if let Some((_, time, _)) = &self.toast_message {

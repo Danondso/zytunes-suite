@@ -9,8 +9,16 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
 
-/// Default iTunes library path.
-pub const DEFAULT_LIBRARY_XML: &str = "/Volumes/Music/Library.xml";
+/// Resolve the iTunes library path: `ZYTUNES_LIBRARY` env var, or `$HOME/Music/Music/Library.xml`.
+pub fn library_xml_path() -> String {
+    if let Ok(p) = std::env::var("ZYTUNES_LIBRARY") {
+        return p;
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return format!("{home}/Music/Music/Library.xml");
+    }
+    "/Music/Music/Library.xml".to_string()
+}
 
 /// Formats the Zune 30 natively supports (no transcoding needed).
 pub const ZUNE_NATIVE_FORMATS: &[&str] = &["mp3", "wma", "aac"];
