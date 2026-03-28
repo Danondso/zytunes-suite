@@ -9,7 +9,7 @@ A Rust CLI tool for syncing music to a Microsoft Zune 30 from macOS.
 ## What works
 
 - **USB detection** — scans connected USB devices via `rusb` and identifies a Zune 30 by Microsoft vendor ID `0x045e` and known product IDs
-- **MTPZ authentication** — the Zune requires Microsoft's encrypted MTPZ handshake before exposing storage. Handled automatically via the native IOKit backend or `aft-mtp-cli` fallback
+- **MTPZ authentication** — the Zune requires Microsoft's encrypted MTPZ handshake before exposing storage. Handled automatically via the native IOKit backend (`zune-mtp`)
 - **File listing** — `ls [path]` enumerates storage and prints the device's directory tree
 - **Music push** — `push <files...>` uploads music files to the Zune with proper metadata via `zune-import`
 - **Music removal** — `rm <device-paths...>` removes files/folders from the device (leaf-first for directories)
@@ -18,12 +18,11 @@ A Rust CLI tool for syncing music to a Microsoft Zune 30 from macOS.
 - **Auto-transcoding** — non-native formats (FLAC, OGG, WAV, M4A, OPUS, ALAC, AIFF) are transcoded to MP3 via ffmpeg with album art resized to 200x200 (Zune 30 constraint)
 - **MP3 passthrough** — native formats (MP3, WMA, AAC) skip transcoding entirely
 - **Library browsing** — `library [xml] [query]` browses/searches an iTunes Library.xml
-- **Library caching** — vendored `aft-mtp-cli` fork caches the device's artist/album library to `~/.aft-library-cache`, eliminating the ~5 min load time on subsequent sessions. Cache auto-updates on imports; use `zune-refresh` to force a full reload
 - **Interactive TUI** — `zytunes-tui` launches a terminal UI (ratatui) for browsing your iTunes library, connecting to the device, managing a sync queue, and monitoring sync progress. Library parsing runs in the background on startup. TUI displays sync status on the Zune ASCII art screen including loading spinner, track count, syncing spinner, and queue count
 - **Device content browsing** — the TUI can browse tracks on the connected Zune organized by artist/album, toggled with `v`. The device library is indexed from the device's Music directory structure (`Artist/Album/Track`)
 - **Device track removal** — in device view mode, `a`/`A` removes selected tracks, albums, or artists from the device. Progress is shown during removal and the device track list auto-refreshes afterward
 - **Theming** — the TUI includes 11 built-in color themes (iTunes 2004, Gruvbox Dark/Light, Everforest Dark/Light, Miami Nights, IBM Mainframe, Windows 95, System 7, BIOS, Red Sands). Press `t` to open the theme picker. Selected theme is persisted to `~/.config/zytunes/config.toml`
-- **Native IOKit USB backend** — the `zune-mtp` crate provides direct MTP/MTPZ communication via Apple's IOKit framework, bypassing libusb. The TUI tries this backend first and falls back to `aft-mtp-cli` if it fails. Playlist creation is not yet supported in the native backend
+- **Native IOKit USB backend** — the `zune-mtp` crate provides direct MTP/MTPZ communication via Apple's IOKit framework, bypassing libusb. This is the sole backend for all device operations, supporting listing, import, removal, track collection, and playlist creation
 
 ## Interactive TUI
 
@@ -142,25 +141,6 @@ Selected theme is persisted to `~/.config/zytunes/config.toml`.
 brew install libusb
 ```
 
-### Build aft-mtp-cli
-
-zytunes includes a vendored fork of [android-file-transfer-linux](https://github.com/whoozle/android-file-transfer-linux) in `aft/` with library caching support (see [Architecture](#architecture) for why). Build it from source:
-
-```
-brew install cmake openssl taglib
-cd aft && mkdir build && cd build
-cmake .. -DBUILD_QT_UI=OFF -DBUILD_MTPZ=ON -DBUILD_FUSE=OFF
-make aft-mtp-cli
-```
-
-zytunes automatically finds the binary at `aft/build/cli/aft-mtp-cli`. You can also set `AFT_MTP_CLI` to override:
-
-```
-export AFT_MTP_CLI=/path/to/aft-mtp-cli
-```
-
-Note: The native IOKit backend (`zune-mtp`) is tried first for device communication. `aft-mtp-cli` is used as a fallback if the native backend fails.
-
 ### MTPZ keys
 
 The Zune requires MTPZ authentication. Place the keys file in your home directory:
@@ -208,12 +188,11 @@ USB-level debug logging can be enabled via environment variables:
 
 ```
 IOKIT_USB_DEBUG=1 cargo run       # Trace native IOKit USB reads/writes
-AFT_USB_DEBUG=1 aft-mtp-cli ...  # Trace aft-mtp-cli USB reads/writes
 ```
 
 ## Architecture
 
-### Why aft-mtp-cli?
+### USB architecture
 
 The Zune 30 uses MTPZ — Microsoft's encrypted extension to MTP — which requires a cryptographic handshake before the device exposes any storage. This handshake involves data-out USB operations (host sending data to device) that are incompatible with libusb on macOS.
 
@@ -224,11 +203,11 @@ The Zune 30 uses MTPZ — Microsoft's encrypted extension to MTP — which requi
 The Zune 30's MTPZ data-out operations work correctly through IOKit but fail through libusb. Specifically:
 - Standard MTP operations (GetDeviceInfo, OpenSession, GetStorageIDs) work fine via libusb
 - Data-out operations (SendWMDRMPDAppRequest for the MTPZ certificate exchange) consistently return `GeneralError (0x2002)` via libusb, regardless of payload content
-- The same operations succeed immediately via IOKit (as used by android-file-transfer-linux)
+- The same operations succeed immediately via IOKit
 
-This appears to be a fundamental incompatibility between libusb's macOS backend and the Zune's USB implementation for data-out transfers. The `android-file-transfer-linux` project uses IOKit directly on macOS, which handles the Zune's USB quirks correctly.
+This appears to be a fundamental incompatibility between libusb's macOS backend and the Zune's USB implementation for data-out transfers.
 
-**Our approach:** zytunes uses `rusb` for fast device detection (which only requires USB descriptor reads and works fine). For MTP/MTPZ communication, the TUI tries the native `zune-mtp` backend first (direct IOKit FFI from Rust) and falls back to `aft-mtp-cli` as a subprocess if the native backend fails. The CLI commands currently still use `aft-mtp-cli`.
+**Our approach:** zytunes uses `rusb` for fast device detection (which only requires USB descriptor reads and works fine). For all MTP/MTPZ communication, zytunes uses the `zune-mtp` crate, which talks directly to IOKit via Rust FFI. There is no fallback — IOKit is the sole transport for device operations.
 
 ### Native IOKit backend (zune-mtp)
 
@@ -240,17 +219,7 @@ The `zune-mtp/` workspace crate provides a pure-Rust native IOKit MTP/MTPZ imple
 - **proplist.rs** — MTP ObjectPropList builder for SendObjectPropList: constructs binary property list payloads with string, u16, and u32 property types
 - **iokit_ffi.rs** — Raw FFI declarations for IOKit/CoreFoundation (IOUSBDeviceInterface, IOUSBInterfaceInterface vtables)
 
-The `NativeSession` in `src/mtp/native.rs` wraps `zune-mtp` and implements the `DeviceSession` trait, providing ls, import, rm, and track collection. Playlist creation is not yet supported in this backend.
-
-### Legacy MTP implementation (preserved)
-
-The `src/mtp_native/` directory contains our earlier pure-Rust MTP/MTPZ implementation built on `rusb`. It includes:
-- Full MTP container format (PTP/MTP packet serialization)
-- MTP session management (OpenSession, GetObjectHandles, GetObjectInfo, etc.)
-- Complete MTPZ handshake implementation (RSA-1024, AES-128-CBC, CMAC, SHA-1)
-- USB bulk pipe transport
-
-This code works correctly for all MTP operations except data-out on macOS due to the libusb limitation. It is preserved for reference.
+The `NativeSession` in `src/mtp/native.rs` wraps `zune-mtp` and implements the `DeviceSession` trait, providing ls, import, rm, track collection, and playlist creation. Track cache is stored at `~/.zytunes-track-cache-{serial}`.
 
 ## What's known
 
@@ -274,7 +243,7 @@ Error codes encountered during development and what they mean in the Zune contex
 | Code | Name | Meaning on Zune 30 |
 |---|---|---|
 | `0x2001` | OK | Success |
-| `0x2002` | GeneralError | Operation rejected. On macOS with libusb: returned for ALL data-out MTP operations (the IOKit gap). Via aft-mtp-cli: returned when trying to `rm` a non-empty folder. |
+| `0x2002` | GeneralError | Operation rejected. On macOS with libusb: returned for ALL data-out MTP operations (the IOKit gap). Also returned when trying to `rm` a non-empty folder. |
 | `0x2006` | ParameterNotSupported | Returned by GetDeviceInfo (Zune does not support this operation) |
 | `0x2008` | InvalidStorageID | Storage ID doesn't exist (storages are hidden until MTPZ auth completes) |
 | `0x200f` | SessionNotOpen | Returned by EnableTrustedFilesOperations when MTPZ confirmation step was not accepted by the device |
@@ -287,15 +256,10 @@ Error codes encountered during development and what they mean in the Zune contex
 
 - **Firmware-dependent behavior** — product IDs and MTP behavior may vary across firmware versions
 - **Ratings / play counts** — how ratings and play counts are represented on-device (playlists are now working via `create-playlist`)
-- **MTPZ confirmation step** — the session confirmation (SendWMDRMPDAppRequest with CMAC signature) returns `0x2002` and EnableTrustedFilesOperations returns `0x200f`. The native backend's CMAC computation and signature match aft-mtp-cli's output, suggesting a protocol sequencing issue rather than a crypto bug
 
 ## Project structure
 
 ```
-aft/                 — vendored fork of android-file-transfer-linux (LGPL-2.1)
-  cli/Session.cpp    — CLI commands including zune-init, zune-import, zune-refresh
-  mtp/metadata/
-    Library.h/cpp    — Zune media library with disk cache support
 zune-mtp/            — native IOKit MTP/MTPZ library (workspace crate)
   src/
     lib.rs           — crate root, public API
@@ -314,25 +278,21 @@ zune-mtp/            — native IOKit MTP/MTPZ library (workspace crate)
     test_tracks.rs   — full Music tree walk and track enumeration
     test_import.rs   — file upload via SendObjectPropList
 src/
-  main.rs            — CLI entry point, commands (ls, push, rm, sync, library), sync engine
+  main.rs            — CLI entry point, commands (ls, push, rm, sync, library)
+  lib.rs             — public API, sync engine, SyncType enum, transcoding
   device.rs          — USB scanning and Zune identification (rusb)
   mtp/
     mod.rs           — module root, DeviceSession trait
-    aft.rs           — aft-mtp-cli subprocess wrapper (MTPZ + MTP)
     native.rs        — native IOKit backend (NativeSession implementing DeviceSession)
-    parse.rs         — output parsing for aft-mtp-cli commands
-  mtp_native/        — original pure-Rust MTP/MTPZ via rusb (preserved for reference)
-    mod.rs
-    transport.rs     — USB bulk pipe read/write
-    container.rs     — MTP/PTP container format and operation codes
-    session.rs       — MTP session management and operations
-    mtpz.rs          — MTPZ handshake (keys, crypto, authentication)
+    parse.rs         — DeviceEntry struct and parsing utilities
   library.rs         — iTunes Library.xml parser (tracks, playlists, artists)
   tui/
     main.rs          — TUI entry point (zytunes-tui binary)
     app.rs           — application state, panel navigation, event handling
     ui.rs            — ratatui widget rendering (layout, panels, overlays)
     background.rs    — background worker thread (device I/O, sync, removal, library loading)
+    anim.rs          — theme-aware animations
+    audio.rs         — local audio playback
     theme.rs         — theme struct and built-in theme presets
     config.rs        — TOML config file loading/saving (~/.config/zytunes/config.toml)
 ```
@@ -341,7 +301,6 @@ src/
 
 | Library | Role | Link |
 |---|---|---|
-| **android-file-transfer-linux** | MTP/MTPZ backend via `aft-mtp-cli`. Uses IOKit on macOS. Has complete MTPZ auth, Zune library management, and dedicated Zune CLI commands. Vendored in `aft/` with library caching additions. Upstream: v4.6, 2025. | [whoozle/android-file-transfer-linux](https://github.com/whoozle/android-file-transfer-linux) |
 | **libmtp-zune** | Protocol documentation. The `mtpz.md` file has the most detailed public description of the MTPZ handshake. Source of the `.mtpz-data` keys. | [kbhomes/libmtp-zune](https://github.com/kbhomes/libmtp-zune) |
 
 ### Other references

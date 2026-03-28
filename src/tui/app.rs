@@ -38,7 +38,6 @@ pub struct DeviceTrackInfo {
     pub device_path: String,
     #[allow(dead_code)]
     pub size: u64,
-    #[allow(dead_code)]
     pub object_id: u64,
     pub artist: String,
     pub album: String,
@@ -59,10 +58,6 @@ pub enum SyncStatus {
         current: usize,
         total: usize,
     },
-    Complete {
-        success: usize,
-        failed: usize,
-    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -76,8 +71,8 @@ pub enum SortColumn {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)]
 pub enum PlaybackState {
-    #[allow(dead_code)]
     Stopped,
     Playing,
     Paused,
@@ -102,6 +97,64 @@ pub struct QueuedItem {
     pub tracks: Vec<SyncItem>,
 }
 
+pub struct DeviceState {
+    pub status: DeviceStatus,
+    pub name: Option<String>,
+    pub firmware: Option<String>,
+    pub serial: Option<String>,
+    pub manufacturer: Option<String>,
+    pub model: Option<String>,
+    pub usb_mode: Option<String>,
+    pub storage: Option<StorageInfo>,
+    pub tracks: Vec<DeviceEntry>,
+    pub loading_tracks: bool,
+    pub selected: usize,
+    pub artists: Vec<String>,
+    pub albums: BTreeMap<String, Vec<String>>,
+    pub album_tracks: BTreeMap<(String, String), Vec<DeviceTrackInfo>>,
+}
+
+impl DeviceState {
+    pub fn new() -> Self {
+        DeviceState {
+            status: DeviceStatus::Disconnected,
+            name: None,
+            firmware: None,
+            serial: None,
+            manufacturer: None,
+            model: None,
+            usb_mode: None,
+            storage: None,
+            tracks: Vec::new(),
+            loading_tracks: false,
+            selected: 0,
+            artists: Vec::new(),
+            albums: BTreeMap::new(),
+            album_tracks: BTreeMap::new(),
+        }
+    }
+}
+
+pub struct SyncState {
+    pub queue: Vec<QueuedItem>,
+    pub queue_selected: usize,
+    pub status: SyncStatus,
+    pub current_track: String,
+    pub log: Vec<String>,
+}
+
+impl SyncState {
+    pub fn new() -> Self {
+        SyncState {
+            queue: Vec::new(),
+            queue_selected: 0,
+            status: SyncStatus::Idle,
+            current_track: String::new(),
+            log: Vec::new(),
+        }
+    }
+}
+
 pub struct App {
     pub active_panel: Panel,
     pub library: Option<ItunesLibrary>,
@@ -118,30 +171,15 @@ pub struct App {
     pub track_scroll: usize,
     pub sort_column: SortColumn,
     pub sort_ascending: bool,
-    pub device_status: DeviceStatus,
-    pub device_name: Option<String>,
-    pub device_firmware: Option<String>,
-    pub device_serial: Option<String>,
-    pub device_manufacturer: Option<String>,
-    pub device_model: Option<String>,
-    pub device_usb_mode: Option<String>,
-    pub device_storage: Option<StorageInfo>,
-    pub device_tracks: Vec<DeviceEntry>,
-    pub device_loading_tracks: bool,
-    pub device_selected: usize,
+    pub device: DeviceState,
     pub browse_mode: BrowseMode,
-    pub device_artists: Vec<String>,
-    pub device_albums: BTreeMap<String, Vec<String>>,
-    pub device_album_tracks: BTreeMap<(String, String), Vec<DeviceTrackInfo>>,
-    pub sync_queue: Vec<QueuedItem>,
-    pub queue_selected: usize,
-    pub sync_status: SyncStatus,
-    pub sync_current_track: String,
-    pub sync_log: Vec<String>,
+    pub sync: SyncState,
     pub throbber_state: ThrobberState,
     pub anim_frame: usize,
     pub connection_anim_start: Option<usize>,
     pub now_playing: Option<NowPlaying>,
+    pub removal_queue: Vec<(String, u64)>,
+    pub pending_removal: Option<Vec<(String, u64)>>,
     pub should_quit: bool,
     pub show_help: bool,
     pub show_keys: bool,
@@ -192,30 +230,15 @@ impl App {
             track_scroll: 0,
             sort_column: SortColumn::Name,
             sort_ascending: true,
-            device_status: DeviceStatus::Disconnected,
-            device_name: None,
-            device_firmware: None,
-            device_serial: None,
-            device_manufacturer: None,
-            device_model: None,
-            device_usb_mode: None,
-            device_storage: None,
-            device_tracks: Vec::new(),
-            device_loading_tracks: false,
-            device_selected: 0,
+            device: DeviceState::new(),
             browse_mode: BrowseMode::Library,
-            device_artists: Vec::new(),
-            device_albums: BTreeMap::new(),
-            device_album_tracks: BTreeMap::new(),
-            sync_queue: Vec::new(),
-            queue_selected: 0,
-            sync_status: SyncStatus::Idle,
-            sync_current_track: String::new(),
-            sync_log: Vec::new(),
+            sync: SyncState::new(),
             throbber_state: ThrobberState::default(),
             anim_frame: 0,
             connection_anim_start: None,
             now_playing: None,
+            removal_queue: Vec::new(),
+            pending_removal: None,
             should_quit: false,
             show_help: false,
             show_keys: true,
@@ -394,13 +417,13 @@ impl App {
     }
 
     pub fn build_device_index(&mut self) {
-        self.device_artists.clear();
-        self.device_albums.clear();
-        self.device_album_tracks.clear();
+        self.device.artists.clear();
+        self.device.albums.clear();
+        self.device.album_tracks.clear();
 
         let mut artist_set = std::collections::BTreeSet::new();
 
-        for entry in &self.device_tracks {
+        for entry in &self.device.tracks {
             if entry.is_dir() {
                 continue;
             }
@@ -433,13 +456,13 @@ impl App {
 
             artist_set.insert(artist.clone());
 
-            self.device_albums
+            self.device.albums
                 .entry(artist.clone())
                 .or_default()
                 .push(album.clone());
 
             let key = (artist.clone(), album.clone());
-            self.device_album_tracks
+            self.device.album_tracks
                 .entry(key)
                 .or_default()
                 .push(DeviceTrackInfo {
@@ -452,19 +475,19 @@ impl App {
                 });
         }
 
-        self.device_artists = artist_set.into_iter().collect();
+        self.device.artists = artist_set.into_iter().collect();
 
         // Deduplicate album lists per artist.
-        for albums in self.device_albums.values_mut() {
+        for albums in self.device.albums.values_mut() {
             albums.sort();
             albums.dedup();
         }
     }
 
     pub fn clear_device_index(&mut self) {
-        self.device_artists.clear();
-        self.device_albums.clear();
-        self.device_album_tracks.clear();
+        self.device.artists.clear();
+        self.device.albums.clear();
+        self.device.album_tracks.clear();
         if self.browse_mode == BrowseMode::Device {
             self.browse_mode = BrowseMode::Library;
             self.refresh_sidebar();
@@ -482,7 +505,7 @@ impl App {
     }
 
     /// Collect device paths for the currently selected item(s) based on active panel.
-    pub fn collect_device_removal_paths(&self) -> Vec<String> {
+    pub fn collect_device_removal_paths(&self) -> Vec<(String, u64)> {
         if self.browse_mode != BrowseMode::Device {
             return Vec::new();
         }
@@ -492,9 +515,9 @@ impl App {
                     // Find the DeviceTrackInfo with matching name in current context.
                     if let Some(item) = self.sidebar_items.get(self.sidebar_selected) {
                         let (artist, album) = self.resolve_device_artist_album(item);
-                        if let Some(tracks) = self.device_album_tracks.get(&(artist, album)) {
+                        if let Some(tracks) = self.device.album_tracks.get(&(artist, album)) {
                             if let Some(dt) = tracks.iter().find(|dt| dt.name == track.name) {
-                                return vec![dt.device_path.clone()];
+                                return vec![(dt.device_path.clone(), dt.object_id)];
                             }
                         }
                     }
@@ -505,8 +528,8 @@ impl App {
                 // All tracks in the selected album.
                 if let Some(album_info) = self.album_list.get(self.album_selected) {
                     let key = (album_info.artist.clone(), album_info.name.clone());
-                    if let Some(tracks) = self.device_album_tracks.get(&key) {
-                        return tracks.iter().map(|t| t.device_path.clone()).collect();
+                    if let Some(tracks) = self.device.album_tracks.get(&key) {
+                        return tracks.iter().map(|t| (t.device_path.clone(), t.object_id)).collect();
                     }
                 }
                 Vec::new()
@@ -522,26 +545,26 @@ impl App {
         }
     }
 
-    fn collect_sidebar_removal_paths(&self, item: &str) -> Vec<String> {
+    fn collect_sidebar_removal_paths(&self, item: &str) -> Vec<(String, u64)> {
         match self.sidebar_mode {
             SidebarMode::Artists => {
-                let Some(albums) = self.device_albums.get(item) else {
+                let Some(albums) = self.device.albums.get(item) else {
                     return Vec::new();
                 };
-                let mut paths = Vec::new();
+                let mut items = Vec::new();
                 for album in albums {
                     let key = (item.to_string(), album.clone());
-                    if let Some(tracks) = self.device_album_tracks.get(&key) {
-                        paths.extend(tracks.iter().map(|t| t.device_path.clone()));
+                    if let Some(tracks) = self.device.album_tracks.get(&key) {
+                        items.extend(tracks.iter().map(|t| (t.device_path.clone(), t.object_id)));
                     }
                 }
-                paths
+                items
             }
             SidebarMode::Albums => {
                 let (artist, album) = self.resolve_device_artist_album(item);
-                self.device_album_tracks
+                self.device.album_tracks
                     .get(&(artist, album))
-                    .map(|tracks| tracks.iter().map(|t| t.device_path.clone()).collect())
+                    .map(|tracks| tracks.iter().map(|t| (t.device_path.clone(), t.object_id)).collect())
                     .unwrap_or_default()
             }
             SidebarMode::Playlists => Vec::new(),
@@ -630,10 +653,10 @@ impl App {
             }
             BrowseMode::Device => {
                 self.sidebar_items = match self.sidebar_mode {
-                    SidebarMode::Artists => self.device_artists.clone(),
+                    SidebarMode::Artists => self.device.artists.clone(),
                     SidebarMode::Albums => {
                         let mut items = Vec::new();
-                        for (artist, albums) in &self.device_albums {
+                        for (artist, albums) in &self.device.albums {
                             for album in albums {
                                 items.push(format!("{} \u{2014} {}", artist, album));
                             }
@@ -732,12 +755,12 @@ impl App {
     fn select_sidebar_item_device(&mut self, item: &str) {
         match self.sidebar_mode {
             SidebarMode::Artists => {
-                if let Some(albums) = self.device_albums.get(item) {
+                if let Some(albums) = self.device.albums.get(item) {
                     self.album_list = albums
                         .iter()
                         .map(|album_name| {
                             let count = self
-                                .device_album_tracks
+                                .device.album_tracks
                                 .get(&(item.to_string(), album_name.clone()))
                                 .map(|t| t.len())
                                 .unwrap_or(0);
@@ -757,7 +780,7 @@ impl App {
                 self.album_list.clear();
                 if let Some((artist, album)) = item.split_once(" \u{2014} ") {
                     let key = (artist.to_string(), album.to_string());
-                    self.track_list = match self.device_album_tracks.get(&key) {
+                    self.track_list = match self.device.album_tracks.get(&key) {
                         Some(tracks) => device_tracks_to_info(tracks),
                         None => Vec::new(),
                     };
@@ -787,7 +810,7 @@ impl App {
 
         if self.browse_mode == BrowseMode::Device {
             let key = (album.artist.clone(), album.name.clone());
-            self.track_list = match self.device_album_tracks.get(&key) {
+            self.track_list = match self.device.album_tracks.get(&key) {
                 Some(tracks) => device_tracks_to_info(tracks),
                 None => Vec::new(),
             };
@@ -898,7 +921,7 @@ impl App {
                     name: track.name.clone(),
                     location: loc.clone(),
                 };
-                self.sync_queue.push(QueuedItem {
+                self.sync.queue.push(QueuedItem {
                     label: format!("{} - {} - {}", track.artist, track.album, track.name),
                     tracks: vec![item],
                 });
@@ -930,7 +953,7 @@ impl App {
             Some(name) => format!("{} ({} tracks)", name, count),
             None => format!("{} tracks", count),
         };
-        self.sync_queue.push(QueuedItem {
+        self.sync.queue.push(QueuedItem {
             label,
             tracks: items,
         });
@@ -938,36 +961,91 @@ impl App {
     }
 
     pub fn add_sidebar_item_to_queue(&mut self) {
-        // First select to populate track list, then add all.
-        self.select_sidebar_item();
-        self.add_all_visible_to_queue();
+        let item = match self.sidebar_items.get(self.sidebar_selected) {
+            Some(i) => i.clone(),
+            None => return,
+        };
+
+        if self.sidebar_mode == SidebarMode::Artists {
+            // For artists, gather ALL tracks across all albums.
+            let lib = match &self.library {
+                Some(l) => l,
+                None => return,
+            };
+            let tracks = lib.artist_tracks(&item);
+            let mut items = Vec::new();
+            for t in &tracks {
+                if let Some(ref loc) = t.location {
+                    items.push(SyncItem {
+                        artist: t.artist.clone(),
+                        album: t.album.clone(),
+                        name: t.name.clone(),
+                        location: loc.clone(),
+                    });
+                }
+            }
+            if items.is_empty() {
+                self.set_toast("No tracks with file locations".into(), true);
+                return;
+            }
+            let count = items.len();
+            self.sync.queue.push(QueuedItem {
+                label: format!("{} ({} tracks)", item, count),
+                tracks: items,
+            });
+            self.set_toast(format!("Added {} tracks to queue", count), false);
+        } else {
+            // For albums/playlists, select to populate track list, then add all.
+            self.select_sidebar_item();
+            self.add_all_visible_to_queue();
+        }
     }
 
     pub fn remove_queue_item(&mut self) {
-        if !self.sync_queue.is_empty() {
-            self.sync_queue.remove(self.queue_selected);
-            if self.queue_selected >= self.sync_queue.len() && self.queue_selected > 0 {
-                self.queue_selected -= 1;
+        if !self.sync.queue.is_empty() {
+            self.sync.queue.remove(self.sync.queue_selected);
+            if self.sync.queue_selected >= self.sync.queue.len() && self.sync.queue_selected > 0 {
+                self.sync.queue_selected -= 1;
             }
         }
     }
 
     pub fn clear_queue(&mut self) {
-        self.sync_queue.clear();
-        self.queue_selected = 0;
+        self.sync.queue.clear();
+        self.sync.queue_selected = 0;
+    }
+
+    pub fn queue_device_removal(&mut self) {
+        let items = self.collect_device_removal_paths();
+        if items.is_empty() {
+            self.set_toast("Nothing to queue for removal".into(), true);
+            return;
+        }
+        let count = items.len();
+        // Deduplicate by object_id
+        for item in items {
+            if !self.removal_queue.iter().any(|(_, id)| *id == item.1 && item.1 > 0) {
+                self.removal_queue.push(item);
+            }
+        }
+        self.set_toast(format!("Queued {} track(s) for removal", count), false);
+    }
+
+    pub fn clear_removal_queue(&mut self) {
+        self.removal_queue.clear();
     }
 
     pub fn execute_sync(&mut self, cmd_tx: &mpsc::Sender<BgCommand>) {
-        if self.sync_queue.is_empty() {
+        if self.sync.queue.is_empty() {
             return;
         }
-        if self.device_status != DeviceStatus::Connected {
+        if self.device.status != DeviceStatus::Connected {
             self.set_toast("Connect a device before syncing".into(), true);
             return;
         }
-        self.sync_log.clear();
+        self.sync.log.clear();
         let items: Vec<SyncItem> = self
-            .sync_queue
+            .sync.queue
             .iter()
             .flat_map(|q| q.tracks.clone())
             .collect();
@@ -989,35 +1067,35 @@ impl App {
                 }
             }
             BgEvent::DeviceDetected(info) => {
-                self.device_name = Some(info.name);
-                self.device_firmware = info.firmware_version;
-                self.device_serial = info.serial_number;
-                self.device_manufacturer = info.manufacturer;
-                self.device_model = info.model;
-                self.device_usb_mode = info.usb_mode;
-                self.device_status = DeviceStatus::Connecting;
+                self.device.name = Some(info.name);
+                self.device.firmware = info.firmware_version;
+                self.device.serial = info.serial_number;
+                self.device.manufacturer = info.manufacturer;
+                self.device.model = info.model;
+                self.device.usb_mode = info.usb_mode;
+                self.device.status = DeviceStatus::Connecting;
             }
             BgEvent::SessionReady(storage) => {
-                self.device_status = DeviceStatus::Connected;
+                self.device.status = DeviceStatus::Connected;
                 self.connection_anim_start = None;
-                self.device_storage = storage;
+                self.device.storage = storage;
                 self.set_toast("Device connected".into(), false);
             }
             BgEvent::SessionFailed(e) => {
-                self.device_status = DeviceStatus::Disconnected;
+                self.device.status = DeviceStatus::Disconnected;
                 self.connection_anim_start = None;
                 self.set_toast(format!("Connection failed: {}", e), true);
             }
             BgEvent::LoadingDeviceTracks => {
-                self.device_loading_tracks = true;
+                self.device.loading_tracks = true;
                 self.set_toast("Loading device tracks...".into(), false);
             }
             BgEvent::DeviceTracksLoaded(tracks) => {
-                self.device_loading_tracks = false;
-                self.device_tracks = tracks;
+                self.device.loading_tracks = false;
+                self.device.tracks = tracks;
                 self.build_device_index();
                 self.set_toast(
-                    format!("Loaded {} device tracks", self.device_tracks.len()),
+                    format!("Loaded {} device tracks", self.device.tracks.len()),
                     false,
                 );
                 if self.browse_mode == BrowseMode::Device {
@@ -1025,19 +1103,19 @@ impl App {
                 }
             }
             BgEvent::Error(e) => {
-                self.device_loading_tracks = false;
+                self.device.loading_tracks = false;
                 self.set_toast(e, true);
             }
             BgEvent::SyncMessage(msg) => {
-                self.sync_log.push(msg);
+                self.sync.log.push(msg);
             }
             BgEvent::SyncProgress {
                 current,
                 total,
                 track_name,
             } => {
-                self.sync_status = SyncStatus::Running { current, total };
-                self.sync_current_track = track_name;
+                self.sync.status = SyncStatus::Running { current, total };
+                self.sync.current_track = track_name;
             }
             BgEvent::SyncTrackDone {
                 track_name,
@@ -1055,12 +1133,9 @@ impl App {
                 success,
                 failed,
             } => {
-                self.sync_status = SyncStatus::Complete {
-                    success,
-                    failed,
-                };
-                self.sync_queue.clear();
-                self.queue_selected = 0;
+                self.sync.status = SyncStatus::Idle;
+                self.sync.queue.clear();
+                self.sync.queue_selected = 0;
                 self.set_toast(
                     format!("Sync complete: {} done, {} failed", success, failed),
                     failed > 0,
@@ -1071,15 +1146,18 @@ impl App {
                 total,
                 name,
             } => {
-                self.sync_status = SyncStatus::Running { current, total };
-                self.sync_current_track = format!("Removing: {}", name);
+                self.sync.status = SyncStatus::Running { current, total };
+                self.sync.current_track = format!("Removing: {}", name);
             }
             BgEvent::RemoveComplete { success, failed } => {
-                self.sync_status = SyncStatus::Idle;
+                self.sync.status = SyncStatus::Idle;
                 self.set_toast(
                     format!("Removed {} tracks, {} failed", success, failed),
                     failed > 0,
                 );
+            }
+            BgEvent::StorageUpdated(storage) => {
+                self.device.storage = Some(storage);
             }
         }
     }
@@ -1105,7 +1183,7 @@ impl App {
     }
 
     pub fn total_queue_tracks(&self) -> usize {
-        self.sync_queue.iter().map(|q| q.tracks.len()).sum()
+        self.sync.queue.iter().map(|q| q.tracks.len()).sum()
     }
 
     // Navigation helpers
@@ -1116,6 +1194,9 @@ impl App {
                 if self.sidebar_selected > 0 {
                     self.sidebar_selected -= 1;
                     self.save_sidebar_pos();
+                    if self.sidebar_mode == SidebarMode::Artists {
+                        self.select_sidebar_item();
+                    }
                 }
             }
             Panel::Albums => {
@@ -1130,13 +1211,13 @@ impl App {
                 }
             }
             Panel::Device => {
-                if self.device_selected > 0 {
-                    self.device_selected -= 1;
+                if self.device.selected > 0 {
+                    self.device.selected -= 1;
                 }
             }
             Panel::SyncQueue => {
-                if self.queue_selected > 0 {
-                    self.queue_selected -= 1;
+                if self.sync.queue_selected > 0 {
+                    self.sync.queue_selected -= 1;
                 }
             }
         }
@@ -1148,6 +1229,9 @@ impl App {
                 if self.sidebar_selected + 1 < self.sidebar_items.len() {
                     self.sidebar_selected += 1;
                     self.save_sidebar_pos();
+                    if self.sidebar_mode == SidebarMode::Artists {
+                        self.select_sidebar_item();
+                    }
                 }
             }
             Panel::Albums => {
@@ -1162,13 +1246,13 @@ impl App {
                 }
             }
             Panel::Device => {
-                if self.device_selected + 1 < self.device_tracks.len() {
-                    self.device_selected += 1;
+                if self.device.selected + 1 < self.device.tracks.len() {
+                    self.device.selected += 1;
                 }
             }
             Panel::SyncQueue => {
-                if self.queue_selected + 1 < self.sync_queue.len() {
-                    self.queue_selected += 1;
+                if self.sync.queue_selected + 1 < self.sync.queue.len() {
+                    self.sync.queue_selected += 1;
                 }
             }
         }
@@ -1184,12 +1268,18 @@ impl App {
             if first_char_upper(&self.sidebar_items[i]) != current_char {
                 self.sidebar_selected = i;
                 self.save_sidebar_pos();
+                if self.sidebar_mode == SidebarMode::Artists {
+                    self.select_sidebar_item();
+                }
                 return;
             }
         }
         // Wrap to top if at the end.
         self.sidebar_selected = 0;
         self.save_sidebar_pos();
+        if self.sidebar_mode == SidebarMode::Artists {
+            self.select_sidebar_item();
+        }
     }
 
     /// Jump backward to the previous letter group in the sidebar.
@@ -1199,24 +1289,26 @@ impl App {
         }
         if self.sidebar_selected == 0 {
             self.sidebar_selected = self.sidebar_items.len() - 1;
-            self.save_sidebar_pos();
-            return;
-        }
-        let current_char = first_char_upper(&self.sidebar_items[self.sidebar_selected]);
-        let mut i = self.sidebar_selected;
-        while i > 0 && first_char_upper(&self.sidebar_items[i - 1]) == current_char {
-            i -= 1;
-        }
-        if i > 0 {
-            let prev_char = first_char_upper(&self.sidebar_items[i - 1]);
-            while i > 0 && first_char_upper(&self.sidebar_items[i - 1]) == prev_char {
+        } else {
+            let current_char = first_char_upper(&self.sidebar_items[self.sidebar_selected]);
+            let mut i = self.sidebar_selected;
+            while i > 0 && first_char_upper(&self.sidebar_items[i - 1]) == current_char {
                 i -= 1;
             }
-            self.sidebar_selected = i;
-        } else {
-            self.sidebar_selected = self.sidebar_items.len() - 1;
+            if i > 0 {
+                let prev_char = first_char_upper(&self.sidebar_items[i - 1]);
+                while i > 0 && first_char_upper(&self.sidebar_items[i - 1]) == prev_char {
+                    i -= 1;
+                }
+                self.sidebar_selected = i;
+            } else {
+                self.sidebar_selected = self.sidebar_items.len() - 1;
+            }
         }
         self.save_sidebar_pos();
+        if self.sidebar_mode == SidebarMode::Artists {
+            self.select_sidebar_item();
+        }
     }
 
     pub fn cycle_panel(&mut self) {
@@ -1357,10 +1449,10 @@ mod tests {
         let app = App::new();
         assert_eq!(app.active_panel, Panel::Library);
         assert_eq!(app.sidebar_mode, SidebarMode::Artists);
-        assert!(app.sync_queue.is_empty());
-        assert!(app.sync_log.is_empty());
-        assert_eq!(app.device_status, DeviceStatus::Disconnected);
-        assert_eq!(app.sync_status, SyncStatus::Idle);
+        assert!(app.sync.queue.is_empty());
+        assert!(app.sync.log.is_empty());
+        assert_eq!(app.device.status, DeviceStatus::Disconnected);
+        assert_eq!(app.sync.status, SyncStatus::Idle);
         assert!(!app.should_quit);
     }
 
@@ -1391,34 +1483,34 @@ mod tests {
     #[test]
     fn queue_add_remove_clear() {
         let mut app = App::new();
-        assert!(app.sync_queue.is_empty());
+        assert!(app.sync.queue.is_empty());
         assert_eq!(app.total_queue_tracks(), 0);
 
-        app.sync_queue.push(QueuedItem {
+        app.sync.queue.push(QueuedItem {
             label: "Test".into(),
             tracks: vec![],
         });
-        assert_eq!(app.sync_queue.len(), 1);
+        assert_eq!(app.sync.queue.len(), 1);
 
-        app.sync_queue.push(QueuedItem {
+        app.sync.queue.push(QueuedItem {
             label: "Test2".into(),
             tracks: vec![],
         });
-        app.queue_selected = 0;
+        app.sync.queue_selected = 0;
         app.remove_queue_item();
-        assert_eq!(app.sync_queue.len(), 1);
-        assert_eq!(app.sync_queue[0].label, "Test2");
+        assert_eq!(app.sync.queue.len(), 1);
+        assert_eq!(app.sync.queue[0].label, "Test2");
 
         app.clear_queue();
-        assert!(app.sync_queue.is_empty());
-        assert_eq!(app.queue_selected, 0);
+        assert!(app.sync.queue.is_empty());
+        assert_eq!(app.sync.queue_selected, 0);
     }
 
     #[test]
     fn remove_queue_item_empty_noop() {
         let mut app = App::new();
         app.remove_queue_item(); // should not panic
-        assert!(app.sync_queue.is_empty());
+        assert!(app.sync.queue.is_empty());
     }
 
     #[test]
@@ -1465,21 +1557,21 @@ mod tests {
     #[test]
     fn build_device_index_three_segments() {
         let mut app = App::new();
-        app.device_tracks = vec![
+        app.device.tracks = vec![
             make_device_entry("Radiohead/OK Computer/Paranoid Android.mp3", 5_000_000),
             make_device_entry("Radiohead/OK Computer/Karma Police.mp3", 4_000_000),
             make_device_entry("Radiohead/The Bends/Fake Plastic Trees.mp3", 3_000_000),
         ];
         app.build_device_index();
 
-        assert_eq!(app.device_artists, vec!["Radiohead"]);
+        assert_eq!(app.device.artists, vec!["Radiohead"]);
         assert_eq!(
-            app.device_albums.get("Radiohead").unwrap(),
+            app.device.albums.get("Radiohead").unwrap(),
             &vec!["OK Computer".to_string(), "The Bends".to_string()]
         );
 
         let ok_tracks = app
-            .device_album_tracks
+            .device.album_tracks
             .get(&("Radiohead".into(), "OK Computer".into()))
             .unwrap();
         assert_eq!(ok_tracks.len(), 2);
@@ -1493,12 +1585,12 @@ mod tests {
     #[test]
     fn build_device_index_two_segments() {
         let mut app = App::new();
-        app.device_tracks = vec![make_device_entry("Artist/track.flac", 1000)];
+        app.device.tracks = vec![make_device_entry("Artist/track.flac", 1000)];
         app.build_device_index();
 
-        assert_eq!(app.device_artists, vec!["Artist"]);
+        assert_eq!(app.device.artists, vec!["Artist"]);
         let tracks = app
-            .device_album_tracks
+            .device.album_tracks
             .get(&("Artist".into(), "Unknown Album".into()))
             .unwrap();
         assert_eq!(tracks.len(), 1);
@@ -1508,12 +1600,12 @@ mod tests {
     #[test]
     fn build_device_index_single_segment() {
         let mut app = App::new();
-        app.device_tracks = vec![make_device_entry("loose_track.mp3", 500)];
+        app.device.tracks = vec![make_device_entry("loose_track.mp3", 500)];
         app.build_device_index();
 
-        assert_eq!(app.device_artists, vec!["Unknown Artist"]);
+        assert_eq!(app.device.artists, vec!["Unknown Artist"]);
         let tracks = app
-            .device_album_tracks
+            .device.album_tracks
             .get(&("Unknown Artist".into(), "Unknown Album".into()))
             .unwrap();
         assert_eq!(tracks[0].name, "loose_track");
@@ -1522,18 +1614,18 @@ mod tests {
     #[test]
     fn build_device_index_deduplicates_albums() {
         let mut app = App::new();
-        app.device_tracks = vec![
+        app.device.tracks = vec![
             make_device_entry("Artist/Album/track1.mp3", 100),
             make_device_entry("Artist/Album/track2.mp3", 200),
             make_device_entry("Artist/Album/track3.mp3", 300),
         ];
         app.build_device_index();
 
-        let albums = app.device_albums.get("Artist").unwrap();
+        let albums = app.device.albums.get("Artist").unwrap();
         assert_eq!(albums, &vec!["Album".to_string()]);
 
         let tracks = app
-            .device_album_tracks
+            .device.album_tracks
             .get(&("Artist".into(), "Album".into()))
             .unwrap();
         assert_eq!(tracks.len(), 3);
@@ -1542,7 +1634,7 @@ mod tests {
     #[test]
     fn build_device_index_skips_directories() {
         let mut app = App::new();
-        app.device_tracks = vec![
+        app.device.tracks = vec![
             DeviceEntry {
                 object_id: 1,
                 storage_id: 65537,
@@ -1554,8 +1646,8 @@ mod tests {
         ];
         app.build_device_index();
 
-        assert_eq!(app.device_artists.len(), 1);
-        assert_eq!(app.device_artists[0], "Artist");
+        assert_eq!(app.device.artists.len(), 1);
+        assert_eq!(app.device.artists[0], "Artist");
     }
 
     #[test]
@@ -1563,9 +1655,9 @@ mod tests {
         let mut app = App::new();
         app.build_device_index();
 
-        assert!(app.device_artists.is_empty());
-        assert!(app.device_albums.is_empty());
-        assert!(app.device_album_tracks.is_empty());
+        assert!(app.device.artists.is_empty());
+        assert!(app.device.albums.is_empty());
+        assert!(app.device.album_tracks.is_empty());
     }
 
     #[test]
@@ -1578,7 +1670,7 @@ mod tests {
     #[test]
     fn collect_removal_paths_device_mode_track() {
         let mut app = App::new();
-        app.device_tracks = vec![
+        app.device.tracks = vec![
             make_device_entry("Art/Alb/song.mp3", 1000),
         ];
         app.build_device_index();
@@ -1593,7 +1685,8 @@ mod tests {
         app.track_selected = 0;
 
         let paths = app.collect_device_removal_paths();
-        assert_eq!(paths, vec!["/Music/Art/Alb/song.mp3"]);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].0, "/Music/Art/Alb/song.mp3");
     }
 
     #[test]
@@ -1613,13 +1706,13 @@ mod tests {
     fn clear_device_index_resets_browse_mode() {
         let mut app = App::new();
         app.browse_mode = BrowseMode::Device;
-        app.device_artists = vec!["Test".into()];
+        app.device.artists = vec!["Test".into()];
         app.clear_device_index();
 
         assert_eq!(app.browse_mode, BrowseMode::Library);
-        assert!(app.device_artists.is_empty());
-        assert!(app.device_albums.is_empty());
-        assert!(app.device_album_tracks.is_empty());
+        assert!(app.device.artists.is_empty());
+        assert!(app.device.albums.is_empty());
+        assert!(app.device.album_tracks.is_empty());
     }
 
     #[test]
@@ -1639,5 +1732,210 @@ mod tests {
         assert_eq!(app.sidebar_selected, 3);
         app.skip_forward(); // C -> wrap to 0
         assert_eq!(app.sidebar_selected, 0);
+    }
+
+    // -- handle_bg_event tests --
+
+    use std::collections::HashMap;
+
+    fn make_minimal_library() -> zytunes::library::ItunesLibrary {
+        zytunes::library::ItunesLibrary {
+            tracks: HashMap::new(),
+            playlists: Vec::new(),
+            music_folder: None,
+        }
+    }
+
+    #[test]
+    fn handle_bg_event_library_loaded_ok() {
+        let mut app = App::new();
+        let lib = make_minimal_library();
+        app.handle_bg_event(BgEvent::LibraryLoaded(Ok(lib)));
+        assert!(app.library.is_some());
+        assert!(!app.loading_library);
+    }
+
+    #[test]
+    fn handle_bg_event_library_loaded_err() {
+        let mut app = App::new();
+        app.loading_library = true;
+        app.handle_bg_event(BgEvent::LibraryLoaded(Err("bad path".into())));
+        assert!(app.library.is_none());
+        assert!(!app.loading_library);
+        let (msg, _, is_error) = app.toast_message.as_ref().unwrap();
+        assert!(is_error);
+        assert!(msg.contains("bad path"));
+    }
+
+    #[test]
+    fn handle_bg_event_session_ready() {
+        let mut app = App::new();
+        app.device.status = DeviceStatus::Connecting;
+        let storage = StorageInfo {
+            used_bytes: 1000,
+            free_bytes: 9000,
+            total_bytes: 10000,
+            used_percent: 10,
+        };
+        app.handle_bg_event(BgEvent::SessionReady(Some(storage)));
+        assert_eq!(app.device.status, DeviceStatus::Connected);
+        assert!(app.device.storage.is_some());
+        assert!(app.connection_anim_start.is_none());
+    }
+
+    #[test]
+    fn handle_bg_event_session_failed() {
+        let mut app = App::new();
+        app.device.status = DeviceStatus::Connecting;
+        app.connection_anim_start = Some(42);
+        app.handle_bg_event(BgEvent::SessionFailed("timeout".into()));
+        assert_eq!(app.device.status, DeviceStatus::Disconnected);
+        assert!(app.connection_anim_start.is_none());
+        let (msg, _, is_error) = app.toast_message.as_ref().unwrap();
+        assert!(is_error);
+        assert!(msg.contains("timeout"));
+    }
+
+    #[test]
+    fn handle_bg_event_device_tracks_loaded() {
+        let mut app = App::new();
+        app.device.loading_tracks = true;
+        let tracks = vec![
+            make_device_entry("Artist/Album/song1.mp3", 1000),
+            make_device_entry("Artist/Album/song2.mp3", 2000),
+        ];
+        app.handle_bg_event(BgEvent::DeviceTracksLoaded(tracks));
+        assert!(!app.device.loading_tracks);
+        assert_eq!(app.device.tracks.len(), 2);
+        // build_device_index should have been called
+        assert!(!app.device.artists.is_empty());
+    }
+
+    #[test]
+    fn handle_bg_event_sync_progress() {
+        let mut app = App::new();
+        app.handle_bg_event(BgEvent::SyncProgress {
+            current: 2,
+            total: 5,
+            track_name: "song".into(),
+        });
+        assert_eq!(
+            app.sync.status,
+            SyncStatus::Running {
+                current: 2,
+                total: 5
+            }
+        );
+        assert_eq!(app.sync.current_track, "song");
+    }
+
+    #[test]
+    fn handle_bg_event_sync_complete() {
+        let mut app = App::new();
+        app.sync.status = SyncStatus::Running {
+            current: 3,
+            total: 4,
+        };
+        app.sync.queue.push(QueuedItem {
+            label: "test".into(),
+            tracks: vec![],
+        });
+        app.handle_bg_event(BgEvent::SyncComplete {
+            success: 3,
+            failed: 1,
+        });
+        assert_eq!(app.sync.status, SyncStatus::Idle);
+        assert!(app.sync.queue.is_empty());
+        assert_eq!(app.sync.queue_selected, 0);
+        // failed > 0 means toast is_error
+        let (_, _, is_error) = app.toast_message.as_ref().unwrap();
+        assert!(is_error);
+    }
+
+    #[test]
+    fn handle_bg_event_error_sets_toast() {
+        let mut app = App::new();
+        app.handle_bg_event(BgEvent::Error("something went wrong".into()));
+        let (msg, _, is_error) = app.toast_message.as_ref().unwrap();
+        assert!(is_error);
+        assert_eq!(msg, "something went wrong");
+    }
+
+    #[test]
+    fn handle_bg_event_sync_message_appends_to_log() {
+        let mut app = App::new();
+        assert!(app.sync.log.is_empty());
+        app.handle_bg_event(BgEvent::SyncMessage("first msg".into()));
+        app.handle_bg_event(BgEvent::SyncMessage("second msg".into()));
+        assert_eq!(app.sync.log.len(), 2);
+        assert_eq!(app.sync.log[0], "first msg");
+        assert_eq!(app.sync.log[1], "second msg");
+    }
+
+    // -- Theme picker tests --
+
+    #[test]
+    fn theme_picker_move_wraps() {
+        let mut app = App::new();
+        app.open_theme_picker();
+        let count = crate::theme::THEMES.len();
+        app.theme_picker_move(-1); // wraps to last
+        assert_eq!(app.theme_picker_index, count - 1);
+        app.theme_picker_move(1); // wraps back to 0
+        assert_eq!(app.theme_picker_index, 0);
+    }
+
+    #[test]
+    fn theme_picker_cancel_restores() {
+        let mut app = App::new();
+        app.theme_index = 3;
+        app.open_theme_picker();
+        app.theme_picker_move(2); // changes preview
+        app.theme_picker_cancel();
+        assert_eq!(app.theme_index, 3);
+        assert!(!app.show_theme_picker);
+    }
+
+    // -- Playback tests --
+
+    #[test]
+    fn toggle_playback_without_now_playing_is_noop() {
+        let mut app = App::new();
+        // toggle_playback needs an audio_tx; when now_playing is None and track_list is empty,
+        // play_selected_track returns early, so nothing happens.
+        let (audio_tx, _audio_rx) = mpsc::channel();
+        app.toggle_playback(&audio_tx);
+        assert!(app.now_playing.is_none());
+    }
+
+    // -- Search filter test --
+
+    #[test]
+    fn search_filters_sidebar() {
+        let mut app = App::new();
+        // Populate sidebar items directly (simulating a loaded library sidebar)
+        app.sidebar_items = vec![
+            "Beatles".into(),
+            "Beach Boys".into(),
+            "Radiohead".into(),
+            "Rolling Stones".into(),
+        ];
+        // Activate search with a query
+        app.search_active = true;
+        app.search_query = "bea".into();
+        // refresh_sidebar in Library mode with no library clears items,
+        // so instead we test the filtering logic directly on Device mode
+        app.browse_mode = BrowseMode::Device;
+        app.device.artists = vec![
+            "Beatles".into(),
+            "Beach Boys".into(),
+            "Radiohead".into(),
+            "Rolling Stones".into(),
+        ];
+        app.sidebar_mode = SidebarMode::Artists;
+        app.refresh_sidebar();
+        assert_eq!(app.sidebar_items.len(), 2);
+        assert!(app.sidebar_items.contains(&"Beatles".to_string()));
+        assert!(app.sidebar_items.contains(&"Beach Boys".to_string()));
     }
 }

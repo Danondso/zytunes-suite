@@ -2,7 +2,7 @@ use ratatui::style::Color;
 use throbber_widgets_tui::symbols::throbber::Set;
 use throbber_widgets_tui::{
     ASCII, BLACK_CIRCLE, BRAILLE_EIGHT, BRAILLE_ONE, BRAILLE_SIX, BRAILLE_SIX_DOUBLE, OGHAM_A,
-    OGHAM_B, QUADRANT_BLOCK, VERTICAL_BLOCK, WHITE_SQUARE,
+    OGHAM_B, QUADRANT_BLOCK, VERTICAL_BLOCK, WHITE_CIRCLE, WHITE_SQUARE,
 };
 
 /// Returns the theme-appropriate spinner set for the given theme index.
@@ -19,6 +19,7 @@ pub fn spinner_set_for_theme(theme_index: usize) -> Set {
         8 => QUADRANT_BLOCK,      // System 7 — ▝▗▖▘ pixel-art era
         9 => ASCII,               // BIOS — |/-\ classic
         10 => BRAILLE_ONE,        // Red Sands — minimal desert
+        11 => WHITE_CIRCLE,       // Newport Lights — smooth circles
         _ => BRAILLE_ONE,         // fallback
     }
 }

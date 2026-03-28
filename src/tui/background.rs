@@ -2,7 +2,6 @@ use std::sync::mpsc;
 use std::thread;
 
 use zytunes::device::ZuneDevice;
-use zytunes::mtp::aft::AftSession;
 use zytunes::mtp::native::NativeSession;
 use zytunes::mtp::parse::DeviceEntry;
 use zytunes::mtp::DeviceSession;
@@ -15,7 +14,7 @@ pub enum BgCommand {
     LoadDeviceTracks,
     Disconnect,
     ExecuteSyncQueue(Vec<SyncItem>),
-    RemoveFromDevice(Vec<String>),
+    RemoveFromDevice(Vec<(String, u64)>),
     CancelSync,
 }
 
@@ -38,8 +37,6 @@ pub struct DeviceInfo {
     pub usb_mode: Option<String>,
     pub manufacturer: Option<String>,
     pub model: Option<String>,
-    #[allow(dead_code)]
-    pub mtp_version: Option<String>,
 }
 
 /// Storage info from the MTP session.
@@ -70,6 +67,7 @@ pub enum BgEvent {
         error: Option<String>,
     },
     SyncMessage(String),
+    StorageUpdated(StorageInfo),
     SyncComplete {
         success: usize,
         failed: usize,
@@ -129,7 +127,6 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                         usb_mode: zune.usb_mode.clone(),
                         manufacturer: None,
                         model: None,
-                        mtp_version: None,
                     };
                     let _ = event_tx.send(BgEvent::DeviceDetected(device_info));
 
@@ -146,6 +143,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                     let connect_result: Result<Box<dyn DeviceSession>, String> =
                         match NativeSession::open(zune.product_id, &native_log) {
                             Ok(mut s) => {
+                                s.set_serial(zune.serial_number.clone());
                                 // Query storage for model detection before boxing.
                                 if let Ok((total, free)) = s.get_storage_info() {
                                     let model =
@@ -170,8 +168,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                                 "Microsoft".to_string(),
                                             ),
                                             model: Some(model.to_string()),
-                                            mtp_version: None,
-                                        },
+                                                            },
                                     ));
                                     let _ = event_tx.send(BgEvent::SessionReady(
                                         Some(StorageInfo {
@@ -189,26 +186,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                 ));
                                 Ok(Box::new(s))
                             }
-                            Err(native_err) => {
-                                let _ = event_tx.send(BgEvent::SyncMessage(format!(
-                                    "Native backend failed: {}",
-                                    native_err
-                                )));
-                                let _ = event_tx.send(BgEvent::SyncMessage(
-                                    "Falling back to aft-mtp-cli...".into(),
-                                ));
-                                match AftSession::open() {
-                                    Ok(mut s) => {
-                                        wire_log_sender(&mut s, &event_tx);
-                                        let _ = event_tx.send(BgEvent::SyncMessage(
-                                            "Connected via aft-mtp-cli fallback".into(),
-                                        ));
-                                        let _ = event_tx.send(BgEvent::SessionReady(None));
-                                        Ok(Box::new(s))
-                                    }
-                                    Err(aft_err) => Err(aft_err),
-                                }
-                            }
+                            Err(e) => Err(e),
                         };
 
                     match connect_result {
@@ -288,9 +266,9 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                 BgCommand::CancelSync => {
                     // Handled inline during sync execution via try_recv.
                 }
-                BgCommand::RemoveFromDevice(paths) => {
+                BgCommand::RemoveFromDevice(items) => {
                     if let Some(ref mut s) = session {
-                        let total = paths.len();
+                        let total = items.len();
                         let mut success = 0usize;
                         let mut failed = 0usize;
 
@@ -299,7 +277,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                             total
                         )));
 
-                        for (i, path) in paths.iter().enumerate() {
+                        for (i, (path, object_id)) in items.iter().enumerate() {
                             // Check for cancel.
                             if let Ok(BgCommand::CancelSync) = cmd_rx.try_recv() {
                                 let _ = event_tx.send(BgEvent::SyncMessage(
@@ -315,7 +293,15 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                 name: name.clone(),
                             });
 
-                            match s.rm(path) {
+                            // Try delete by object ID first (most reliable),
+                            // fall back to path-based rm.
+                            let result = if *object_id > 0 {
+                                s.rm_by_id(*object_id as u32)
+                            } else {
+                                s.rm(path)
+                            };
+
+                            match result {
                                 Ok(()) => {
                                     success += 1;
                                     let _ = event_tx.send(BgEvent::SyncMessage(format!(
@@ -337,6 +323,31 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                             "Removal done: {} removed, {} failed",
                             success, failed
                         )));
+
+                        // Clean up empty artist/album folders.
+                        if success > 0 {
+                            match s.cleanup_empty_folders() {
+                                Ok(n) if n > 0 => {
+                                    let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                                        "Cleaned up {} empty folder(s)", n
+                                    )));
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        // Update storage after removal.
+                        if let Ok((tot, free)) = s.get_storage_info() {
+                            let used = tot.saturating_sub(free);
+                            let pct = if tot > 0 { (used * 100 / tot) as u8 } else { 0 };
+                            let _ = event_tx.send(BgEvent::StorageUpdated(StorageInfo {
+                                total_bytes: tot,
+                                free_bytes: free,
+                                used_bytes: used,
+                                used_percent: pct,
+                            }));
+                        }
+
                         let _ = event_tx.send(BgEvent::RemoveComplete { success, failed });
 
                         reload_device_tracks(s.as_mut(), &event_tx);
@@ -431,6 +442,19 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                         success: true,
                                         error: None,
                                     });
+                                    // Update storage info every 5 tracks (avoid per-track USB overhead).
+                                    if (i + 1).is_multiple_of(5) || i + 1 == total {
+                                        if let Ok((tot, free)) = s.get_storage_info() {
+                                            let used = tot.saturating_sub(free);
+                                            let pct = if tot > 0 { (used * 100 / tot) as u8 } else { 0 };
+                                            let _ = event_tx.send(BgEvent::StorageUpdated(StorageInfo {
+                                                total_bytes: tot,
+                                                free_bytes: free,
+                                                used_bytes: used,
+                                                used_percent: pct,
+                                            }));
+                                        }
+                                    }
                                 }
                                 Err(e) => {
                                     failed += 1;
@@ -486,15 +510,6 @@ fn wire_log_sender(
                 let _ = log_event_tx.send(BgEvent::SyncMessage(msg));
             }
         });
-    } else if let Some(s) = session.downcast_mut::<AftSession>() {
-        let log_event_tx = event_tx.clone();
-        let (log_tx, log_rx) = mpsc::channel::<String>();
-        s.set_log_sender(log_tx);
-        thread::spawn(move || {
-            while let Ok(msg) = log_rx.recv() {
-                let _ = log_event_tx.send(BgEvent::SyncMessage(msg));
-            }
-        });
     }
 }
 
@@ -516,36 +531,7 @@ fn reload_device_tracks(
     }
 }
 
-/// Query storage info from the first storage on the device.
-/// Currently unused — reserved for the aft-mtp-cli fallback path.
-#[allow(dead_code)]
-fn query_storage_info(session: &mut AftSession) -> Option<StorageInfo> {
-    // List storages first to get a valid storage ID.
-    let lines = session.send("storage-list").ok()?;
-    // Find first storage line with an ID — format: "65537   volume: ..., description: ..."
-    let storage_id = lines.iter().find_map(|line| {
-        let trimmed = line.trim();
-        let first_token = trimmed.split_whitespace().next()?;
-        first_token
-            .parse::<u64>()
-            .ok()
-            .map(|_| first_token.to_string())
-    })?;
-
-    let info_lines = session.storage_info(&storage_id).ok()?;
-
-    // Parse: "used 12345678 (45%), free 15000000 bytes of 27345678"
-    for line in &info_lines {
-        if line.contains("used ") && line.contains("free ") {
-            return parse_storage_line(line);
-        }
-    }
-    None
-}
-
-/// Parse a storage info line from aft-mtp-cli output.
-/// Currently unused — reserved for the aft-mtp-cli fallback path (used by query_storage_info).
-#[allow(dead_code)]
+#[cfg(test)]
 fn parse_storage_line(line: &str) -> Option<StorageInfo> {
     // "used 12345678 (45%), free 15000000 bytes of 27345678"
     let parts: Vec<&str> = line.split_whitespace().collect();

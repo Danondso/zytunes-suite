@@ -1,5 +1,6 @@
 use crate::container::OperationCode;
 use crate::session::MtpSession;
+use crate::MtpError;
 
 use aes::Aes128;
 use cipher::{BlockDecryptMut, KeyIvInit};
@@ -21,27 +22,27 @@ pub struct MtpzKeys {
 
 impl MtpzKeys {
     /// Load keys from the .mtpz-data file format (5 hex lines).
-    pub fn load(path: &str) -> Result<Self, String> {
+    pub fn load(path: &str) -> Result<Self, MtpError> {
         let content = std::fs::read_to_string(path)
-            .map_err(|e| format!("Could not read {path}: {e}"))?;
+            .map_err(|e| MtpError::KeyLoad(format!("Could not read {path}: {e}")))?;
         let lines: Vec<&str> = content.lines().collect();
         if lines.len() < 5 {
-            return Err(format!(
+            return Err(MtpError::KeyLoad(format!(
                 "Expected 5 lines in .mtpz-data, got {}",
                 lines.len()
-            ));
+            )));
         }
 
         let public_exp = BigUint::parse_bytes(lines[0].trim().as_bytes(), 16)
-            .ok_or("Invalid public exponent")?;
+            .ok_or(MtpError::KeyLoad("Invalid public exponent".to_string()))?;
         let session_key = hex::decode(lines[1].trim())
-            .map_err(|e| format!("Invalid session key hex: {e}"))?;
+            .map_err(|e| MtpError::KeyLoad(format!("Invalid session key hex: {e}")))?;
         let modulus = BigUint::parse_bytes(lines[2].trim().as_bytes(), 16)
-            .ok_or("Invalid modulus")?;
+            .ok_or(MtpError::KeyLoad("Invalid modulus".to_string()))?;
         let private_exp = BigUint::parse_bytes(lines[3].trim().as_bytes(), 16)
-            .ok_or("Invalid private exponent")?;
+            .ok_or(MtpError::KeyLoad("Invalid private exponent".to_string()))?;
         let certificate = hex::decode(lines[4].trim())
-            .map_err(|e| format!("Invalid certificate hex: {e}"))?;
+            .map_err(|e| MtpError::KeyLoad(format!("Invalid certificate hex: {e}")))?;
 
         Ok(MtpzKeys {
             public_exp,
@@ -53,8 +54,8 @@ impl MtpzKeys {
     }
 
     /// Load from the default location ~/.mtpz-data.
-    pub fn load_default() -> Result<Self, String> {
-        let home = std::env::var("HOME").map_err(|_| "HOME not set")?;
+    pub fn load_default() -> Result<Self, MtpError> {
+        let home = std::env::var("HOME").map_err(|_| MtpError::KeyLoad("HOME not set".to_string()))?;
         Self::load(&format!("{home}/.mtpz-data"))
     }
 
@@ -142,21 +143,21 @@ impl MtpzKeys {
         (challenge, message)
     }
 
-    fn aes_decrypt(key: &[u8], data: &[u8]) -> Result<Vec<u8>, String> {
+    fn aes_decrypt(key: &[u8], data: &[u8]) -> Result<Vec<u8>, MtpError> {
         if key.len() != 16 {
-            return Err(format!("AES key must be 16 bytes, got {}", key.len()));
+            return Err(MtpError::Crypto(format!("AES key must be 16 bytes, got {}", key.len())));
         }
         let iv = [0u8; 16];
         let mut buf = data.to_vec();
         Aes128CbcDec::new(key.into(), &iv.into())
             .decrypt_padded_mut::<cipher::block_padding::NoPadding>(&mut buf)
-            .map_err(|e| format!("AES decrypt failed: {e}"))?;
+            .map_err(|e| MtpError::Crypto(format!("AES decrypt failed: {e}")))?;
         Ok(buf)
     }
 
-    fn cmac(key: &[u8], data: &[u8]) -> Result<Vec<u8>, String> {
+    fn cmac(key: &[u8], data: &[u8]) -> Result<Vec<u8>, MtpError> {
         let mut mac = <Cmac<Aes128> as Mac>::new_from_slice(key)
-            .map_err(|e| format!("CMAC init: {e}"))?;
+            .map_err(|e| MtpError::Crypto(format!("CMAC init: {e}")))?;
         mac.update(data);
         Ok(mac.finalize().into_bytes().to_vec())
     }
@@ -165,26 +166,26 @@ impl MtpzKeys {
         &self,
         response: &[u8],
         original_challenge: &[u8],
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<Vec<u8>, MtpError> {
         let rsa_size = self.rsa_size();
         let mut pos = 0;
 
         if response.len() < 4 {
-            return Err("Response too short".to_string());
+            return Err(MtpError::Crypto("Response too short".to_string()));
         }
         if response[pos] != 0x02 || response[pos + 1] != 0x02 {
-            return Err(format!(
+            return Err(MtpError::Crypto(format!(
                 "Invalid response tag: {:02x} {:02x}",
                 response[pos],
                 response[pos + 1]
-            ));
+            )));
         }
         pos += 2;
 
         let sig_size = ((response[pos] as usize) << 8) | (response[pos + 1] as usize);
         pos += 2;
         if sig_size < 0x80 || sig_size != rsa_size {
-            return Err(format!("Invalid signature size: {sig_size}"));
+            return Err(MtpError::Crypto(format!("Invalid signature size: {sig_size}")));
         }
 
         let sig_data = &response[pos..pos + sig_size];
@@ -205,29 +206,29 @@ impl MtpzKeys {
         let aes_key: Vec<u8> = signature[0x70..].to_vec();
 
         if pos + 4 > response.len() {
-            return Err("Response too short for payload header".to_string());
+            return Err(MtpError::Crypto("Response too short for payload header".to_string()));
         }
         if response[pos] != 0 || response[pos + 1] != 0 {
-            return Err("Invalid payload record".to_string());
+            return Err(MtpError::Crypto("Invalid payload record".to_string()));
         }
         pos += 2;
         let payload_size = ((response[pos] as usize) << 8) | (response[pos + 1] as usize);
         pos += 2;
 
         if pos + payload_size > response.len() {
-            return Err("Response too short for payload".to_string());
+            return Err(MtpError::Crypto("Response too short for payload".to_string()));
         }
 
         let payload = Self::aes_decrypt(&aes_key, &response[pos..pos + payload_size])?;
 
         let mut pp = 0;
         if payload.is_empty() || payload[pp] != 1 {
-            return Err("Decryption failed (bad payload marker)".to_string());
+            return Err(MtpError::Crypto("Decryption failed (bad payload marker)".to_string()));
         }
         pp += 1;
 
         if pp + 4 > payload.len() {
-            return Err("Payload too short for cert size".to_string());
+            return Err(MtpError::Crypto("Payload too short for cert size".to_string()));
         }
         let cert_size = ((payload[pp] as usize) << 24)
             | ((payload[pp + 1] as usize) << 16)
@@ -237,33 +238,33 @@ impl MtpzKeys {
         pp += cert_size;
 
         if pp + 2 > payload.len() {
-            return Err("Payload too short for challenge size".to_string());
+            return Err(MtpError::Crypto("Payload too short for challenge size".to_string()));
         }
         let challenge_size = ((payload[pp] as usize) << 8) | (payload[pp + 1] as usize);
         pp += 2;
         if challenge_size != original_challenge.len() {
-            return Err(format!("Challenge size mismatch: {challenge_size}"));
+            return Err(MtpError::Crypto(format!("Challenge size mismatch: {challenge_size}")));
         }
         if pp + challenge_size > payload.len() {
-            return Err("Payload too short for challenge".to_string());
+            return Err(MtpError::Crypto("Payload too short for challenge".to_string()));
         }
         if &payload[pp..pp + challenge_size] != original_challenge {
-            return Err("Challenge does not match!".to_string());
+            return Err(MtpError::Crypto("Challenge does not match!".to_string()));
         }
         pp += challenge_size;
 
         if pp + 2 > payload.len() {
-            return Err("Payload too short for device challenge".to_string());
+            return Err(MtpError::Crypto("Payload too short for device challenge".to_string()));
         }
         let dev_challenge_size = ((payload[pp] as usize) << 8) | (payload[pp + 1] as usize);
         pp += 2;
         pp += dev_challenge_size;
 
         if pp + 3 > payload.len() {
-            return Err("Payload too short for signature header".to_string());
+            return Err(MtpError::Crypto("Payload too short for signature header".to_string()));
         }
         if payload[pp] != 1 {
-            return Err(format!("Invalid signature marker: 0x{:02x} at pp={}", payload[pp], pp));
+            return Err(MtpError::Crypto(format!("Invalid signature marker: 0x{:02x} at pp={}", payload[pp], pp)));
         }
         pp += 1;
         let dev_sig_size = ((payload[pp] as usize) << 8) | (payload[pp + 1] as usize);
@@ -271,22 +272,22 @@ impl MtpzKeys {
         pp += dev_sig_size;
 
         if pp + 3 > payload.len() {
-            return Err("Payload too short for CMAC header".to_string());
+            return Err(MtpError::Crypto("Payload too short for CMAC header".to_string()));
         }
         if payload[pp] != 1 {
-            return Err(format!("Invalid CMAC record marker: 0x{:02x} at pp={}", payload[pp], pp));
+            return Err(MtpError::Crypto(format!("Invalid CMAC record marker: 0x{:02x} at pp={}", payload[pp], pp)));
         }
         pp += 1;
         let cmac_size = ((payload[pp] as usize) << 8) | (payload[pp + 1] as usize);
         pp += 2;
         if pp + cmac_size > payload.len() {
-            return Err("Payload too short for CMAC key".to_string());
+            return Err(MtpError::Crypto("Payload too short for CMAC key".to_string()));
         }
 
         Ok(payload[pp..pp + cmac_size].to_vec())
     }
 
-    fn sign_response(cmac_key: &[u8]) -> Result<Vec<u8>, String> {
+    fn sign_response(cmac_key: &[u8]) -> Result<Vec<u8>, MtpError> {
         let mut text = vec![0u8; 16];
         text[15] = 1;
 
@@ -301,7 +302,7 @@ impl MtpzKeys {
         Ok(message)
     }
 
-    fn sign_session_request(cmac_key: &[u8]) -> Result<[u32; 4], String> {
+    fn sign_session_request(cmac_key: &[u8]) -> Result<[u32; 4], MtpError> {
         let key = &cmac_key[..16];
         let data = if cmac_key.len() >= 20 {
             &cmac_key[16..20]
@@ -327,7 +328,7 @@ pub fn authenticate(
     session: &mut MtpSession,
     keys: &MtpzKeys,
     log: &dyn Fn(&str),
-) -> Result<(), String> {
+) -> Result<(), MtpError> {
     log("MTPZ: Setting session initiator...");
     let _ = session.set_device_prop_string(0xD406, "zune-mtp - MTPZClassDriver");
 

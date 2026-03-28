@@ -96,6 +96,11 @@ pub fn draw(f: &mut Frame, app: &App) {
         draw_keys_panel(f, app, outer[2]);
     }
 
+    // Removal confirmation overlay.
+    if let Some(ref paths) = app.pending_removal {
+        draw_confirm_removal(f, app, paths.len());
+    }
+
     // Toast overlay.
     if let Some((ref msg, _, is_error)) = app.toast_message {
         draw_toast(f, app, msg, is_error);
@@ -200,7 +205,7 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
                 }
             }
             BrowseMode::Device => {
-                if app.device_tracks.is_empty() {
+                if app.device.tracks.is_empty() {
                     "No tracks on device"
                 } else if app.sidebar_mode == SidebarMode::Playlists {
                     "Playlists not available\nin device view"
@@ -583,11 +588,11 @@ fn draw_device_info(f: &mut Frame, app: &App, area: Rect) {
         t.border()
     };
 
-    let title = match app.device_status {
+    let title = match app.device.status {
         DeviceStatus::Disconnected => " Device [c] ".to_string(),
         DeviceStatus::Detecting | DeviceStatus::Connecting => " Device ".to_string(),
         DeviceStatus::Connected => {
-            let name = app.device_name.as_deref().unwrap_or("Zune");
+            let name = app.device.name.as_deref().unwrap_or("Zune");
             format!(" {} ", name)
         }
     };
@@ -601,7 +606,7 @@ fn draw_device_info(f: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    match app.device_status {
+    match app.device.status {
         DeviceStatus::Disconnected => {
             let p = Paragraph::new("No device.\nPress 'c' to connect.").style(t.dim());
             f.render_widget(p, inner);
@@ -629,8 +634,8 @@ fn draw_device_info(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_device_info_connected(f: &mut Frame, app: &App, area: Rect) {
     let t = app.theme();
-    let is_syncing = matches!(app.sync_status, SyncStatus::Running { .. });
-    let is_busy = app.device_loading_tracks;
+    let is_syncing = matches!(app.sync.status, SyncStatus::Running { .. });
+    let is_busy = app.device.loading_tracks;
 
     // Screen content: two lines inside the screen area.
     let (screen_line1, screen_line2) = if is_syncing {
@@ -640,7 +645,7 @@ fn draw_device_info_connected(f: &mut Frame, app: &App, area: Rect) {
         let symbol = throbber_symbol(&app.throbber_state, app.theme_index);
         (symbol, "Loading...".to_string())
     } else {
-        let count = app.device_tracks.len();
+        let count = app.device.tracks.len();
         let formatted = format_with_commas(count);
         (formatted, "tracks".to_string())
     };
@@ -663,25 +668,25 @@ fn draw_device_info_connected(f: &mut Frame, app: &App, area: Rect) {
     }
 
     // Device info lines below art.
-    if let Some(ref fw) = app.device_firmware {
+    if let Some(ref fw) = app.device.firmware {
         lines.push(Line::from(vec![
             Span::styled(" FW: ", t.dim()),
             Span::raw(fw.as_str()),
         ]));
     }
-    if let Some(ref mfr) = app.device_manufacturer {
+    if let Some(ref mfr) = app.device.manufacturer {
         lines.push(Line::from(vec![
             Span::styled(" Mfr: ", t.dim()),
             Span::raw(mfr.as_str()),
         ]));
     }
-    if let Some(ref mode) = app.device_usb_mode {
+    if let Some(ref mode) = app.device.usb_mode {
         lines.push(Line::from(vec![
             Span::styled(" USB: ", t.dim()),
             Span::raw(mode.as_str()),
         ]));
     }
-    if let Some(ref serial) = app.device_serial {
+    if let Some(ref serial) = app.device.serial {
         let display = if serial.chars().count() > 12 {
             format!("{}...", serial.chars().take(12).collect::<String>())
         } else {
@@ -694,7 +699,7 @@ fn draw_device_info_connected(f: &mut Frame, app: &App, area: Rect) {
     }
 
     // Storage info.
-    if let Some(ref storage) = app.device_storage {
+    if let Some(ref storage) = app.device.storage {
         let total_gb = storage.total_bytes as f64 / 1_073_741_824.0;
         let free_gb = storage.free_bytes as f64 / 1_073_741_824.0;
         let used_gb = storage.used_bytes as f64 / 1_073_741_824.0;
@@ -720,10 +725,10 @@ fn draw_device_info_connected(f: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from(bar_spans));
     }
 
-    if !app.device_loading_tracks {
+    if !app.device.loading_tracks {
         lines.push(Line::from(format!(
             " {} tracks on device",
-            app.device_tracks.len()
+            app.device.tracks.len()
         )));
     }
 
@@ -740,7 +745,7 @@ fn draw_sync_queue(f: &mut Frame, app: &App, area: Rect) {
         t.border()
     };
 
-    match app.sync_status {
+    match app.sync.status {
         SyncStatus::Running { current, total } => {
             let symbol = throbber_symbol(&app.throbber_state, app.theme_index);
             let title = format!(" {} {}/{} ", symbol, current, total);
@@ -757,67 +762,93 @@ fn draw_sync_queue(f: &mut Frame, app: &App, area: Rect) {
                 .split(inner);
 
             let track_color = anim::pulse_color(t.sidebar_text, app.anim_frame, 40);
-            let status_line = format!(" {}", app.sync_current_track);
+            let status_line = format!(" {}", app.sync.current_track);
             f.render_widget(
                 Paragraph::new(status_line).style(Style::default().fg(track_color)),
                 chunks[0],
             );
         }
-        SyncStatus::Complete {
-            success, failed, ..
-        } => {
-            let title = format!(" Done {}/{} fail ", success, failed);
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_style(border_style)
-                .title(title);
-            f.render_widget(block, area);
-        }
         SyncStatus::Idle => {
-            let total_tracks = app.total_queue_tracks();
-            let title = format!(
-                " Queue {} / {} trk ",
-                app.sync_queue.len(),
-                total_tracks
-            );
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_style(border_style)
-                .title(title)
-                .style(Style::default().bg(t.main_bg));
-            let inner = block.inner(area);
-            f.render_widget(block, area);
-
-            if app.sync_queue.is_empty() {
-                let p =
-                    Paragraph::new("Press 'a' to add.").style(t.dim());
-                f.render_widget(p, inner);
-            } else {
-                let items: Vec<ListItem> = app
-                    .sync_queue
-                    .iter()
-                    .enumerate()
-                    .map(|(i, q)| {
-                        let style = if i == app.queue_selected && is_active {
-                            t.sidebar_item_selected()
-                        } else {
-                            Style::default().fg(t.sidebar_text).bg(t.main_bg)
-                        };
-                        ListItem::new(format!("  {} ({} tracks)", q.label, q.tracks.len()))
-                            .style(style)
-                    })
-                    .collect();
+            if app.browse_mode == BrowseMode::Device && !app.removal_queue.is_empty() {
+                // Show removal queue in device mode.
+                let title = format!(
+                    " Remove Queue ({}) ",
+                    app.removal_queue.len()
+                );
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(t.error_text))
+                    .title(title)
+                    .style(Style::default().bg(t.main_bg));
+                let inner = block.inner(area);
+                f.render_widget(block, area);
 
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([Constraint::Min(2), Constraint::Length(1)])
                     .split(inner);
 
+                let items: Vec<ListItem> = app
+                    .removal_queue
+                    .iter()
+                    .map(|(path, _)| {
+                        let name = path.rsplit('/').next().unwrap_or(path);
+                        ListItem::new(format!("  x {}", name))
+                            .style(Style::default().fg(t.error_text).bg(t.main_bg))
+                    })
+                    .collect();
                 let list = List::new(items);
                 f.render_widget(list, chunks[0]);
 
-                let hints = "S:sync d:rm C:clr";
+                let hints = "D:delete C:clr";
                 f.render_widget(Paragraph::new(hints).style(t.dim()), chunks[1]);
+            } else {
+                // Show sync queue in library mode.
+                let total_tracks = app.total_queue_tracks();
+                let title = format!(
+                    " Queue {} / {} trk ",
+                    app.sync.queue.len(),
+                    total_tracks
+                );
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(border_style)
+                    .title(title)
+                    .style(Style::default().bg(t.main_bg));
+                let inner = block.inner(area);
+                f.render_widget(block, area);
+
+                if app.sync.queue.is_empty() {
+                    let p =
+                        Paragraph::new("Press 'a' to add.").style(t.dim());
+                    f.render_widget(p, inner);
+                } else {
+                    let items: Vec<ListItem> = app
+                        .sync.queue
+                        .iter()
+                        .enumerate()
+                        .map(|(i, q)| {
+                            let style = if i == app.sync.queue_selected && is_active {
+                                t.sidebar_item_selected()
+                            } else {
+                                Style::default().fg(t.sidebar_text).bg(t.main_bg)
+                            };
+                            ListItem::new(format!("  {} ({} tracks)", q.label, q.tracks.len()))
+                                .style(style)
+                        })
+                        .collect();
+
+                    let chunks = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Min(2), Constraint::Length(1)])
+                        .split(inner);
+
+                    let list = List::new(items);
+                    f.render_widget(list, chunks[0]);
+
+                    let hints = "S:sync d:rm C:clr";
+                    f.render_widget(Paragraph::new(hints).style(t.dim()), chunks[1]);
+                }
             }
         }
     }
@@ -833,7 +864,7 @@ fn draw_sync_log(f: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    if app.sync_log.is_empty() {
+    if app.sync.log.is_empty() {
         let p = Paragraph::new("No messages yet.").style(t.dim());
         f.render_widget(p, inner);
         return;
@@ -841,8 +872,8 @@ fn draw_sync_log(f: &mut Frame, app: &App, area: Rect) {
 
     // Show the most recent messages that fit, scrolled to the bottom.
     let visible = inner.height as usize;
-    let start = app.sync_log.len().saturating_sub(visible);
-    let lines: Vec<Line> = app.sync_log[start..]
+    let start = app.sync.log.len().saturating_sub(visible);
+    let lines: Vec<Line> = app.sync.log[start..]
         .iter()
         .map(|msg| {
             let style = if msg.contains("FAILED") {
@@ -1127,10 +1158,17 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
 
     let left = match app.browse_mode {
         BrowseMode::Library => format!(" {} tracks", app.track_count()),
-        BrowseMode::Device => format!(" {} on device", app.device_tracks.len()),
+        BrowseMode::Device => {
+            let rm_count = app.removal_queue.len();
+            if rm_count > 0 {
+                format!(" {} on device | {} queued for removal", app.device.tracks.len(), rm_count)
+            } else {
+                format!(" {} on device", app.device.tracks.len())
+            }
+        }
     };
     let right = if app.browse_mode == BrowseMode::Device {
-        "v:library | a:remove | q:quit | ?:help"
+        "v:library | a:queue rm | D:delete | C:clr | ?:help"
     } else {
         "v:device | a:add | S:sync | q:quit | ?:help"
     };
@@ -1147,6 +1185,32 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             .style(t.footer()),
         chunks[1],
     );
+}
+
+fn draw_confirm_removal(f: &mut Frame, app: &App, count: usize) {
+    let t = app.theme();
+    let area = f.area();
+    let w = 36u16.min(area.width.saturating_sub(4));
+    let h = 5u16.min(area.height.saturating_sub(2));
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let rect = Rect::new(x, y, w, h);
+
+    f.render_widget(Clear, rect);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(t.error())
+        .title(" Confirm Delete ")
+        .title_alignment(Alignment::Center);
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(format!(" Delete {} track(s)?", count)),
+        Line::from(Span::styled(" Enter/y:yes  Esc/n:no", t.dim())),
+    ];
+    let p = Paragraph::new(lines).block(block);
+    f.render_widget(p, rect);
 }
 
 fn draw_toast(f: &mut Frame, app: &App, msg: &str, is_error: bool) {

@@ -154,6 +154,20 @@ fn run_loop(
                     continue;
                 }
 
+                // Handle removal confirmation dialog.
+                if app.pending_removal.is_some() {
+                    match key.code {
+                        KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                            confirm_device_removal(app, cmd_tx);
+                        }
+                        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                            app.pending_removal = None;
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 // Handle help overlay.
                 if app.show_help {
                     match key.code {
@@ -204,7 +218,7 @@ fn run_loop(
                         app.active_panel = Panel::Library;
                     }
                     KeyCode::Char('4') => {
-                        if !app.sync_queue.is_empty() {
+                        if !app.sync.queue.is_empty() {
                             app.active_panel = Panel::SyncQueue;
                         }
                     }
@@ -213,7 +227,7 @@ fn run_loop(
                     }
                     KeyCode::Char('v') => {
                         if app.browse_mode == BrowseMode::Device
-                            || app.device_status == DeviceStatus::Connected
+                            || app.device.status == DeviceStatus::Connected
                         {
                             app.toggle_browse_mode();
                         } else {
@@ -221,8 +235,8 @@ fn run_loop(
                         }
                     }
                     KeyCode::Char('c') => {
-                        if app.device_status == DeviceStatus::Disconnected {
-                            app.device_status = DeviceStatus::Detecting;
+                        if app.device.status == DeviceStatus::Disconnected {
+                            app.device.status = DeviceStatus::Detecting;
                             app.connection_anim_start = Some(app.anim_frame);
                             let _ = cmd_tx.send(BgCommand::Connect);
                         }
@@ -233,16 +247,16 @@ fn run_loop(
                         }
                         Panel::Device => {
                             let _ = cmd_tx.send(BgCommand::Disconnect);
-                            app.device_status = DeviceStatus::Disconnected;
-                            app.device_name = None;
-                            app.device_tracks.clear();
+                            app.device.status = DeviceStatus::Disconnected;
+                            app.device.name = None;
+                            app.device.tracks.clear();
                             app.clear_device_index();
                             app.set_toast("Disconnected".into(), false);
                         }
                         _ => {}
                     },
                     KeyCode::Char('r') => {
-                        if app.device_status == DeviceStatus::Connected {
+                        if app.device.status == DeviceStatus::Connected {
                             let _ = cmd_tx.send(BgCommand::LoadDeviceTracks);
                             app.set_toast("Refreshing device tracks...".into(), false);
                         }
@@ -307,15 +321,29 @@ fn run_loop(
                             app.cycle_sort();
                         }
                     }
+                    KeyCode::Char('L') => {
+                        let path = std::path::PathBuf::from("/tmp/zytunes-log.txt");
+                        let content = app.sync.log.join("\n");
+                        match std::fs::write(&path, &content) {
+                            Ok(_) => app.set_toast(
+                                format!("Log dumped to {}", path.display()),
+                                false,
+                            ),
+                            Err(e) => app.set_toast(
+                                format!("Log dump failed: {}", e),
+                                true,
+                            ),
+                        }
+                    }
                     KeyCode::Char('S') => {
-                        if !app.sync_queue.is_empty() {
+                        if !app.sync.queue.is_empty() {
                             app.active_panel = Panel::SyncQueue;
                             app.execute_sync(cmd_tx);
                         }
                     }
                     KeyCode::Char('a') => {
                         if app.browse_mode == BrowseMode::Device {
-                            send_device_removal(app, cmd_tx);
+                            app.queue_device_removal();
                         } else {
                             match app.active_panel {
                                 Panel::TrackList => {
@@ -333,26 +361,33 @@ fn run_loop(
                     }
                     KeyCode::Char('A') => {
                         if app.browse_mode == BrowseMode::Device {
-                            send_device_removal(app, cmd_tx);
+                            app.queue_device_removal();
                         } else if app.active_panel == Panel::TrackList {
                             app.add_all_visible_to_queue();
                         }
                     }
+                    KeyCode::Char('D') => {
+                        if app.browse_mode == BrowseMode::Device && !app.removal_queue.is_empty() {
+                            app.pending_removal = Some(app.removal_queue.clone());
+                        }
+                    }
                     KeyCode::Char('C') => {
-                        if app.active_panel == Panel::SyncQueue {
+                        if app.browse_mode == BrowseMode::Device {
+                            let count = app.removal_queue.len();
+                            app.clear_removal_queue();
+                            if count > 0 {
+                                app.set_toast(format!("Cleared {} queued removal(s)", count), false);
+                            }
+                        } else if app.active_panel == Panel::SyncQueue {
                             app.clear_queue();
                         }
                     }
                     KeyCode::Esc => {
-                        if matches!(app.sync_status, SyncStatus::Running { .. }) {
+                        if matches!(app.sync.status, SyncStatus::Running { .. }) {
                             let _ = cmd_tx.send(BgCommand::CancelSync);
                         }
                         // Dismiss toast.
                         app.toast_message = None;
-                        // Reset sync complete status.
-                        if matches!(app.sync_status, SyncStatus::Complete { .. }) {
-                            app.sync_status = SyncStatus::Idle;
-                        }
                     }
                     _ => {}
                 }
@@ -370,16 +405,14 @@ fn run_loop(
     Ok(())
 }
 
-fn send_device_removal(app: &mut App, cmd_tx: &mpsc::Sender<BgCommand>) {
-    let paths = app.collect_device_removal_paths();
-    if paths.is_empty() {
-        app.set_toast("Nothing to remove".into(), true);
-    } else {
-        let count = paths.len();
+fn confirm_device_removal(app: &mut App, cmd_tx: &mpsc::Sender<BgCommand>) {
+    if let Some(items) = app.pending_removal.take() {
+        let count = items.len();
         app.set_toast(
             format!("Removing {} track(s) from device...", count),
             false,
         );
-        let _ = cmd_tx.send(BgCommand::RemoveFromDevice(paths));
+        let _ = cmd_tx.send(BgCommand::RemoveFromDevice(items));
+        app.removal_queue.clear();
     }
 }

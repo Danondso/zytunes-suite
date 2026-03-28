@@ -1,9 +1,0 @@
-*.ninja*
-cmake_*
-CMakeFiles*
-CMakeCache*
-nbproject
-build
-*.user
-doc
-.vscode

@@ -1,5 +1,6 @@
 use crate::container::*;
 use crate::transport::IokitTransport;
+use crate::MtpError;
 
 /// An active MTP session with a device.
 pub struct MtpSession {
@@ -23,7 +24,7 @@ pub struct ObjectInfo {
 
 impl MtpSession {
     /// Open an MTP session on the device.
-    pub fn open(vendor_id: u16, product_id: u16) -> Result<Self, String> {
+    pub fn open(vendor_id: u16, product_id: u16) -> Result<Self, MtpError> {
         let transport = IokitTransport::open(vendor_id, product_id)?;
         let mut session = MtpSession {
             transport,
@@ -37,7 +38,7 @@ impl MtpSession {
         // Use read_container which has a 30s timeout via read_with_timeout.
         let open_resp = session.transport.read_container()?;
         let _open_hdr = ContainerHeader::parse(&open_resp)
-            .ok_or("Bad OpenSession response")?;
+            .ok_or(MtpError::Protocol("Bad OpenSession response".to_string()))?;
 
         // GetDeviceInfo with tid=1 (matching aft's Session constructor).
         let _ = session.execute_data_in(OperationCode::GetDeviceInfo, &[]);
@@ -55,17 +56,17 @@ impl MtpSession {
         &mut self,
         code: OperationCode,
         params: &[u32],
-    ) -> Result<u16, String> {
+    ) -> Result<u16, MtpError> {
         let tid = self.next_transaction();
         let cmd = build_command(code, tid, params);
         self.transport.write(&cmd)?;
 
         let resp = self.transport.read_container()?;
-        let hdr = ContainerHeader::parse(&resp).ok_or("Bad response")?;
+        let hdr = ContainerHeader::parse(&resp).ok_or(MtpError::Protocol("Bad response".to_string()))?;
 
         if hdr.is_data() {
             let resp2 = self.transport.read_container()?;
-            let hdr2 = ContainerHeader::parse(&resp2).ok_or("Bad response after data")?;
+            let hdr2 = ContainerHeader::parse(&resp2).ok_or(MtpError::Protocol("Bad response after data".to_string()))?;
             return Ok(hdr2.code);
         }
 
@@ -77,25 +78,25 @@ impl MtpSession {
         &mut self,
         code: OperationCode,
         params: &[u32],
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<Vec<u8>, MtpError> {
         let tid = self.next_transaction();
         let cmd = build_command(code, tid, params);
         self.transport.write(&cmd)?;
 
         let data = self.transport.read_container()?;
-        let hdr = ContainerHeader::parse(&data).ok_or("Bad data response")?;
+        let hdr = ContainerHeader::parse(&data).ok_or(MtpError::Protocol("Bad data response".to_string()))?;
         if !hdr.is_data() {
-            return Err(format!(
+            return Err(MtpError::Protocol(format!(
                 "Expected data container, got type={} code=0x{:04x}",
                 hdr.container_type, hdr.code
-            ));
+            )));
         }
         let payload = data[CONTAINER_HEADER_SIZE..].to_vec();
 
         let resp = self.transport.read_container()?;
-        let resp_hdr = ContainerHeader::parse(&resp).ok_or("Bad response")?;
+        let resp_hdr = ContainerHeader::parse(&resp).ok_or(MtpError::Protocol("Bad response".to_string()))?;
         if !resp_hdr.is_ok() {
-            return Err(format!("Operation failed: 0x{:04x}", resp_hdr.code));
+            return Err(MtpError::Protocol(format!("Operation failed: 0x{:04x}", resp_hdr.code)));
         }
 
         Ok(payload)
@@ -107,7 +108,7 @@ impl MtpSession {
         &mut self,
         code: OperationCode,
         payload: &[u8],
-    ) -> Result<u16, String> {
+    ) -> Result<u16, MtpError> {
         let tid = self.next_transaction();
 
         let total_size = (CONTAINER_HEADER_SIZE + payload.len()) as u32;
@@ -121,7 +122,7 @@ impl MtpSession {
         self.transport.write(payload)?;
 
         let resp = self.transport.read_container()?;
-        let hdr = ContainerHeader::parse(&resp).ok_or("Bad response")?;
+        let hdr = ContainerHeader::parse(&resp).ok_or(MtpError::Protocol("Bad response".to_string()))?;
         Ok(hdr.code)
     }
 
@@ -131,7 +132,7 @@ impl MtpSession {
         code: OperationCode,
         data: &[u8],
         _log: &dyn Fn(&str),
-    ) -> Result<(), String> {
+    ) -> Result<(), MtpError> {
         let tid = self.next_transaction();
 
         // Send command container.
@@ -147,19 +148,19 @@ impl MtpSession {
 
         // Read response (may get data container first, then response).
         let resp = self.transport.read_container()?;
-        let hdr = ContainerHeader::parse(&resp).ok_or("Bad response")?;
+        let hdr = ContainerHeader::parse(&resp).ok_or(MtpError::Protocol("Bad response".to_string()))?;
         let response_code = if hdr.is_data() {
             let resp2 = self.transport.read_container()?;
-            let hdr2 = ContainerHeader::parse(&resp2).ok_or("Bad response after data")?;
+            let hdr2 = ContainerHeader::parse(&resp2).ok_or(MtpError::Protocol("Bad response after data".to_string()))?;
             hdr2.code
         } else {
             hdr.code
         };
         if response_code != ResponseCode::Ok as u16 {
-            return Err(format!(
+            return Err(MtpError::Protocol(format!(
                 "Operation 0x{:04x} failed: 0x{:04x}",
                 code as u16, response_code
-            ));
+            )));
         }
         Ok(())
     }
@@ -169,37 +170,37 @@ impl MtpSession {
         &mut self,
         code: OperationCode,
         _log: &dyn Fn(&str),
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<Vec<u8>, MtpError> {
         self.execute_data_in(code, &[])
     }
 
     /// Enable MTPZ secure file operations using a CMAC-signed session token.
-    pub fn enable_secure_file_operations(&mut self, cmac: [u32; 4]) -> Result<(), String> {
+    pub fn enable_secure_file_operations(&mut self, cmac: [u32; 4]) -> Result<(), MtpError> {
         let resp = self.execute_simple(OperationCode::EnableTrustedFilesOperations, &cmac)?;
         if resp != ResponseCode::Ok as u16 {
-            return Err(format!(
+            return Err(MtpError::Protocol(format!(
                 "EnableSecureFileOperations failed: 0x{:04x}",
                 resp
-            ));
+            )));
         }
         Ok(())
     }
 
     /// Get list of storage IDs on the device.
-    pub fn get_storage_ids(&mut self) -> Result<Vec<u32>, String> {
+    pub fn get_storage_ids(&mut self) -> Result<Vec<u32>, MtpError> {
         let data = self.execute_data_in(OperationCode::GetStorageIDs, &[])?;
         Ok(parse_u32_array(&data))
     }
 
     /// Get storage info: returns (max_capacity, free_space) in bytes.
-    pub fn get_storage_info(&mut self, storage_id: u32) -> Result<(u64, u64), String> {
+    pub fn get_storage_info(&mut self, storage_id: u32) -> Result<(u64, u64), MtpError> {
         let data = self.execute_data_in(OperationCode::GetStorageInfo, &[storage_id])?;
         // StorageInfo dataset: type(2) + fs_type(2) + access(2) + max_cap(8) + free(8) + ...
         if data.len() < 22 {
-            return Err("StorageInfo too short".to_string());
+            return Err(MtpError::Protocol("StorageInfo too short".to_string()));
         }
-        let max_capacity = u64::from_le_bytes(data[6..14].try_into().unwrap());
-        let free_space = u64::from_le_bytes(data[14..22].try_into().unwrap());
+        let max_capacity = le_u64(&data, 6);
+        let free_space = le_u64(&data, 14);
         Ok((max_capacity, free_space))
     }
 
@@ -208,7 +209,7 @@ impl MtpSession {
         &mut self,
         storage_id: u32,
         parent: u32,
-    ) -> Result<Vec<u32>, String> {
+    ) -> Result<Vec<u32>, MtpError> {
         let data = self.execute_data_in(
             OperationCode::GetObjectHandles,
             &[storage_id, 0x00000000, parent],
@@ -217,16 +218,16 @@ impl MtpSession {
     }
 
     /// Get info about a specific object.
-    pub fn get_object_info(&mut self, handle: u32) -> Result<ObjectInfo, String> {
+    pub fn get_object_info(&mut self, handle: u32) -> Result<ObjectInfo, MtpError> {
         let data = self.execute_data_in(OperationCode::GetObjectInfo, &[handle])?;
         parse_object_info(&data)
     }
 
     /// Delete an object by handle.
-    pub fn delete_object(&mut self, handle: u32) -> Result<(), String> {
+    pub fn delete_object(&mut self, handle: u32) -> Result<(), MtpError> {
         let resp = self.execute_simple(OperationCode::DeleteObject, &[handle])?;
         if resp != ResponseCode::Ok as u16 {
-            return Err(format!("DeleteObject failed: 0x{:04x}", resp));
+            return Err(MtpError::Protocol(format!("DeleteObject failed: 0x{:04x}", resp)));
         }
         Ok(())
     }
@@ -237,7 +238,7 @@ impl MtpSession {
         storage_id: u32,
         parent: u32,
         info_dataset: &[u8],
-    ) -> Result<(u32, u32, u32), String> {
+    ) -> Result<(u32, u32, u32), MtpError> {
         let tid = self.next_transaction();
         let cmd = build_command(OperationCode::SendObjectInfo, tid, &[storage_id, parent]);
         self.transport.write(&cmd)?;
@@ -246,9 +247,9 @@ impl MtpSession {
         self.transport.write(&data_container)?;
 
         let resp = self.transport.read_container()?;
-        let hdr = ContainerHeader::parse(&resp).ok_or("Bad SendObjectInfo response")?;
+        let hdr = ContainerHeader::parse(&resp).ok_or(MtpError::Protocol("Bad SendObjectInfo response".to_string()))?;
         if !hdr.is_ok() {
-            return Err(format!("SendObjectInfo failed: 0x{:04x}", hdr.code));
+            return Err(MtpError::Protocol(format!("SendObjectInfo failed: 0x{:04x}", hdr.code)));
         }
 
         // Response params: storage_id, parent_handle, object_handle
@@ -261,7 +262,7 @@ impl MtpSession {
     }
 
     /// Send object data (upload file content).
-    pub fn send_object(&mut self, data: &[u8]) -> Result<(), String> {
+    pub fn send_object(&mut self, data: &[u8]) -> Result<(), MtpError> {
         let tid = self.next_transaction();
 
         // Command container first.
@@ -276,15 +277,15 @@ impl MtpSession {
         }
 
         let resp = self.transport.read_container()?;
-        let hdr = ContainerHeader::parse(&resp).ok_or("Bad SendObject response")?;
+        let hdr = ContainerHeader::parse(&resp).ok_or(MtpError::Protocol("Bad SendObject response".to_string()))?;
         if !hdr.is_ok() {
-            return Err(format!("SendObject failed: 0x{:04x}", hdr.code));
+            return Err(MtpError::Protocol(format!("SendObject failed: 0x{:04x}", hdr.code)));
         }
         Ok(())
     }
 
     /// Set a string device property (e.g., SessionInitiatorVersionInfo 0xD406).
-    pub fn set_device_prop_string(&mut self, prop: u32, value: &str) -> Result<(), String> {
+    pub fn set_device_prop_string(&mut self, prop: u32, value: &str) -> Result<(), MtpError> {
         let tid = self.next_transaction();
         // Command with property code as parameter.
         let cmd = build_command(OperationCode::SetDevicePropValue, tid, &[prop]);
@@ -305,30 +306,30 @@ impl MtpSession {
         self.transport.write(&data_container[CONTAINER_HEADER_SIZE..])?;
 
         let resp = self.transport.read_container()?;
-        let hdr = ContainerHeader::parse(&resp).ok_or("Bad SetDeviceProp response")?;
+        let hdr = ContainerHeader::parse(&resp).ok_or(MtpError::Protocol("Bad SetDeviceProp response".to_string()))?;
         if hdr.is_ok() {
             Ok(())
         } else {
-            Err(format!("SetDevicePropValue failed: 0x{:04x}", hdr.code))
+            Err(MtpError::Protocol(format!("SetDevicePropValue failed: 0x{:04x}", hdr.code)))
         }
     }
 
     /// Get supported properties for an object format (0x9806).
-    pub fn get_object_props_supported(&mut self, format: u16) -> Result<Vec<u16>, String> {
+    pub fn get_object_props_supported(&mut self, format: u16) -> Result<Vec<u16>, MtpError> {
         let data =
             self.execute_data_in(OperationCode::GetObjectPropsSupported, &[format as u32])?;
         // Returns u16 array: [u32 count] [u16 values...]
         if data.len() < 4 {
             return Ok(Vec::new());
         }
-        let count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+        let count = le_u32(&data, 0) as usize;
         let mut props = Vec::with_capacity(count);
         for i in 0..count {
             let offset = 4 + i * 2;
             if offset + 2 > data.len() {
                 break;
             }
-            props.push(u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()));
+            props.push(le_u16(&data, offset));
         }
         Ok(props)
     }
@@ -342,7 +343,7 @@ impl MtpSession {
         property: u32,
         group_code: u32,
         depth: u32,
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<Vec<u8>, MtpError> {
         self.execute_data_in(
             OperationCode::GetObjectPropList,
             &[object_id, format, property, group_code, depth],
@@ -355,7 +356,7 @@ impl MtpSession {
         object_id: u32,
         prop: u16,
         value: &[u8],
-    ) -> Result<(), String> {
+    ) -> Result<(), MtpError> {
         let tid = self.next_transaction();
         let cmd = build_command(
             OperationCode::SetObjectPropValue,
@@ -371,9 +372,9 @@ impl MtpSession {
         }
 
         let resp = self.transport.read_container()?;
-        let hdr = ContainerHeader::parse(&resp).ok_or("Bad SetObjectPropValue response")?;
+        let hdr = ContainerHeader::parse(&resp).ok_or(MtpError::Protocol("Bad SetObjectPropValue response".to_string()))?;
         if !hdr.is_ok() {
-            return Err(format!("SetObjectPropValue failed: 0x{:04x}", hdr.code));
+            return Err(MtpError::Protocol(format!("SetObjectPropValue failed: 0x{:04x}", hdr.code)));
         }
         Ok(())
     }
@@ -387,7 +388,7 @@ impl MtpSession {
         format: u16,
         object_size: u64,
         prop_list: &[u8],
-    ) -> Result<(u32, u32, u32), String> {
+    ) -> Result<(u32, u32, u32), MtpError> {
         let tid = self.next_transaction();
         let size_hi = (object_size >> 32) as u32;
         let size_lo = object_size as u32;
@@ -406,9 +407,9 @@ impl MtpSession {
         }
 
         let resp = self.transport.read_container()?;
-        let hdr = ContainerHeader::parse(&resp).ok_or("Bad SendObjectPropList response")?;
+        let hdr = ContainerHeader::parse(&resp).ok_or(MtpError::Protocol("Bad SendObjectPropList response".to_string()))?;
         if !hdr.is_ok() {
-            return Err(format!("SendObjectPropList failed: 0x{:04x}", hdr.code));
+            return Err(MtpError::Protocol(format!("SendObjectPropList failed: 0x{:04x}", hdr.code)));
         }
 
         let params = parse_response_params(&resp);
@@ -420,7 +421,7 @@ impl MtpSession {
     }
 
     /// Get object references (linked objects like album tracks).
-    pub fn get_object_references(&mut self, object_id: u32) -> Result<Vec<u32>, String> {
+    pub fn get_object_references(&mut self, object_id: u32) -> Result<Vec<u32>, MtpError> {
         let data = self.execute_data_in(OperationCode::GetObjectReferences, &[object_id])?;
         Ok(parse_u32_array(&data))
     }
@@ -430,7 +431,7 @@ impl MtpSession {
         &mut self,
         object_id: u32,
         refs: &[u32],
-    ) -> Result<(), String> {
+    ) -> Result<(), MtpError> {
         let tid = self.next_transaction();
         let cmd = build_command(OperationCode::SetObjectReferences, tid, &[object_id]);
         self.transport.write(&cmd)?;
@@ -447,9 +448,9 @@ impl MtpSession {
         self.transport.write(&data_container[CONTAINER_HEADER_SIZE..])?;
 
         let resp = self.transport.read_container()?;
-        let hdr = ContainerHeader::parse(&resp).ok_or("Bad SetObjectReferences response")?;
+        let hdr = ContainerHeader::parse(&resp).ok_or(MtpError::Protocol("Bad SetObjectReferences response".to_string()))?;
         if !hdr.is_ok() {
-            return Err(format!("SetObjectReferences failed: 0x{:04x}", hdr.code));
+            return Err(MtpError::Protocol(format!("SetObjectReferences failed: 0x{:04x}", hdr.code)));
         }
         Ok(())
     }
@@ -460,21 +461,37 @@ impl MtpSession {
     }
 }
 
+/// Read a little-endian u16 from a byte slice at the given offset.
+fn le_u16(data: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes([data[offset], data[offset + 1]])
+}
+
+/// Read a little-endian u32 from a byte slice at the given offset.
+fn le_u32(data: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]])
+}
+
+/// Read a little-endian u64 from a byte slice at the given offset.
+fn le_u64(data: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes([
+        data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+        data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7],
+    ])
+}
+
 /// Parse MTP u32 array: [u32 count] [u32 values...]
 fn parse_u32_array(data: &[u8]) -> Vec<u32> {
     if data.len() < 4 {
         return vec![];
     }
-    let count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+    let count = le_u32(data, 0) as usize;
     let mut result = Vec::with_capacity(count);
     for i in 0..count {
         let offset = 4 + i * 4;
         if offset + 4 > data.len() {
             break;
         }
-        result.push(u32::from_le_bytes(
-            data[offset..offset + 4].try_into().unwrap(),
-        ));
+        result.push(le_u32(data, offset));
     }
     result
 }
@@ -494,7 +511,7 @@ fn read_mtp_string(data: &[u8], offset: &mut usize) -> String {
         if *offset + 2 > data.len() {
             break;
         }
-        let ch = u16::from_le_bytes(data[*offset..*offset + 2].try_into().unwrap());
+        let ch = le_u16(data, *offset);
         *offset += 2;
         if ch != 0 {
             chars.push(ch);
@@ -504,15 +521,15 @@ fn read_mtp_string(data: &[u8], offset: &mut usize) -> String {
 }
 
 /// Parse the MTP ObjectInfo dataset.
-fn parse_object_info(data: &[u8]) -> Result<ObjectInfo, String> {
+fn parse_object_info(data: &[u8]) -> Result<ObjectInfo, MtpError> {
     if data.len() < 52 {
-        return Err("ObjectInfo too short".to_string());
+        return Err(MtpError::Protocol("ObjectInfo too short".to_string()));
     }
 
-    let storage_id = u32::from_le_bytes(data[0..4].try_into().unwrap());
-    let object_format = u16::from_le_bytes(data[4..6].try_into().unwrap());
-    let compressed_size = u32::from_le_bytes(data[8..12].try_into().unwrap());
-    let association_type = u16::from_le_bytes(data[42..44].try_into().unwrap());
+    let storage_id = le_u32(data, 0);
+    let object_format = le_u16(data, 4);
+    let compressed_size = le_u32(data, 8);
+    let association_type = le_u16(data, 42);
 
     let mut offset = 52;
     let filename = read_mtp_string(data, &mut offset);
@@ -535,9 +552,7 @@ fn parse_response_params(resp: &[u8]) -> Vec<u32> {
     let mut params = Vec::new();
     let mut offset = CONTAINER_HEADER_SIZE;
     while offset + 4 <= resp.len() {
-        params.push(u32::from_le_bytes(
-            resp[offset..offset + 4].try_into().unwrap(),
-        ));
+        params.push(le_u32(resp, offset));
         offset += 4;
     }
     params

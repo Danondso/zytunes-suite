@@ -4,10 +4,48 @@ pub mod mtp;
 
 use device::ZuneDevice;
 use library::ItunesLibrary;
-use mtp::{AftSession, DeviceSession};
+use mtp::{DeviceSession, NativeSession};
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
+use std::fmt;
+use std::str::FromStr;
+
+/// The type of sync operation to perform.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SyncType {
+    Artist,
+    Album,
+    Playlist,
+    Track,
+}
+
+impl FromStr for SyncType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "artist" => Ok(SyncType::Artist),
+            "album" => Ok(SyncType::Album),
+            "playlist" => Ok(SyncType::Playlist),
+            "track" => Ok(SyncType::Track),
+            other => Err(format!(
+                "Unknown sync type: \"{other}\". Use: artist, album, playlist, track"
+            )),
+        }
+    }
+}
+
+impl fmt::Display for SyncType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SyncType::Artist => write!(f, "artist"),
+            SyncType::Album => write!(f, "album"),
+            SyncType::Playlist => write!(f, "playlist"),
+            SyncType::Track => write!(f, "track"),
+        }
+    }
+}
 
 /// Resolve the iTunes library path: `ZYTUNES_LIBRARY` env var, or `$HOME/Music/Music/Library.xml`.
 pub fn library_xml_path() -> String {
@@ -24,20 +62,20 @@ pub fn library_xml_path() -> String {
 pub const ZUNE_NATIVE_FORMATS: &[&str] = &["mp3", "wma", "aac"];
 
 /// Connect to the Zune and return an active session.
-pub fn connect() -> Result<AftSession, String> {
-    match ZuneDevice::find() {
-        Ok(z) => {
-            println!(
-                "Zune detected: {}",
-                z.product_name.as_deref().unwrap_or("Zune")
-            );
-        }
-        Err(e) => return Err(format!("{}", e)),
-    };
+pub fn connect() -> Result<NativeSession, String> {
+    let zune = ZuneDevice::find().map_err(|e| format!("{}", e))?;
+    println!(
+        "Zune detected: {}",
+        zune.product_name.as_deref().unwrap_or("Zune")
+    );
 
     print!("Connecting (MTPZ handshake)... ");
-    match AftSession::open() {
-        Ok(s) => {
+    let log = |msg: &str| {
+        eprintln!("{}", msg);
+    };
+    match NativeSession::open(zune.product_id, &log) {
+        Ok(mut s) => {
+            s.set_serial(zune.serial_number);
             println!("OK");
             Ok(s)
         }
@@ -110,40 +148,20 @@ pub fn transcode_to_mp3(input: &str, temp_dir: &Path) -> Result<String, String> 
         .map(|o| !o.stdout.is_empty())
         .unwrap_or(false);
 
-    let mut args = vec![
-        "-i".to_string(),
-        input.to_string(),
-        "-codec:a".to_string(),
-        "libmp3lame".to_string(),
-        "-q:a".to_string(),
-        "2".to_string(),
-        "-map_metadata".to_string(),
-        "0".to_string(),
-    ];
+    let output_str = output.to_string_lossy();
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-i", input, "-codec:a", "libmp3lame", "-q:a", "2", "-map_metadata", "0"]);
 
     if has_art {
         // Resize album art to 200x200 JPEG (Zune rejects larger art).
-        args.extend([
-            "-vf".into(),
-            "scale=200:200".into(),
-            "-codec:v".into(),
-            "mjpeg".into(),
-            "-q:v".into(),
-            "5".into(),
-        ]);
+        cmd.args(["-vf", "scale=200:200", "-codec:v", "mjpeg", "-q:v", "5"]);
     } else {
-        args.push("-vn".into());
+        cmd.arg("-vn");
     }
 
-    args.extend([
-        "-id3v2_version".into(),
-        "3".into(),
-        "-y".into(),
-        output.to_string_lossy().into_owned(),
-    ]);
+    cmd.args(["-id3v2_version", "3", "-y", &output_str]);
 
-    let result = Command::new("ffmpeg")
-        .args(&args)
+    let result = cmd
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -159,11 +177,11 @@ pub fn transcode_to_mp3(input: &str, temp_dir: &Path) -> Result<String, String> 
 /// Find matching tracks from the library for the given sync type and name.
 pub fn find_matching_tracks<'a>(
     lib: &'a ItunesLibrary,
-    sync_type: &str,
+    sync_type: SyncType,
     name: &str,
 ) -> Result<Vec<&'a library::Track>, String> {
     match sync_type {
-        "artist" => {
+        SyncType::Artist => {
             let tracks = lib.artist_tracks(name);
             if tracks.is_empty() {
                 let mut msg = format!("No tracks found for artist \"{}\"", name);
@@ -184,7 +202,7 @@ pub fn find_matching_tracks<'a>(
             println!("Artist \"{}\": {} tracks", name, tracks.len());
             Ok(tracks)
         }
-        "album" => {
+        SyncType::Album => {
             let tracks: Vec<&library::Track> = lib
                 .tracks
                 .values()
@@ -196,7 +214,7 @@ pub fn find_matching_tracks<'a>(
             println!("Album \"{}\": {} tracks", name, tracks.len());
             Ok(tracks)
         }
-        "playlist" => {
+        SyncType::Playlist => {
             let tracks = lib.playlist_tracks(name);
             if tracks.is_empty() {
                 let mut msg = format!("No tracks found for playlist \"{}\"", name);
@@ -212,7 +230,7 @@ pub fn find_matching_tracks<'a>(
             println!("Playlist \"{}\": {} tracks", name, tracks.len());
             Ok(tracks)
         }
-        "track" => {
+        SyncType::Track => {
             let tracks: Vec<&library::Track> = lib
                 .tracks
                 .values()
@@ -224,9 +242,6 @@ pub fn find_matching_tracks<'a>(
             println!("Track \"{}\": {} match(es)", name, tracks.len());
             Ok(tracks)
         }
-        other => Err(format!(
-            "Unknown sync type: \"{other}\". Use: artist, album, playlist, track"
-        )),
     }
 }
 
@@ -241,7 +256,7 @@ pub struct SyncResult {
 pub fn sync_to_device(
     session: &mut dyn DeviceSession,
     pushable: &[&library::Track],
-    sync_type: &str,
+    sync_type: SyncType,
     name: &str,
     temp_dir: &Path,
 ) -> Result<SyncResult, String> {
@@ -251,9 +266,13 @@ pub fn sync_to_device(
     let existing_names: std::collections::HashSet<String> = existing_tracks
         .iter()
         .map(|t| {
-            let name = t.name.rsplit('/').next().unwrap_or(&t.name);
-            let stem = name.rsplit('.').next_back().unwrap_or(name);
-            strip_track_number(stem).to_lowercase()
+            // Device path format: "Artist/Album/track.ext" — extract artist and track stem.
+            let parts: Vec<&str> = t.name.splitn(3, '/').collect();
+            let artist = parts.first().unwrap_or(&"").to_lowercase();
+            let fallback = t.name.as_str();
+            let filename = parts.last().unwrap_or(&fallback);
+            let stem = filename.rsplit('.').next_back().unwrap_or(filename);
+            format!("{}/{}", artist, strip_track_number(stem).to_lowercase())
         })
         .collect();
     println!("{} tracks on device", existing_tracks.len());
@@ -262,7 +281,7 @@ pub fn sync_to_device(
     let mut to_push: Vec<&library::Track> = Vec::new();
     let mut skipped = 0;
     for track in pushable {
-        let key = track.name.to_lowercase();
+        let key = format!("{}/{}", track.artist.to_lowercase(), track.name.to_lowercase());
         if existing_names.contains(&key) {
             skipped += 1;
         } else {
@@ -309,7 +328,7 @@ pub fn sync_to_device(
     }
 
     // For playlist syncs, create a playlist on the device.
-    if sync_type == "playlist" {
+    if sync_type == SyncType::Playlist {
         create_device_playlist(session, name, pushable, &imported_ids, &existing_tracks)?;
     }
 
@@ -594,25 +613,25 @@ mod tests {
     fn find_matching_tracks_all_types() {
         let lib = make_test_library();
         assert_eq!(
-            find_matching_tracks(&lib, "artist", "Radiohead")
+            find_matching_tracks(&lib, SyncType::Artist, "Radiohead")
                 .unwrap()
                 .len(),
             2
         );
         assert_eq!(
-            find_matching_tracks(&lib, "album", "OK Computer")
+            find_matching_tracks(&lib, SyncType::Album, "OK Computer")
                 .unwrap()
                 .len(),
             1
         );
         assert_eq!(
-            find_matching_tracks(&lib, "playlist", "Road Trip")
+            find_matching_tracks(&lib, SyncType::Playlist, "Road Trip")
                 .unwrap()
                 .len(),
             2
         );
         assert_eq!(
-            find_matching_tracks(&lib, "track", "Creep").unwrap().len(),
+            find_matching_tracks(&lib, SyncType::Track, "Creep").unwrap().len(),
             1
         );
     }
@@ -620,7 +639,7 @@ mod tests {
     #[test]
     fn find_matching_tracks_artist_not_found_suggests() {
         let lib = make_test_library();
-        let err = find_matching_tracks(&lib, "artist", "Radio").unwrap_err();
+        let err = find_matching_tracks(&lib, SyncType::Artist, "Radio").unwrap_err();
         assert!(err.contains("No tracks found"));
         assert!(err.contains("Radiohead"));
     }
@@ -628,10 +647,16 @@ mod tests {
     #[test]
     fn find_matching_tracks_error_cases() {
         let lib = make_test_library();
-        assert!(find_matching_tracks(&lib, "album", "Nonexistent").is_err());
-        assert!(find_matching_tracks(&lib, "genre", "Rock")
-            .unwrap_err()
-            .contains("Unknown sync type"));
+        assert!(find_matching_tracks(&lib, SyncType::Album, "Nonexistent").is_err());
+    }
+
+    #[test]
+    fn sync_type_from_str() {
+        assert_eq!("artist".parse::<SyncType>().unwrap(), SyncType::Artist);
+        assert_eq!("album".parse::<SyncType>().unwrap(), SyncType::Album);
+        assert_eq!("playlist".parse::<SyncType>().unwrap(), SyncType::Playlist);
+        assert_eq!("track".parse::<SyncType>().unwrap(), SyncType::Track);
+        assert!("genre".parse::<SyncType>().unwrap_err().contains("Unknown sync type"));
     }
 
     // -- collect_music_files --
@@ -733,6 +758,15 @@ mod tests {
         fn rm(&mut self, _device_path: &str) -> Result<(), String> {
             Ok(())
         }
+        fn rm_by_id(&mut self, _object_id: u32) -> Result<(), String> {
+            Ok(())
+        }
+        fn cleanup_empty_folders(&mut self) -> Result<usize, String> {
+            Ok(0)
+        }
+        fn get_storage_info(&mut self) -> Result<(u64, u64), String> {
+            Ok((30_000_000_000, 15_000_000_000))
+        }
         fn collect_all_tracks(
             &mut self,
             _path: &str,
@@ -773,7 +807,7 @@ mod tests {
         let tracks: Vec<&library::Track> = vec![&t1, &t2, &t3, &t4, &t5];
 
         let mut mock = MockSession::new();
-        let result = sync_to_device(&mut mock, &tracks, "artist", "Artist", &temp_dir).unwrap();
+        let result = sync_to_device(&mut mock, &tracks, SyncType::Artist, "Artist", &temp_dir).unwrap();
 
         assert_eq!(result.success, 5);
         assert_eq!(result.skipped, 0);
@@ -795,7 +829,7 @@ mod tests {
 
         let mut mock = MockSession::new();
         let result =
-            sync_to_device(&mut mock, &tracks, "playlist", "Road Trip", &temp_dir).unwrap();
+            sync_to_device(&mut mock, &tracks, SyncType::Playlist, "Road Trip", &temp_dir).unwrap();
 
         assert_eq!(result.success, 4);
         assert_eq!(mock.playlist_calls.len(), 1);
@@ -816,14 +850,86 @@ mod tests {
         let tracks: Vec<&library::Track> = vec![&t1, &t2, &t3];
 
         let mut mock = MockSession::new();
-        mock.device_tracks.push(make_device_entry(50, "Song 2.mp3"));
+        mock.device_tracks.push(make_device_entry(50, "Artist/Album/Song 2.mp3"));
 
-        let result = sync_to_device(&mut mock, &tracks, "artist", "Artist", &temp_dir).unwrap();
+        let result = sync_to_device(&mut mock, &tracks, SyncType::Artist, "Artist", &temp_dir).unwrap();
 
         assert_eq!(result.success, 2);
         assert_eq!(result.skipped, 1);
         assert_eq!(mock.import_calls.len(), 2);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- Transcoding decision tests --
+
+    #[test]
+    fn needs_transcoding_native_formats() {
+        assert!(!needs_transcoding("song.mp3"));
+        assert!(!needs_transcoding("song.wma"));
+        assert!(!needs_transcoding("song.aac"));
+        assert!(!needs_transcoding("SONG.MP3")); // case insensitive
+    }
+
+    #[test]
+    fn needs_transcoding_non_native_formats() {
+        assert!(needs_transcoding("song.flac"));
+        assert!(needs_transcoding("song.ogg"));
+        assert!(needs_transcoding("song.wav"));
+        assert!(needs_transcoding("song.m4a"));
+        assert!(needs_transcoding("song.opus"));
+        assert!(needs_transcoding("song.alac"));
+        assert!(needs_transcoding("song.aiff"));
+    }
+
+    #[test]
+    fn needs_transcoding_no_extension() {
+        assert!(needs_transcoding("noext"));
+        assert!(needs_transcoding(""));
+    }
+
+    // -- Sync dedup key tests (artist-based dedup) --
+
+    #[test]
+    fn sync_does_not_skip_same_name_different_artist() {
+        let (dir, files) = setup_test_files("dedup-artist", 2);
+        let temp_dir = dir.join("transcode");
+
+        let t1 = make_test_track(1, "Song", "Artist A", "Album", &files[0]);
+        let t2 = make_test_track(2, "Song", "Artist B", "Album", &files[1]);
+        let tracks: Vec<&library::Track> = vec![&t1, &t2];
+
+        let mut mock = MockSession::new();
+        mock.device_tracks
+            .push(make_device_entry(50, "Artist A/Album/Song.mp3"));
+
+        let result =
+            sync_to_device(&mut mock, &tracks, SyncType::Artist, "Test", &temp_dir).unwrap();
+
+        assert_eq!(result.success, 1); // Only Artist B's track imported
+        assert_eq!(result.skipped, 1); // Artist A's track skipped
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- Library path resolution test --
+
+    #[test]
+    fn library_xml_path_uses_env_var() {
+        let original = std::env::var("ZYTUNES_LIBRARY").ok();
+        std::env::set_var("ZYTUNES_LIBRARY", "/custom/path.xml");
+        assert_eq!(library_xml_path(), "/custom/path.xml");
+        match original {
+            Some(v) => std::env::set_var("ZYTUNES_LIBRARY", v),
+            None => std::env::remove_var("ZYTUNES_LIBRARY"),
+        }
+    }
+
+    // -- strip_track_number edge cases --
+
+    #[test]
+    fn strip_track_number_edge_cases() {
+        assert_eq!(strip_track_number("01 "), ""); // number + space + empty
+        assert_eq!(strip_track_number("1"), "1"); // just a number, no space
     }
 }

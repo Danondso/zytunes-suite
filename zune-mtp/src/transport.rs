@@ -4,6 +4,7 @@
 //! Uses IOUSBDeviceInterface/IOUSBInterfaceInterface directly via FFI.
 
 use crate::iokit_ffi::*;
+use crate::MtpError;
 use std::ffi::CString;
 use std::os::raw::c_void;
 
@@ -25,16 +26,16 @@ unsafe impl Send for IokitTransport {}
 
 impl IokitTransport {
     /// Open a USB device by vendor/product ID and claim its MTP interface.
-    pub fn open(vendor_id: u16, product_id: u16) -> Result<Self, String> {
+    pub fn open(vendor_id: u16, product_id: u16) -> Result<Self, MtpError> {
         unsafe { Self::open_inner(vendor_id, product_id) }
     }
 
-    unsafe fn open_inner(vendor_id: u16, product_id: u16) -> Result<Self, String> {
+    unsafe fn open_inner(vendor_id: u16, product_id: u16) -> Result<Self, MtpError> {
         // Find the USB device via IOKit service matching.
         let class_name = CString::new(kUSBDeviceClassName).unwrap();
         let matching = IOServiceMatching(class_name.as_ptr());
         if matching.is_null() {
-            return Err("IOServiceMatching failed".to_string());
+            return Err(MtpError::Usb("IOServiceMatching failed".to_string()));
         }
 
         // Add vendor/product filters to the matching dictionary.
@@ -64,15 +65,15 @@ impl IokitTransport {
             &mut iterator,
         );
         if kr != kIOReturnSuccess {
-            return Err(format!("IOServiceGetMatchingServices failed: {kr}"));
+            return Err(MtpError::Usb(format!("IOServiceGetMatchingServices failed: {kr}")));
         }
 
         let service = IOIteratorNext(iterator);
         IOObjectRelease(iterator);
         if service == 0 {
-            return Err(format!(
+            return Err(MtpError::Usb(format!(
                 "No USB device found with vid=0x{vendor_id:04x} pid=0x{product_id:04x}"
-            ));
+            )));
         }
 
         // Create plugin interface for the device.
@@ -93,7 +94,7 @@ impl IokitTransport {
         CFRelease(plugin_iface_id as CFTypeRef);
 
         if kr != kIOReturnSuccess || plugin.is_null() {
-            return Err(format!("IOCreatePlugInInterfaceForService failed: {kr}"));
+            return Err(MtpError::Usb(format!("IOCreatePlugInInterfaceForService failed: {kr}")));
         }
 
         // Query for the device interface.
@@ -107,14 +108,14 @@ impl IokitTransport {
         ((**plugin).Release)(plugin);
 
         if hr != 0 || device.is_null() {
-            return Err(format!("QueryInterface for device failed: {hr}"));
+            return Err(MtpError::Usb(format!("QueryInterface for device failed: {hr}")));
         }
 
         // Open the device.
         let kr = ((**device).USBDeviceOpen)(device);
         if kr != kIOReturnSuccess {
             ((**device).Release)(device);
-            return Err(format!("USBDeviceOpen failed: 0x{kr:08x}"));
+            return Err(MtpError::Usb(format!("USBDeviceOpen failed: 0x{kr:08x}")));
         }
 
         // Wake up suspended device (aft does this in DeviceDescriptor constructor).
@@ -139,7 +140,7 @@ impl IokitTransport {
         if kr != kIOReturnSuccess {
             ((**device).USBDeviceClose)(device);
             ((**device).Release)(device);
-            return Err(format!("CreateInterfaceIterator failed: 0x{kr:08x}"));
+            return Err(MtpError::Usb(format!("CreateInterfaceIterator failed: 0x{kr:08x}")));
         }
 
         let iface_service = IOIteratorNext(iface_iterator);
@@ -157,14 +158,14 @@ impl IokitTransport {
             if kr != kIOReturnSuccess {
                 ((**device).USBDeviceClose)(device);
                 ((**device).Release)(device);
-                return Err("No USB interfaces found on device".to_string());
+                return Err(MtpError::Usb("No USB interfaces found on device".to_string()));
             }
             let iface_service2 = IOIteratorNext(iface_iterator2);
             IOObjectRelease(iface_iterator2);
             if iface_service2 == 0 {
                 ((**device).USBDeviceClose)(device);
                 ((**device).Release)(device);
-                return Err("No USB interfaces found on device".to_string());
+                return Err(MtpError::Usb("No USB interfaces found on device".to_string()));
             }
             return Self::open_interface(device, iface_service2);
         }
@@ -175,7 +176,7 @@ impl IokitTransport {
     unsafe fn open_interface(
         device: *mut *mut IOUSBDeviceInterface,
         iface_service: io_service_t,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, MtpError> {
         // Create plugin for the interface (uses interface-specific type ID).
         let plugin_type = cf_uuid(kIOUSBInterfaceUserClientTypeID_str);
         let plugin_iface_id = cf_uuid(kIOCFPlugInInterfaceID_str);
@@ -196,7 +197,7 @@ impl IokitTransport {
         if kr != kIOReturnSuccess || plugin.is_null() {
             ((**device).USBDeviceClose)(device);
             ((**device).Release)(device);
-            return Err(format!("IOCreatePlugInInterfaceForService (interface) failed: {kr}"));
+            return Err(MtpError::Usb(format!("IOCreatePlugInInterfaceForService (interface) failed: {kr}")));
         }
 
         // Query for the interface interface.
@@ -212,7 +213,7 @@ impl IokitTransport {
         if hr != 0 || interface.is_null() {
             ((**device).USBDeviceClose)(device);
             ((**device).Release)(device);
-            return Err(format!("QueryInterface for interface failed: {hr}"));
+            return Err(MtpError::Usb(format!("QueryInterface for interface failed: {hr}")));
         }
 
         // Open the interface.
@@ -221,7 +222,7 @@ impl IokitTransport {
             ((**interface).Release)(interface);
             ((**device).USBDeviceClose)(device);
             ((**device).Release)(device);
-            return Err(format!("USBInterfaceOpen failed: 0x{kr:08x}"));
+            return Err(MtpError::Usb(format!("USBInterfaceOpen failed: 0x{kr:08x}")));
         }
 
         // Discover bulk endpoints.
@@ -267,7 +268,7 @@ impl IokitTransport {
             ((**interface).Release)(interface);
             ((**device).USBDeviceClose)(device);
             ((**device).Release)(device);
-            return Err("Could not find bulk IN/OUT endpoints".to_string());
+            return Err(MtpError::Usb("Could not find bulk IN/OUT endpoints".to_string()));
         }
 
         Ok(IokitTransport {
@@ -315,7 +316,7 @@ impl IokitTransport {
 
     /// Write data to the bulk OUT endpoint.
     /// Writes in max-packet-size chunks, matching aft-mtp-cli behavior.
-    pub fn write(&self, data: &[u8]) -> Result<usize, String> {
+    pub fn write(&self, data: &[u8]) -> Result<usize, MtpError> {
         let chunk_size = self.max_packet_size as usize;
         let mut offset = 0;
         // SAFETY: We hold valid IOKit interface pointers.
@@ -330,7 +331,7 @@ impl IokitTransport {
                     chunk.len() as UInt32,
                 );
                 if kr != kIOReturnSuccess {
-                    return Err(format!("WritePipe failed: 0x{kr:08x}"));
+                    return Err(MtpError::Usb(format!("WritePipe failed: 0x{kr:08x}")));
                 }
                 offset = end;
             }
@@ -339,7 +340,7 @@ impl IokitTransport {
     }
 
     /// Read data from the bulk IN endpoint.
-    pub fn read(&self, buf: &mut [u8]) -> Result<usize, String> {
+    pub fn read(&self, buf: &mut [u8]) -> Result<usize, MtpError> {
         // SAFETY: We hold valid IOKit interface pointers.
         unsafe {
             let mut size = buf.len() as UInt32;
@@ -350,7 +351,7 @@ impl IokitTransport {
                 &mut size,
             );
             if kr != kIOReturnSuccess {
-                return Err(format!("ReadPipe failed: 0x{kr:08x}"));
+                return Err(MtpError::Usb(format!("ReadPipe failed: 0x{kr:08x}")));
             }
             Ok(size as usize)
         }
@@ -358,14 +359,14 @@ impl IokitTransport {
 
     /// Read with a timeout (in seconds). Uses a background thread since
     /// the base IOUSBInterfaceInterface100 doesn't have ReadPipeTO.
-    pub fn read_with_timeout(&self, buf: &mut [u8], timeout_secs: u64) -> Result<usize, String> {
+    pub fn read_with_timeout(&self, buf: &mut [u8], timeout_secs: u64) -> Result<usize, MtpError> {
         use std::sync::{Arc, Mutex};
 
         // SAFETY: The interface pointer remains valid for the duration of the read,
         // and we join the thread before returning. Cast to usize to cross Send boundary.
         let buf_len = buf.len();
         let shared_buf = Arc::new(Mutex::new(vec![0u8; buf_len]));
-        let result = Arc::new(Mutex::new(None::<Result<usize, String>>));
+        let result = Arc::new(Mutex::new(None::<Result<usize, i32>>));
 
         let iface_addr = self.interface as usize;
         let pipe = self.pipe_in;
@@ -390,7 +391,7 @@ impl IokitTransport {
                 )
             };
             let r = if kr != kIOReturnSuccess {
-                Err(format!("ReadPipe failed: 0x{kr:08x}"))
+                Err(kr)
             } else {
                 Ok(size as usize)
             };
@@ -405,26 +406,31 @@ impl IokitTransport {
                     ((**self.interface).AbortPipe)(self.interface, self.pipe_in);
                 }
                 let _ = handle.join();
-                return Err(format!("ReadPipe timed out ({timeout_secs}s)"));
+                return Err(MtpError::Usb(format!("ReadPipe timed out ({timeout_secs}s)")));
             }
             if let Some(r) = result.lock().unwrap().take() {
                 let _ = handle.join();
-                if let Ok(n) = &r {
-                    let locked = shared_buf.lock().unwrap();
-                    buf[..*n].copy_from_slice(&locked[..*n]);
+                match r {
+                    Ok(n) => {
+                        let locked = shared_buf.lock().unwrap();
+                        buf[..n].copy_from_slice(&locked[..n]);
+                        return Ok(n);
+                    }
+                    Err(kr) => {
+                        return Err(MtpError::Usb(format!("ReadPipe failed: 0x{kr:08x}")));
+                    }
                 }
-                return r;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
 
     /// Read a full MTP container, reassembling multi-packet responses.
-    pub fn read_container(&self) -> Result<Vec<u8>, String> {
+    pub fn read_container(&self) -> Result<Vec<u8>, MtpError> {
         let mut buf = vec![0u8; 16384];
         let n = self.read_with_timeout(&mut buf, 30)?;
         if n < 4 {
-            return Err("Short USB read".to_string());
+            return Err(MtpError::Usb("Short USB read".to_string()));
         }
         let expected_len = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
         let mut data = buf[..n].to_vec();

@@ -8,11 +8,22 @@ use crate::mtp::DeviceSession;
 use zune_mtp::container::MTP_ROOT;
 use zune_mtp::proplist::*;
 use zune_mtp::session::ObjectInfo;
-use zune_mtp::{MtpSession, MtpzKeys};
+use zune_mtp::{MtpError, MtpSession, MtpzKeys};
 
 use id3::TagLike;
 use std::collections::HashMap;
 use std::path::PathBuf;
+
+/// Extension trait to convert MtpError results to String results at the DeviceSession boundary.
+trait MtpResultExt<T> {
+    fn mtp_err(self) -> Result<T, String>;
+}
+
+impl<T> MtpResultExt<T> for Result<T, MtpError> {
+    fn mtp_err(self) -> Result<T, String> {
+        self.map_err(|e| e.to_string())
+    }
+}
 
 /// Microsoft vendor ID.
 const MICROSOFT_VENDOR_ID: u16 = 0x045e;
@@ -56,18 +67,134 @@ struct DeviceLibrary {
     albums: HashMap<(String, String), AlbumInfo>,
 }
 
+/// Track cache for persisting device track lists across sessions.
+pub struct TrackCache {
+    serial: Option<String>,
+    cache_dir: Option<PathBuf>,
+}
+
+impl TrackCache {
+    fn new(serial: Option<String>) -> Self {
+        let cache_dir = std::env::var("HOME").ok().map(PathBuf::from);
+        TrackCache { serial, cache_dir }
+    }
+
+    fn cache_path(&self) -> Option<PathBuf> {
+        let dir = self.cache_dir.as_ref()?;
+        let filename = match &self.serial {
+            Some(s) => format!(".zytunes-track-cache-{}", s),
+            None => ".zytunes-track-cache".to_string(),
+        };
+        Some(dir.join(filename))
+    }
+
+    #[cfg(test)]
+    fn load(&self) -> Option<Vec<DeviceEntry>> {
+        let path = self.cache_path()?;
+        let content = std::fs::read_to_string(&path).ok()?;
+        let mut entries = Vec::new();
+        for line in content.lines() {
+            let parts: Vec<&str> = line.splitn(5, '\t').collect();
+            if parts.len() < 5 {
+                continue;
+            }
+            entries.push(DeviceEntry {
+                object_id: parts[0].parse().unwrap_or(0),
+                storage_id: parts[1].parse().unwrap_or(0),
+                format: parts[2].to_string(),
+                size: parts[3].parse().unwrap_or(0),
+                name: parts[4].to_string(),
+            });
+        }
+        if entries.is_empty() { None } else { Some(entries) }
+    }
+
+    fn save(&self, tracks: &[DeviceEntry]) {
+        let path = match self.cache_path() {
+            Some(p) => p,
+            None => return,
+        };
+        let mut content = String::new();
+        for t in tracks {
+            let safe_name = t.name.replace('\t', " ");
+            content.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\n",
+                t.object_id, t.storage_id, t.format, t.size, safe_name
+            ));
+        }
+        let _ = std::fs::write(path, content);
+    }
+
+    /// Clear the track cache entirely.
+    pub fn clear(&self) {
+        if let Some(path) = self.cache_path() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    fn append(&self, entry: &DeviceEntry) {
+        let path = match self.cache_path() {
+            Some(p) => p,
+            None => return,
+        };
+        use std::io::Write;
+        let safe_name = entry.name.replace('\t', " ");
+        let line = format!(
+            "{}\t{}\t{}\t{}\t{}\n",
+            entry.object_id, entry.storage_id, entry.format, entry.size, safe_name
+        );
+        if let Ok(mut file) = std::fs::OpenOptions::new().append(true).create(true).open(path) {
+            let _ = file.write_all(line.as_bytes());
+        }
+    }
+
+    fn remove(&self, device_path: &str) {
+        let path = match self.cache_path() {
+            Some(p) => p,
+            None => return,
+        };
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let path_suffix = device_path.trim_start_matches("/Music/");
+        let filtered: String = content
+            .lines()
+            .filter(|line| {
+                line.splitn(5, '\t')
+                    .nth(4)
+                    .map(|name| name != path_suffix)
+                    .unwrap_or(true)
+            })
+            .map(|line| format!("{}\n", line))
+            .collect();
+        let _ = std::fs::write(path, filtered);
+    }
+}
+
 /// Native MTP session using IOKit.
 pub struct NativeSession {
     session: MtpSession,
     storage_id: u32,
     log: Option<std::sync::mpsc::Sender<String>>,
     library: Option<DeviceLibrary>,
+    cache: TrackCache,
 }
 
 impl NativeSession {
+    /// Access the device library state, returning an error if not yet initialized.
+    fn lib(&self) -> Result<&DeviceLibrary, String> {
+        self.library.as_ref().ok_or_else(|| "Device library not initialized".to_string())
+    }
+
     /// Set a log channel for progress messages.
     pub fn set_log_sender(&mut self, tx: std::sync::mpsc::Sender<String>) {
         self.log = Some(tx);
+    }
+
+    /// Set the device serial number (used to key the track cache per-device).
+    pub fn set_serial(&mut self, serial: Option<String>) {
+        self.cache = TrackCache::new(serial);
     }
 
     fn log_msg(&self, msg: &str) {
@@ -78,7 +205,7 @@ impl NativeSession {
 
     /// Query storage info. Returns (total_bytes, free_bytes).
     pub fn get_storage_info(&mut self) -> Result<(u64, u64), String> {
-        self.session.get_storage_info(self.storage_id)
+        self.session.get_storage_info(self.storage_id).mtp_err()
     }
 
     /// Open a native IOKit MTP session to the Zune.
@@ -117,6 +244,7 @@ impl NativeSession {
             storage_id,
             log: None,
             library: None,
+            cache: TrackCache::new(None),
         })
     }
 
@@ -130,7 +258,8 @@ impl NativeSession {
     ) -> Result<(), String> {
         let handles = self
             .session
-            .get_object_handles(self.storage_id, parent)?;
+            .get_object_handles(self.storage_id, parent)
+            .mtp_err()?;
 
         for handle in handles {
             let info = match self.session.get_object_info(handle) {
@@ -139,8 +268,6 @@ impl NativeSession {
             };
 
             let full_name = if prefix.is_empty() {
-                // Top-level = artist names. Log progress.
-                self.log_msg(&format!("Scanning: {}", info.filename));
                 info.filename.clone()
             } else {
                 format!("{}/{}", prefix, info.filename)
@@ -152,17 +279,32 @@ impl NativeSession {
                 format_name(info.object_format)
             };
 
-            entries.push(DeviceEntry {
-                object_id: handle as u64,
-                storage_id: info.storage_id as u64,
-                format: format_str,
-                size: info.compressed_size as u64,
-                name: full_name.clone(),
-            });
-
-            // Recurse into directories.
             if info.object_format == ASSOCIATION_FORMAT {
+                // Recurse into directories; only add the directory entry
+                // if it contains children (skip empty leftover folders).
+                let before = entries.len();
                 self.list_recursive(handle, &full_name, entries)?;
+                let has_children = entries.len() > before;
+                if has_children && prefix.is_empty() {
+                    self.log_msg(&format!("Scanning: {}", info.filename));
+                }
+                if has_children {
+                    entries.push(DeviceEntry {
+                        object_id: handle as u64,
+                        storage_id: info.storage_id as u64,
+                        format: format_str,
+                        size: info.compressed_size as u64,
+                        name: full_name.clone(),
+                    });
+                }
+            } else {
+                entries.push(DeviceEntry {
+                    object_id: handle as u64,
+                    storage_id: info.storage_id as u64,
+                    format: format_str,
+                    size: info.compressed_size as u64,
+                    name: full_name.clone(),
+                });
             }
         }
         Ok(())
@@ -172,7 +314,8 @@ impl NativeSession {
     fn find_object(&mut self, parent: u32, name: &str) -> Result<Option<u32>, String> {
         let handles = self
             .session
-            .get_object_handles(self.storage_id, parent)?;
+            .get_object_handles(self.storage_id, parent)
+            .mtp_err()?;
         for handle in handles {
             if let Ok(info) = self.session.get_object_info(handle) {
                 if info.filename == name {
@@ -232,7 +375,8 @@ impl NativeSession {
         // Find root folders.
         let root_handles = self
             .session
-            .get_object_handles(self.storage_id, MTP_ROOT)?;
+            .get_object_handles(self.storage_id, MTP_ROOT)
+            .mtp_err()?;
 
         let mut music_folder = None;
         let mut artists_folder = None;
@@ -253,6 +397,72 @@ impl NativeSession {
         let artists_folder = artists_folder.unwrap_or(music_folder);
         let albums_folder = albums_folder.unwrap_or(music_folder);
 
+        // Scan existing artists from the Artists folder.
+        let mut artists = HashMap::new();
+        if artist_supported {
+            if let Ok(handles) = self.session.get_object_handles(self.storage_id, artists_folder) {
+                for h in handles {
+                    if let Ok(info) = self.session.get_object_info(h) {
+                        if info.object_format == FORMAT_ARTIST {
+                            let name = info.filename.trim_end_matches(".art").to_string();
+                            // Find the corresponding Music/{Artist}/ folder.
+                            let music_folder_id = self.find_object(music_folder, &name)
+                                .ok()
+                                .flatten()
+                                .unwrap_or(music_folder);
+                            artists.insert(name, ArtistInfo {
+                                id: h,
+                                music_folder_id,
+                            });
+                        }
+                    }
+                }
+            }
+        } else {
+            // No artist objects — scan Music/ subfolders as artist folders.
+            if let Ok(handles) = self.session.get_object_handles(self.storage_id, music_folder) {
+                for h in handles {
+                    if let Ok(info) = self.session.get_object_info(h) {
+                        if info.object_format == ASSOCIATION_FORMAT {
+                            artists.insert(info.filename.clone(), ArtistInfo {
+                                id: h,
+                                music_folder_id: h,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        self.log_msg(&format!("Found {} existing artists", artists.len()));
+
+        // Scan existing albums from the Albums folder.
+        let mut albums = HashMap::new();
+        if let Ok(handles) = self.session.get_object_handles(self.storage_id, albums_folder) {
+            for h in handles {
+                if let Ok(info) = self.session.get_object_info(h) {
+                    if info.object_format == FORMAT_ABSTRACT_AUDIO_ALBUM {
+                        // Filename format: "Artist--Album.alb"
+                        let base = info.filename.trim_end_matches(".alb");
+                        if let Some((artist_name, album_name)) = base.split_once("--") {
+                            // Find the Music/{Artist}/{Album}/ folder.
+                            let artist_folder = artists.get(artist_name)
+                                .map(|a| a.music_folder_id)
+                                .unwrap_or(music_folder);
+                            let album_folder_id = self.find_object(artist_folder, album_name)
+                                .ok()
+                                .flatten()
+                                .unwrap_or(artist_folder);
+                            albums.insert(
+                                (artist_name.to_string(), album_name.to_string()),
+                                AlbumInfo { id: h, music_folder_id: album_folder_id },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        self.log_msg(&format!("Found {} existing albums", albums.len()));
+
         self.library = Some(DeviceLibrary {
             music_folder,
             artists_folder,
@@ -262,8 +472,8 @@ impl NativeSession {
                 album_date_supported,
                 album_cover_supported,
             },
-            artists: HashMap::new(),
-            albums: HashMap::new(),
+            artists,
+            albums,
         });
 
         Ok(())
@@ -278,9 +488,10 @@ impl NativeSession {
             }
         }
 
-        let music_folder = self.library.as_ref().unwrap().music_folder;
-        let artists_folder = self.library.as_ref().unwrap().artists_folder;
-        let artist_supported = self.library.as_ref().unwrap().caps.artist_supported;
+        let lib = self.lib()?;
+        let music_folder = lib.music_folder;
+        let artists_folder = lib.artists_folder;
+        let artist_supported = lib.caps.artist_supported;
 
         // Create music subfolder: /Music/{Artist}/
         let folder_id = match self.find_object(music_folder, name)? {
@@ -292,7 +503,8 @@ impl NativeSession {
                     .build();
                 let (_, _, id) = self.session.send_object_prop_list(
                     self.storage_id, music_folder, ASSOCIATION_FORMAT, 0, &props,
-                )?;
+                ).mtp_err()?;
+                let _ = self.session.send_object(&[]);
                 id
             }
         };
@@ -306,7 +518,11 @@ impl NativeSession {
             match self.session.send_object_prop_list(
                 self.storage_id, artists_folder, FORMAT_ARTIST, 0, &props,
             ) {
-                Ok((_, _, id)) => id,
+                Ok((_, _, id)) => {
+                    // Complete the two-phase MTP operation with empty data.
+                    let _ = self.session.send_object(&[]);
+                    id
+                }
                 Err(_) => folder_id, // Fallback to folder ID if artist creation fails.
             }
         } else {
@@ -338,11 +554,11 @@ impl NativeSession {
             }
         }
 
-        let albums_folder = self.library.as_ref().unwrap().albums_folder;
-        let artist_folder = self.library.as_ref()
-            .and_then(|l| l.artists.get(artist_name))
+        let lib = self.lib()?;
+        let albums_folder = lib.albums_folder;
+        let artist_folder = lib.artists.get(artist_name)
             .map(|a| a.music_folder_id)
-            .unwrap_or(self.library.as_ref().unwrap().music_folder);
+            .unwrap_or(lib.music_folder);
 
         // Create music subfolder: /Music/{Artist}/{Album}/
         let folder_id = match self.find_object(artist_folder, album_name)? {
@@ -354,7 +570,8 @@ impl NativeSession {
                     .build();
                 let (_, _, id) = self.session.send_object_prop_list(
                     self.storage_id, artist_folder, ASSOCIATION_FORMAT, 0, &props,
-                )?;
+                ).mtp_err()?;
+                let _ = self.session.send_object(&[]);
                 id
             }
         };
@@ -373,7 +590,11 @@ impl NativeSession {
         let album_id = match self.session.send_object_prop_list(
             self.storage_id, albums_folder, FORMAT_ABSTRACT_AUDIO_ALBUM, 0, &album_data,
         ) {
-            Ok((_, _, id)) => id,
+            Ok((_, _, id)) => {
+                // Complete the two-phase MTP operation with empty data.
+                let _ = self.session.send_object(&[]);
+                id
+            }
             Err(_) => folder_id, // Fallback if album creation fails.
         };
 
@@ -393,7 +614,8 @@ impl DeviceSession for NativeSession {
         let parent = self.resolve_path(path)?;
         let handles = self
             .session
-            .get_object_handles(self.storage_id, parent)?;
+            .get_object_handles(self.storage_id, parent)
+            .mtp_err()?;
 
         let mut entries = Vec::new();
         for handle in handles {
@@ -462,10 +684,10 @@ impl DeviceSession for NativeSession {
             format,
             file_data.len() as u64,
             &prop_data,
-        )?;
+        ).mtp_err()?;
 
         // Upload the actual audio file.
-        self.session.send_object(&file_data)?;
+        self.session.send_object(&file_data).mtp_err()?;
 
         // Link track to album via object references.
         if let Ok(mut refs) = self.session.get_object_references(album_obj_id) {
@@ -476,20 +698,7 @@ impl DeviceSession for NativeSession {
         }
 
         // Set album art if available and supported.
-        if self.library.as_ref().map(|l| l.caps.album_cover_supported).unwrap_or(false) {
-            if let Ok(tag) = id3::Tag::read_from_path(local_path) {
-                if let Some(pic) = tag.pictures().next() {
-                    let mut art_data = Vec::with_capacity(4 + pic.data.len());
-                    art_data.extend_from_slice(&(pic.data.len() as u32).to_le_bytes());
-                    art_data.extend_from_slice(&pic.data);
-                    let _ = self.session.set_object_prop_value(
-                        album_obj_id,
-                        PROP_REPRESENTATIVE_SAMPLE_DATA,
-                        &art_data,
-                    );
-                }
-            }
-        }
+        self.try_set_album_art(local_path, album_obj_id);
 
         // Update the track cache incrementally.
         let new_entry = DeviceEntry {
@@ -499,25 +708,72 @@ impl DeviceSession for NativeSession {
             size: file_data.len() as u64,
             name: format!("{}/{}/{}", artist, album, filename),
         };
-        Self::append_to_cache(&new_entry);
+        self.cache.append(&new_entry);
 
         Ok(track_id as u64)
     }
 
     fn rm(&mut self, device_path: &str) -> Result<(), String> {
         let handle = self.resolve_path(device_path)?;
-        self.session.delete_object(handle)?;
-        Self::remove_from_cache(device_path);
+        self.session.delete_object(handle).mtp_err()?;
+        self.cache.remove(device_path);
         Ok(())
     }
 
-    fn collect_all_tracks(&mut self, path: &str) -> Result<Vec<DeviceEntry>, String> {
-        // Try loading from cache first.
-        if let Some(cached) = Self::load_cache() {
-            self.log_msg(&format!("Loaded {} tracks from cache", cached.len()));
-            return Ok(cached);
-        }
+    fn rm_by_id(&mut self, object_id: u32) -> Result<(), String> {
+        self.session.delete_object(object_id).mtp_err()
+    }
 
+    fn cleanup_empty_folders(&mut self) -> Result<usize, String> {
+        let music_folder = match self.resolve_path("/Music") {
+            Ok(h) => h,
+            Err(_) => return Ok(0),
+        };
+        let mut removed = 0usize;
+        let artist_handles = self.session.get_object_handles(self.storage_id, music_folder).mtp_err()?;
+
+        for artist_h in artist_handles {
+            let artist_info = match self.session.get_object_info(artist_h) {
+                Ok(i) => i,
+                Err(_) => continue,
+            };
+            if artist_info.object_format != ASSOCIATION_FORMAT {
+                continue;
+            }
+
+            // Check album subfolders inside this artist folder.
+            let album_handles = self.session.get_object_handles(self.storage_id, artist_h)
+                .unwrap_or_default();
+            for album_h in &album_handles {
+                let album_info = match self.session.get_object_info(*album_h) {
+                    Ok(i) => i,
+                    Err(_) => continue,
+                };
+                if album_info.object_format != ASSOCIATION_FORMAT {
+                    continue;
+                }
+                // If album folder is empty, delete it.
+                let children = self.session.get_object_handles(self.storage_id, *album_h)
+                    .unwrap_or_default();
+                if children.is_empty() && self.session.delete_object(*album_h).is_ok() {
+                    self.log_msg(&format!("Cleaned up empty folder: {}/{}", artist_info.filename, album_info.filename));
+                    removed += 1;
+                }
+            }
+
+            // Re-check artist folder — it may now be empty after album cleanup.
+            let remaining = self.session.get_object_handles(self.storage_id, artist_h)
+                .unwrap_or_default();
+            if remaining.is_empty() && self.session.delete_object(artist_h).is_ok() {
+                self.log_msg(&format!("Cleaned up empty folder: {}", artist_info.filename));
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    fn collect_all_tracks(&mut self, path: &str) -> Result<Vec<DeviceEntry>, String> {
+        // Always scan fresh — cache causes stale path issues on delete.
         let parent = match self.resolve_path(path) {
             Ok(h) => h,
             Err(_) => return Ok(Vec::new()),
@@ -530,7 +786,7 @@ impl DeviceSession for NativeSession {
             entries.into_iter().filter(|e| !e.is_dir()).collect();
 
         // Save to cache for next time.
-        Self::save_cache(&tracks);
+        self.cache.save(&tracks);
         self.log_msg(&format!("Cached {} tracks", tracks.len()));
 
         Ok(tracks)
@@ -542,7 +798,7 @@ impl DeviceSession for NativeSession {
         track_ids: &[u64],
     ) -> Result<(), String> {
         self.ensure_library()?;
-        let music_folder = self.library.as_ref().unwrap().music_folder;
+        let music_folder = self.lib()?.music_folder;
 
         // Step 1: Create playlist object via SendObjectPropList.
         let props = PropListBuilder::new()
@@ -554,10 +810,10 @@ impl DeviceSession for NativeSession {
             FORMAT_ABSTRACT_AV_PLAYLIST,
             0,
             &props,
-        )?;
+        ).mtp_err()?;
 
         // Step 2: Send empty object data.
-        self.session.send_object(&[])?;
+        self.session.send_object(&[]).mtp_err()?;
 
         // Step 3: Set display name via SetObjectPropValue.
         let mut name_data = Vec::new();
@@ -567,111 +823,51 @@ impl DeviceSession for NativeSession {
             name_data.extend_from_slice(&ch.to_le_bytes());
         }
         name_data.extend_from_slice(&0u16.to_le_bytes());
-        let _ = self.session.set_object_prop_value(playlist_id, 0xDC44, &name_data);
+        let _ = self.session.set_object_prop_value(playlist_id, PROP_NAME, &name_data);
 
         // Step 4: Link tracks via SetObjectReferences.
         let refs: Vec<u32> = track_ids.iter().map(|&id| id as u32).collect();
-        self.session.set_object_references(playlist_id, &refs)?;
+        self.session.set_object_references(playlist_id, &refs).mtp_err()?;
 
         Ok(())
+    }
+
+    fn get_storage_info(&mut self) -> Result<(u64, u64), String> {
+        self.session.get_storage_info(self.storage_id).mtp_err()
     }
 }
 
 impl NativeSession {
-    fn cache_path() -> Option<PathBuf> {
-        let home = std::env::var("HOME").ok()?;
-        Some(PathBuf::from(home).join(".zytunes-track-cache"))
-    }
-
-    fn load_cache() -> Option<Vec<DeviceEntry>> {
-        let path = Self::cache_path()?;
-        let content = std::fs::read_to_string(&path).ok()?;
-        let mut entries = Vec::new();
-        for line in content.lines() {
-            let parts: Vec<&str> = line.splitn(5, '\t').collect();
-            if parts.len() < 5 {
-                continue;
-            }
-            entries.push(DeviceEntry {
-                object_id: parts[0].parse().unwrap_or(0),
-                storage_id: parts[1].parse().unwrap_or(0),
-                format: parts[2].to_string(),
-                size: parts[3].parse().unwrap_or(0),
-                name: parts[4].to_string(),
-            });
-        }
-        if entries.is_empty() {
-            None
-        } else {
-            Some(entries)
-        }
-    }
-
-    fn save_cache(tracks: &[DeviceEntry]) {
-        let path = match Self::cache_path() {
-            Some(p) => p,
-            None => return,
-        };
-        let mut content = String::new();
-        for t in tracks {
-            // Strip tabs from name to preserve the tab-delimited cache format.
-            let safe_name = t.name.replace('\t', " ");
-            content.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{}\n",
-                t.object_id, t.storage_id, t.format, t.size, safe_name
-            ));
-        }
-        let _ = std::fs::write(path, content);
-    }
-
     /// Clear the track cache entirely.
-    pub fn clear_cache() {
-        if let Some(path) = Self::cache_path() {
-            let _ = std::fs::remove_file(path);
-        }
+    pub fn clear_cache(&self) {
+        self.cache.clear();
     }
 
-    /// Append a single track to the cache file.
-    fn append_to_cache(entry: &DeviceEntry) {
-        let path = match Self::cache_path() {
-            Some(p) => p,
-            None => return,
-        };
-        use std::io::Write;
-        // Strip tabs from name to preserve the tab-delimited cache format.
-        let safe_name = entry.name.replace('\t', " ");
-        let line = format!(
-            "{}\t{}\t{}\t{}\t{}\n",
-            entry.object_id, entry.storage_id, entry.format, entry.size, safe_name
-        );
-        if let Ok(mut file) = std::fs::OpenOptions::new().append(true).create(true).open(path) {
-            let _ = file.write_all(line.as_bytes());
+    /// Try to extract and set album art on the device. Logs but doesn't fail on errors.
+    fn try_set_album_art(&mut self, local_path: &str, album_obj_id: u32) {
+        let supported = self.library.as_ref().map(|l| l.caps.album_cover_supported).unwrap_or(false);
+        if !supported {
+            return;
         }
-    }
-
-    /// Remove a track from the cache by device path.
-    fn remove_from_cache(device_path: &str) {
-        let path = match Self::cache_path() {
-            Some(p) => p,
-            None => return,
+        let jpeg_data = match extract_album_art(local_path) {
+            Some(data) => data,
+            None => {
+                self.log_msg("No album art found in file");
+                return;
+            }
         };
-        let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        // Filter out lines whose name (5th field) matches the path suffix.
-        let path_suffix = device_path.trim_start_matches("/Music/");
-        let filtered: String = content
-            .lines()
-            .filter(|line| {
-                line.splitn(5, '\t')
-                    .nth(4)
-                    .map(|name| name != path_suffix)
-                    .unwrap_or(true)
-            })
-            .map(|line| format!("{}\n", line))
-            .collect();
-        let _ = std::fs::write(path, filtered);
+        self.log_msg(&format!("Setting album art ({} bytes)", jpeg_data.len()));
+        let mut art_data = Vec::with_capacity(4 + jpeg_data.len());
+        art_data.extend_from_slice(&(jpeg_data.len() as u32).to_le_bytes());
+        art_data.extend_from_slice(&jpeg_data);
+        match self.session.set_object_prop_value(
+            album_obj_id,
+            PROP_REPRESENTATIVE_SAMPLE_DATA,
+            &art_data,
+        ) {
+            Ok(_) => self.log_msg("Album art set successfully"),
+            Err(e) => self.log_msg(&format!("Album art failed: {}", e)),
+        }
     }
 }
 
@@ -707,6 +903,35 @@ fn format_name(format: u16) -> String {
 
 /// Read metadata from an audio file (ID3 tags for MP3).
 /// Returns (artist, album, title, track_number, genre).
+/// Extract album art from an audio file, resized to 200x200 JPEG.
+/// Uses ffmpeg for reliable extraction from any format.
+fn extract_album_art(path: &str) -> Option<Vec<u8>> {
+    let temp = std::env::temp_dir().join("zytunes-art.jpg");
+    let result = std::process::Command::new("ffmpeg")
+        .args([
+            "-y", "-i", path,
+            "-an",                     // no audio
+            "-vf", "scale=200:200",    // resize to 200x200
+            "-codec:v", "mjpeg",       // output JPEG
+            "-q:v", "5",               // quality
+        ])
+        .arg(temp.as_os_str())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .ok()?;
+    if !result.success() {
+        return None;
+    }
+    let data = std::fs::read(&temp).ok()?;
+    let _ = std::fs::remove_file(&temp);
+    if data.is_empty() {
+        None
+    } else {
+        Some(data)
+    }
+}
+
 fn read_metadata(path: &str, filename: &str) -> (String, String, String, u16, String) {
     // Try ID3 tags first.
     if let Ok(tag) = id3::Tag::read_from_path(path) {
@@ -909,5 +1134,128 @@ mod tests {
         assert_eq!(title, "path");
         assert_eq!(track_num, 0);
         assert_eq!(genre, "");
+    }
+
+    fn make_cache(serial: Option<&str>) -> TrackCache {
+        let dir = std::env::temp_dir().join(format!("zytunes-test-cache-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        TrackCache {
+            serial: serial.map(|s| s.to_string()),
+            cache_dir: Some(dir),
+        }
+    }
+
+    fn sample_entry(name: &str, id: u64) -> DeviceEntry {
+        DeviceEntry {
+            object_id: id,
+            storage_id: 65537,
+            format: "MP3".to_string(),
+            size: 1024,
+            name: name.to_string(),
+        }
+    }
+
+    #[test]
+    fn track_cache_path_uses_serial() {
+        let cache = make_cache(Some("ABC123"));
+        let path = cache.cache_path().unwrap();
+        assert!(path.to_str().unwrap().contains("zytunes-track-cache-ABC123"));
+    }
+
+    #[test]
+    fn track_cache_path_without_serial() {
+        let cache = make_cache(None);
+        let path = cache.cache_path().unwrap();
+        assert!(path.to_str().unwrap().contains("zytunes-track-cache"));
+        assert!(!path.to_str().unwrap().contains("zytunes-track-cache-"));
+    }
+
+    #[test]
+    fn track_cache_save_and_load() {
+        let cache = make_cache(Some("save-load"));
+        let entries = vec![
+            sample_entry("Artist/Album/track1.mp3", 100),
+            sample_entry("Artist/Album/track2.mp3", 101),
+        ];
+        cache.save(&entries);
+
+        let loaded = cache.load().unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].name, "Artist/Album/track1.mp3");
+        assert_eq!(loaded[0].object_id, 100);
+        assert_eq!(loaded[1].name, "Artist/Album/track2.mp3");
+
+        // Cleanup.
+        if let Some(p) = cache.cache_path() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn track_cache_append() {
+        let cache = make_cache(Some("append"));
+        let entries = vec![sample_entry("first.mp3", 1)];
+        cache.save(&entries);
+
+        cache.append(&sample_entry("second.mp3", 2));
+
+        let loaded = cache.load().unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[1].name, "second.mp3");
+
+        if let Some(p) = cache.cache_path() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn track_cache_remove() {
+        let cache = make_cache(Some("remove"));
+        let entries = vec![
+            sample_entry("Artist/Album/keep.mp3", 1),
+            sample_entry("Artist/Album/delete.mp3", 2),
+        ];
+        cache.save(&entries);
+
+        cache.remove("/Music/Artist/Album/delete.mp3");
+
+        let loaded = cache.load().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "Artist/Album/keep.mp3");
+
+        if let Some(p) = cache.cache_path() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn track_cache_clear() {
+        let cache = make_cache(Some("clear"));
+        cache.save(&[sample_entry("x.mp3", 1)]);
+        assert!(cache.cache_path().unwrap().exists());
+
+        cache.clear();
+        assert!(!cache.cache_path().unwrap().exists());
+    }
+
+    #[test]
+    fn track_cache_load_empty_returns_none() {
+        let cache = make_cache(Some("empty"));
+        assert!(cache.load().is_none());
+    }
+
+    #[test]
+    fn track_cache_tabs_in_name_handled() {
+        let cache = make_cache(Some("tabs"));
+        let entries = vec![sample_entry("Art\tist/Album/track.mp3", 1)];
+        cache.save(&entries);
+
+        let loaded = cache.load().unwrap();
+        // Tab should be replaced with space in saved format.
+        assert_eq!(loaded[0].name, "Art ist/Album/track.mp3");
+
+        if let Some(p) = cache.cache_path() {
+            let _ = std::fs::remove_file(p);
+        }
     }
 }

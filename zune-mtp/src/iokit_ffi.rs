@@ -31,6 +31,7 @@ pub type SInt32 = i32;
 pub type UInt8 = u8;
 pub type UInt16 = u16;
 pub type UInt32 = u32;
+#[allow(clippy::upper_case_acronyms)] // Matches COM/IOKit FFI convention.
 pub type HRESULT = i32;
 
 pub const kIOReturnSuccess: IOReturn = 0;

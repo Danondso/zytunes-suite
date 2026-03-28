@@ -180,7 +180,7 @@ fn cmd_sync(args: &[String]) -> Result<(), String> {
         return Err("Usage: zytunes sync <type> <name> [--library <path>]".into());
     }
 
-    let sync_type = args[0].as_str();
+    let sync_type: zytunes::SyncType = args[0].parse()?;
     let name = &args[1];
 
     // Check for --library flag.
@@ -254,7 +254,7 @@ fn cmd_sync(args: &[String]) -> Result<(), String> {
             .map_err(|e| format!("Failed to create temp directory: {e}"))?;
     }
 
-    let result = sync_to_device(&mut session, &pushable, sync_type, name, &temp_dir)?;
+    let result = sync_to_device(&mut session, &pushable, sync_type, name.as_str(), &temp_dir)?;
 
     // Clean up temp files.
     let _ = std::fs::remove_dir_all(&temp_dir);

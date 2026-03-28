@@ -81,6 +81,7 @@ pub const THEMES: &[Theme] = &[
     SYSTEM_7,
     BIOS,
     RED_SANDS,
+    NEWPORT_LIGHTS,
 ];
 
 pub const ITUNES_2004: Theme = Theme {
@@ -290,6 +291,25 @@ pub const RED_SANDS: Theme = Theme {
     success_text: Color::Rgb(180, 210, 90),
     progress_bar: Color::Rgb(210, 163, 58),
     progress_bg: Color::Rgb(88, 26, 16),
+};
+
+pub const NEWPORT_LIGHTS: Theme = Theme {
+    name: "Newport Lights",
+    sidebar_bg: Color::Rgb(0, 106, 95),        // deep teal
+    sidebar_text: Color::Rgb(230, 240, 235),    // off-white
+    selection_bg: Color::Rgb(255, 255, 255),    // white
+    selection_text: Color::Rgb(0, 80, 70),      // dark teal
+    main_bg: Color::Rgb(0, 130, 115),           // seafoam green
+    alt_row_bg: Color::Rgb(0, 118, 105),        // slightly darker seafoam
+    border: Color::Rgb(180, 220, 210),          // pale mint
+    footer_bg: Color::Rgb(0, 90, 80),           // dark teal
+    footer_text: Color::Rgb(230, 240, 235),     // off-white
+    header_text: Color::Rgb(255, 255, 255),     // white
+    dim_text: Color::Rgb(100, 170, 155),        // muted mint
+    error_text: Color::Rgb(255, 100, 80),       // warm red
+    success_text: Color::Rgb(180, 255, 200),    // bright mint
+    progress_bar: Color::Rgb(255, 255, 255),    // white
+    progress_bg: Color::Rgb(0, 80, 70),         // dark teal
 };
 
 /// Find a theme index by name (case-insensitive). Returns 0 (default) if not found.
