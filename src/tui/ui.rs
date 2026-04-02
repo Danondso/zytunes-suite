@@ -1,9 +1,7 @@
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, Wrap,
-};
+use ratatui::widgets::{Cell, Clear, List, ListItem, Paragraph, Row, Table, Wrap};
 use ratatui::Frame;
 use throbber_widgets_tui::{Throbber, ThrobberState, WhichUse};
 
@@ -101,6 +99,10 @@ pub fn draw(f: &mut Frame, app: &App) {
         draw_confirm_removal(f, app, paths.len());
     }
 
+    if app.pending_cache_clear {
+        draw_confirm_cache_clear(f, app);
+    }
+
     // Toast overlay.
     if let Some((ref msg, _, is_error)) = app.toast_message {
         draw_toast(f, app, msg, is_error);
@@ -125,7 +127,7 @@ pub fn draw(f: &mut Frame, app: &App) {
 fn draw_startup(f: &mut Frame, app: &App, area: Rect) {
     let t = app.theme();
     let symbol = throbber_symbol(&app.throbber_state, app.theme_index);
-    let pulse = anim::pulse_color(t.accent_color(), app.anim_frame, 40);
+    let pulse = anim::animated_accent(t.accent_color(), t.accent_secondary, t.accent_anim, app.anim_frame, 40);
 
     let path_display = app
         .library_path
@@ -146,8 +148,7 @@ fn draw_startup(f: &mut Frame, app: &App, area: Rect) {
         Line::from(Span::styled(path_display, t.dim())),
     ];
 
-    let block = Block::default()
-        .borders(Borders::ALL)
+    let block = t.block()
         .border_style(t.dim())
         .title(" Starting ")
         .title_alignment(Alignment::Center);
@@ -186,8 +187,7 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
     } else {
         t.border()
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
+    let block = t.block()
         .border_style(border_style)
         .title(title)
         .style(Style::default().bg(t.sidebar_bg));
@@ -273,8 +273,7 @@ fn draw_album_browser(f: &mut Frame, app: &App, area: Rect) {
     } else {
         t.border()
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
+    let block = t.block()
         .border_style(border_style)
         .title(title)
         .style(Style::default().bg(t.sidebar_bg));
@@ -351,8 +350,7 @@ fn draw_album_detail(f: &mut Frame, app: &App, area: Rect) {
         truncate(album_name, area.width.saturating_sub(4) as usize)
     );
 
-    let block = Block::default()
-        .borders(Borders::ALL)
+    let block = t.block()
         .border_style(border_style)
         .title(title)
         .style(Style::default().bg(t.main_bg));
@@ -460,8 +458,7 @@ fn draw_track_table(f: &mut Frame, app: &App, area: Rect) {
     } else {
         t.border()
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
+    let block = t.block()
         .border_style(border_style)
         .title(title)
         .style(Style::default().bg(t.main_bg));
@@ -597,8 +594,7 @@ fn draw_device_info(f: &mut Frame, app: &App, area: Rect) {
         }
     };
 
-    let block = Block::default()
-        .borders(Borders::ALL)
+    let block = t.block()
         .border_style(border_style)
         .title(title)
         .title_alignment(Alignment::Center);
@@ -618,7 +614,7 @@ fn draw_device_info(f: &mut Frame, app: &App, area: Rect) {
                 .unwrap_or(0);
             let (screen1, screen2) = anim::connection_screen_lines(conn_frame);
             let zune_art = build_zune_art(screen1, screen2);
-            let pulse = anim::pulse_color(t.accent_color(), app.anim_frame, 40);
+            let pulse = anim::animated_accent(t.accent_color(), t.accent_secondary, t.accent_anim, app.anim_frame, 40);
             let art_lines: Vec<Line> = zune_art
                 .iter()
                 .map(|l| Line::from(Span::styled(l.as_str(), Style::default().fg(pulse))).alignment(Alignment::Center))
@@ -653,7 +649,7 @@ fn draw_device_info_connected(f: &mut Frame, app: &App, area: Rect) {
     let zune_art = build_zune_art(&screen_line1, &screen_line2);
 
     let art_color = if is_syncing || is_busy {
-        anim::pulse_color(t.accent_color(), app.anim_frame, 40)
+        anim::animated_accent(t.accent_color(), t.accent_secondary, t.accent_anim, app.anim_frame, 40)
     } else {
         t.dim_text
     };
@@ -749,8 +745,7 @@ fn draw_sync_queue(f: &mut Frame, app: &App, area: Rect) {
         SyncStatus::Running { current, total } => {
             let symbol = throbber_symbol(&app.throbber_state, app.theme_index);
             let title = format!(" {} {}/{} ", symbol, current, total);
-            let block = Block::default()
-                .borders(Borders::ALL)
+            let block = t.block()
                 .border_style(border_style)
                 .title(title);
             let inner = block.inner(area);
@@ -775,8 +770,7 @@ fn draw_sync_queue(f: &mut Frame, app: &App, area: Rect) {
                     " Remove Queue ({}) ",
                     app.removal_queue.len()
                 );
-                let block = Block::default()
-                    .borders(Borders::ALL)
+                let block = t.block()
                     .border_style(Style::default().fg(t.error_text))
                     .title(title)
                     .style(Style::default().bg(t.main_bg));
@@ -810,8 +804,7 @@ fn draw_sync_queue(f: &mut Frame, app: &App, area: Rect) {
                     app.sync.queue.len(),
                     total_tracks
                 );
-                let block = Block::default()
-                    .borders(Borders::ALL)
+                let block = t.block()
                     .border_style(border_style)
                     .title(title)
                     .style(Style::default().bg(t.main_bg));
@@ -856,9 +849,7 @@ fn draw_sync_queue(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_sync_log(f: &mut Frame, app: &App, area: Rect) {
     let t = app.theme();
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(t.border())
+    let block = t.block()
         .title(" Log ")
         .style(Style::default().bg(t.main_bg));
     let inner = block.inner(area);
@@ -893,9 +884,7 @@ fn draw_sync_log(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_keys_panel(f: &mut Frame, app: &App, area: Rect) {
     let t = app.theme();
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(t.border())
+    let block = t.block()
         .title(" Keys [h] ")
         .style(Style::default().bg(t.sidebar_bg));
     let inner = block.inner(area);
@@ -916,6 +905,7 @@ fn draw_keys_panel(f: &mut Frame, app: &App, area: Rect) {
         ("t", "Theme picker"),
         ("/", "Search"),
         ("c", "Connect"),
+        ("X", "Clear cache"),
     ];
     lines.push(Line::from(Span::styled(
         " Global",
@@ -1014,7 +1004,7 @@ fn draw_now_playing(f: &mut Frame, app: &App, np: &NowPlaying, area: Rect) {
     };
 
     let border_color = if np.state == PlaybackState::Playing {
-        anim::pulse_color(t.accent_color(), app.anim_frame, 40)
+        anim::animated_accent(t.accent_color(), t.accent_secondary, t.accent_anim, app.anim_frame, 40)
     } else {
         t.border
     };
@@ -1027,8 +1017,7 @@ fn draw_now_playing(f: &mut Frame, app: &App, np: &NowPlaying, area: Rect) {
 
     // --- Left: track info + controls ---
     let title = format!(" {} Now Playing ", state_icon);
-    let info_block = Block::default()
-        .borders(Borders::ALL)
+    let info_block = t.block()
         .border_style(Style::default().fg(border_color))
         .title(title)
         .style(Style::default().bg(t.main_bg));
@@ -1036,8 +1025,7 @@ fn draw_now_playing(f: &mut Frame, app: &App, np: &NowPlaying, area: Rect) {
     f.render_widget(info_block, cols[0]);
 
     // --- Right: art sub-panel ---
-    let art_block = Block::default()
-        .borders(Borders::ALL)
+    let art_block = t.block()
         .border_style(Style::default().fg(border_color))
         .style(Style::default().bg(t.main_bg));
     let art_inner = art_block.inner(cols[1]);
@@ -1046,7 +1034,7 @@ fn draw_now_playing(f: &mut Frame, app: &App, np: &NowPlaying, area: Rect) {
     let art_frame = np.paused_frame.unwrap_or(app.anim_frame);
     let art_lines = (skin.art_fn)(true, art_frame);
     let art_color = if np.state == PlaybackState::Playing {
-        anim::pulse_color(t.accent_color(), app.anim_frame, 40)
+        anim::animated_accent(t.accent_color(), t.accent_secondary, t.accent_anim, app.anim_frame, 40)
     } else {
         t.accent_color()
     };
@@ -1149,9 +1137,7 @@ fn draw_now_playing(f: &mut Frame, app: &App, np: &NowPlaying, area: Rect) {
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let t = app.theme();
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(t.border())
+    let block = t.block()
         .style(t.footer());
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -1198,8 +1184,7 @@ fn draw_confirm_removal(f: &mut Frame, app: &App, count: usize) {
 
     f.render_widget(Clear, rect);
 
-    let block = Block::default()
-        .borders(Borders::ALL)
+    let block = t.block()
         .border_style(t.error())
         .title(" Confirm Delete ")
         .title_alignment(Alignment::Center);
@@ -1207,6 +1192,31 @@ fn draw_confirm_removal(f: &mut Frame, app: &App, count: usize) {
     let lines = vec![
         Line::from(""),
         Line::from(format!(" Delete {} track(s)?", count)),
+        Line::from(Span::styled(" Enter/y:yes  Esc/n:no", t.dim())),
+    ];
+    let p = Paragraph::new(lines).block(block);
+    f.render_widget(p, rect);
+}
+
+fn draw_confirm_cache_clear(f: &mut Frame, app: &App) {
+    let t = app.theme();
+    let area = f.area();
+    let w = 36u16.min(area.width.saturating_sub(4));
+    let h = 5u16.min(area.height.saturating_sub(2));
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let rect = Rect::new(x, y, w, h);
+
+    f.render_widget(Clear, rect);
+
+    let block = t.block()
+        .border_style(t.error())
+        .title(" Clear Cache ")
+        .title_alignment(Alignment::Center);
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(" Clear playback cache?"),
         Line::from(Span::styled(" Enter/y:yes  Esc/n:no", t.dim())),
     ];
     let p = Paragraph::new(lines).block(block);
@@ -1231,7 +1241,7 @@ fn draw_toast(f: &mut Frame, app: &App, msg: &str, is_error: bool) {
     } else {
         t.success()
     };
-    let block = Block::default().borders(Borders::ALL).border_style(style);
+    let block = t.block().border_style(style);
     let p = Paragraph::new(format!(" {} ", msg))
         .block(block)
         .style(style);
@@ -1278,14 +1288,14 @@ fn draw_help_overlay(f: &mut Frame, app: &App) {
         "  Device",
         "  c           Connect to Zune",
         "  r           Refresh device tracks",
+        "  X           Clear playback cache",
         "  Esc         Close / cancel",
         "  q           Quit",
     ];
 
     let lines: Vec<Line> = help_text.iter().map(|l| Line::from(*l)).collect();
 
-    let block = Block::default()
-        .borders(Borders::ALL)
+    let block = t.block()
         .border_style(Style::default().fg(t.selection_bg))
         .title(" Help — press Esc to close ");
     let p = Paragraph::new(lines)
@@ -1306,8 +1316,7 @@ fn draw_theme_picker(f: &mut Frame, app: &App) {
 
     f.render_widget(Clear, rect);
 
-    let block = Block::default()
-        .borders(Borders::ALL)
+    let block = t.block()
         .border_style(Style::default().fg(t.selection_bg))
         .title(" Theme [t] ")
         .style(Style::default().bg(t.sidebar_bg));
@@ -1342,8 +1351,7 @@ fn draw_search_overlay(f: &mut Frame, app: &App) {
 
     f.render_widget(Clear, rect);
 
-    let block = Block::default()
-        .borders(Borders::ALL)
+    let block = t.block()
         .border_style(Style::default().fg(t.selection_bg))
         .title(" Search ");
     let p = Paragraph::new(format!(" {}_", app.search_query)).block(block);
