@@ -154,6 +154,36 @@ fn run_loop(
                     continue;
                 }
 
+                // Handle cache clear confirmation dialog.
+                if app.pending_cache_clear {
+                    match key.code {
+                        KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                            app.pending_cache_clear = false;
+                            let playback_dir = std::env::temp_dir().join("zytunes-playback");
+                            let mut total: u64 = 0;
+                            if playback_dir.exists() {
+                                if let Ok(entries) = std::fs::read_dir(&playback_dir) {
+                                    for entry in entries.flatten() {
+                                        total += entry.metadata().map(|m| m.len()).unwrap_or(0);
+                                    }
+                                }
+                                let _ = std::fs::remove_dir_all(&playback_dir);
+                            }
+                            if total > 0 {
+                                let mb = total as f64 / (1024.0 * 1024.0);
+                                app.set_toast(format!("Cleared {:.1} MB of cached audio", mb), false);
+                            } else {
+                                app.set_toast("Cache is already empty".into(), false);
+                            }
+                        }
+                        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                            app.pending_cache_clear = false;
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 // Handle removal confirmation dialog.
                 if app.pending_removal.is_some() {
                     match key.code {
@@ -381,6 +411,9 @@ fn run_loop(
                         } else if app.active_panel == Panel::SyncQueue {
                             app.clear_queue();
                         }
+                    }
+                    KeyCode::Char('X') => {
+                        app.pending_cache_clear = true;
                     }
                     KeyCode::Esc => {
                         if matches!(app.sync.status, SyncStatus::Running { .. }) {
