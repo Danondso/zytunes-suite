@@ -130,12 +130,9 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                     };
                     let _ = event_tx.send(BgEvent::DeviceDetected(device_info));
 
-                    // Try native IOKit backend first, fall back to aft-mtp-cli.
                     let _ = event_tx.send(BgEvent::SyncMessage(
                         "MTPZ handshake...".into(),
                     ));
-
-                    // Try native IOKit backend first, fall back to aft-mtp-cli.
                     let native_log_tx = event_tx.clone();
                     let native_log = move |msg: &str| {
                         let _ = native_log_tx.send(BgEvent::SyncMessage(msg.to_string()));
