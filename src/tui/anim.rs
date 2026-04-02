@@ -5,6 +5,8 @@ use throbber_widgets_tui::{
     OGHAM_B, QUADRANT_BLOCK, VERTICAL_BLOCK, WHITE_CIRCLE, WHITE_SQUARE,
 };
 
+use super::theme::AccentAnim;
+
 /// Returns the theme-appropriate spinner set for the given theme index.
 pub fn spinner_set_for_theme(theme_index: usize) -> Set {
     match theme_index {
@@ -49,6 +51,93 @@ pub fn pulse_color(base: Color, frame: usize, period: usize) -> Color {
         )
     } else {
         base
+    }
+}
+
+/// Rotate the hue of an RGB color. Non-RGB colors pass through unchanged.
+fn hue_cycle(base: Color, frame: usize, period: usize) -> Color {
+    if let Color::Rgb(r, g, b) = base {
+        let (r, g, b) = (r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0);
+        let max = r.max(g).max(b);
+        let min = r.min(g).min(b);
+        let delta = max - min;
+        let l = (max + min) / 2.0;
+        if delta < 0.001 {
+            return base; // achromatic, nothing to rotate
+        }
+        let s = if l < 0.5 {
+            delta / (max + min)
+        } else {
+            delta / (2.0 - max - min)
+        };
+        let h = if (max - r).abs() < 0.001 {
+            ((g - b) / delta).rem_euclid(6.0) * 60.0
+        } else if (max - g).abs() < 0.001 {
+            ((b - r) / delta + 2.0) * 60.0
+        } else {
+            ((r - g) / delta + 4.0) * 60.0
+        };
+        let period = period.max(1);
+        let new_h = (h + (frame % period) as f32 * 360.0 / period as f32) % 360.0;
+        let (ro, go, bo) = hsl_to_rgb(new_h, s, l);
+        Color::Rgb(ro, go, bo)
+    } else {
+        base
+    }
+}
+
+/// Interpolate between two RGB colors using a sine wave.
+fn color_shift(base: Color, target: Color, frame: usize, period: usize) -> Color {
+    if let (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) = (base, target) {
+        let period = period.max(1);
+        let idx = (frame % period) * 40 / period;
+        let t = SINE_TABLE[idx.min(39)];
+        Color::Rgb(
+            lerp_u8(r1, r2, t),
+            lerp_u8(g1, g2, t),
+            lerp_u8(b1, b2, t),
+        )
+    } else {
+        base
+    }
+}
+
+fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
+    (a as f32 + (b as f32 - a as f32) * t) as u8
+}
+
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+    let m = l - c / 2.0;
+    let (r, g, b) = match h as u32 {
+        0..=59 => (c, x, 0.0),
+        60..=119 => (x, c, 0.0),
+        120..=179 => (0.0, c, x),
+        180..=239 => (0.0, x, c),
+        240..=299 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    (
+        ((r + m) * 255.0) as u8,
+        ((g + m) * 255.0) as u8,
+        ((b + m) * 255.0) as u8,
+    )
+}
+
+/// Returns the animated accent color for a theme based on its accent animation mode.
+pub fn animated_accent(
+    base: Color,
+    secondary: Color,
+    mode: AccentAnim,
+    frame: usize,
+    period: usize,
+) -> Color {
+    match mode {
+        AccentAnim::None => base,
+        AccentAnim::Pulse => pulse_color(base, frame, period),
+        AccentAnim::HueCycle => hue_cycle(base, frame, period),
+        AccentAnim::ColorShift => color_shift(base, secondary, frame, period),
     }
 }
 
@@ -178,6 +267,7 @@ pub fn player_skin(theme_index: usize) -> &'static PlayerSkin {
         8 => &SKIN_SYSTEM7,
         9 => &SKIN_BIOS,
         10 => &SKIN_RED_SANDS,
+        11 => &SKIN_NEWPORT,
         _ => &SKIN_ITUNES,
     }
 }
@@ -586,13 +676,81 @@ static SKIN_RED_SANDS: PlayerSkin = PlayerSkin {
     art_fn: art_red_sands,
 };
 
+// --- Newport Lights: cigarette out of pack, then horizontal with smoke ---
+fn art_newport(_playing: bool, frame: usize) -> Vec<&'static str> {
+    let p = (frame / 8) % 8;
+    match p {
+        0 => vec![
+            "  /NEWPORT/|  ",
+            " /       / |  ",
+            "/________/ |  ",
+            "|       | /   ",
+            "|_______|/    ",
+        ],
+        1 => vec![
+            "    []        ",
+            "  /N||PORT/|  ",
+            " /       / |  ",
+            "/________/ |  ",
+            "|_______|/    ",
+        ],
+        2 => vec![
+            "    []        ",
+            "    ||        ",
+            "  /N||PORT/|  ",
+            " /________/|  ",
+            " |_______|/   ",
+        ],
+        3 => vec![
+            "    []        ",
+            "    ||        ",
+            "    ||        ",
+            "  /NEWPORT/|  ",
+            "  |_______|/  ",
+        ],
+        4 => vec![
+            "              ",
+            "              ",
+            "   _______    ",
+            " ()_______))))",
+            "              ",
+        ],
+        5 => vec![
+            "              ",
+            "         (    ",
+            "   ______     ",
+            " ()______)))  ",
+            "              ",
+        ],
+        6 => vec![
+            "        (     ",
+            "       )      ",
+            "   _____      ",
+            " ()_____)))   ",
+            "              ",
+        ],
+        _ => vec![
+            "       )      ",
+            "      (       ",
+            "   ____       ",
+            " ()____))     ",
+            "              ",
+        ],
+    }
+}
+static SKIN_NEWPORT: PlayerSkin = PlayerSkin {
+    play: "▶", pause: "||", next: "▷▷", prev: "◁◁",
+    bar_filled: '█', bar_empty: '░',
+    art_fn: art_newport,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn spinner_set_for_all_themes() {
-        for i in 0..11 {
+        for i in 0..12 {
             let set = spinner_set_for_theme(i);
             assert!(
                 !set.symbols.is_empty(),
@@ -714,7 +872,7 @@ mod tests {
 
     #[test]
     fn player_skin_for_all_themes() {
-        for i in 0..11 {
+        for i in 0..12 {
             let skin = player_skin(i);
             assert!(!skin.play.is_empty(), "Theme {} has empty play symbol", i);
             assert!(!skin.pause.is_empty(), "Theme {} has empty pause symbol", i);
@@ -740,5 +898,54 @@ mod tests {
         let unique: std::collections::HashSet<String> =
             frames.iter().map(|f| format!("{:?}", f)).collect();
         assert!(unique.len() >= 2, "IBM should have animated frames");
+    }
+
+    #[test]
+    fn animated_accent_none_returns_base() {
+        let base = Color::Rgb(100, 150, 200);
+        let sec = Color::Rgb(200, 100, 50);
+        assert_eq!(animated_accent(base, sec, AccentAnim::None, 10, 40), base);
+    }
+
+    #[test]
+    fn animated_accent_pulse_matches_pulse_color() {
+        let base = Color::Rgb(100, 150, 200);
+        let sec = Color::Rgb(200, 100, 50);
+        for frame in 0..40 {
+            assert_eq!(
+                animated_accent(base, sec, AccentAnim::Pulse, frame, 40),
+                pulse_color(base, frame, 40),
+            );
+        }
+    }
+
+    #[test]
+    fn hue_cycle_produces_different_colors() {
+        let base = Color::Rgb(200, 50, 50);
+        let colors: std::collections::HashSet<_> = (0..40)
+            .map(|f| format!("{:?}", hue_cycle(base, f, 40)))
+            .collect();
+        assert!(colors.len() > 5, "Hue cycle should produce varied colors");
+    }
+
+    #[test]
+    fn hue_cycle_achromatic_passthrough() {
+        let grey = Color::Rgb(128, 128, 128);
+        assert_eq!(hue_cycle(grey, 10, 40), grey);
+    }
+
+    #[test]
+    fn color_shift_endpoints() {
+        let a = Color::Rgb(100, 0, 0);
+        let b = Color::Rgb(0, 100, 0);
+        // At frame 0 (t=0.5 in sine table), should be a mix
+        let mid = color_shift(a, b, 0, 40);
+        assert_ne!(mid, a);
+        assert_ne!(mid, b);
+    }
+
+    #[test]
+    fn color_shift_non_rgb_passthrough() {
+        assert_eq!(color_shift(Color::White, Color::Rgb(0, 0, 0), 5, 40), Color::White);
     }
 }
