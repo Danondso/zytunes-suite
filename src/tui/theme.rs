@@ -1,4 +1,25 @@
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::widgets::block::BorderType;
+use ratatui::widgets::{Block, Borders};
+
+// Modifier bit constants for const-compatible theme presets.
+const BOLD: u16 = Modifier::BOLD.bits();
+const DIM: u16 = Modifier::DIM.bits();
+const ITALIC: u16 = Modifier::ITALIC.bits();
+const NONE: u16 = 0;
+
+/// Animated accent color mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccentAnim {
+    /// No animation; static accent color.
+    None,
+    /// Sine-wave brightness oscillation.
+    Pulse,
+    /// Rotate through hue values (rainbow).
+    HueCycle,
+    /// Shift between accent and a secondary color.
+    ColorShift,
+}
 
 pub struct Theme {
     pub name: &'static str,
@@ -17,9 +38,23 @@ pub struct Theme {
     pub success_text: Color,
     pub progress_bar: Color,
     pub progress_bg: Color,
+    // Styled borders
+    pub border_type: BorderType,
+    // Text styling modifiers (stored as raw u16 bits for const compatibility)
+    pub header_modifier: u16,
+    pub sidebar_modifier: u16,
+    pub dim_modifier: u16,
+    pub footer_modifier: u16,
+    // Animated accent
+    pub accent_anim: AccentAnim,
+    pub accent_secondary: Color,
 }
 
 impl Theme {
+    const fn modifier(bits: u16) -> Modifier {
+        Modifier::from_bits_truncate(bits)
+    }
+
     pub fn selected(&self) -> Style {
         Style::default()
             .bg(self.selection_bg)
@@ -28,7 +63,9 @@ impl Theme {
     }
 
     pub fn sidebar_item(&self) -> Style {
-        Style::default().fg(self.sidebar_text)
+        Style::default()
+            .fg(self.sidebar_text)
+            .add_modifier(Self::modifier(self.sidebar_modifier))
     }
 
     pub fn sidebar_item_selected(&self) -> Style {
@@ -38,15 +75,20 @@ impl Theme {
     pub fn header(&self) -> Style {
         Style::default()
             .fg(self.header_text)
-            .add_modifier(Modifier::BOLD)
+            .add_modifier(Self::modifier(self.header_modifier))
     }
 
     pub fn dim(&self) -> Style {
-        Style::default().fg(self.dim_text)
+        Style::default()
+            .fg(self.dim_text)
+            .add_modifier(Self::modifier(self.dim_modifier))
     }
 
     pub fn footer(&self) -> Style {
-        Style::default().bg(self.footer_bg).fg(self.footer_text)
+        Style::default()
+            .bg(self.footer_bg)
+            .fg(self.footer_text)
+            .add_modifier(Self::modifier(self.footer_modifier))
     }
 
     pub fn border(&self) -> Style {
@@ -59,6 +101,14 @@ impl Theme {
 
     pub fn success(&self) -> Style {
         Style::default().fg(self.success_text)
+    }
+
+    /// Returns a pre-configured Block with the theme's border style and type.
+    pub fn block(&self) -> Block<'static> {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(self.border())
+            .border_type(self.border_type)
     }
 
     /// The most "active" accent color for the theme, used for pulse animations.
@@ -101,6 +151,13 @@ pub const ITUNES_2004: Theme = Theme {
     success_text: Color::Rgb(50, 160, 50),
     progress_bar: Color::Rgb(56, 117, 215),
     progress_bg: Color::Rgb(220, 220, 220),
+    border_type: BorderType::Rounded,
+    header_modifier: BOLD,
+    sidebar_modifier: NONE,
+    dim_modifier: NONE,
+    footer_modifier: NONE,
+    accent_anim: AccentAnim::Pulse,
+    accent_secondary: Color::Rgb(56, 117, 215),
 };
 
 pub const GRUVBOX_DARK: Theme = Theme {
@@ -120,6 +177,13 @@ pub const GRUVBOX_DARK: Theme = Theme {
     success_text: Color::Rgb(152, 151, 26),
     progress_bar: Color::Rgb(214, 93, 14),
     progress_bg: Color::Rgb(60, 56, 54),
+    border_type: BorderType::Plain,
+    header_modifier: BOLD,
+    sidebar_modifier: NONE,
+    dim_modifier: DIM,
+    footer_modifier: NONE,
+    accent_anim: AccentAnim::Pulse,
+    accent_secondary: Color::Rgb(214, 93, 14),
 };
 
 pub const GRUVBOX_LIGHT: Theme = Theme {
@@ -139,6 +203,13 @@ pub const GRUVBOX_LIGHT: Theme = Theme {
     success_text: Color::Rgb(121, 116, 14),
     progress_bar: Color::Rgb(175, 58, 3),
     progress_bg: Color::Rgb(213, 196, 161),
+    border_type: BorderType::Plain,
+    header_modifier: BOLD,
+    sidebar_modifier: NONE,
+    dim_modifier: DIM,
+    footer_modifier: NONE,
+    accent_anim: AccentAnim::None,
+    accent_secondary: Color::Rgb(175, 58, 3),
 };
 
 pub const EVERFOREST_DARK: Theme = Theme {
@@ -158,6 +229,13 @@ pub const EVERFOREST_DARK: Theme = Theme {
     success_text: Color::Rgb(167, 192, 128),
     progress_bar: Color::Rgb(167, 192, 128),
     progress_bg: Color::Rgb(52, 61, 68),
+    border_type: BorderType::Rounded,
+    header_modifier: BOLD,
+    sidebar_modifier: ITALIC,
+    dim_modifier: DIM,
+    footer_modifier: NONE,
+    accent_anim: AccentAnim::Pulse,
+    accent_secondary: Color::Rgb(167, 192, 128),
 };
 
 pub const EVERFOREST_LIGHT: Theme = Theme {
@@ -177,6 +255,13 @@ pub const EVERFOREST_LIGHT: Theme = Theme {
     success_text: Color::Rgb(141, 161, 1),
     progress_bar: Color::Rgb(141, 161, 1),
     progress_bg: Color::Rgb(221, 222, 208),
+    border_type: BorderType::Rounded,
+    header_modifier: BOLD,
+    sidebar_modifier: ITALIC,
+    dim_modifier: DIM,
+    footer_modifier: NONE,
+    accent_anim: AccentAnim::None,
+    accent_secondary: Color::Rgb(141, 161, 1),
 };
 
 pub const MIAMI_NIGHTS: Theme = Theme {
@@ -196,6 +281,13 @@ pub const MIAMI_NIGHTS: Theme = Theme {
     success_text: Color::Rgb(80, 255, 180),
     progress_bar: Color::Rgb(233, 69, 96),
     progress_bg: Color::Rgb(32, 32, 58),
+    border_type: BorderType::Thick,
+    header_modifier: BOLD | ITALIC,
+    sidebar_modifier: NONE,
+    dim_modifier: DIM,
+    footer_modifier: BOLD,
+    accent_anim: AccentAnim::HueCycle,
+    accent_secondary: Color::Rgb(120, 220, 232),
 };
 
 pub const IBM_MAINFRAME: Theme = Theme {
@@ -215,6 +307,13 @@ pub const IBM_MAINFRAME: Theme = Theme {
     success_text: Color::Rgb(51, 255, 51),
     progress_bar: Color::Rgb(51, 255, 51),
     progress_bg: Color::Rgb(0, 40, 0),
+    border_type: BorderType::Double,
+    header_modifier: BOLD,
+    sidebar_modifier: NONE,
+    dim_modifier: NONE,
+    footer_modifier: BOLD,
+    accent_anim: AccentAnim::Pulse,
+    accent_secondary: Color::Rgb(51, 255, 51),
 };
 
 pub const WINDOWS_95: Theme = Theme {
@@ -234,6 +333,13 @@ pub const WINDOWS_95: Theme = Theme {
     success_text: Color::Rgb(0, 128, 0),
     progress_bar: Color::Rgb(0, 0, 128),
     progress_bg: Color::Rgb(192, 192, 192),
+    border_type: BorderType::QuadrantOutside,
+    header_modifier: BOLD,
+    sidebar_modifier: NONE,
+    dim_modifier: NONE,
+    footer_modifier: NONE,
+    accent_anim: AccentAnim::None,
+    accent_secondary: Color::Rgb(0, 0, 128),
 };
 
 pub const SYSTEM_7: Theme = Theme {
@@ -253,6 +359,13 @@ pub const SYSTEM_7: Theme = Theme {
     success_text: Color::Rgb(0, 128, 0),
     progress_bar: Color::Rgb(0, 0, 0),
     progress_bg: Color::Rgb(204, 204, 204),
+    border_type: BorderType::Plain,
+    header_modifier: BOLD,
+    sidebar_modifier: NONE,
+    dim_modifier: NONE,
+    footer_modifier: NONE,
+    accent_anim: AccentAnim::None,
+    accent_secondary: Color::Rgb(0, 0, 0),
 };
 
 pub const BIOS: Theme = Theme {
@@ -272,6 +385,13 @@ pub const BIOS: Theme = Theme {
     success_text: Color::Rgb(85, 255, 85),
     progress_bar: Color::Rgb(255, 255, 85),
     progress_bg: Color::Rgb(0, 0, 100),
+    border_type: BorderType::Double,
+    header_modifier: BOLD,
+    sidebar_modifier: NONE,
+    dim_modifier: NONE,
+    footer_modifier: BOLD,
+    accent_anim: AccentAnim::ColorShift,
+    accent_secondary: Color::Rgb(85, 255, 85),
 };
 
 pub const RED_SANDS: Theme = Theme {
@@ -291,6 +411,13 @@ pub const RED_SANDS: Theme = Theme {
     success_text: Color::Rgb(180, 210, 90),
     progress_bar: Color::Rgb(210, 163, 58),
     progress_bg: Color::Rgb(88, 26, 16),
+    border_type: BorderType::Plain,
+    header_modifier: BOLD | ITALIC,
+    sidebar_modifier: ITALIC,
+    dim_modifier: DIM,
+    footer_modifier: NONE,
+    accent_anim: AccentAnim::ColorShift,
+    accent_secondary: Color::Rgb(200, 80, 40),
 };
 
 pub const NEWPORT_LIGHTS: Theme = Theme {
@@ -310,6 +437,13 @@ pub const NEWPORT_LIGHTS: Theme = Theme {
     success_text: Color::Rgb(180, 255, 200),    // bright mint
     progress_bar: Color::Rgb(255, 255, 255),    // white
     progress_bg: Color::Rgb(0, 80, 70),         // dark teal
+    border_type: BorderType::Rounded,
+    header_modifier: BOLD,
+    sidebar_modifier: NONE,
+    dim_modifier: DIM,
+    footer_modifier: NONE,
+    accent_anim: AccentAnim::Pulse,
+    accent_secondary: Color::Rgb(255, 255, 255),
 };
 
 /// Find a theme index by name (case-insensitive). Returns 0 (default) if not found.
@@ -345,5 +479,20 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn block_helper_returns_block() {
+        for t in THEMES {
+            let _ = t.block();
+        }
+    }
+
+    #[test]
+    fn modifier_round_trip() {
+        assert_eq!(Theme::modifier(BOLD), Modifier::BOLD);
+        assert_eq!(Theme::modifier(DIM), Modifier::DIM);
+        assert_eq!(Theme::modifier(BOLD | ITALIC), Modifier::BOLD | Modifier::ITALIC);
+        assert_eq!(Theme::modifier(NONE), Modifier::empty());
     }
 }
