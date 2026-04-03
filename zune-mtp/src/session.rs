@@ -52,21 +52,19 @@ impl MtpSession {
     }
 
     /// Send a command with parameters, read the response. Returns response code.
-    pub fn execute_simple(
-        &mut self,
-        code: OperationCode,
-        params: &[u32],
-    ) -> Result<u16, MtpError> {
+    pub fn execute_simple(&mut self, code: OperationCode, params: &[u32]) -> Result<u16, MtpError> {
         let tid = self.next_transaction();
         let cmd = build_command(code, tid, params);
         self.transport.write(&cmd)?;
 
         let resp = self.transport.read_container()?;
-        let hdr = ContainerHeader::parse(&resp).ok_or(MtpError::Protocol("Bad response".to_string()))?;
+        let hdr =
+            ContainerHeader::parse(&resp).ok_or(MtpError::Protocol("Bad response".to_string()))?;
 
         if hdr.is_data() {
             let resp2 = self.transport.read_container()?;
-            let hdr2 = ContainerHeader::parse(&resp2).ok_or(MtpError::Protocol("Bad response after data".to_string()))?;
+            let hdr2 = ContainerHeader::parse(&resp2)
+                .ok_or(MtpError::Protocol("Bad response after data".to_string()))?;
             return Ok(hdr2.code);
         }
 
@@ -84,7 +82,8 @@ impl MtpSession {
         self.transport.write(&cmd)?;
 
         let data = self.transport.read_container()?;
-        let hdr = ContainerHeader::parse(&data).ok_or(MtpError::Protocol("Bad data response".to_string()))?;
+        let hdr = ContainerHeader::parse(&data)
+            .ok_or(MtpError::Protocol("Bad data response".to_string()))?;
         if !hdr.is_data() {
             return Err(MtpError::Protocol(format!(
                 "Expected data container, got type={} code=0x{:04x}",
@@ -94,9 +93,13 @@ impl MtpSession {
         let payload = data[CONTAINER_HEADER_SIZE..].to_vec();
 
         let resp = self.transport.read_container()?;
-        let resp_hdr = ContainerHeader::parse(&resp).ok_or(MtpError::Protocol("Bad response".to_string()))?;
+        let resp_hdr =
+            ContainerHeader::parse(&resp).ok_or(MtpError::Protocol("Bad response".to_string()))?;
         if !resp_hdr.is_ok() {
-            return Err(MtpError::Protocol(format!("Operation failed: 0x{:04x}", resp_hdr.code)));
+            return Err(MtpError::Protocol(format!(
+                "Operation failed: 0x{:04x}",
+                resp_hdr.code
+            )));
         }
 
         Ok(payload)
@@ -122,7 +125,8 @@ impl MtpSession {
         self.transport.write(payload)?;
 
         let resp = self.transport.read_container()?;
-        let hdr = ContainerHeader::parse(&resp).ok_or(MtpError::Protocol("Bad response".to_string()))?;
+        let hdr =
+            ContainerHeader::parse(&resp).ok_or(MtpError::Protocol("Bad response".to_string()))?;
         Ok(hdr.code)
     }
 
@@ -141,17 +145,21 @@ impl MtpSession {
 
         // Send data container (header and payload as separate writes for Microsoft).
         let data_container = build_data(code, tid, data);
-        self.transport.write(&data_container[..CONTAINER_HEADER_SIZE])?;
+        self.transport
+            .write(&data_container[..CONTAINER_HEADER_SIZE])?;
         if !data.is_empty() {
-            self.transport.write(&data_container[CONTAINER_HEADER_SIZE..])?;
+            self.transport
+                .write(&data_container[CONTAINER_HEADER_SIZE..])?;
         }
 
         // Read response (may get data container first, then response).
         let resp = self.transport.read_container()?;
-        let hdr = ContainerHeader::parse(&resp).ok_or(MtpError::Protocol("Bad response".to_string()))?;
+        let hdr =
+            ContainerHeader::parse(&resp).ok_or(MtpError::Protocol("Bad response".to_string()))?;
         let response_code = if hdr.is_data() {
             let resp2 = self.transport.read_container()?;
-            let hdr2 = ContainerHeader::parse(&resp2).ok_or(MtpError::Protocol("Bad response after data".to_string()))?;
+            let hdr2 = ContainerHeader::parse(&resp2)
+                .ok_or(MtpError::Protocol("Bad response after data".to_string()))?;
             hdr2.code
         } else {
             hdr.code
@@ -227,7 +235,10 @@ impl MtpSession {
     pub fn delete_object(&mut self, handle: u32) -> Result<(), MtpError> {
         let resp = self.execute_simple(OperationCode::DeleteObject, &[handle])?;
         if resp != ResponseCode::Ok as u16 {
-            return Err(MtpError::Protocol(format!("DeleteObject failed: 0x{:04x}", resp)));
+            return Err(MtpError::Protocol(format!(
+                "DeleteObject failed: 0x{:04x}",
+                resp
+            )));
         }
         Ok(())
     }
@@ -247,9 +258,14 @@ impl MtpSession {
         self.transport.write(&data_container)?;
 
         let resp = self.transport.read_container()?;
-        let hdr = ContainerHeader::parse(&resp).ok_or(MtpError::Protocol("Bad SendObjectInfo response".to_string()))?;
+        let hdr = ContainerHeader::parse(&resp).ok_or(MtpError::Protocol(
+            "Bad SendObjectInfo response".to_string(),
+        ))?;
         if !hdr.is_ok() {
-            return Err(MtpError::Protocol(format!("SendObjectInfo failed: 0x{:04x}", hdr.code)));
+            return Err(MtpError::Protocol(format!(
+                "SendObjectInfo failed: 0x{:04x}",
+                hdr.code
+            )));
         }
 
         // Response params: storage_id, parent_handle, object_handle
@@ -271,15 +287,21 @@ impl MtpSession {
 
         // Data container (split header and payload for Microsoft).
         let data_container = build_data(OperationCode::SendObject, tid, data);
-        self.transport.write(&data_container[..CONTAINER_HEADER_SIZE])?;
+        self.transport
+            .write(&data_container[..CONTAINER_HEADER_SIZE])?;
         if !data.is_empty() {
-            self.transport.write(&data_container[CONTAINER_HEADER_SIZE..])?;
+            self.transport
+                .write(&data_container[CONTAINER_HEADER_SIZE..])?;
         }
 
         let resp = self.transport.read_container()?;
-        let hdr = ContainerHeader::parse(&resp).ok_or(MtpError::Protocol("Bad SendObject response".to_string()))?;
+        let hdr = ContainerHeader::parse(&resp)
+            .ok_or(MtpError::Protocol("Bad SendObject response".to_string()))?;
         if !hdr.is_ok() {
-            return Err(MtpError::Protocol(format!("SendObject failed: 0x{:04x}", hdr.code)));
+            return Err(MtpError::Protocol(format!(
+                "SendObject failed: 0x{:04x}",
+                hdr.code
+            )));
         }
         Ok(())
     }
@@ -302,15 +324,21 @@ impl MtpSession {
 
         // Data container with property value.
         let data_container = build_data(OperationCode::SetDevicePropValue, tid, &payload);
-        self.transport.write(&data_container[..CONTAINER_HEADER_SIZE])?;
-        self.transport.write(&data_container[CONTAINER_HEADER_SIZE..])?;
+        self.transport
+            .write(&data_container[..CONTAINER_HEADER_SIZE])?;
+        self.transport
+            .write(&data_container[CONTAINER_HEADER_SIZE..])?;
 
         let resp = self.transport.read_container()?;
-        let hdr = ContainerHeader::parse(&resp).ok_or(MtpError::Protocol("Bad SetDeviceProp response".to_string()))?;
+        let hdr = ContainerHeader::parse(&resp)
+            .ok_or(MtpError::Protocol("Bad SetDeviceProp response".to_string()))?;
         if hdr.is_ok() {
             Ok(())
         } else {
-            Err(MtpError::Protocol(format!("SetDevicePropValue failed: 0x{:04x}", hdr.code)))
+            Err(MtpError::Protocol(format!(
+                "SetDevicePropValue failed: 0x{:04x}",
+                hdr.code
+            )))
         }
     }
 
@@ -366,15 +394,22 @@ impl MtpSession {
         self.transport.write(&cmd)?;
 
         let data_container = build_data(OperationCode::SetObjectPropValue, tid, value);
-        self.transport.write(&data_container[..CONTAINER_HEADER_SIZE])?;
+        self.transport
+            .write(&data_container[..CONTAINER_HEADER_SIZE])?;
         if !value.is_empty() {
-            self.transport.write(&data_container[CONTAINER_HEADER_SIZE..])?;
+            self.transport
+                .write(&data_container[CONTAINER_HEADER_SIZE..])?;
         }
 
         let resp = self.transport.read_container()?;
-        let hdr = ContainerHeader::parse(&resp).ok_or(MtpError::Protocol("Bad SetObjectPropValue response".to_string()))?;
+        let hdr = ContainerHeader::parse(&resp).ok_or(MtpError::Protocol(
+            "Bad SetObjectPropValue response".to_string(),
+        ))?;
         if !hdr.is_ok() {
-            return Err(MtpError::Protocol(format!("SetObjectPropValue failed: 0x{:04x}", hdr.code)));
+            return Err(MtpError::Protocol(format!(
+                "SetObjectPropValue failed: 0x{:04x}",
+                hdr.code
+            )));
         }
         Ok(())
     }
@@ -401,15 +436,22 @@ impl MtpSession {
 
         // Send property list as data container (split for Microsoft).
         let data_container = build_data(OperationCode::SendObjectPropList, tid, prop_list);
-        self.transport.write(&data_container[..CONTAINER_HEADER_SIZE])?;
+        self.transport
+            .write(&data_container[..CONTAINER_HEADER_SIZE])?;
         if !prop_list.is_empty() {
-            self.transport.write(&data_container[CONTAINER_HEADER_SIZE..])?;
+            self.transport
+                .write(&data_container[CONTAINER_HEADER_SIZE..])?;
         }
 
         let resp = self.transport.read_container()?;
-        let hdr = ContainerHeader::parse(&resp).ok_or(MtpError::Protocol("Bad SendObjectPropList response".to_string()))?;
+        let hdr = ContainerHeader::parse(&resp).ok_or(MtpError::Protocol(
+            "Bad SendObjectPropList response".to_string(),
+        ))?;
         if !hdr.is_ok() {
-            return Err(MtpError::Protocol(format!("SendObjectPropList failed: 0x{:04x}", hdr.code)));
+            return Err(MtpError::Protocol(format!(
+                "SendObjectPropList failed: 0x{:04x}",
+                hdr.code
+            )));
         }
 
         let params = parse_response_params(&resp);
@@ -427,11 +469,7 @@ impl MtpSession {
     }
 
     /// Set object references (link objects together).
-    pub fn set_object_references(
-        &mut self,
-        object_id: u32,
-        refs: &[u32],
-    ) -> Result<(), MtpError> {
+    pub fn set_object_references(&mut self, object_id: u32, refs: &[u32]) -> Result<(), MtpError> {
         let tid = self.next_transaction();
         let cmd = build_command(OperationCode::SetObjectReferences, tid, &[object_id]);
         self.transport.write(&cmd)?;
@@ -442,15 +480,21 @@ impl MtpSession {
         for r in refs {
             payload.extend_from_slice(&r.to_le_bytes());
         }
-        let data_container =
-            build_data(OperationCode::SetObjectReferences, tid, &payload);
-        self.transport.write(&data_container[..CONTAINER_HEADER_SIZE])?;
-        self.transport.write(&data_container[CONTAINER_HEADER_SIZE..])?;
+        let data_container = build_data(OperationCode::SetObjectReferences, tid, &payload);
+        self.transport
+            .write(&data_container[..CONTAINER_HEADER_SIZE])?;
+        self.transport
+            .write(&data_container[CONTAINER_HEADER_SIZE..])?;
 
         let resp = self.transport.read_container()?;
-        let hdr = ContainerHeader::parse(&resp).ok_or(MtpError::Protocol("Bad SetObjectReferences response".to_string()))?;
+        let hdr = ContainerHeader::parse(&resp).ok_or(MtpError::Protocol(
+            "Bad SetObjectReferences response".to_string(),
+        ))?;
         if !hdr.is_ok() {
-            return Err(MtpError::Protocol(format!("SetObjectReferences failed: 0x{:04x}", hdr.code)));
+            return Err(MtpError::Protocol(format!(
+                "SetObjectReferences failed: 0x{:04x}",
+                hdr.code
+            )));
         }
         Ok(())
     }
@@ -468,14 +512,25 @@ fn le_u16(data: &[u8], offset: usize) -> u16 {
 
 /// Read a little-endian u32 from a byte slice at the given offset.
 fn le_u32(data: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]])
+    u32::from_le_bytes([
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+    ])
 }
 
 /// Read a little-endian u64 from a byte slice at the given offset.
 fn le_u64(data: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes([
-        data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
-        data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7],
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+        data[offset + 4],
+        data[offset + 5],
+        data[offset + 6],
+        data[offset + 7],
     ])
 }
 
@@ -644,7 +699,7 @@ mod tests {
             data.extend_from_slice(&ch.to_le_bytes());
         }
         data.extend_from_slice(&0u16.to_le_bytes()); // null terminator
-        // empty capture_date and modification_date
+                                                     // empty capture_date and modification_date
         data.push(0);
         data.push(0);
 

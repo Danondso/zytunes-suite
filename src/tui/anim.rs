@@ -10,19 +10,19 @@ use super::theme::AccentAnim;
 /// Returns the theme-appropriate spinner set for the given theme index.
 pub fn spinner_set_for_theme(theme_index: usize) -> Set {
     match theme_index {
-        0 => BRAILLE_EIGHT,       // iTunes 2004 — smooth Apple-era feel
-        1 => BRAILLE_SIX_DOUBLE,  // Gruvbox Dark — warm, dense dots
-        2 => BRAILLE_SIX,         // Gruvbox Light — lighter variant
-        3 => OGHAM_A,             // Everforest Dark — organic strokes
-        4 => OGHAM_B,             // Everforest Light — same family, lighter
-        5 => BLACK_CIRCLE,        // Miami Nights — ◑◒◐◓ moon phases
-        6 => VERTICAL_BLOCK,      // IBM Mainframe — ▁▂▃▄▅▆▇█ block chars
-        7 => WHITE_SQUARE,        // Windows 95 — ◳◲◱◰ chunky squares
-        8 => QUADRANT_BLOCK,      // System 7 — ▝▗▖▘ pixel-art era
-        9 => ASCII,               // BIOS — |/-\ classic
-        10 => BRAILLE_ONE,        // Red Sands — minimal desert
-        11 => WHITE_CIRCLE,       // Newport Lights — smooth circles
-        _ => BRAILLE_ONE,         // fallback
+        0 => BRAILLE_EIGHT,      // iTunes 2004 — smooth Apple-era feel
+        1 => BRAILLE_SIX_DOUBLE, // Gruvbox Dark — warm, dense dots
+        2 => BRAILLE_SIX,        // Gruvbox Light — lighter variant
+        3 => OGHAM_A,            // Everforest Dark — organic strokes
+        4 => OGHAM_B,            // Everforest Light — same family, lighter
+        5 => BLACK_CIRCLE,       // Miami Nights — ◑◒◐◓ moon phases
+        6 => VERTICAL_BLOCK,     // IBM Mainframe — ▁▂▃▄▅▆▇█ block chars
+        7 => WHITE_SQUARE,       // Windows 95 — ◳◲◱◰ chunky squares
+        8 => QUADRANT_BLOCK,     // System 7 — ▝▗▖▘ pixel-art era
+        9 => ASCII,              // BIOS — |/-\ classic
+        10 => BRAILLE_ONE,       // Red Sands — minimal desert
+        11 => WHITE_CIRCLE,      // Newport Lights — smooth circles
+        _ => BRAILLE_ONE,        // fallback
     }
 }
 
@@ -92,11 +92,7 @@ fn color_shift(base: Color, target: Color, frame: usize, period: usize) -> Color
         let period = period.max(1);
         let idx = (frame % period) * 40 / period;
         let t = SINE_TABLE[idx.min(39)];
-        Color::Rgb(
-            lerp_u8(r1, r2, t),
-            lerp_u8(g1, g2, t),
-            lerp_u8(b1, b2, t),
-        )
+        Color::Rgb(lerp_u8(r1, r2, t), lerp_u8(g1, g2, t), lerp_u8(b1, b2, t))
     } else {
         base
     }
@@ -164,9 +160,7 @@ pub fn progress_bar_with_shine(filled: usize, empty: usize, frame: usize) -> Vec
     (0..total)
         .map(|i| {
             if i < filled {
-                let is_shine = shine_pos.is_some_and(|sp| {
-                    i >= sp.saturating_sub(1) && i <= sp + 1
-                });
+                let is_shine = shine_pos.is_some_and(|sp| i >= sp.saturating_sub(1) && i <= sp + 1);
                 ('=', is_shine)
             } else {
                 (' ', false)
@@ -310,8 +304,12 @@ fn art_itunes(_playing: bool, frame: usize) -> Vec<&'static str> {
     }
 }
 static SKIN_ITUNES: PlayerSkin = PlayerSkin {
-    play: "▶", pause: "❚❚", next: "▷▷", prev: "◁◁",
-    bar_filled: '━', bar_empty: '─',
+    play: "▶",
+    pause: "❚❚",
+    next: "▷▷",
+    prev: "◁◁",
+    bar_filled: '━',
+    bar_empty: '─',
     art_fn: art_itunes,
 };
 
@@ -350,8 +348,12 @@ fn art_gruvbox_dark(_playing: bool, frame: usize) -> Vec<&'static str> {
     }
 }
 static SKIN_GRUVBOX_DARK: PlayerSkin = PlayerSkin {
-    play: "►", pause: "▪", next: "▸▸", prev: "◂◂",
-    bar_filled: '●', bar_empty: '○',
+    play: "►",
+    pause: "▪",
+    next: "▸▸",
+    prev: "◂◂",
+    bar_filled: '●',
+    bar_empty: '○',
     art_fn: art_gruvbox_dark,
 };
 
@@ -360,8 +362,12 @@ fn art_gruvbox_light(_p: bool, f: usize) -> Vec<&'static str> {
     art_gruvbox_dark(_p, f)
 }
 static SKIN_GRUVBOX_LIGHT: PlayerSkin = PlayerSkin {
-    play: "►", pause: "■", next: "▸▸", prev: "◂◂",
-    bar_filled: '◆', bar_empty: '◇',
+    play: "►",
+    pause: "■",
+    next: "▸▸",
+    prev: "◂◂",
+    bar_filled: '◆',
+    bar_empty: '◇',
     art_fn: art_gruvbox_light,
 };
 
@@ -400,8 +406,12 @@ fn art_everforest_dark(_playing: bool, frame: usize) -> Vec<&'static str> {
     }
 }
 static SKIN_EVERFOREST_DARK: PlayerSkin = PlayerSkin {
-    play: "▶", pause: "||", next: "▷▷", prev: "◁◁",
-    bar_filled: '▓', bar_empty: '░',
+    play: "▶",
+    pause: "||",
+    next: "▷▷",
+    prev: "◁◁",
+    bar_filled: '▓',
+    bar_empty: '░',
     art_fn: art_everforest_dark,
 };
 
@@ -410,8 +420,12 @@ fn art_everforest_light(_p: bool, f: usize) -> Vec<&'static str> {
     art_everforest_dark(_p, f)
 }
 static SKIN_EVERFOREST_LIGHT: PlayerSkin = PlayerSkin {
-    play: "▶", pause: "||", next: "▷▷", prev: "◁◁",
-    bar_filled: '▓', bar_empty: '░',
+    play: "▶",
+    pause: "||",
+    next: "▷▷",
+    prev: "◁◁",
+    bar_filled: '▓',
+    bar_empty: '░',
     art_fn: art_everforest_light,
 };
 
@@ -450,8 +464,12 @@ fn art_miami(_playing: bool, frame: usize) -> Vec<&'static str> {
     }
 }
 static SKIN_MIAMI: PlayerSkin = PlayerSkin {
-    play: "▶", pause: "||", next: "▷▷", prev: "◁◁",
-    bar_filled: '█', bar_empty: '░',
+    play: "▶",
+    pause: "||",
+    next: "▷▷",
+    prev: "◁◁",
+    bar_filled: '█',
+    bar_empty: '░',
     art_fn: art_miami,
 };
 
@@ -490,8 +508,12 @@ fn art_ibm(_playing: bool, frame: usize) -> Vec<&'static str> {
     }
 }
 static SKIN_IBM: PlayerSkin = PlayerSkin {
-    play: "►", pause: "[]", next: ">>", prev: "<<",
-    bar_filled: '▓', bar_empty: '░',
+    play: "►",
+    pause: "[]",
+    next: ">>",
+    prev: "<<",
+    bar_filled: '▓',
+    bar_empty: '░',
     art_fn: art_ibm,
 };
 
@@ -530,8 +552,12 @@ fn art_win95(_playing: bool, frame: usize) -> Vec<&'static str> {
     }
 }
 static SKIN_WIN95: PlayerSkin = PlayerSkin {
-    play: "|>", pause: "||", next: ">>|", prev: "|<<",
-    bar_filled: '█', bar_empty: '░',
+    play: "|>",
+    pause: "||",
+    next: ">>|",
+    prev: "|<<",
+    bar_filled: '█',
+    bar_empty: '░',
     art_fn: art_win95,
 };
 
@@ -563,8 +589,12 @@ fn art_system7(_playing: bool, frame: usize) -> Vec<&'static str> {
     }
 }
 static SKIN_SYSTEM7: PlayerSkin = PlayerSkin {
-    play: "▶", pause: "■", next: "▷▷", prev: "◁◁",
-    bar_filled: '█', bar_empty: '·',
+    play: "▶",
+    pause: "■",
+    next: "▷▷",
+    prev: "◁◁",
+    bar_filled: '█',
+    bar_empty: '·',
     art_fn: art_system7,
 };
 
@@ -603,8 +633,12 @@ fn art_bios(_playing: bool, frame: usize) -> Vec<&'static str> {
     }
 }
 static SKIN_BIOS: PlayerSkin = PlayerSkin {
-    play: "|>", pause: "||", next: ">>|", prev: "|<<",
-    bar_filled: '=', bar_empty: '-',
+    play: "|>",
+    pause: "||",
+    next: ">>|",
+    prev: "|<<",
+    bar_filled: '=',
+    bar_empty: '-',
     art_fn: art_bios,
 };
 
@@ -671,8 +705,12 @@ fn art_red_sands(_playing: bool, frame: usize) -> Vec<&'static str> {
     }
 }
 static SKIN_RED_SANDS: PlayerSkin = PlayerSkin {
-    play: "▸", pause: "◾", next: "▸▸", prev: "◂◂",
-    bar_filled: '▬', bar_empty: '·',
+    play: "▸",
+    pause: "◾",
+    next: "▸▸",
+    prev: "◂◂",
+    bar_filled: '▬',
+    bar_empty: '·',
     art_fn: art_red_sands,
 };
 
@@ -739,8 +777,12 @@ fn art_newport(_playing: bool, frame: usize) -> Vec<&'static str> {
     }
 }
 static SKIN_NEWPORT: PlayerSkin = PlayerSkin {
-    play: "▶", pause: "||", next: "▷▷", prev: "◁◁",
-    bar_filled: '█', bar_empty: '░',
+    play: "▶",
+    pause: "||",
+    next: "▷▷",
+    prev: "◁◁",
+    bar_filled: '█',
+    bar_empty: '░',
     art_fn: art_newport,
 };
 
@@ -946,6 +988,9 @@ mod tests {
 
     #[test]
     fn color_shift_non_rgb_passthrough() {
-        assert_eq!(color_shift(Color::White, Color::Rgb(0, 0, 0), 5, 40), Color::White);
+        assert_eq!(
+            color_shift(Color::White, Color::Rgb(0, 0, 0), 5, 40),
+            Color::White
+        );
     }
 }

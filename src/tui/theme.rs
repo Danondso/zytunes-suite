@@ -1,5 +1,5 @@
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::block::BorderType;
+use ratatui::widgets::BorderType;
 use ratatui::widgets::{Block, Borders};
 
 // Modifier bit constants for const-compatible theme presets.
@@ -422,21 +422,21 @@ pub const RED_SANDS: Theme = Theme {
 
 pub const NEWPORT_LIGHTS: Theme = Theme {
     name: "Newport Lights",
-    sidebar_bg: Color::Rgb(0, 106, 95),        // deep teal
-    sidebar_text: Color::Rgb(230, 240, 235),    // off-white
-    selection_bg: Color::Rgb(255, 255, 255),    // white
-    selection_text: Color::Rgb(0, 80, 70),      // dark teal
-    main_bg: Color::Rgb(0, 130, 115),           // seafoam green
-    alt_row_bg: Color::Rgb(0, 118, 105),        // slightly darker seafoam
-    border: Color::Rgb(180, 220, 210),          // pale mint
-    footer_bg: Color::Rgb(0, 90, 80),           // dark teal
-    footer_text: Color::Rgb(230, 240, 235),     // off-white
-    header_text: Color::Rgb(255, 255, 255),     // white
-    dim_text: Color::Rgb(100, 170, 155),        // muted mint
-    error_text: Color::Rgb(255, 100, 80),       // warm red
-    success_text: Color::Rgb(180, 255, 200),    // bright mint
-    progress_bar: Color::Rgb(255, 255, 255),    // white
-    progress_bg: Color::Rgb(0, 80, 70),         // dark teal
+    sidebar_bg: Color::Rgb(0, 106, 95),      // deep teal
+    sidebar_text: Color::Rgb(230, 240, 235), // off-white
+    selection_bg: Color::Rgb(255, 255, 255), // white
+    selection_text: Color::Rgb(0, 80, 70),   // dark teal
+    main_bg: Color::Rgb(0, 130, 115),        // seafoam green
+    alt_row_bg: Color::Rgb(0, 118, 105),     // slightly darker seafoam
+    border: Color::Rgb(180, 220, 210),       // pale mint
+    footer_bg: Color::Rgb(0, 90, 80),        // dark teal
+    footer_text: Color::Rgb(230, 240, 235),  // off-white
+    header_text: Color::Rgb(255, 255, 255),  // white
+    dim_text: Color::Rgb(100, 170, 155),     // muted mint
+    error_text: Color::Rgb(255, 100, 80),    // warm red
+    success_text: Color::Rgb(180, 255, 200), // bright mint
+    progress_bar: Color::Rgb(255, 255, 255), // white
+    progress_bg: Color::Rgb(0, 80, 70),      // dark teal
     border_type: BorderType::Rounded,
     header_modifier: BOLD,
     sidebar_modifier: NONE,
@@ -492,7 +492,10 @@ mod tests {
     fn modifier_round_trip() {
         assert_eq!(Theme::modifier(BOLD), Modifier::BOLD);
         assert_eq!(Theme::modifier(DIM), Modifier::DIM);
-        assert_eq!(Theme::modifier(BOLD | ITALIC), Modifier::BOLD | Modifier::ITALIC);
+        assert_eq!(
+            Theme::modifier(BOLD | ITALIC),
+            Modifier::BOLD | Modifier::ITALIC
+        );
         assert_eq!(Theme::modifier(NONE), Modifier::empty());
     }
 }

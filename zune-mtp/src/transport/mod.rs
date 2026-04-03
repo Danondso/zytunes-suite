@@ -6,9 +6,9 @@
 use crate::MtpError;
 
 #[cfg(target_os = "macos")]
-pub(crate) mod iokit_ffi;
-#[cfg(target_os = "macos")]
 mod iokit;
+#[cfg(target_os = "macos")]
+pub(crate) mod iokit_ffi;
 #[cfg(target_os = "macos")]
 pub use iokit::IokitTransport as Transport;
 
@@ -47,7 +47,11 @@ where
 /// Split data into chunks of `chunk_size` and write each via the writer function.
 ///
 /// Returns the total number of bytes written.
-pub(crate) fn chunked_write<F>(data: &[u8], chunk_size: usize, mut write_fn: F) -> Result<usize, MtpError>
+pub(crate) fn chunked_write<F>(
+    data: &[u8],
+    chunk_size: usize,
+    mut write_fn: F,
+) -> Result<usize, MtpError>
 where
     F: FnMut(&[u8]) -> Result<usize, MtpError>,
 {
@@ -143,11 +147,13 @@ mod tests {
 
     #[test]
     fn reassemble_reader_error_propagates() {
-        let result = reassemble_container(|_buf| {
-            Err(MtpError::Usb("device disconnected".to_string()))
-        });
+        let result =
+            reassemble_container(|_buf| Err(MtpError::Usb("device disconnected".to_string())));
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("device disconnected"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("device disconnected"));
     }
 
     #[test]
@@ -181,7 +187,8 @@ mod tests {
             assert_eq!(chunk.len(), 512);
             chunks_seen += 1;
             Ok(chunk.len())
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(total, 1024);
         assert_eq!(chunks_seen, 2);
     }
@@ -193,7 +200,8 @@ mod tests {
         let total = chunked_write(&data, 512, |chunk| {
             chunk_sizes.push(chunk.len());
             Ok(chunk.len())
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(total, 700);
         assert_eq!(chunk_sizes, vec![512, 188]);
     }
@@ -204,7 +212,8 @@ mod tests {
         let total = chunked_write(&[], 512, |_chunk| {
             called = true;
             Ok(0)
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(total, 0);
         assert!(!called);
     }
@@ -228,5 +237,4 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("pipe broken"));
     }
-
 }

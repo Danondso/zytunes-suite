@@ -14,13 +14,17 @@ use rodio::{Decoder, OutputStream, Sink};
 const RODIO_NATIVE: &[&str] = &["mp3", "wav", "flac", "ogg"];
 
 pub enum AudioCommand {
-    Play { path: String },
+    Play {
+        path: String,
+    },
     Pause,
     Resume,
     Stop,
     QueryPosition,
     /// Seek forward/backward by this many milliseconds (negative = rewind).
-    Scrub { delta_ms: i64 },
+    Scrub {
+        delta_ms: i64,
+    },
 }
 
 pub enum AudioEvent {
@@ -57,14 +61,26 @@ fn transcode_for_playback(input: &str) -> Result<String, String> {
     }
 
     let result = Command::new("ffmpeg")
-        .args(["-y", "-i", input, "-vn", "-acodec", "pcm_s16le", "-ar", "44100"])
+        .args([
+            "-y",
+            "-i",
+            input,
+            "-vn",
+            "-acodec",
+            "pcm_s16le",
+            "-ar",
+            "44100",
+        ])
         .arg(&output)
         .output()
         .map_err(|e| format!("ffmpeg: {}", e))?;
 
     if !result.status.success() {
         let stderr = String::from_utf8_lossy(&result.stderr);
-        return Err(format!("ffmpeg failed: {}", stderr.lines().last().unwrap_or("unknown")));
+        return Err(format!(
+            "ffmpeg failed: {}",
+            stderr.lines().last().unwrap_or("unknown")
+        ));
     }
 
     Ok(output.to_string_lossy().into_owned())
@@ -86,10 +102,7 @@ pub fn spawn(event_tx: mpsc::Sender<AudioEvent>) -> mpsc::Sender<AudioCommand> {
         let (_stream, stream_handle) = match OutputStream::try_default() {
             Ok(s) => s,
             Err(e) => {
-                let _ = event_tx.send(AudioEvent::PlaybackError(format!(
-                    "Audio output: {}",
-                    e
-                )));
+                let _ = event_tx.send(AudioEvent::PlaybackError(format!("Audio output: {}", e)));
                 return;
             }
         };
@@ -120,10 +133,8 @@ pub fn spawn(event_tx: mpsc::Sender<AudioEvent>) -> mpsc::Sender<AudioCommand> {
                     let new_sink = match Sink::try_new(&stream_handle) {
                         Ok(s) => s,
                         Err(e) => {
-                            let _ = event_tx.send(AudioEvent::PlaybackError(format!(
-                                "Sink: {}",
-                                e
-                            )));
+                            let _ =
+                                event_tx.send(AudioEvent::PlaybackError(format!("Sink: {}", e)));
                             continue;
                         }
                     };
@@ -131,34 +142,31 @@ pub fn spawn(event_tx: mpsc::Sender<AudioEvent>) -> mpsc::Sender<AudioCommand> {
                     let file = match File::open(&play_path) {
                         Ok(f) => f,
                         Err(e) => {
-                            let _ = event_tx.send(AudioEvent::PlaybackError(format!(
-                                "Open: {}",
-                                e
-                            )));
+                            let _ =
+                                event_tx.send(AudioEvent::PlaybackError(format!("Open: {}", e)));
                             continue;
                         }
                     };
 
                     // rodio can panic on certain files (seek errors in symphonia)
                     let reader = BufReader::new(file);
-                    let source = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        Decoder::new(reader)
-                    })) {
-                        Ok(Ok(s)) => s,
-                        Ok(Err(e)) => {
-                            let _ = event_tx.send(AudioEvent::PlaybackError(format!(
-                                "Decode: {}",
-                                e
-                            )));
-                            continue;
-                        }
-                        Err(_) => {
-                            let _ = event_tx.send(AudioEvent::PlaybackError(
-                                "Decoder crashed — unsupported file".into(),
-                            ));
-                            continue;
-                        }
-                    };
+                    let source =
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            Decoder::new(reader)
+                        })) {
+                            Ok(Ok(s)) => s,
+                            Ok(Err(e)) => {
+                                let _ = event_tx
+                                    .send(AudioEvent::PlaybackError(format!("Decode: {}", e)));
+                                continue;
+                            }
+                            Err(_) => {
+                                let _ = event_tx.send(AudioEvent::PlaybackError(
+                                    "Decoder crashed — unsupported file".into(),
+                                ));
+                                continue;
+                            }
+                        };
 
                     new_sink.append(source);
                     play_start = Instant::now();
@@ -219,9 +227,11 @@ pub fn spawn(event_tx: mpsc::Sender<AudioEvent>) -> mpsc::Sender<AudioCommand> {
                         if let Ok(new_sink) = Sink::try_new(&stream_handle) {
                             if let Ok(file) = File::open(path) {
                                 let reader = BufReader::new(file);
-                                if let Ok(Ok(source)) = std::panic::catch_unwind(
-                                    std::panic::AssertUnwindSafe(|| Decoder::new(reader)),
-                                ) {
+                                if let Ok(Ok(source)) =
+                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                        Decoder::new(reader)
+                                    }))
+                                {
                                     use rodio::Source;
                                     new_sink.append(source.skip_duration(new_pos));
                                     if !playing {

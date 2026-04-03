@@ -31,11 +31,18 @@ fn main() {
 
     // Find Music folder.
     let root = session.get_object_handles(sid, 0xFFFFFFFF).unwrap();
-    let music = root.iter().find_map(|h| {
-        session.get_object_info(*h).ok().and_then(|info| {
-            if info.filename == "Music" { Some(*h) } else { None }
+    let music = root
+        .iter()
+        .find_map(|h| {
+            session.get_object_info(*h).ok().and_then(|info| {
+                if info.filename == "Music" {
+                    Some(*h)
+                } else {
+                    None
+                }
+            })
         })
-    }).expect("No Music folder");
+        .expect("No Music folder");
 
     eprintln!("Music folder: {music}");
 

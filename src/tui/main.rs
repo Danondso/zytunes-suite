@@ -74,7 +74,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = cmd_tx.send(BgCommand::LoadLibrary(library_path.to_string()));
 
     // Main event loop.
-    let result = run_loop(&mut terminal, &mut app, &cmd_tx, &event_rx, &audio_cmd_tx, &audio_event_rx);
+    let result = run_loop(
+        &mut terminal,
+        &mut app,
+        &cmd_tx,
+        &event_rx,
+        &audio_cmd_tx,
+        &audio_event_rx,
+    );
 
     // Restore terminal.
     disable_raw_mode()?;
@@ -191,7 +198,10 @@ fn run_loop(
                             }
                             if total > 0 {
                                 let mb = total as f64 / (1024.0 * 1024.0);
-                                app.set_toast(format!("Cleared {:.1} MB of cached audio", mb), false);
+                                app.set_toast(
+                                    format!("Cleared {:.1} MB of cached audio", mb),
+                                    false,
+                                );
                             } else {
                                 app.set_toast("Cache is already empty".into(), false);
                             }
@@ -381,14 +391,10 @@ fn run_loop(
                         let path = std::path::PathBuf::from("/tmp/zytunes-log.txt");
                         let content = app.sync.log.join("\n");
                         match std::fs::write(&path, &content) {
-                            Ok(_) => app.set_toast(
-                                format!("Log dumped to {}", path.display()),
-                                false,
-                            ),
-                            Err(e) => app.set_toast(
-                                format!("Log dump failed: {}", e),
-                                true,
-                            ),
+                            Ok(_) => {
+                                app.set_toast(format!("Log dumped to {}", path.display()), false)
+                            }
+                            Err(e) => app.set_toast(format!("Log dump failed: {}", e), true),
                         }
                     }
                     KeyCode::Char('S') => {
@@ -432,7 +438,10 @@ fn run_loop(
                             let count = app.removal_queue.len();
                             app.clear_removal_queue();
                             if count > 0 {
-                                app.set_toast(format!("Cleared {} queued removal(s)", count), false);
+                                app.set_toast(
+                                    format!("Cleared {} queued removal(s)", count),
+                                    false,
+                                );
                             }
                         } else if app.active_panel == Panel::SyncQueue {
                             app.clear_queue();
@@ -467,10 +476,7 @@ fn run_loop(
 fn confirm_device_removal(app: &mut App, cmd_tx: &mpsc::Sender<BgCommand>) {
     if let Some(items) = app.pending_removal.take() {
         let count = items.len();
-        app.set_toast(
-            format!("Removing {} track(s) from device...", count),
-            false,
-        );
+        app.set_toast(format!("Removing {} track(s) from device...", count), false);
         let _ = cmd_tx.send(BgCommand::RemoveFromDevice(items));
         app.removal_queue.clear();
     }

@@ -1,5 +1,9 @@
 # zytunes
 
+[![CI](https://github.com/Danondso/zytunes/actions/workflows/ci.yml/badge.svg)](https://github.com/Danondso/zytunes/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.87%2B-orange.svg)](https://www.rust-lang.org)
+
 A Rust CLI tool for syncing music to a Microsoft Zune 30 from macOS.
 
 ## Status
@@ -128,6 +132,17 @@ Selected theme is persisted to `~/.config/zytunes/config.toml`.
 3. Press `S` or switch to the queue and press `Enter` to start syncing
 4. Non-native formats are auto-transcoded to MP3, album art resized to 200x200
 5. Progress and results appear in the log panel; device track list auto-refreshes on completion
+
+## Claude Code Skills
+
+This project includes custom [Claude Code](https://claude.ai/code) skills in `.claude/skills/`:
+
+| Skill | Command | What it does |
+|-------|---------|--------------|
+| **Review** | `/review` | Diffs the current branch against main, reviews for correctness, Rust idioms, cleanliness, readability, refactoring opportunities, and security. Posts findings as line-level comments on the PR, fixes them in priority order, and replies to each comment with the resolution commit. |
+| **Fix CI** | `/fix-ci` | Finds the PR for the current branch, pulls failing CI check logs, correlates failures with local code, and produces a structured fix plan for approval before making changes. |
+
+Both skills run `cargo fmt` and `cargo clippy -- -D warnings` as part of their fix workflow, and add meaningful test coverage (regression tests for bugs, edge cases for new logic) without test theatre.
 
 ## What's planned
 

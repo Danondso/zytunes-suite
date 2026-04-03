@@ -3,7 +3,8 @@ use cmac::{Cmac, Mac};
 
 fn main() {
     // Known-answer CMAC vector
-    let cmac_key = hex::decode("5b77ddd5e97c73b5524874232e1919e109f873d31797a048e733d30bf6e0b6e3").unwrap();
+    let cmac_key =
+        hex::decode("5b77ddd5e97c73b5524874232e1919e109f873d31797a048e733d30bf6e0b6e3").unwrap();
 
     // Our SignResponse implementation
     let key = &cmac_key[..16];
@@ -23,5 +24,8 @@ fn main() {
 
     println!("Our signature:  {}", hex::encode(&message));
     println!("Expected:       02030010a12cffdd28a2d815152c5736129b7ffc");
-    println!("Match: {}", hex::encode(&message) == "02030010a12cffdd28a2d815152c5736129b7ffc");
+    println!(
+        "Match: {}",
+        hex::encode(&message) == "02030010a12cffdd28a2d815152c5736129b7ffc"
+    );
 }

@@ -6,9 +6,9 @@ use device::ZuneDevice;
 use library::ItunesLibrary;
 use mtp::{DeviceSession, NativeSession};
 use std::collections::HashMap;
+use std::fmt;
 use std::path::Path;
 use std::process::Command;
-use std::fmt;
 use std::str::FromStr;
 
 /// The type of sync operation to perform.
@@ -150,7 +150,16 @@ pub fn transcode_to_mp3(input: &str, temp_dir: &Path) -> Result<String, String> 
 
     let output_str = output.to_string_lossy();
     let mut cmd = Command::new("ffmpeg");
-    cmd.args(["-i", input, "-codec:a", "libmp3lame", "-q:a", "2", "-map_metadata", "0"]);
+    cmd.args([
+        "-i",
+        input,
+        "-codec:a",
+        "libmp3lame",
+        "-q:a",
+        "2",
+        "-map_metadata",
+        "0",
+    ]);
 
     if has_art {
         // Resize album art to 200x200 JPEG (Zune rejects larger art).
@@ -170,7 +179,15 @@ pub fn transcode_to_mp3(input: &str, temp_dir: &Path) -> Result<String, String> 
     if !output_result.status.success() {
         let stderr = String::from_utf8_lossy(&output_result.stderr);
         // Take the last few lines of stderr — that's where ffmpeg puts the actual error.
-        let tail: String = stderr.lines().rev().take(5).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+        let tail: String = stderr
+            .lines()
+            .rev()
+            .take(5)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
         return Err(format!("ffmpeg transcode failed: {tail}"));
     }
 
@@ -284,7 +301,11 @@ pub fn sync_to_device(
     let mut to_push: Vec<&library::Track> = Vec::new();
     let mut skipped = 0;
     for track in pushable {
-        let key = format!("{}/{}", track.artist.to_lowercase(), track.name.to_lowercase());
+        let key = format!(
+            "{}/{}",
+            track.artist.to_lowercase(),
+            track.name.to_lowercase()
+        );
         if existing_names.contains(&key) {
             skipped += 1;
         } else {
@@ -634,7 +655,9 @@ mod tests {
             2
         );
         assert_eq!(
-            find_matching_tracks(&lib, SyncType::Track, "Creep").unwrap().len(),
+            find_matching_tracks(&lib, SyncType::Track, "Creep")
+                .unwrap()
+                .len(),
             1
         );
     }
@@ -659,7 +682,10 @@ mod tests {
         assert_eq!("album".parse::<SyncType>().unwrap(), SyncType::Album);
         assert_eq!("playlist".parse::<SyncType>().unwrap(), SyncType::Playlist);
         assert_eq!("track".parse::<SyncType>().unwrap(), SyncType::Track);
-        assert!("genre".parse::<SyncType>().unwrap_err().contains("Unknown sync type"));
+        assert!("genre"
+            .parse::<SyncType>()
+            .unwrap_err()
+            .contains("Unknown sync type"));
     }
 
     // -- collect_music_files --
@@ -810,7 +836,8 @@ mod tests {
         let tracks: Vec<&library::Track> = vec![&t1, &t2, &t3, &t4, &t5];
 
         let mut mock = MockSession::new();
-        let result = sync_to_device(&mut mock, &tracks, SyncType::Artist, "Artist", &temp_dir).unwrap();
+        let result =
+            sync_to_device(&mut mock, &tracks, SyncType::Artist, "Artist", &temp_dir).unwrap();
 
         assert_eq!(result.success, 5);
         assert_eq!(result.skipped, 0);
@@ -831,8 +858,14 @@ mod tests {
         let tracks: Vec<&library::Track> = vec![&t1, &t2, &t3, &t4];
 
         let mut mock = MockSession::new();
-        let result =
-            sync_to_device(&mut mock, &tracks, SyncType::Playlist, "Road Trip", &temp_dir).unwrap();
+        let result = sync_to_device(
+            &mut mock,
+            &tracks,
+            SyncType::Playlist,
+            "Road Trip",
+            &temp_dir,
+        )
+        .unwrap();
 
         assert_eq!(result.success, 4);
         assert_eq!(mock.playlist_calls.len(), 1);
@@ -853,9 +886,11 @@ mod tests {
         let tracks: Vec<&library::Track> = vec![&t1, &t2, &t3];
 
         let mut mock = MockSession::new();
-        mock.device_tracks.push(make_device_entry(50, "Artist/Album/Song 2.mp3"));
+        mock.device_tracks
+            .push(make_device_entry(50, "Artist/Album/Song 2.mp3"));
 
-        let result = sync_to_device(&mut mock, &tracks, SyncType::Artist, "Artist", &temp_dir).unwrap();
+        let result =
+            sync_to_device(&mut mock, &tracks, SyncType::Artist, "Artist", &temp_dir).unwrap();
 
         assert_eq!(result.success, 2);
         assert_eq!(result.skipped, 1);

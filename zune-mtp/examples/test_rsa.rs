@@ -1,5 +1,4 @@
 use num_bigint::BigUint;
-use std::process::Command;
 
 fn main() {
     // Load keys from .mtpz-data

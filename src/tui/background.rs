@@ -98,15 +98,12 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                 }
                 BgCommand::Connect => {
                     // Detect device first via USB.
-                    let _ = event_tx.send(BgEvent::SyncMessage(
-                        "Scanning USB for Zune...".into(),
-                    ));
+                    let _ = event_tx.send(BgEvent::SyncMessage("Scanning USB for Zune...".into()));
                     let zune = match ZuneDevice::find() {
                         Ok(z) => z,
                         Err(e) => {
-                            let _ = event_tx.send(BgEvent::SyncMessage(format!(
-                                "Device not found: {}", e
-                            )));
+                            let _ = event_tx
+                                .send(BgEvent::SyncMessage(format!("Device not found: {}", e)));
                             let _ = event_tx.send(BgEvent::SessionFailed(format!("{}", e)));
                             continue;
                         }
@@ -116,9 +113,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                         .product_name
                         .clone()
                         .unwrap_or_else(|| "Zune".to_string());
-                    let _ = event_tx.send(BgEvent::SyncMessage(format!(
-                        "Detected: {}", dev_name
-                    )));
+                    let _ = event_tx.send(BgEvent::SyncMessage(format!("Detected: {}", dev_name)));
 
                     let device_info = DeviceInfo {
                         name: dev_name,
@@ -130,9 +125,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                     };
                     let _ = event_tx.send(BgEvent::DeviceDetected(device_info));
 
-                    let _ = event_tx.send(BgEvent::SyncMessage(
-                        "MTPZ handshake...".into(),
-                    ));
+                    let _ = event_tx.send(BgEvent::SyncMessage("MTPZ handshake...".into()));
                     let native_log_tx = event_tx.clone();
                     let native_log = move |msg: &str| {
                         let _ = native_log_tx.send(BgEvent::SyncMessage(msg.to_string()));
@@ -143,38 +136,28 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                 s.set_serial(zune.serial_number.clone());
                                 // Query storage for model detection before boxing.
                                 if let Ok((total, free)) = s.get_storage_info() {
-                                    let model =
-                                        zytunes::device::zune_model_from_storage(total);
+                                    let model = zytunes::device::zune_model_from_storage(total);
                                     let used = total.saturating_sub(free);
                                     let pct = if total > 0 {
                                         (used * 100 / total) as u8
                                     } else {
                                         0
                                     };
-                                    let _ = event_tx.send(BgEvent::DeviceDetected(
-                                        DeviceInfo {
-                                            name: model.to_string(),
-                                            firmware_version: zune
-                                                .firmware_version
-                                                .clone(),
-                                            serial_number: zune
-                                                .serial_number
-                                                .clone(),
-                                            usb_mode: zune.usb_mode.clone(),
-                                            manufacturer: Some(
-                                                "Microsoft".to_string(),
-                                            ),
-                                            model: Some(model.to_string()),
-                                                            },
-                                    ));
-                                    let _ = event_tx.send(BgEvent::SessionReady(
-                                        Some(StorageInfo {
+                                    let _ = event_tx.send(BgEvent::DeviceDetected(DeviceInfo {
+                                        name: model.to_string(),
+                                        firmware_version: zune.firmware_version.clone(),
+                                        serial_number: zune.serial_number.clone(),
+                                        usb_mode: zune.usb_mode.clone(),
+                                        manufacturer: Some("Microsoft".to_string()),
+                                        model: Some(model.to_string()),
+                                    }));
+                                    let _ =
+                                        event_tx.send(BgEvent::SessionReady(Some(StorageInfo {
                                             total_bytes: total,
                                             free_bytes: free,
                                             used_bytes: used,
                                             used_percent: pct,
-                                        }),
-                                    ));
+                                        })));
                                 }
 
                                 wire_log_sender(&mut s, &event_tx);
@@ -188,16 +171,14 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
 
                     match connect_result {
                         Ok(s) => {
-                            let _ = event_tx.send(BgEvent::SyncMessage(
-                                "Session established".into(),
-                            ));
+                            let _ =
+                                event_tx.send(BgEvent::SyncMessage("Session established".into()));
 
                             session = Some(s);
 
                             // Auto-load device tracks after connection.
-                            let _ = event_tx.send(BgEvent::SyncMessage(
-                                "Loading device library...".into(),
-                            ));
+                            let _ = event_tx
+                                .send(BgEvent::SyncMessage("Loading device library...".into()));
                             let _ = event_tx.send(BgEvent::LoadingDeviceTracks);
                             if let Some(ref mut s) = session {
                                 match s.collect_all_tracks("/Music") {
@@ -206,12 +187,12 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                             "Loaded {} tracks from device",
                                             tracks.len()
                                         )));
-                                        let _ =
-                                            event_tx.send(BgEvent::DeviceTracksLoaded(tracks));
+                                        let _ = event_tx.send(BgEvent::DeviceTracksLoaded(tracks));
                                     }
                                     Err(e) => {
                                         let _ = event_tx.send(BgEvent::SyncMessage(format!(
-                                            "Failed to load tracks: {}", e
+                                            "Failed to load tracks: {}",
+                                            e
                                         )));
                                         let _ = event_tx.send(BgEvent::Error(e));
                                     }
@@ -219,18 +200,16 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                             }
                         }
                         Err(e) => {
-                            let _ = event_tx.send(BgEvent::SyncMessage(format!(
-                                "Connection failed: {}", e
-                            )));
+                            let _ = event_tx
+                                .send(BgEvent::SyncMessage(format!("Connection failed: {}", e)));
                             let _ = event_tx.send(BgEvent::SessionFailed(e));
                         }
                     }
                 }
                 BgCommand::LoadDeviceTracks => {
                     if let Some(ref mut s) = session {
-                        let _ = event_tx.send(BgEvent::SyncMessage(
-                            "Refreshing device library...".into(),
-                        ));
+                        let _ = event_tx
+                            .send(BgEvent::SyncMessage("Refreshing device library...".into()));
                         let _ = event_tx.send(BgEvent::LoadingDeviceTracks);
                         match s.collect_all_tracks("/Music") {
                             Ok(tracks) => {
@@ -241,23 +220,18 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                 let _ = event_tx.send(BgEvent::DeviceTracksLoaded(tracks));
                             }
                             Err(e) => {
-                                let _ = event_tx.send(BgEvent::SyncMessage(format!(
-                                    "Refresh failed: {}", e
-                                )));
+                                let _ = event_tx
+                                    .send(BgEvent::SyncMessage(format!("Refresh failed: {}", e)));
                                 let _ = event_tx.send(BgEvent::Error(e));
                             }
                         }
                     } else {
-                        let _ = event_tx.send(BgEvent::SyncMessage(
-                            "No active session".into(),
-                        ));
+                        let _ = event_tx.send(BgEvent::SyncMessage("No active session".into()));
                         let _ = event_tx.send(BgEvent::Error("No active session".into()));
                     }
                 }
                 BgCommand::Disconnect => {
-                    let _ = event_tx.send(BgEvent::SyncMessage(
-                        "Disconnected".into(),
-                    ));
+                    let _ = event_tx.send(BgEvent::SyncMessage("Disconnected".into()));
                     session = None;
                 }
                 BgCommand::CancelSync => {
@@ -277,9 +251,8 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                         for (i, (path, object_id)) in items.iter().enumerate() {
                             // Check for cancel.
                             if let Ok(BgCommand::CancelSync) = cmd_rx.try_recv() {
-                                let _ = event_tx.send(BgEvent::SyncMessage(
-                                    "Removal cancelled".into(),
-                                ));
+                                let _ =
+                                    event_tx.send(BgEvent::SyncMessage("Removal cancelled".into()));
                                 break;
                             }
 
@@ -303,15 +276,21 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                     success += 1;
                                     let _ = event_tx.send(BgEvent::SyncMessage(format!(
                                         "[{}/{}] Removed \"{}\"",
-                                        i + 1, total, name
+                                        i + 1,
+                                        total,
+                                        name
                                     )));
-                                    let _ = event_tx.send(BgEvent::DeviceTrackRemoved(path.clone()));
+                                    let _ =
+                                        event_tx.send(BgEvent::DeviceTrackRemoved(path.clone()));
                                 }
                                 Err(e) => {
                                     failed += 1;
                                     let _ = event_tx.send(BgEvent::SyncMessage(format!(
                                         "[{}/{}] Failed to remove \"{}\": {}",
-                                        i + 1, total, name, e
+                                        i + 1,
+                                        total,
+                                        name,
+                                        e
                                     )));
                                 }
                             }
@@ -327,7 +306,8 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                             match s.cleanup_empty_folders() {
                                 Ok(n) if n > 0 => {
                                     let _ = event_tx.send(BgEvent::SyncMessage(format!(
-                                        "Cleaned up {} empty folder(s)", n
+                                        "Cleaned up {} empty folder(s)",
+                                        n
                                     )));
                                 }
                                 _ => {}
@@ -372,9 +352,8 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                         for (i, item) in items.iter().enumerate() {
                             // Check for cancel command.
                             if let Ok(BgCommand::CancelSync) = cmd_rx.try_recv() {
-                                let _ = event_tx.send(BgEvent::SyncMessage(
-                                    "Sync cancelled".into(),
-                                ));
+                                let _ =
+                                    event_tx.send(BgEvent::SyncMessage("Sync cancelled".into()));
                                 break;
                             }
                             let _ = event_tx.send(BgEvent::SyncProgress {
@@ -392,9 +371,8 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                 )));
                                 match transcode_to_mp3(&item.location, &temp_dir) {
                                     Ok(p) => {
-                                        let size = std::fs::metadata(&p)
-                                            .map(|m| m.len())
-                                            .unwrap_or(0);
+                                        let size =
+                                            std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
                                         let _ = event_tx.send(BgEvent::SyncMessage(format!(
                                             "  Transcoded ({:.1} MB)",
                                             size as f64 / 1_048_576.0
@@ -429,10 +407,8 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                             match s.zune_import(&upload_path) {
                                 Ok(id) => {
                                     success += 1;
-                                    let _ = event_tx.send(BgEvent::SyncMessage(format!(
-                                        "  OK (id: {})",
-                                        id
-                                    )));
+                                    let _ = event_tx
+                                        .send(BgEvent::SyncMessage(format!("  OK (id: {})", id)));
                                     let _ = event_tx.send(BgEvent::SyncTrackDone {
                                         track_name: item.name.clone(),
                                         success: true,
@@ -457,22 +433,23 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                     if (i + 1).is_multiple_of(5) || i + 1 == total {
                                         if let Ok((tot, free)) = s.get_storage_info() {
                                             let used = tot.saturating_sub(free);
-                                            let pct = if tot > 0 { (used * 100 / tot) as u8 } else { 0 };
-                                            let _ = event_tx.send(BgEvent::StorageUpdated(StorageInfo {
-                                                total_bytes: tot,
-                                                free_bytes: free,
-                                                used_bytes: used,
-                                                used_percent: pct,
-                                            }));
+                                            let pct =
+                                                if tot > 0 { (used * 100 / tot) as u8 } else { 0 };
+                                            let _ = event_tx.send(BgEvent::StorageUpdated(
+                                                StorageInfo {
+                                                    total_bytes: tot,
+                                                    free_bytes: free,
+                                                    used_bytes: used,
+                                                    used_percent: pct,
+                                                },
+                                            ));
                                         }
                                     }
                                 }
                                 Err(e) => {
                                     failed += 1;
-                                    let _ = event_tx.send(BgEvent::SyncMessage(format!(
-                                        "  FAILED: {}",
-                                        e
-                                    )));
+                                    let _ = event_tx
+                                        .send(BgEvent::SyncMessage(format!("  FAILED: {}", e)));
                                     let _ = event_tx.send(BgEvent::SyncTrackDone {
                                         track_name: item.name.clone(),
                                         success: false,
@@ -488,10 +465,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                             "Done: {} synced, {} failed",
                             success, failed
                         )));
-                        let _ = event_tx.send(BgEvent::SyncComplete {
-                            success,
-                            failed,
-                        });
+                        let _ = event_tx.send(BgEvent::SyncComplete { success, failed });
                     } else {
                         let _ = event_tx.send(BgEvent::Error("No active session".into()));
                     }
@@ -505,10 +479,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
 
 /// Wire up a log-sender channel: creates a channel, calls set_log_sender on the
 /// session, and spawns a forwarding thread that relays log messages as BgEvent::SyncMessage.
-fn wire_log_sender(
-    session: &mut dyn std::any::Any,
-    event_tx: &mpsc::Sender<BgEvent>,
-) {
+fn wire_log_sender(session: &mut dyn std::any::Any, event_tx: &mpsc::Sender<BgEvent>) {
     // We need to handle both session types that have set_log_sender.
     if let Some(s) = session.downcast_mut::<NativeSession>() {
         let log_event_tx = event_tx.clone();

@@ -1,0 +1,179 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      bump: ${{ steps.bump.outputs.bump }}
+      new_version: ${{ steps.bump.outputs.new_version }}
+      old_version: ${{ steps.bump.outputs.old_version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine version bump from commits
+        id: bump
+        run: |
+          # Get the latest tag, or use initial commit if none exists.
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          if [ -z "$LATEST_TAG" ]; then
+            RANGE="HEAD"
+          else
+            RANGE="${LATEST_TAG}..HEAD"
+          fi
+
+          # Read current version from Cargo.toml.
+          OLD_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          echo "old_version=$OLD_VERSION" >> "$GITHUB_OUTPUT"
+
+          # Analyze conventional commits to determine bump type.
+          BUMP=""
+          while IFS= read -r msg; do
+            if echo "$msg" | grep -qiE "BREAKING[ -]CHANGE|^[a-z]+(\(.+\))?!:"; then
+              BUMP="major"
+              break
+            elif echo "$msg" | grep -qE "^feat(\(.+\))?:"; then
+              BUMP="minor"
+            elif [ -z "$BUMP" ] && echo "$msg" | grep -qE "^(fix|perf)(\(.+\))?:"; then
+              BUMP="patch"
+            fi
+          done < <(git log "$RANGE" --pretty=format:"%s" 2>/dev/null)
+
+          if [ -z "$BUMP" ]; then
+            echo "No version-bumping commits found (feat/fix/perf/BREAKING). Skipping release."
+            echo "bump=" >> "$GITHUB_OUTPUT"
+            echo "new_version=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Calculate new version.
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$OLD_VERSION"
+          case "$BUMP" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH + 1)) ;;
+          esac
+          NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+
+          # Skip if tag already exists.
+          if git rev-parse "v${NEW_VERSION}" >/dev/null 2>&1; then
+            echo "Tag v${NEW_VERSION} already exists. Skipping."
+            echo "bump=" >> "$GITHUB_OUTPUT"
+            echo "new_version=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "bump=$BUMP" >> "$GITHUB_OUTPUT"
+          echo "new_version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Bump: $BUMP ($OLD_VERSION -> $NEW_VERSION)"
+
+  build:
+    needs: check-version
+    if: needs.check-version.outputs.bump != ''
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            suffix: macos-arm64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            suffix: linux-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install libusb and ALSA (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev libasound2-dev
+
+      - name: Build release binaries
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package binaries
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/zytunes dist/zytunes-${{ matrix.suffix }}
+          cp target/${{ matrix.target }}/release/zytunes-tui dist/zytunes-tui-${{ matrix.suffix }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.suffix }}
+          path: dist/
+
+  release:
+    needs: [check-version, build]
+    if: needs.check-version.outputs.bump != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Bump version in Cargo.toml files
+        run: |
+          OLD="${{ needs.check-version.outputs.old_version }}"
+          NEW="${{ needs.check-version.outputs.new_version }}"
+          sed -i "0,/version = \"$OLD\"/s//version = \"$NEW\"/" Cargo.toml
+          sed -i "s/version = \"$OLD\"/version = \"$NEW\"/" zune-mtp/Cargo.toml
+
+      - name: Commit version bump
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml zune-mtp/Cargo.toml
+          git commit -m "chore: bump version to v${{ needs.check-version.outputs.new_version }}"
+          git push
+
+      - name: Create tag
+        run: |
+          git tag "v${{ needs.check-version.outputs.new_version }}"
+          git push origin "v${{ needs.check-version.outputs.new_version }}"
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate release notes
+        id: notes
+        run: |
+          LATEST_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -z "$LATEST_TAG" ]; then
+            RANGE="HEAD"
+          else
+            RANGE="${LATEST_TAG}..HEAD"
+          fi
+          {
+            echo "notes<<RELEASE_EOF"
+            echo "## What's Changed"
+            echo ""
+            git log "$RANGE" --pretty=format:"- %s" | grep -E "^- (feat|fix|perf|refactor|docs)" || true
+            echo ""
+            echo ""
+            echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${LATEST_TAG}...v${{ needs.check-version.outputs.new_version }}"
+            echo "RELEASE_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "v${{ needs.check-version.outputs.new_version }}" \
+            --title "v${{ needs.check-version.outputs.new_version }}" \
+            --notes "${{ steps.notes.outputs.notes }}" \
+            dist/*

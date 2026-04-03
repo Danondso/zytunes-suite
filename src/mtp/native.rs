@@ -105,7 +105,11 @@ impl TrackCache {
                 name: parts[4].to_string(),
             });
         }
-        if entries.is_empty() { None } else { Some(entries) }
+        if entries.is_empty() {
+            None
+        } else {
+            Some(entries)
+        }
     }
 
     fn save(&self, tracks: &[DeviceEntry]) {
@@ -142,7 +146,11 @@ impl TrackCache {
             "{}\t{}\t{}\t{}\t{}\n",
             entry.object_id, entry.storage_id, entry.format, entry.size, safe_name
         );
-        if let Ok(mut file) = std::fs::OpenOptions::new().append(true).create(true).open(path) {
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)
+        {
             let _ = file.write_all(line.as_bytes());
         }
     }
@@ -160,7 +168,7 @@ impl TrackCache {
     fn remove_by_id(&self, object_id: u32) {
         let id_str = object_id.to_string();
         self.filter_cache(|line| {
-            line.splitn(2, '\t')
+            line.split('\t')
                 .next()
                 .map(|id| id != id_str)
                 .unwrap_or(true)
@@ -198,7 +206,9 @@ pub struct NativeSession {
 impl NativeSession {
     /// Access the device library state, returning an error if not yet initialized.
     fn lib(&self) -> Result<&DeviceLibrary, String> {
-        self.library.as_ref().ok_or_else(|| "Device library not initialized".to_string())
+        self.library
+            .as_ref()
+            .ok_or_else(|| "Device library not initialized".to_string())
     }
 
     /// Set a log channel for progress messages.
@@ -225,18 +235,14 @@ impl NativeSession {
     /// Open a native MTP session to the Zune.
     /// Performs device detection, MTP session open, and MTPZ authentication.
     /// The `log` callback receives diagnostic messages for each step.
-    pub fn open(
-        product_id: u16,
-        log: &dyn Fn(&str),
-    ) -> Result<Self, String> {
+    pub fn open(product_id: u16, log: &dyn Fn(&str)) -> Result<Self, String> {
         log("MTP: Opening USB device...");
         let mut session = MtpSession::open(MICROSOFT_VENDOR_ID, product_id)
             .map_err(|e| format!("USB open failed: {e}"))?;
         log("MTP: USB device opened, MTP session started");
 
         log("MTP: Loading MTPZ keys from ~/.mtpz-data...");
-        let keys = MtpzKeys::load_default()
-            .map_err(|e| format!("MTPZ keys failed: {e}"))?;
+        let keys = MtpzKeys::load_default().map_err(|e| format!("MTPZ keys failed: {e}"))?;
         log("MTP: Keys loaded, starting MTPZ handshake...");
 
         zune_mtp::mtpz::authenticate(&mut session, &keys, log)
@@ -417,34 +423,47 @@ impl NativeSession {
         // Scan existing artists from the Artists folder.
         let mut artists = HashMap::new();
         if artist_supported {
-            if let Ok(handles) = self.session.get_object_handles(self.storage_id, artists_folder) {
+            if let Ok(handles) = self
+                .session
+                .get_object_handles(self.storage_id, artists_folder)
+            {
                 for h in handles {
                     if let Ok(info) = self.session.get_object_info(h) {
                         if info.object_format == FORMAT_ARTIST {
                             let name = info.filename.trim_end_matches(".art").to_string();
                             // Find the corresponding Music/{Artist}/ folder.
-                            let music_folder_id = self.find_object(music_folder, &name)
+                            let music_folder_id = self
+                                .find_object(music_folder, &name)
                                 .ok()
                                 .flatten()
                                 .unwrap_or(music_folder);
-                            artists.insert(name, ArtistInfo {
-                                id: h,
-                                music_folder_id,
-                            });
+                            artists.insert(
+                                name,
+                                ArtistInfo {
+                                    id: h,
+                                    music_folder_id,
+                                },
+                            );
                         }
                     }
                 }
             }
         } else {
             // No artist objects — scan Music/ subfolders as artist folders.
-            if let Ok(handles) = self.session.get_object_handles(self.storage_id, music_folder) {
+            if let Ok(handles) = self
+                .session
+                .get_object_handles(self.storage_id, music_folder)
+            {
                 for h in handles {
                     if let Ok(info) = self.session.get_object_info(h) {
                         if info.object_format == ASSOCIATION_FORMAT {
-                            artists.insert(info.filename.clone(), ArtistInfo {
-                                id: h,
-                                music_folder_id: h,
-                            });
+                            artists.insert(
+                                info.filename.clone(),
+                                ArtistInfo {
+                                    id: h,
+                                    music_folder_id: h,
+                                },
+                            );
                         }
                     }
                 }
@@ -454,7 +473,10 @@ impl NativeSession {
 
         // Scan existing albums from the Albums folder.
         let mut albums = HashMap::new();
-        if let Ok(handles) = self.session.get_object_handles(self.storage_id, albums_folder) {
+        if let Ok(handles) = self
+            .session
+            .get_object_handles(self.storage_id, albums_folder)
+        {
             for h in handles {
                 if let Ok(info) = self.session.get_object_info(h) {
                     if info.object_format == FORMAT_ABSTRACT_AUDIO_ALBUM {
@@ -462,16 +484,21 @@ impl NativeSession {
                         let base = info.filename.trim_end_matches(".alb");
                         if let Some((artist_name, album_name)) = base.split_once("--") {
                             // Find the Music/{Artist}/{Album}/ folder.
-                            let artist_folder = artists.get(artist_name)
+                            let artist_folder = artists
+                                .get(artist_name)
                                 .map(|a| a.music_folder_id)
                                 .unwrap_or(music_folder);
-                            let album_folder_id = self.find_object(artist_folder, album_name)
+                            let album_folder_id = self
+                                .find_object(artist_folder, album_name)
                                 .ok()
                                 .flatten()
                                 .unwrap_or(artist_folder);
                             albums.insert(
                                 (artist_name.to_string(), album_name.to_string()),
-                                AlbumInfo { id: h, music_folder_id: album_folder_id },
+                                AlbumInfo {
+                                    id: h,
+                                    music_folder_id: album_folder_id,
+                                },
                             );
                         }
                     }
@@ -518,9 +545,16 @@ impl NativeSession {
                 let props = PropListBuilder::new()
                     .add_string(PROP_OBJECT_FILENAME, name)
                     .build();
-                let (_, _, id) = self.session.send_object_prop_list(
-                    self.storage_id, music_folder, ASSOCIATION_FORMAT, 0, &props,
-                ).mtp_err()?;
+                let (_, _, id) = self
+                    .session
+                    .send_object_prop_list(
+                        self.storage_id,
+                        music_folder,
+                        ASSOCIATION_FORMAT,
+                        0,
+                        &props,
+                    )
+                    .mtp_err()?;
                 let _ = self.session.send_object(&[]);
                 id
             }
@@ -533,7 +567,11 @@ impl NativeSession {
                 .add_string(PROP_OBJECT_FILENAME, &format!("{}.art", name))
                 .build();
             match self.session.send_object_prop_list(
-                self.storage_id, artists_folder, FORMAT_ARTIST, 0, &props,
+                self.storage_id,
+                artists_folder,
+                FORMAT_ARTIST,
+                0,
+                &props,
             ) {
                 Ok((_, _, id)) => {
                     // Complete the two-phase MTP operation with empty data.
@@ -547,10 +585,13 @@ impl NativeSession {
         };
 
         if let Some(lib) = &mut self.library {
-            lib.artists.insert(name.to_string(), ArtistInfo {
-                id: artist_id,
-                music_folder_id: folder_id,
-            });
+            lib.artists.insert(
+                name.to_string(),
+                ArtistInfo {
+                    id: artist_id,
+                    music_folder_id: folder_id,
+                },
+            );
         }
 
         Ok((artist_id, folder_id))
@@ -573,7 +614,9 @@ impl NativeSession {
 
         let lib = self.lib()?;
         let albums_folder = lib.albums_folder;
-        let artist_folder = lib.artists.get(artist_name)
+        let artist_folder = lib
+            .artists
+            .get(artist_name)
             .map(|a| a.music_folder_id)
             .unwrap_or(lib.music_folder);
 
@@ -585,9 +628,16 @@ impl NativeSession {
                 let props = PropListBuilder::new()
                     .add_string(PROP_OBJECT_FILENAME, album_name)
                     .build();
-                let (_, _, id) = self.session.send_object_prop_list(
-                    self.storage_id, artist_folder, ASSOCIATION_FORMAT, 0, &props,
-                ).mtp_err()?;
+                let (_, _, id) = self
+                    .session
+                    .send_object_prop_list(
+                        self.storage_id,
+                        artist_folder,
+                        ASSOCIATION_FORMAT,
+                        0,
+                        &props,
+                    )
+                    .mtp_err()?;
                 let _ = self.session.send_object(&[]);
                 id
             }
@@ -601,11 +651,18 @@ impl NativeSession {
             props.add_string(PROP_ARTIST, artist_name);
         }
         props.add_string(PROP_NAME, album_name);
-        props.add_string(PROP_OBJECT_FILENAME, &format!("{}--{}.alb", artist_name, album_name));
+        props.add_string(
+            PROP_OBJECT_FILENAME,
+            &format!("{}--{}.alb", artist_name, album_name),
+        );
         let album_data = props.build();
 
         let album_id = match self.session.send_object_prop_list(
-            self.storage_id, albums_folder, FORMAT_ABSTRACT_AUDIO_ALBUM, 0, &album_data,
+            self.storage_id,
+            albums_folder,
+            FORMAT_ABSTRACT_AUDIO_ALBUM,
+            0,
+            &album_data,
         ) {
             Ok((_, _, id)) => {
                 // Complete the two-phase MTP operation with empty data.
@@ -616,10 +673,13 @@ impl NativeSession {
         };
 
         if let Some(lib) = &mut self.library {
-            lib.albums.insert(key, AlbumInfo {
-                id: album_id,
-                music_folder_id: folder_id,
-            });
+            lib.albums.insert(
+                key,
+                AlbumInfo {
+                    id: album_id,
+                    music_folder_id: folder_id,
+                },
+            );
         }
 
         Ok((album_id, folder_id))
@@ -646,8 +706,8 @@ impl DeviceSession for NativeSession {
     }
 
     fn zune_import(&mut self, local_path: &str) -> Result<u64, String> {
-        let file_data = std::fs::read(local_path)
-            .map_err(|e| format!("Cannot read {}: {}", local_path, e))?;
+        let file_data =
+            std::fs::read(local_path).map_err(|e| format!("Cannot read {}: {}", local_path, e))?;
 
         let filename = std::path::Path::new(local_path)
             .file_name()
@@ -695,13 +755,16 @@ impl DeviceSession for NativeSession {
         let prop_data = props.build();
 
         self.log_msg(&format!("Importing: {}", title));
-        let (_, _, track_id) = self.session.send_object_prop_list(
-            self.storage_id,
-            album_folder,
-            format,
-            file_data.len() as u64,
-            &prop_data,
-        ).mtp_err()?;
+        let (_, _, track_id) = self
+            .session
+            .send_object_prop_list(
+                self.storage_id,
+                album_folder,
+                format,
+                file_data.len() as u64,
+                &prop_data,
+            )
+            .mtp_err()?;
 
         // Upload the actual audio file.
         self.session.send_object(&file_data).mtp_err()?;
@@ -711,7 +774,9 @@ impl DeviceSession for NativeSession {
             refs.push(track_id);
             let _ = self.session.set_object_references(album_obj_id, &refs);
         } else {
-            let _ = self.session.set_object_references(album_obj_id, &[track_id]);
+            let _ = self
+                .session
+                .set_object_references(album_obj_id, &[track_id]);
         }
 
         // Set album art if available and supported.
@@ -749,7 +814,10 @@ impl DeviceSession for NativeSession {
             Err(_) => return Ok(0),
         };
         let mut removed = 0usize;
-        let artist_handles = self.session.get_object_handles(self.storage_id, music_folder).mtp_err()?;
+        let artist_handles = self
+            .session
+            .get_object_handles(self.storage_id, music_folder)
+            .mtp_err()?;
 
         for artist_h in artist_handles {
             let artist_info = match self.session.get_object_info(artist_h) {
@@ -761,7 +829,9 @@ impl DeviceSession for NativeSession {
             }
 
             // Check album subfolders inside this artist folder.
-            let album_handles = self.session.get_object_handles(self.storage_id, artist_h)
+            let album_handles = self
+                .session
+                .get_object_handles(self.storage_id, artist_h)
                 .unwrap_or_default();
             for album_h in &album_handles {
                 let album_info = match self.session.get_object_info(*album_h) {
@@ -772,19 +842,29 @@ impl DeviceSession for NativeSession {
                     continue;
                 }
                 // If album folder is empty, delete it.
-                let children = self.session.get_object_handles(self.storage_id, *album_h)
+                let children = self
+                    .session
+                    .get_object_handles(self.storage_id, *album_h)
                     .unwrap_or_default();
                 if children.is_empty() && self.session.delete_object(*album_h).is_ok() {
-                    self.log_msg(&format!("Cleaned up empty folder: {}/{}", artist_info.filename, album_info.filename));
+                    self.log_msg(&format!(
+                        "Cleaned up empty folder: {}/{}",
+                        artist_info.filename, album_info.filename
+                    ));
                     removed += 1;
                 }
             }
 
             // Re-check artist folder — it may now be empty after album cleanup.
-            let remaining = self.session.get_object_handles(self.storage_id, artist_h)
+            let remaining = self
+                .session
+                .get_object_handles(self.storage_id, artist_h)
                 .unwrap_or_default();
             if remaining.is_empty() && self.session.delete_object(artist_h).is_ok() {
-                self.log_msg(&format!("Cleaned up empty folder: {}", artist_info.filename));
+                self.log_msg(&format!(
+                    "Cleaned up empty folder: {}",
+                    artist_info.filename
+                ));
                 removed += 1;
             }
         }
@@ -806,8 +886,7 @@ impl DeviceSession for NativeSession {
         self.log_msg("Scanning device (first time may take a minute)...");
         let mut entries = Vec::new();
         self.list_recursive(parent, "", &mut entries)?;
-        let tracks: Vec<DeviceEntry> =
-            entries.into_iter().filter(|e| !e.is_dir()).collect();
+        let tracks: Vec<DeviceEntry> = entries.into_iter().filter(|e| !e.is_dir()).collect();
 
         self.cache.save(&tracks);
         self.log_msg(&format!("Cached {} tracks", tracks.len()));
@@ -815,11 +894,7 @@ impl DeviceSession for NativeSession {
         Ok(tracks)
     }
 
-    fn create_playlist(
-        &mut self,
-        name: &str,
-        track_ids: &[u64],
-    ) -> Result<(), String> {
+    fn create_playlist(&mut self, name: &str, track_ids: &[u64]) -> Result<(), String> {
         self.ensure_library()?;
         let music_folder = self.lib()?.music_folder;
 
@@ -827,13 +902,16 @@ impl DeviceSession for NativeSession {
         let props = PropListBuilder::new()
             .add_string(PROP_OBJECT_FILENAME, &format!("{}.pla", name))
             .build();
-        let (_, _, playlist_id) = self.session.send_object_prop_list(
-            self.storage_id,
-            music_folder,
-            FORMAT_ABSTRACT_AV_PLAYLIST,
-            0,
-            &props,
-        ).mtp_err()?;
+        let (_, _, playlist_id) = self
+            .session
+            .send_object_prop_list(
+                self.storage_id,
+                music_folder,
+                FORMAT_ABSTRACT_AV_PLAYLIST,
+                0,
+                &props,
+            )
+            .mtp_err()?;
 
         // Step 2: Send empty object data.
         self.session.send_object(&[]).mtp_err()?;
@@ -846,11 +924,15 @@ impl DeviceSession for NativeSession {
             name_data.extend_from_slice(&ch.to_le_bytes());
         }
         name_data.extend_from_slice(&0u16.to_le_bytes());
-        let _ = self.session.set_object_prop_value(playlist_id, PROP_NAME, &name_data);
+        let _ = self
+            .session
+            .set_object_prop_value(playlist_id, PROP_NAME, &name_data);
 
         // Step 4: Link tracks via SetObjectReferences.
         let refs: Vec<u32> = track_ids.iter().map(|&id| id as u32).collect();
-        self.session.set_object_references(playlist_id, &refs).mtp_err()?;
+        self.session
+            .set_object_references(playlist_id, &refs)
+            .mtp_err()?;
 
         Ok(())
     }
@@ -881,7 +963,11 @@ impl NativeSession {
             "Probed caps: artist={} date={} cover={}",
             artist_supported, album_date_supported, album_cover_supported
         ));
-        Some((artist_supported, album_date_supported, album_cover_supported))
+        Some((
+            artist_supported,
+            album_date_supported,
+            album_cover_supported,
+        ))
     }
 
     /// Clear the track cache entirely.
@@ -891,7 +977,11 @@ impl NativeSession {
 
     /// Try to extract and set album art on the device. Logs but doesn't fail on errors.
     fn try_set_album_art(&mut self, local_path: &str, album_obj_id: u32) {
-        let supported = self.library.as_ref().map(|l| l.caps.album_cover_supported).unwrap_or(false);
+        let supported = self
+            .library
+            .as_ref()
+            .map(|l| l.caps.album_cover_supported)
+            .unwrap_or(false);
         if !supported {
             self.log_msg("Album art not supported by device");
             return;
@@ -956,11 +1046,16 @@ fn extract_album_art(path: &str) -> Option<Vec<u8>> {
     let temp = std::env::temp_dir().join("zytunes-art.jpg");
     let result = std::process::Command::new("ffmpeg")
         .args([
-            "-y", "-i", path,
-            "-an",                     // no audio
-            "-vf", "scale=200:200",    // resize to 200x200
-            "-codec:v", "mjpeg",       // output JPEG
-            "-q:v", "5",               // quality
+            "-y",
+            "-i",
+            path,
+            "-an", // no audio
+            "-vf",
+            "scale=200:200", // resize to 200x200
+            "-codec:v",
+            "mjpeg", // output JPEG
+            "-q:v",
+            "5", // quality
         ])
         .arg(temp.as_os_str())
         .stdout(std::process::Stdio::null())
@@ -982,18 +1077,9 @@ fn extract_album_art(path: &str) -> Option<Vec<u8>> {
 fn read_metadata(path: &str, filename: &str) -> (String, String, String, u16, String) {
     // Try ID3 tags first.
     if let Ok(tag) = id3::Tag::read_from_path(path) {
-        let artist = tag
-            .artist()
-            .unwrap_or("Unknown Artist")
-            .to_string();
-        let album = tag
-            .album()
-            .unwrap_or("Unknown Album")
-            .to_string();
-        let title = tag
-            .title()
-            .unwrap_or_else(|| stem(filename))
-            .to_string();
+        let artist = tag.artist().unwrap_or("Unknown Artist").to_string();
+        let album = tag.album().unwrap_or("Unknown Album").to_string();
+        let title = tag.title().unwrap_or_else(|| stem(filename)).to_string();
         let track_num = tag.track().unwrap_or(0) as u16;
         let genre = tag
             .genre_parsed()
@@ -1023,11 +1109,7 @@ fn stem(filename: &str) -> &str {
 
 /// Detect MTP audio format from filename extension.
 fn detect_format(filename: &str) -> u16 {
-    let ext = filename
-        .rsplit('.')
-        .next()
-        .unwrap_or("")
-        .to_lowercase();
+    let ext = filename.rsplit('.').next().unwrap_or("").to_lowercase();
     match ext.as_str() {
         "mp3" => FORMAT_MP3,
         "wma" => FORMAT_WMA,
@@ -1206,7 +1288,10 @@ mod tests {
     fn track_cache_path_uses_serial() {
         let cache = make_cache(Some("ABC123"));
         let path = cache.cache_path().unwrap();
-        assert!(path.to_str().unwrap().contains("zytunes-track-cache-ABC123"));
+        assert!(path
+            .to_str()
+            .unwrap()
+            .contains("zytunes-track-cache-ABC123"));
     }
 
     #[test]

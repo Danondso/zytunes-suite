@@ -1,8 +1,9 @@
 /target
 /aft/build
 
-# Claude Code
-.claude/
+# Claude Code (keep skills tracked, ignore local config/memory)
+.claude/*
+!.claude/skills/
 
 # Music files (test artifacts, copyrighted content)
 *.mp3

@@ -32,9 +32,7 @@ impl LibusbTransport {
             .iter()
             .find(|dev| {
                 dev.device_descriptor()
-                    .map(|desc| {
-                        desc.vendor_id() == vendor_id && desc.product_id() == product_id
-                    })
+                    .map(|desc| desc.vendor_id() == vendor_id && desc.product_id() == product_id)
                     .unwrap_or(false)
             })
             .ok_or_else(|| {
@@ -64,9 +62,9 @@ impl LibusbTransport {
         Self::probe_os_descriptors(&handle);
 
         // Find the MTP interface and its bulk endpoints.
-        let config = device.active_config_descriptor().map_err(|e| {
-            MtpError::Usb(format!("Failed to get config descriptor: {e}"))
-        })?;
+        let config = device
+            .active_config_descriptor()
+            .map_err(|e| MtpError::Usb(format!("Failed to get config descriptor: {e}")))?;
 
         let mut interface_number = 0u8;
         let mut endpoint_in = 0u8;
@@ -126,9 +124,7 @@ impl LibusbTransport {
 
         // Claim the MTP interface.
         handle.claim_interface(interface_number).map_err(|e| {
-            MtpError::Usb(format!(
-                "Failed to claim interface {interface_number}: {e}"
-            ))
+            MtpError::Usb(format!("Failed to claim interface {interface_number}: {e}"))
         })?;
 
         Ok(LibusbTransport {
@@ -151,9 +147,7 @@ impl LibusbTransport {
             0x80,   // Device-to-host, Standard, Device
             0x06,   // GET_DESCRIPTOR
             0x03EE, // String descriptor, index 0xEE
-            0x0000,
-            &mut buf,
-            timeout,
+            0x0000, &mut buf, timeout,
         );
 
         if let Ok(n) = result {
@@ -178,7 +172,9 @@ impl LibusbTransport {
     pub fn write(&self, data: &[u8]) -> Result<usize, MtpError> {
         let timeout = Duration::from_secs(30);
         super::chunked_write(data, self.max_packet_size as usize, |chunk| {
-            let n = self.handle.write_bulk(self.endpoint_out, chunk, timeout)
+            let n = self
+                .handle
+                .write_bulk(self.endpoint_out, chunk, timeout)
                 .map_err(|e| MtpError::Usb(format!("write_bulk failed: {e}")))?;
             Ok(n)
         })
@@ -187,7 +183,9 @@ impl LibusbTransport {
     /// Read data from the bulk IN endpoint.
     pub fn read(&self, buf: &mut [u8]) -> Result<usize, MtpError> {
         let timeout = Duration::from_secs(30);
-        let n = self.handle.read_bulk(self.endpoint_in, buf, timeout)
+        let n = self
+            .handle
+            .read_bulk(self.endpoint_in, buf, timeout)
             .map_err(|e| MtpError::Usb(format!("read_bulk failed: {e}")))?;
         Ok(n)
     }
@@ -196,7 +194,9 @@ impl LibusbTransport {
     /// libusb supports native timeouts, so no background thread is needed.
     pub fn read_with_timeout(&self, buf: &mut [u8], timeout_secs: u64) -> Result<usize, MtpError> {
         let timeout = Duration::from_secs(timeout_secs);
-        let n = self.handle.read_bulk(self.endpoint_in, buf, timeout)
+        let n = self
+            .handle
+            .read_bulk(self.endpoint_in, buf, timeout)
             .map_err(|e| match e {
                 rusb::Error::Timeout => {
                     MtpError::Usb(format!("read_bulk timed out ({timeout_secs}s)"))
