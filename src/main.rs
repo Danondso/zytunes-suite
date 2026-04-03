@@ -6,7 +6,6 @@ use zytunes::{
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::process::Command;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -64,7 +63,7 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("  sync playlist <name>   Sync all tracks in a playlist");
             println!("  sync track <name>      Sync a single track by name");
             println!("\nUnsupported formats (FLAC, OGG, WAV, M4A, OPUS, etc.)");
-            println!("are auto-transcoded to MP3 with album art via ffmpeg.");
+            println!("are auto-transcoded to MP3 with album art.");
             println!("\nExamples:");
             println!("  zytunes sync artist \"Radiohead\"");
             println!("  zytunes sync playlist \"Classic Rock\"");
@@ -234,10 +233,6 @@ fn cmd_sync(args: &[String]) -> Result<(), String> {
         to_transcode
     );
 
-    if to_transcode > 0 && Command::new("ffmpeg").arg("-version").output().is_err() {
-        return Err("ffmpeg is required for transcoding. Install with: brew install ffmpeg".into());
-    }
-
     // Connect to Zune.
     let mut session = connect()?;
     println!();
@@ -305,12 +300,6 @@ fn cmd_push(paths: &[String]) -> Result<(), String> {
             "  {} file(s) will be transcoded to MP3 (Zune doesn't support FLAC/OGG/etc.)",
             needs_transcode
         );
-        // Verify ffmpeg is available.
-        if Command::new("ffmpeg").arg("-version").output().is_err() {
-            return Err("ffmpeg is required for transcoding but was not found.\n\
-                 Install with: brew install ffmpeg"
-                .into());
-        }
     }
     println!();
 

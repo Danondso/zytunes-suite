@@ -9,7 +9,6 @@ use mtp::{DeviceSession, NativeSession};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
-use std::process::Command;
 use std::str::FromStr;
 
 /// The type of sync operation to perform.
@@ -169,72 +168,218 @@ pub fn transcode_and_import(
     session.zune_import(&upload_path)
 }
 
-/// Transcode a file to MP3 using ffmpeg.
+/// Transcode a file to MP3 using pure Rust libraries.
 /// Preserves metadata and resizes album art to 200x200 (Zune rejects larger art with 0xa803).
 pub fn transcode_to_mp3(input: &str, temp_dir: &Path) -> Result<String, String> {
+    use id3::TagLike;
+    use symphonia::core::audio::SampleBuffer;
+    use symphonia::core::codecs::DecoderOptions;
+    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::meta::MetadataOptions;
+    use symphonia::core::probe::Hint;
+
     let input_path = Path::new(input);
     let stem = input_path.file_stem().unwrap_or_default().to_string_lossy();
     let output = temp_dir.join(format!("{stem}.mp3"));
 
-    // Check if the source has embedded art.
-    let has_art = Command::new("ffprobe")
-        .args([
-            "-v",
-            "quiet",
-            "-select_streams",
-            "v",
-            "-show_entries",
-            "stream=codec_type",
-            input,
-        ])
-        .output()
-        .map(|o| !o.stdout.is_empty())
-        .unwrap_or(false);
+    // 1. Read metadata and album art with lofty
+    let meta = read_lofty_metadata(input)?;
 
-    let output_str = output.to_string_lossy();
-    let mut cmd = Command::new("ffmpeg");
-    cmd.args([
-        "-i",
-        input,
-        "-codec:a",
-        "libmp3lame",
-        "-q:a",
-        "2",
-        "-map_metadata",
-        "0",
-    ]);
-
-    if has_art {
-        // Resize album art to 200x200 JPEG (Zune rejects larger art).
-        cmd.args(["-vf", "scale=200:200", "-codec:v", "mjpeg", "-q:v", "5"]);
-    } else {
-        cmd.arg("-vn");
+    // 2. Decode audio with symphonia
+    let file = std::fs::File::open(input).map_err(|e| format!("Cannot open {input}: {e}"))?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = input_path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
     }
 
-    cmd.args(["-id3v2_version", "3", "-y", &output_str]);
+    let probed = symphonia::default::get_probe()
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .map_err(|e| format!("Failed to probe {input}: {e}"))?;
 
-    let output_result = cmd
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .map_err(|e| format!("ffmpeg failed to start: {e}"))?;
+    let mut format = probed.format;
+    let track = format
+        .default_track()
+        .ok_or("No audio track found")?
+        .clone();
 
-    if !output_result.status.success() {
-        let stderr = String::from_utf8_lossy(&output_result.stderr);
-        // Take the last few lines of stderr — that's where ffmpeg puts the actual error.
-        let tail: String = stderr
-            .lines()
-            .rev()
-            .take(5)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect::<Vec<_>>()
-            .join("\n");
-        return Err(format!("ffmpeg transcode failed: {tail}"));
+    let sample_rate = track
+        .codec_params
+        .sample_rate
+        .ok_or("Unknown sample rate")?;
+    let channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(2);
+
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &DecoderOptions::default())
+        .map_err(|e| format!("Failed to create decoder: {e}"))?;
+
+    // 3. Encode to MP3 with LAME
+    let mut mp3_builder = mp3lame_encoder::Builder::new().ok_or("Failed to create LAME builder")?;
+    mp3_builder
+        .set_num_channels(channels as u8)
+        .map_err(|e| format!("LAME set channels: {e:?}"))?;
+    mp3_builder
+        .set_sample_rate(sample_rate)
+        .map_err(|e| format!("LAME set sample rate: {e:?}"))?;
+    mp3_builder
+        .set_vbr_mode(mp3lame_encoder::VbrMode::Mtrh)
+        .map_err(|e| format!("LAME set VBR mode: {e:?}"))?;
+    mp3_builder
+        .set_vbr_quality(mp3lame_encoder::Quality::NearBest)
+        .map_err(|e| format!("LAME set VBR quality: {e:?}"))?;
+    let mut mp3_encoder = mp3_builder
+        .build()
+        .map_err(|e| format!("LAME build: {e:?}"))?;
+
+    let mut mp3_data = Vec::new();
+    let mut sample_buf: Option<SampleBuffer<f32>> = None;
+
+    loop {
+        let packet = match format.next_packet() {
+            Ok(p) => p,
+            Err(symphonia::core::errors::Error::IoError(ref e))
+                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break;
+            }
+            Err(e) => return Err(format!("Decode error: {e}")),
+        };
+
+        if packet.track_id() != track.id {
+            continue;
+        }
+
+        let decoded = decoder
+            .decode(&packet)
+            .map_err(|e| format!("Decode packet: {e}"))?;
+
+        let spec = *decoded.spec();
+        let duration = decoded.capacity() as u64;
+
+        if sample_buf.is_none() {
+            sample_buf = Some(SampleBuffer::new(duration, spec));
+        }
+        let sbuf = sample_buf.as_mut().unwrap();
+        sbuf.copy_interleaved_ref(decoded);
+
+        let samples = sbuf.samples();
+        let input_pcm = mp3lame_encoder::InterleavedPcm(samples);
+        mp3_data.reserve(mp3lame_encoder::max_required_buffer_size(
+            samples.len() / channels,
+        ));
+        mp3_encoder
+            .encode_to_vec(input_pcm, &mut mp3_data)
+            .map_err(|e| format!("LAME encode: {e:?}"))?;
     }
+
+    // Flush the encoder
+    mp3_encoder
+        .flush_to_vec::<mp3lame_encoder::FlushNoGap>(&mut mp3_data)
+        .map_err(|e| format!("LAME flush: {e:?}"))?;
+
+    // 4. Write the MP3 file
+    std::fs::write(&output, &mp3_data).map_err(|e| format!("Write MP3: {e}"))?;
+
+    // 5. Write ID3v2.3 tags and album art
+    let mut tag = id3::Tag::new();
+    if !meta.artist.is_empty() {
+        tag.set_artist(&meta.artist);
+    }
+    if !meta.album.is_empty() {
+        tag.set_album(&meta.album);
+    }
+    if !meta.title.is_empty() {
+        tag.set_title(&meta.title);
+    }
+    if meta.track_num > 0 {
+        tag.set_track(meta.track_num);
+    }
+    if !meta.genre.is_empty() {
+        tag.set_genre(&meta.genre);
+    }
+
+    // Resize and embed album art (200x200 JPEG for Zune)
+    if let Some(art_data) = meta.album_art {
+        if let Ok(img) = image::load_from_memory(&art_data) {
+            let resized = img.resize_exact(200, 200, image::imageops::FilterType::Lanczos3);
+            let mut jpeg_buf = std::io::Cursor::new(Vec::new());
+            if resized
+                .write_to(&mut jpeg_buf, image::ImageFormat::Jpeg)
+                .is_ok()
+            {
+                tag.add_frame(id3::frame::Picture {
+                    mime_type: "image/jpeg".to_string(),
+                    picture_type: id3::frame::PictureType::CoverFront,
+                    description: String::new(),
+                    data: jpeg_buf.into_inner(),
+                });
+            }
+        }
+    }
+
+    tag.write_to_path(&output, id3::Version::Id3v23)
+        .map_err(|e| format!("Write ID3 tags: {e}"))?;
 
     Ok(output.to_string_lossy().to_string())
+}
+
+/// Metadata extracted from an audio file for transcoding.
+struct AudioMetadata {
+    artist: String,
+    album: String,
+    title: String,
+    track_num: u32,
+    genre: String,
+    album_art: Option<Vec<u8>>,
+}
+
+/// Read metadata and album art from an audio file using lofty.
+fn read_lofty_metadata(path: &str) -> Result<AudioMetadata, String> {
+    use lofty::file::TaggedFileExt;
+    use lofty::tag::Accessor;
+
+    let tagged = lofty::probe::read_from_path(path)
+        .map_err(|e| format!("Failed to read metadata from {path}: {e}"))?;
+
+    let tag = match tagged.primary_tag().or_else(|| tagged.first_tag()) {
+        Some(t) => t,
+        None => {
+            let stem = Path::new(path)
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            return Ok(AudioMetadata {
+                artist: String::new(),
+                album: String::new(),
+                title: stem,
+                track_num: 0,
+                genre: String::new(),
+                album_art: None,
+            });
+        }
+    };
+
+    Ok(AudioMetadata {
+        artist: tag.artist().map(|s| s.to_string()).unwrap_or_default(),
+        album: tag.album().map(|s| s.to_string()).unwrap_or_default(),
+        title: tag.title().map(|s| s.to_string()).unwrap_or_else(|| {
+            Path::new(path)
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string()
+        }),
+        track_num: tag.track().unwrap_or(0),
+        genre: tag.genre().map(|s| s.to_string()).unwrap_or_default(),
+        album_art: tag.pictures().first().map(|pic| pic.data().to_vec()),
+    })
 }
 
 /// Find matching tracks from the library for the given sync type and name.
@@ -571,6 +716,7 @@ pub fn collect_music_files_recursive(dir: &Path, extensions: &[&str], files: &mu
 mod tests {
     use super::*;
     use crate::library::ItunesLibrary;
+    use id3::TagLike;
 
     #[test]
     fn needs_transcoding_by_extension() {
@@ -1005,5 +1151,208 @@ mod tests {
     fn strip_track_number_edge_cases() {
         assert_eq!(strip_track_number("01 "), ""); // number + space + empty
         assert_eq!(strip_track_number("1"), "1"); // just a number, no space
+    }
+
+    // -- transcode_to_mp3 tests --
+
+    /// Generate a minimal valid WAV file (PCM s16le, stereo, 44100 Hz).
+    fn make_wav(path: &std::path::Path, num_samples: usize) {
+        use std::io::Write;
+        let channels: u16 = 2;
+        let sample_rate: u32 = 44100;
+        let bits_per_sample: u16 = 16;
+        let byte_rate = sample_rate * u32::from(channels) * u32::from(bits_per_sample) / 8;
+        let block_align = channels * bits_per_sample / 8;
+        let data_size =
+            (num_samples * usize::from(channels) * usize::from(bits_per_sample) / 8) as u32;
+        let file_size = 36 + data_size;
+
+        let mut f = std::fs::File::create(path).unwrap();
+        f.write_all(b"RIFF").unwrap();
+        f.write_all(&file_size.to_le_bytes()).unwrap();
+        f.write_all(b"WAVE").unwrap();
+        f.write_all(b"fmt ").unwrap();
+        f.write_all(&16u32.to_le_bytes()).unwrap(); // chunk size
+        f.write_all(&1u16.to_le_bytes()).unwrap(); // PCM
+        f.write_all(&channels.to_le_bytes()).unwrap();
+        f.write_all(&sample_rate.to_le_bytes()).unwrap();
+        f.write_all(&byte_rate.to_le_bytes()).unwrap();
+        f.write_all(&block_align.to_le_bytes()).unwrap();
+        f.write_all(&bits_per_sample.to_le_bytes()).unwrap();
+        f.write_all(b"data").unwrap();
+        f.write_all(&data_size.to_le_bytes()).unwrap();
+        // Write silence (zeros)
+        let silence = vec![0u8; data_size as usize];
+        f.write_all(&silence).unwrap();
+    }
+
+    /// Generate a minimal JPEG image of given dimensions.
+    fn make_jpeg(width: u32, height: u32) -> Vec<u8> {
+        use image::{ImageBuffer, Rgb};
+        let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::new(width, height);
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, image::ImageFormat::Jpeg).unwrap();
+        buf.into_inner()
+    }
+
+    #[test]
+    fn transcode_wav_to_mp3() {
+        let dir = std::env::temp_dir().join("zytunes-test-transcode-wav");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let wav_path = dir.join("silence.wav");
+        make_wav(&wav_path, 44100); // 1 second of stereo silence
+
+        let out_dir = dir.join("out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        let result = transcode_to_mp3(wav_path.to_str().unwrap(), &out_dir);
+        assert!(result.is_ok(), "transcode failed: {:?}", result.err());
+
+        let mp3_path = result.unwrap();
+        assert!(mp3_path.ends_with(".mp3"));
+        assert!(std::path::Path::new(&mp3_path).exists());
+
+        // Verify it's a valid MP3 (starts with ID3 header or MPEG sync)
+        let data = std::fs::read(&mp3_path).unwrap();
+        assert!(!data.is_empty());
+        let has_id3 = data.starts_with(b"ID3");
+        let has_sync = data.len() >= 2 && data[0] == 0xff && (data[1] & 0xe0) == 0xe0;
+        assert!(has_id3 || has_sync, "output is not a valid MP3 file");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transcode_preserves_metadata() {
+        let dir = std::env::temp_dir().join("zytunes-test-transcode-meta");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let wav_path = dir.join("tagged.wav");
+        make_wav(&wav_path, 44100);
+
+        // Write metadata to the WAV using lofty
+        {
+            use lofty::file::TaggedFileExt;
+            use lofty::tag::{Accessor, Tag, TagExt};
+            let mut tagged = lofty::probe::read_from_path(&wav_path).unwrap();
+            let tag_type = tagged.primary_tag_type();
+            // Insert a tag if none exists (WAV files may not have one)
+            if tagged.primary_tag().is_none() {
+                tagged.insert_tag(Tag::new(tag_type));
+            }
+            let tag = tagged.primary_tag_mut().unwrap();
+            tag.set_artist("Test Artist".to_string());
+            tag.set_album("Test Album".to_string());
+            tag.set_title("Test Title".to_string());
+            tag.set_track(7);
+            tag.set_genre("Rock".to_string());
+            tag.save_to_path(&wav_path, lofty::config::WriteOptions::default())
+                .unwrap();
+        }
+
+        let out_dir = dir.join("out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        let mp3_path = transcode_to_mp3(wav_path.to_str().unwrap(), &out_dir).unwrap();
+
+        // Read back the ID3 tags from the output MP3
+        let tag = id3::Tag::read_from_path(&mp3_path).unwrap();
+        assert_eq!(tag.artist(), Some("Test Artist"));
+        assert_eq!(tag.album(), Some("Test Album"));
+        assert_eq!(tag.title(), Some("Test Title"));
+        assert_eq!(tag.track(), Some(7));
+        assert_eq!(tag.genre_parsed().as_deref(), Some("Rock"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transcode_resizes_album_art() {
+        let dir = std::env::temp_dir().join("zytunes-test-transcode-art");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let wav_path = dir.join("art.wav");
+        make_wav(&wav_path, 44100);
+
+        // Embed a 500x500 JPEG as album art
+        let big_art = make_jpeg(500, 500);
+        {
+            use lofty::file::TaggedFileExt;
+            use lofty::picture::{MimeType, Picture, PictureType};
+            use lofty::tag::{Accessor, Tag, TagExt};
+            let mut tagged = lofty::probe::read_from_path(&wav_path).unwrap();
+            let tag_type = tagged.primary_tag_type();
+            if tagged.primary_tag().is_none() {
+                tagged.insert_tag(Tag::new(tag_type));
+            }
+            let tag = tagged.primary_tag_mut().unwrap();
+            tag.set_artist("Art Artist".to_string());
+            let pic = Picture::new_unchecked(
+                PictureType::CoverFront,
+                Some(MimeType::Jpeg),
+                None,
+                big_art,
+            );
+            tag.push_picture(pic);
+            tag.save_to_path(&wav_path, lofty::config::WriteOptions::default())
+                .unwrap();
+        }
+
+        let out_dir = dir.join("out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        let mp3_path = transcode_to_mp3(wav_path.to_str().unwrap(), &out_dir).unwrap();
+
+        // Read the embedded art from the output MP3 and check dimensions
+        let tag = id3::Tag::read_from_path(&mp3_path).unwrap();
+        let pics: Vec<_> = tag.pictures().collect();
+        assert!(!pics.is_empty(), "no album art in output MP3");
+        let art_data = &pics[0].data;
+        let img = image::load_from_memory(art_data).unwrap();
+        assert_eq!(img.width(), 200);
+        assert_eq!(img.height(), 200);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transcode_no_art_still_works() {
+        let dir = std::env::temp_dir().join("zytunes-test-transcode-noart");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let wav_path = dir.join("noart.wav");
+        make_wav(&wav_path, 44100);
+
+        let out_dir = dir.join("out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        let result = transcode_to_mp3(wav_path.to_str().unwrap(), &out_dir);
+        assert!(result.is_ok(), "transcode failed: {:?}", result.err());
+
+        // Verify no art embedded
+        let mp3_path = result.unwrap();
+        let tag = id3::Tag::read_from_path(&mp3_path);
+        if let Ok(tag) = tag {
+            assert_eq!(tag.pictures().count(), 0);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transcode_nonexistent_file_errors() {
+        let out_dir = std::env::temp_dir().join("zytunes-test-transcode-nofile");
+        let _ = std::fs::remove_dir_all(&out_dir);
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        let result = transcode_to_mp3("/nonexistent/path/song.flac", &out_dir);
+        assert!(result.is_err());
+
+        let _ = std::fs::remove_dir_all(&out_dir);
     }
 }

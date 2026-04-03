@@ -21,7 +21,13 @@ toml = "0.8"
 zune-mtp = { path = "zune-mtp" }
 id3 = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
-rodio = { version = "0.19", default-features = true, features = ["symphonia-aac", "symphonia-isomp4"] }
+lofty = "0.22"
+mp3lame-encoder = "0.2"
+rodio = { version = "0.22", default-features = true, features = [
+    "symphonia-aac", "symphonia-isomp4", "symphonia-alac",
+    "symphonia-flac", "symphonia-vorbis", "symphonia-wav", "symphonia-mp3",
+] }
+symphonia = { version = "0.5", features = ["all"] }
 
 [[bin]]
 name = "zytunes"

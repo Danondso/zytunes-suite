@@ -50,8 +50,8 @@ CLI commands: `ls [path]`, `push <files...>`, `rm <paths...>`, `sync <type> <nam
 - `mtp/native.rs` — `NativeSession` implements `DeviceSession` using `zune-mtp`: opens IOKit USB transport, performs MTPZ handshake, provides ls/import/rm/collect_all_tracks/create_playlist. Resolves device paths by walking object handles. `TrackCache` struct (extracted from NativeSession) handles per-device caching to `~/.zytunes-track-cache-{serial}`. `MtpResultExt` trait converts `MtpError` to `String` at the `DeviceSession` boundary
 - `mtp/parse.rs` — `DeviceEntry` struct and parsing utilities
 - `library.rs` — `MusicLibrary` trait abstracting library queries (artists, albums, playlists, track lookups). `ItunesLibrary` implements it via iTunes Library.xml plist parsing (streaming parser). `Track` and `Playlist` are shared data types used by all backends
-- `dirlib.rs` — `DirectoryLibrary` implements `MusicLibrary` by scanning a folder recursively for audio files. Reads ID3 tags for MP3 files, infers metadata from `Artist/Album/Track.ext` path structure for other formats. Generates stable track IDs via path hashing. No playlist support
-- `main.rs` — CLI entry point, `run()` dispatcher, `cmd_sync`/`cmd_push`/`cmd_rm`/`cmd_ls`/`cmd_library` commands, `sync_to_device()` engine (takes `SyncType`), `find_matching_tracks()` (takes `SyncType`), transcoding via ffmpeg
+- `dirlib.rs` — `DirectoryLibrary` implements `MusicLibrary` by scanning a folder recursively for audio files. Reads metadata from all audio formats via lofty (FLAC, M4A, OGG, WAV, MP3, etc.), falls back to `Artist/Album/Track.ext` path structure for untagged files. Generates stable track IDs via path hashing. No playlist support
+- `main.rs` — CLI entry point, `run()` dispatcher, `cmd_sync`/`cmd_push`/`cmd_rm`/`cmd_ls`/`cmd_library` commands, `sync_to_device()` engine (takes `SyncType`), `find_matching_tracks()` (takes `SyncType`), transcoding via symphonia + LAME
 - `tui/main.rs` — TUI entry point (`zytunes-tui` binary), event loop (50ms poll), terminal setup/teardown
 - `tui/app.rs` — TUI application state (`App`), input handling, panel navigation. Panels: `Library` (sidebar), `Albums`, `TrackList`, `Device`, `SyncQueue` — cycled via Tab. Two browse modes: `BrowseMode::Library` and `BrowseMode::Device` (toggled with `v`). Three sidebar modes: `Artists`, `Albums`, `Playlists` (keys `1`/`2`/`3`). Sidebar selection positions saved per browse-mode × sidebar-mode pair. Device mode builds in-memory artist/album/track index from `Music/{Artist}/{Album}/{Track}` paths. `App` uses `DeviceState` sub-struct (holds device status, name, firmware, serial, storage, tracks, etc.) and `SyncState` sub-struct (holds sync queue, status, current track, and log). State machines: `DeviceStatus` (Disconnected → Detecting → Connecting → Connected), `SyncStatus` (Idle → Running)
 - `tui/background.rs` — background worker thread communicating via `mpsc` channels. Commands (`BgCommand`): `LoadLibrary`, `Connect`, `LoadDeviceTracks`, `Disconnect`, `ExecuteSyncQueue`, `RemoveFromDevice`, `CancelSync`. Events (`BgEvent`): `LibraryLoaded`, `DeviceDetected`, `SessionReady`, `SessionFailed`, `DeviceTracksLoaded`, `SyncProgress`, `SyncTrackDone`, `SyncComplete`, `RemoveProgress`, `RemoveComplete`, `StorageUpdated`, `Error`, `SyncMessage`. `DeviceInfo` struct does not include `mtp_version`. Uses NativeSession exclusively
@@ -65,9 +65,9 @@ CLI commands: `ls [path]`, `push <files...>`, `rm <paths...>`, `sync <type> <nam
 
 **Licensing:** MIT license (`LICENSE`). Third-party attribution in `THIRD_PARTY.md` (MTPZ keys from libmtp-zune).
 
-**External tool dependencies:** `ffmpeg`/`ffprobe` (transcoding), `libusb` (via rusb).
+**External tool dependencies:** `libusb` (via rusb). Optional: `ffmpeg` for TUI playback of WMA files.
 
-**Transcoding:** Non-native formats (FLAC, OGG, WAV, M4A, OPUS, ALAC, AIFF) are automatically transcoded to MP3 via ffmpeg. Native formats (MP3, WMA, AAC) skip transcoding entirely. Album art is resized to 200x200 JPEG (Zune 30 rejects larger art with error `0xa803`).
+**Transcoding:** Non-native formats (FLAC, OGG, WAV, M4A, OPUS, ALAC, AIFF) are automatically transcoded to MP3 using pure Rust libraries (symphonia for decoding, mp3lame-encoder for encoding, lofty for metadata). Native formats (MP3, WMA, AAC) skip transcoding entirely. Album art is resized to 200x200 JPEG via the image crate (Zune 30 rejects larger art with error `0xa803`).
 
 ## Claude Code Skills
 
