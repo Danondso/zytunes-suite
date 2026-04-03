@@ -12,6 +12,59 @@ use crate::app::{
 };
 use crate::theme;
 
+/// Responsive layout dimensions computed from terminal size.
+struct LayoutMetrics {
+    device_width: u16,
+    sidebar_width: u16,
+    album_width: u16,
+    keys_width: u16,
+    show_now_playing: bool,
+    show_zip_art: bool,
+    footer_left_width: u16,
+}
+
+impl LayoutMetrics {
+    fn new(area: Rect, show_keys: bool, has_album_browser: bool, has_player: bool) -> Self {
+        let w = area.width;
+        let h = area.height;
+
+        if w < 100 {
+            // Compact: hide device panel, force-hide keys, narrow sidebar.
+            LayoutMetrics {
+                device_width: 0,
+                sidebar_width: 20,
+                album_width: if has_album_browser { 22 } else { 0 },
+                keys_width: 0,
+                show_now_playing: has_player && h >= 20,
+                show_zip_art: false,
+                footer_left_width: 12,
+            }
+        } else if w < 140 {
+            // Standard: narrower device panel, force-hide keys.
+            LayoutMetrics {
+                device_width: 28,
+                sidebar_width: 24,
+                album_width: if has_album_browser { 24 } else { 0 },
+                keys_width: 0,
+                show_now_playing: has_player && h >= 20,
+                show_zip_art: true,
+                footer_left_width: 16,
+            }
+        } else {
+            // Full: current behavior.
+            LayoutMetrics {
+                device_width: 36,
+                sidebar_width: if has_album_browser { 24 } else { 28 },
+                album_width: if has_album_browser { 30 } else { 0 },
+                keys_width: if show_keys { 24 } else { 0 },
+                show_now_playing: has_player && h >= 20,
+                show_zip_art: true,
+                footer_left_width: 16,
+            }
+        }
+    }
+}
+
 fn throbber_symbol(state: &ThrobberState, theme_index: usize) -> String {
     Throbber::default()
         .throbber_set(anim::spinner_set_for_theme(theme_index))
@@ -30,23 +83,30 @@ pub fn draw(f: &mut Frame, app: &App) {
         return;
     }
 
+    let m = LayoutMetrics::new(
+        size,
+        app.show_keys,
+        app.has_album_browser(),
+        app.now_playing.is_some(),
+    );
+
     // Outer horizontal: device left | middle content | keys right
-    let keys_width = if app.show_keys { 24 } else { 0 };
     let outer = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(36),
+            Constraint::Length(m.device_width),
             Constraint::Min(40),
-            Constraint::Length(keys_width),
+            Constraint::Length(m.keys_width),
         ])
         .split(size);
 
     // Left column: device info + sync queue + log
-    draw_device_left_panel(f, app, outer[0]);
+    if m.device_width > 0 {
+        draw_device_left_panel(f, app, outer[0]);
+    }
 
     // Middle: browser area + optional now-playing + footer
-    let has_player = app.now_playing.is_some();
-    let middle = if has_player {
+    let middle = if m.show_now_playing {
         Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -63,37 +123,39 @@ pub fn draw(f: &mut Frame, app: &App) {
     };
 
     // Browser columns: sidebar | optional albums | tracks
-    let browser = if app.has_album_browser() {
+    let browser = if m.album_width > 0 {
         Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Length(24),
-                Constraint::Length(30),
+                Constraint::Length(m.sidebar_width),
+                Constraint::Length(m.album_width),
                 Constraint::Min(20),
             ])
             .split(middle[0])
     } else {
         Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(28), Constraint::Min(30)])
+            .constraints([Constraint::Length(m.sidebar_width), Constraint::Min(30)])
             .split(middle[0])
     };
 
     draw_sidebar(f, app, browser[0]);
-    if app.has_album_browser() {
+    if m.album_width > 0 {
         draw_album_browser(f, app, browser[1]);
-        draw_track_list(f, app, browser[2]);
+        draw_track_list(f, app, browser[2], m.show_zip_art);
     } else {
-        draw_track_list(f, app, browser[1]);
+        draw_track_list(f, app, browser[1], m.show_zip_art);
     }
 
-    if let Some(ref np) = app.now_playing {
-        draw_now_playing(f, app, np, middle[1]);
+    if m.show_now_playing {
+        if let Some(ref np) = app.now_playing {
+            draw_now_playing(f, app, np, middle[1]);
+        }
     }
-    let footer_idx = if has_player { 2 } else { 1 };
-    draw_footer(f, app, middle[footer_idx]);
+    let footer_idx = if m.show_now_playing { 2 } else { 1 };
+    draw_footer(f, app, middle[footer_idx], m.footer_left_width);
 
-    if app.show_keys {
+    if m.keys_width > 0 {
         draw_keys_panel(f, app, outer[2]);
     }
 
@@ -337,15 +399,15 @@ fn draw_album_browser(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(list, inner);
 }
 
-fn draw_track_list(f: &mut Frame, app: &App, area: Rect) {
+fn draw_track_list(f: &mut Frame, app: &App, area: Rect, show_zip_art: bool) {
     if app.has_album_browser() {
-        draw_album_detail(f, app, area);
+        draw_album_detail(f, app, area, show_zip_art);
     } else {
         draw_track_table(f, app, area);
     }
 }
 
-fn draw_album_detail(f: &mut Frame, app: &App, area: Rect) {
+fn draw_album_detail(f: &mut Frame, app: &App, area: Rect, show_zip_art: bool) {
     let t = app.theme();
     let is_active = app.active_panel == Panel::TrackList;
     let border_style = if is_active {
@@ -388,35 +450,40 @@ fn draw_album_detail(f: &mut Frame, app: &App, area: Rect) {
         .map(|y| y.to_string())
         .unwrap_or_default();
 
-    // Zip disk ASCII art by mga — https://www.asciiart.eu/art/324546af3173c962
-    // Album/artist/track info embedded into the disk body and label.
-    let art_lines = build_zip_art(
-        app,
-        album_name,
-        album_artist,
-        &year_str,
-        track_count,
-        &dur_str,
-    );
+    if show_zip_art {
+        // Zip disk ASCII art by mga — https://www.asciiart.eu/art/324546af3173c962
+        // Album/artist/track info embedded into the disk body and label.
+        let art_lines = build_zip_art(
+            app,
+            album_name,
+            album_artist,
+            &year_str,
+            track_count,
+            &dur_str,
+        );
 
-    // Side-by-side: zip art on the left, track listing + album art on the right.
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(31), Constraint::Min(12)])
-        .split(inner);
+        // Side-by-side: zip art on the left, track listing + album art on the right.
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(31), Constraint::Min(12)])
+            .split(inner);
 
-    let art = Paragraph::new(art_lines);
-    f.render_widget(art, cols[0]);
+        let art = Paragraph::new(art_lines);
+        f.render_widget(art, cols[0]);
 
-    // Split right column: tracks on top, album art below.
-    let art_rows = app.album_art_lines.len() as u16;
-    let right_split = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(4), Constraint::Length(art_rows)])
-        .split(cols[1]);
+        // Split right column: tracks on top, album art below.
+        let art_rows = app.album_art_lines.len() as u16;
+        let right_split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(4), Constraint::Length(art_rows)])
+            .split(cols[1]);
 
-    draw_album_track_list(f, app, right_split[0]);
-    draw_album_art_inline(f, app, right_split[1]);
+        draw_album_track_list(f, app, right_split[0]);
+        draw_album_art_inline(f, app, right_split[1]);
+    } else {
+        // Compact: full-width track list, no zip art.
+        draw_album_track_list(f, app, inner);
+    }
 }
 
 fn draw_album_art_inline(f: &mut Frame, app: &App, area: Rect) {
@@ -788,7 +855,7 @@ fn draw_device_info_connected(f: &mut Frame, app: &App, area: Rect) {
             " {:.1}/{:.1} GB ({:.1} free)",
             used_gb, total_gb, free_gb
         )));
-        let bar_width = 26usize;
+        let bar_width = (area.width as usize).saturating_sub(8).min(26);
         let filled = (bar_width as f64 * storage.used_percent as f64 / 100.0) as usize;
         let empty = bar_width.saturating_sub(filled);
         let bar_chars = anim::progress_bar_with_shine(filled, empty, app.anim_frame);
@@ -1254,7 +1321,7 @@ fn draw_now_playing(f: &mut Frame, app: &App, np: &NowPlaying, area: Rect) {
     f.render_widget(Paragraph::new(time_line).style(t.dim()), rows[4]);
 }
 
-fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
+fn draw_footer(f: &mut Frame, app: &App, area: Rect, footer_left_width: u16) {
     let t = app.theme();
     let block = t.block().style(t.footer());
     let inner = block.inner(area);
@@ -1283,7 +1350,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
 
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(16), Constraint::Min(20)])
+        .constraints([Constraint::Length(footer_left_width), Constraint::Min(20)])
         .split(inner);
 
     f.render_widget(Paragraph::new(left).style(t.footer()), chunks[0]);

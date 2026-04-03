@@ -266,7 +266,7 @@ impl App {
             pending_cache_clear: false,
             should_quit: false,
             show_help: false,
-            show_keys: true,
+            show_keys: false,
             search_active: false,
             search_query: String::new(),
             toast_message: None,

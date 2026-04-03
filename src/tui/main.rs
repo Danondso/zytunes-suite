@@ -110,14 +110,24 @@ fn run_loop(
         // Pre-render album art for the area below the track list in album detail view.
         if app.album_art.is_some() && app.has_album_browser() {
             let size = terminal.size()?;
-            let keys_w: u16 = if app.show_keys { 24 } else { 0 };
-            let middle_w = size.width.saturating_sub(36 + keys_w);
-            // Right column = middle - sidebar(24) - albums(30) - block border(2).
-            let right_w = middle_w.saturating_sub(24 + 30 + 2);
+            let w = size.width;
+            // Match the responsive tier logic in ui::LayoutMetrics.
+            let (device_w, sidebar_w, album_w, keys_w) = if w < 100 {
+                (0u16, 20u16, 22u16, 0u16)
+            } else if w < 140 {
+                (28, 24, 24, 0)
+            } else {
+                let kw: u16 = if app.show_keys { 24 } else { 0 };
+                (36, 24, 30, kw)
+            };
+            let middle_w = w.saturating_sub(device_w + keys_w);
+            // Right column = middle - sidebar - albums - block border(2).
+            let right_w = middle_w.saturating_sub(sidebar_w + album_w + 2);
             // Available height below tracks: total browser height minus
             // a minimum of 4 rows for the track list, borders, footer, player.
             let has_player = app.now_playing.is_some();
-            let overhead = 2 + 3 + if has_player { 9 } else { 0 }; // borders + footer + player
+            let show_player = has_player && size.height >= 20;
+            let overhead = 2 + 3 + if show_player { 9 } else { 0 }; // borders + footer + player
             let browser_h = size.height.saturating_sub(overhead as u16);
             let track_min = 4u16.min(app.track_list.len() as u16);
             let art_h = browser_h.saturating_sub(track_min).min(26);
