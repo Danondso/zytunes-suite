@@ -235,6 +235,7 @@ pub struct TrackInfo {
     pub kind: Option<String>,
     pub location: Option<String>,
     pub track_number: Option<u32>,
+    pub disc_number: Option<u32>,
 }
 
 impl App {
@@ -878,9 +879,12 @@ impl App {
         };
 
         self.track_list = tracks_to_info(lib.album_tracks_by_artist(&album.artist, &album.name));
-        // Sort by track number for album views.
-        self.track_list
-            .sort_by(|a, b| a.track_number.cmp(&b.track_number));
+        // Sort by disc number then track number for album views.
+        self.track_list.sort_by(|a, b| {
+            a.disc_number
+                .cmp(&b.disc_number)
+                .then(a.track_number.cmp(&b.track_number))
+        });
         self.track_selected = 0;
         self.track_scroll = 0;
         self.refresh_album_art();
@@ -1549,6 +1553,7 @@ fn tracks_to_info(tracks: Vec<&Track>) -> Vec<TrackInfo> {
             kind: t.kind.clone(),
             location: t.location.clone(),
             track_number: t.track_number,
+            disc_number: t.disc_number,
         })
         .collect()
 }
@@ -1564,6 +1569,7 @@ fn device_tracks_to_info(tracks: &[DeviceTrackInfo]) -> Vec<TrackInfo> {
             kind: None,
             location: None,
             track_number: None,
+            disc_number: None,
         })
         .collect()
 }

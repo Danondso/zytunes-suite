@@ -502,7 +502,9 @@ fn draw_album_detail(f: &mut Frame, app: &App, area: Rect, show_zip_art: bool) {
         .map(|y| y.to_string())
         .unwrap_or_default();
 
-    if show_zip_art {
+    // Show zip art only if the tier allows it AND there's enough width
+    // (31 for art + 12 for tracks = 43 minimum).
+    if show_zip_art && inner.width >= 43 {
         // Zip disk ASCII art by mga — https://www.asciiart.eu/art/324546af3173c962
         // Album/artist/track info embedded into the disk body and label.
         let art_lines = build_zip_art(
@@ -533,7 +535,7 @@ fn draw_album_detail(f: &mut Frame, app: &App, area: Rect, show_zip_art: bool) {
         draw_album_track_list(f, app, right_split[0]);
         draw_album_art_inline(f, app, right_split[1]);
     } else {
-        // Compact: full-width track list, no zip art.
+        // Not enough width or compact tier: full-width track list, no zip art.
         draw_album_track_list(f, app, inner);
     }
 }
@@ -585,43 +587,77 @@ fn draw_album_track_list(f: &mut Frame, app: &App, area: Rect) {
     }
 
     let is_active = app.active_panel == Panel::TrackList;
-    let visible_height = area.height as usize;
-    let scroll = compute_scroll(app.track_selected, visible_height, app.track_list.len());
 
-    let rows: Vec<Row> = app
-        .track_list
-        .iter()
-        .enumerate()
-        .skip(scroll)
-        .take(visible_height)
-        .map(|(i, track)| {
-            let is_selected = i == app.track_selected && is_active;
-            let bg = if is_selected {
-                t.selection_bg
-            } else if i % 2 == 0 {
-                t.main_bg
-            } else {
-                t.alt_row_bg
+    // Determine if this is a multi-disc album.
+    let disc_count = {
+        let mut discs: Vec<Option<u32>> = app.track_list.iter().map(|t| t.disc_number).collect();
+        discs.dedup();
+        discs.len()
+    };
+    let is_multi_disc = disc_count > 1;
+
+    // Build a flat list of rows, interleaving disc headers for multi-disc albums.
+    // Each entry: (Option<track_index>, Row).
+    let mut flat_rows: Vec<(Option<usize>, Row)> = Vec::new();
+    let mut last_disc: Option<Option<u32>> = None;
+    for (i, track) in app.track_list.iter().enumerate() {
+        if is_multi_disc && last_disc != Some(track.disc_number) {
+            let disc_label = match track.disc_number {
+                Some(d) => format!("\u{2500}\u{2500} Disc {} \u{2500}\u{2500}", d),
+                None => "\u{2500}\u{2500} Disc ? \u{2500}\u{2500}".to_string(),
             };
-            let fg = if is_selected {
-                t.selection_text
-            } else {
-                t.sidebar_text
-            };
+            flat_rows.push((
+                None,
+                Row::new(vec![Cell::from(""), Cell::from(disc_label), Cell::from("")])
+                    .style(t.dim()),
+            ));
+            last_disc = Some(track.disc_number);
+        }
 
-            let num = track
-                .track_number
-                .map(|n| format!("{}.", n))
-                .unwrap_or_default();
-            let dur = track.duration_ms.map(format_duration).unwrap_or_default();
+        let is_selected = i == app.track_selected && is_active;
+        let bg = if is_selected {
+            t.selection_bg
+        } else if i % 2 == 0 {
+            t.main_bg
+        } else {
+            t.alt_row_bg
+        };
+        let fg = if is_selected {
+            t.selection_text
+        } else {
+            t.sidebar_text
+        };
 
+        let num = track
+            .track_number
+            .map(|n| format!("{}.", n))
+            .unwrap_or_default();
+        let dur = track.duration_ms.map(format_duration).unwrap_or_default();
+
+        flat_rows.push((
+            Some(i),
             Row::new(vec![
                 Cell::from(num),
                 Cell::from(track.name.clone()),
                 Cell::from(dur),
             ])
-            .style(Style::default().bg(bg).fg(fg))
-        })
+            .style(Style::default().bg(bg).fg(fg)),
+        ));
+    }
+
+    // Scroll based on the selected track's position in the flat list.
+    let selected_flat = flat_rows
+        .iter()
+        .position(|(idx, _)| *idx == Some(app.track_selected))
+        .unwrap_or(0);
+    let visible_height = area.height as usize;
+    let scroll = compute_scroll(selected_flat, visible_height, flat_rows.len());
+
+    let visible_rows: Vec<Row> = flat_rows
+        .into_iter()
+        .skip(scroll)
+        .take(visible_height)
+        .map(|(_, row)| row)
         .collect();
 
     let widths = [
@@ -630,7 +666,7 @@ fn draw_album_track_list(f: &mut Frame, app: &App, area: Rect) {
         Constraint::Length(6),
     ];
 
-    let table = Table::new(rows, widths);
+    let table = Table::new(visible_rows, widths);
     f.render_widget(table, area);
 }
 
