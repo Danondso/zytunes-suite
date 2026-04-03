@@ -1,5 +1,5 @@
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Clear, List, ListItem, Paragraph, Row, Table, Wrap};
 use ratatui::Frame;
@@ -379,7 +379,7 @@ fn draw_album_detail(f: &mut Frame, app: &App, area: Rect) {
     // Album/artist/track info embedded into the disk body and label.
     let art_lines = build_zip_art(app, album_name, album_artist, &year_str, track_count, &dur_str);
 
-    // Side-by-side: zip art on the left, track listing on the right.
+    // Side-by-side: zip art on the left, track listing + album art on the right.
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(31), Constraint::Min(12)])
@@ -388,7 +388,50 @@ fn draw_album_detail(f: &mut Frame, app: &App, area: Rect) {
     let art = Paragraph::new(art_lines);
     f.render_widget(art, cols[0]);
 
-    draw_album_track_list(f, app, cols[1]);
+    // Split right column: tracks on top, album art below.
+    let art_rows = app.album_art_lines.len() as u16;
+    let right_split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(4), Constraint::Length(art_rows)])
+        .split(cols[1]);
+
+    draw_album_track_list(f, app, right_split[0]);
+    draw_album_art_inline(f, app, right_split[1]);
+}
+
+fn draw_album_art_inline(f: &mut Frame, app: &App, area: Rect) {
+    if app.album_art_lines.is_empty() || area.height == 0 {
+        return;
+    }
+
+    let art_w = app.album_art_lines.first().map(|r| r.len()).unwrap_or(0) as u16;
+    let x_offset = area.width.saturating_sub(art_w) / 2;
+
+    let lines: Vec<Line> = app
+        .album_art_lines
+        .iter()
+        .take(area.height as usize)
+        .map(|row| {
+            let mut spans: Vec<Span> = Vec::with_capacity(row.len() + 1);
+            if x_offset > 0 {
+                spans.push(Span::styled(
+                    " ".repeat(x_offset as usize),
+                    Style::default().bg(app.theme().main_bg),
+                ));
+            }
+            for &(ch, fg, bg) in row.iter().take(area.width.saturating_sub(x_offset) as usize) {
+                spans.push(Span::styled(
+                    ch.to_string(),
+                    Style::default()
+                        .fg(Color::Rgb(fg[0], fg[1], fg[2]))
+                        .bg(Color::Rgb(bg[0], bg[1], bg[2])),
+                ));
+            }
+            Line::from(spans)
+        })
+        .collect();
+
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 fn draw_album_track_list(f: &mut Frame, app: &App, area: Rect) {

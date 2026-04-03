@@ -20,6 +20,7 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 zune-mtp = { path = "zune-mtp" }
 id3 = "1"
+image = "0.25"
 rodio = { version = "0.19", default-features = true, features = ["symphonia-aac", "symphonia-isomp4"] }
 
 [[bin]]

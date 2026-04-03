@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::mpsc;
 use std::time::Instant;
 
+use image::DynamicImage;
 use throbber_widgets_tui::ThrobberState;
 use zytunes::library::{ItunesLibrary, Track};
 use zytunes::mtp::parse::DeviceEntry;
@@ -208,6 +209,14 @@ pub struct App {
     pub show_theme_picker: bool,
     pub theme_picker_index: usize,
     pub theme_before_picker: usize,
+    /// Cached album art extracted from ID3 tags.
+    pub album_art: Option<DynamicImage>,
+    /// Key used to avoid re-extracting art (e.g. "artist/album").
+    album_art_key: String,
+    /// Cached halfblock art lines: (char, fg_rgb, bg_rgb) per cell.
+    pub album_art_lines: Vec<Vec<(char, [u8; 3], [u8; 3])>>,
+    /// Dimensions (w, h) the cached ASCII art was rendered for.
+    album_art_size: (u16, u16),
 }
 
 #[derive(Clone)]
@@ -269,6 +278,10 @@ impl App {
             show_theme_picker: false,
             theme_picker_index: 0,
             theme_before_picker: 0,
+            album_art: None,
+            album_art_key: String::new(),
+            album_art_lines: Vec::new(),
+            album_art_size: (0, 0),
         }
     }
 
@@ -768,6 +781,7 @@ impl App {
                 self.sort_tracks();
                 self.track_selected = 0;
                 self.track_scroll = 0;
+                self.refresh_album_art();
             }
             SidebarMode::Playlists => {
                 self.album_list.clear();
@@ -777,6 +791,7 @@ impl App {
                 self.sort_tracks();
                 self.track_selected = 0;
                 self.track_scroll = 0;
+                self.refresh_album_art();
             }
         }
     }
@@ -867,10 +882,86 @@ impl App {
             .sort_by(|a, b| a.track_number.cmp(&b.track_number));
         self.track_selected = 0;
         self.track_scroll = 0;
+        self.refresh_album_art();
     }
 
     pub fn has_album_browser(&self) -> bool {
         !self.album_list.is_empty()
+    }
+
+    /// Extract embedded album art from the first track that has it.
+    pub fn refresh_album_art(&mut self) {
+        // Build a cache key from the current track list context.
+        let key = if let Some(t) = self.track_list.first() {
+            format!("{}/{}", t.artist, t.album)
+        } else {
+            self.album_art = None;
+            self.album_art_key.clear();
+            self.album_art_lines.clear();
+            self.album_art_size = (0, 0);
+            return;
+        };
+
+        if key == self.album_art_key {
+            return; // already cached
+        }
+        self.album_art_key = key;
+        self.album_art = None;
+        self.album_art_lines.clear();
+        self.album_art_size = (0, 0);
+
+        for track in &self.track_list {
+            if let Some(ref loc) = track.location {
+                if let Ok(tag) = id3::Tag::read_from_path(loc) {
+                    if let Some(pic) = tag.pictures().next() {
+                        if let Ok(img) = image::load_from_memory(&pic.data) {
+                            self.album_art = Some(img);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Render album art as halfblock characters sized to a square that fits
+    /// within the given terminal area. Each cell packs two vertical pixels
+    /// using ▀ with fg=top color, bg=bottom color — doubling vertical resolution.
+    pub fn render_album_art(&mut self, width: u16, height: u16) {
+        if (width, height) == self.album_art_size && !self.album_art_lines.is_empty() {
+            return;
+        }
+        self.album_art_size = (width, height);
+        self.album_art_lines.clear();
+
+        let img = match &self.album_art {
+            Some(img) => img,
+            None => return,
+        };
+
+        // Terminal chars are roughly 1:2 (w:h), so 1 cell = 1 pixel wide, 2 pixels tall.
+        // For a square image: pixel_w = cols, pixel_h = rows * 2.
+        // Pick the largest square that fits: side = min(width, height * 2).
+        let side = (width as u32).min(height as u32 * 2);
+        let cols = side;
+        let rows = side / 2;
+
+        let resized = img.resize_exact(
+            cols,
+            rows * 2, // 2 pixel rows per terminal row
+            image::imageops::FilterType::Lanczos3,
+        );
+        let rgba = resized.to_rgba8();
+
+        for row in 0..rows {
+            let mut line = Vec::with_capacity(cols as usize);
+            for col in 0..cols {
+                let top = rgba.get_pixel(col, row * 2);
+                let bot = rgba.get_pixel(col, row * 2 + 1);
+                line.push(('▀', [top[0], top[1], top[2]], [bot[0], bot[1], bot[2]]));
+            }
+            self.album_art_lines.push(line);
+        }
     }
 
     fn sort_tracks(&mut self) {

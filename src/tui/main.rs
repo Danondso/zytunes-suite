@@ -97,6 +97,25 @@ fn run_loop(
     audio_rx: &mpsc::Receiver<audio::AudioEvent>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
+        // Pre-render album art for the area below the track list in album detail view.
+        if app.album_art.is_some() && app.has_album_browser() {
+            let size = terminal.size()?;
+            let keys_w: u16 = if app.show_keys { 24 } else { 0 };
+            let middle_w = size.width.saturating_sub(36 + keys_w);
+            // Right column = middle - sidebar(24) - albums(30) - block border(2).
+            let right_w = middle_w.saturating_sub(24 + 30 + 2);
+            // Available height below tracks: total browser height minus
+            // a minimum of 4 rows for the track list, borders, footer, player.
+            let has_player = app.now_playing.is_some();
+            let overhead = 2 + 3 + if has_player { 9 } else { 0 }; // borders + footer + player
+            let browser_h = size.height.saturating_sub(overhead as u16);
+            let track_min = 4u16.min(app.track_list.len() as u16);
+            let art_h = browser_h.saturating_sub(track_min).min(18);
+            if right_w >= 6 && art_h >= 3 {
+                app.render_album_art(right_w, art_h);
+            }
+        }
+
         terminal.draw(|f| ui::draw(f, app))?;
 
         // Process background events.
