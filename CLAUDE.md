@@ -86,6 +86,20 @@ Leave the codebase better than you found it. Prefer the maintainable solution ov
 
 When choosing between approaches, bias toward the one that makes the next change easier, not just the one that closes the current task fastest. Avoid papering over problems with workarounds that will need to be undone later.
 
+## Commit Convention
+
+This project uses **Conventional Commits** to drive automatic releases. The release workflow (`.github/workflows/release.yml`) analyzes commit messages on `main` to determine version bumps. Always use the correct prefix:
+
+| Prefix | Bump | Example |
+|--------|------|---------|
+| `feat:` | minor | `feat: add playlist sync support` |
+| `fix:` | patch | `fix: handle empty album art gracefully` |
+| `perf:` | patch | `perf: reduce memory usage during transcoding` |
+| `feat!:` or `BREAKING CHANGE` | major | `feat!: redesign device session API` |
+| `docs:`, `chore:`, `refactor:`, `ci:`, `test:`, `style:` | no release | `chore: update dependencies` |
+
+Scopes are optional: `feat(tui): add theme picker` is fine. Commits that don't match a release prefix (`docs:`, `chore:`, `refactor:`, `ci:`, `test:`, `style:`) will not trigger a release.
+
 ## Zune 30 Constraints
 
 - Only accepts MP3, WMA, AAC formats
