@@ -1,5 +1,6 @@
 /target
 /aft/build
+/tools
 
 # Claude Code (keep skills tracked, ignore local config/memory)
 .claude/*

@@ -1,5 +1,6 @@
 pub mod native;
 pub mod parse;
+pub mod zmdb;
 
 pub use native::NativeSession;
 use parse::DeviceEntry;

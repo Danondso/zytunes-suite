@@ -499,6 +499,13 @@ impl MtpSession {
         ))
     }
 
+    /// Retrieve the Zune's internal metadata database (ZMDB).
+    /// Returns the raw binary ZMDB blob for the requested content type.
+    /// `content_type`: 1 = music library.
+    pub fn get_zmdb(&mut self, content_type: u32) -> Result<Vec<u8>, MtpError> {
+        self.execute_data_in(OperationCode::GetZuneMetadataDatabase, &[content_type])
+    }
+
     /// Get object references (linked objects like album tracks).
     pub fn get_object_references(&mut self, object_id: u32) -> Result<Vec<u32>, MtpError> {
         let data = self.execute_data_in(OperationCode::GetObjectReferences, &[object_id])?;

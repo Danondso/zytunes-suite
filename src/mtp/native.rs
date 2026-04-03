@@ -381,6 +381,15 @@ impl NativeSession {
         Ok(current)
     }
 
+    /// Try to load the device library via the ZMDB vendor operation.
+    /// Returns DeviceEntry values with synthesized paths matching the device filesystem.
+    fn try_zmdb(&mut self) -> Result<Vec<DeviceEntry>, String> {
+        let raw = self.session.get_zmdb(1).mtp_err()?;
+        let zmdb = crate::mtp::zmdb::Zmdb::parse(&raw)?;
+        self.log_msg(&format!("ZMDB: {}", zmdb.summary()));
+        Ok(zmdb.to_device_entries())
+    }
+
     /// Initialize the device library — find/create Music, Artists, Albums folders
     /// and scan existing artists+albums.
     fn ensure_library(&mut self) -> Result<(), String> {
@@ -895,6 +904,18 @@ impl DeviceSession for NativeSession {
             return Ok(cached);
         }
 
+        // Try ZMDB — single MTP call for the entire device library.
+        match self.try_zmdb() {
+            Ok(tracks) => {
+                self.cache.save(&tracks);
+                return Ok(tracks);
+            }
+            Err(e) => {
+                self.log_msg(&format!("ZMDB unavailable ({}), falling back to scan", e));
+            }
+        }
+
+        // Fallback: recursive MTP object handle walk.
         let parent = match self.resolve_path(path) {
             Ok(h) => h,
             Err(_) => return Ok(Vec::new()),
