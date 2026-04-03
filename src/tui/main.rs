@@ -119,8 +119,7 @@ fn run_loop(
             // Available height below tracks: total browser height minus
             // a minimum of 4 rows for the track list, borders, footer, player.
             let has_player = app.now_playing.is_some();
-            let show_player =
-                has_player && ui::LayoutMetrics::show_now_playing(size.height);
+            let show_player = has_player && ui::LayoutMetrics::show_now_playing(size.height);
             let overhead = 2 + 3 + if show_player { 9 } else { 0 }; // borders + footer + player
             let browser_h = size.height.saturating_sub(overhead as u16);
             let track_min = 4u16.min(app.track_list.len() as u16);

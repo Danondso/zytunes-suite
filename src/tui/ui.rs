@@ -2031,7 +2031,10 @@ mod tests {
             let area = Rect::new(0, 0, w, 30);
             let m = LayoutMetrics::new(area, show_keys, has_albums, false);
             let (dw, sw, aw, kw) = LayoutMetrics::panel_widths(w, show_keys, has_albums);
-            assert_eq!((dw, sw, aw, kw), (m.device_width, m.sidebar_width, m.album_width, m.keys_width));
+            assert_eq!(
+                (dw, sw, aw, kw),
+                (m.device_width, m.sidebar_width, m.album_width, m.keys_width)
+            );
         }
     }
 }

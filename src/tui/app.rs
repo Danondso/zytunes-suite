@@ -770,13 +770,11 @@ impl App {
                     })
                     .collect();
                 // Sort by year (oldest first), albums without a year go last.
-                self.album_list.sort_by(|a, b| {
-                    match (a.year, b.year) {
-                        (Some(ya), Some(yb)) => ya.cmp(&yb).then_with(|| a.name.cmp(&b.name)),
-                        (Some(_), None) => std::cmp::Ordering::Less,
-                        (None, Some(_)) => std::cmp::Ordering::Greater,
-                        (None, None) => a.name.cmp(&b.name),
-                    }
+                self.album_list.sort_by(|a, b| match (a.year, b.year) {
+                    (Some(ya), Some(yb)) => ya.cmp(&yb).then_with(|| a.name.cmp(&b.name)),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => a.name.cmp(&b.name),
                 });
                 self.album_selected = 0;
                 self.select_album();
@@ -1450,8 +1448,7 @@ impl App {
                 if self.sidebar_selected == 0 {
                     self.sidebar_selected = self.sidebar_items.len() - 1;
                 } else {
-                    let current_char =
-                        first_char_upper(&self.sidebar_items[self.sidebar_selected]);
+                    let current_char = first_char_upper(&self.sidebar_items[self.sidebar_selected]);
                     let mut i = self.sidebar_selected;
                     while i > 0 && first_char_upper(&self.sidebar_items[i - 1]) == current_char {
                         i -= 1;
@@ -2133,9 +2130,24 @@ mod tests {
     fn album_year_sort_oldest_first() {
         let mut app = App::new();
         app.album_list = vec![
-            AlbumInfo { name: "C".into(), artist: "X".into(), year: None, track_count: 1 },
-            AlbumInfo { name: "A".into(), artist: "X".into(), year: Some(2000), track_count: 1 },
-            AlbumInfo { name: "B".into(), artist: "X".into(), year: Some(1990), track_count: 1 },
+            AlbumInfo {
+                name: "C".into(),
+                artist: "X".into(),
+                year: None,
+                track_count: 1,
+            },
+            AlbumInfo {
+                name: "A".into(),
+                artist: "X".into(),
+                year: Some(2000),
+                track_count: 1,
+            },
+            AlbumInfo {
+                name: "B".into(),
+                artist: "X".into(),
+                year: Some(1990),
+                track_count: 1,
+            },
         ];
         // Simulate the sort that select_sidebar_item does.
         app.album_list.sort_by(|a, b| match (a.year, b.year) {
@@ -2154,10 +2166,30 @@ mod tests {
         let mut app = App::new();
         app.active_panel = Panel::Albums;
         app.album_list = vec![
-            AlbumInfo { name: "A".into(), artist: "X".into(), year: Some(1990), track_count: 1 },
-            AlbumInfo { name: "B".into(), artist: "X".into(), year: Some(1990), track_count: 1 },
-            AlbumInfo { name: "C".into(), artist: "X".into(), year: Some(2000), track_count: 1 },
-            AlbumInfo { name: "D".into(), artist: "X".into(), year: None, track_count: 1 },
+            AlbumInfo {
+                name: "A".into(),
+                artist: "X".into(),
+                year: Some(1990),
+                track_count: 1,
+            },
+            AlbumInfo {
+                name: "B".into(),
+                artist: "X".into(),
+                year: Some(1990),
+                track_count: 1,
+            },
+            AlbumInfo {
+                name: "C".into(),
+                artist: "X".into(),
+                year: Some(2000),
+                track_count: 1,
+            },
+            AlbumInfo {
+                name: "D".into(),
+                artist: "X".into(),
+                year: None,
+                track_count: 1,
+            },
         ];
         app.album_selected = 0;
         app.skip_forward(); // 1990 -> 2000
@@ -2173,10 +2205,30 @@ mod tests {
         let mut app = App::new();
         app.active_panel = Panel::Albums;
         app.album_list = vec![
-            AlbumInfo { name: "A".into(), artist: "X".into(), year: Some(1990), track_count: 1 },
-            AlbumInfo { name: "B".into(), artist: "X".into(), year: Some(1990), track_count: 1 },
-            AlbumInfo { name: "C".into(), artist: "X".into(), year: Some(2000), track_count: 1 },
-            AlbumInfo { name: "D".into(), artist: "X".into(), year: None, track_count: 1 },
+            AlbumInfo {
+                name: "A".into(),
+                artist: "X".into(),
+                year: Some(1990),
+                track_count: 1,
+            },
+            AlbumInfo {
+                name: "B".into(),
+                artist: "X".into(),
+                year: Some(1990),
+                track_count: 1,
+            },
+            AlbumInfo {
+                name: "C".into(),
+                artist: "X".into(),
+                year: Some(2000),
+                track_count: 1,
+            },
+            AlbumInfo {
+                name: "D".into(),
+                artist: "X".into(),
+                year: None,
+                track_count: 1,
+            },
         ];
         app.album_selected = 3;
         app.skip_back(); // None -> start of 2000

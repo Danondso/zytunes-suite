@@ -115,7 +115,11 @@ fn track_from_lofty(path: &Path, id: u64) -> Option<Track> {
         disc_number: tag.disk(),
         total_time_ms: {
             let dur = tagged.properties().duration();
-            if dur.is_zero() { None } else { Some(dur.as_millis() as u64) }
+            if dur.is_zero() {
+                None
+            } else {
+                Some(dur.as_millis() as u64)
+            }
         },
         location: Some(path.to_string_lossy().to_string()),
         kind: Some(format!(
