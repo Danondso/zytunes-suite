@@ -3,7 +3,7 @@
 //! Replaces the rusb/libusb transport that fails on data-out operations.
 //! Uses IOUSBDeviceInterface/IOUSBInterfaceInterface directly via FFI.
 
-use crate::iokit_ffi::*;
+use super::iokit_ffi::*;
 use crate::MtpError;
 use std::ffi::CString;
 use std::os::raw::c_void;
@@ -317,13 +317,9 @@ impl IokitTransport {
     /// Write data to the bulk OUT endpoint.
     /// Writes in max-packet-size chunks, matching aft-mtp-cli behavior.
     pub fn write(&self, data: &[u8]) -> Result<usize, MtpError> {
-        let chunk_size = self.max_packet_size as usize;
-        let mut offset = 0;
-        // SAFETY: We hold valid IOKit interface pointers.
-        unsafe {
-            while offset < data.len() {
-                let end = (offset + chunk_size).min(data.len());
-                let chunk = &data[offset..end];
+        super::chunked_write(data, self.max_packet_size as usize, |chunk| {
+            // SAFETY: We hold valid IOKit interface pointers.
+            unsafe {
                 let kr = ((**self.interface).WritePipe)(
                     self.interface,
                     self.pipe_out,
@@ -333,10 +329,9 @@ impl IokitTransport {
                 if kr != kIOReturnSuccess {
                     return Err(MtpError::Usb(format!("WritePipe failed: 0x{kr:08x}")));
                 }
-                offset = end;
+                Ok(chunk.len())
             }
-        }
-        Ok(data.len())
+        })
     }
 
     /// Read data from the bulk IN endpoint.
@@ -427,22 +422,7 @@ impl IokitTransport {
 
     /// Read a full MTP container, reassembling multi-packet responses.
     pub fn read_container(&self) -> Result<Vec<u8>, MtpError> {
-        let mut buf = vec![0u8; 16384];
-        let n = self.read_with_timeout(&mut buf, 30)?;
-        if n < 4 {
-            return Err(MtpError::Usb("Short USB read".to_string()));
-        }
-        let expected_len = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
-        let mut data = buf[..n].to_vec();
-
-        while data.len() < expected_len {
-            let n = self.read_with_timeout(&mut buf, 30)?;
-            if n == 0 {
-                break;
-            }
-            data.extend_from_slice(&buf[..n]);
-        }
-        Ok(data)
+        super::reassemble_container(|buf| self.read_with_timeout(buf, 30))
     }
 }
 

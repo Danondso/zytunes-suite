@@ -141,6 +141,8 @@ pub struct SyncState {
     pub status: SyncStatus,
     pub current_track: String,
     pub log: Vec<String>,
+    /// Lines scrolled up from the bottom of the log. 0 = pinned to bottom.
+    pub log_scroll: usize,
 }
 
 impl SyncState {
@@ -151,7 +153,19 @@ impl SyncState {
             status: SyncStatus::Idle,
             current_track: String::new(),
             log: Vec::new(),
+            log_scroll: 0,
         }
+    }
+
+    /// Scroll the log up by `n` lines.
+    pub fn log_scroll_up(&mut self, n: usize) {
+        let max = self.log.len().saturating_sub(1);
+        self.log_scroll = (self.log_scroll + n).min(max);
+    }
+
+    /// Scroll the log down by `n` lines (toward the bottom).
+    pub fn log_scroll_down(&mut self, n: usize) {
+        self.log_scroll = self.log_scroll.saturating_sub(n);
     }
 }
 
@@ -172,6 +186,7 @@ pub struct App {
     pub sort_column: SortColumn,
     pub sort_ascending: bool,
     pub device: DeviceState,
+    pub device_index_dirty: bool,
     pub browse_mode: BrowseMode,
     pub sync: SyncState,
     pub throbber_state: ThrobberState,
@@ -232,6 +247,7 @@ impl App {
             sort_column: SortColumn::Name,
             sort_ascending: true,
             device: DeviceState::new(),
+            device_index_dirty: false,
             browse_mode: BrowseMode::Library,
             sync: SyncState::new(),
             throbber_state: ThrobberState::default(),
@@ -414,6 +430,17 @@ impl App {
             AudioEvent::PlaybackError(msg) => {
                 self.now_playing = None;
                 self.set_toast(format!("Playback: {}", msg), true);
+            }
+        }
+    }
+
+    /// Rebuild device index if it was marked dirty by incremental updates.
+    pub fn flush_device_index(&mut self) {
+        if self.device_index_dirty {
+            self.device_index_dirty = false;
+            self.build_device_index();
+            if self.browse_mode == BrowseMode::Device {
+                self.refresh_sidebar();
             }
         }
     }
@@ -1103,6 +1130,17 @@ impl App {
                 if self.browse_mode == BrowseMode::Device {
                     self.refresh_sidebar();
                 }
+            }
+            BgEvent::DeviceTrackAdded(entry) => {
+                self.device.tracks.push(entry);
+                self.device_index_dirty = true;
+            }
+            BgEvent::DeviceTrackRemoved(path) => {
+                // path is a full device path like "/Music/Artist/Album/track.mp3"
+                // but DeviceEntry.name is relative like "Artist/Album/track.mp3"
+                let relative = path.strip_prefix("/Music/").unwrap_or(&path);
+                self.device.tracks.retain(|t| t.name != relative);
+                self.device_index_dirty = true;
             }
             BgEvent::Error(e) => {
                 self.device.loading_tracks = false;

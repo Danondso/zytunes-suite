@@ -861,10 +861,11 @@ fn draw_sync_log(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    // Show the most recent messages that fit, scrolled to the bottom.
+    // Show messages with scroll support. log_scroll=0 means pinned to bottom.
     let visible = inner.height as usize;
-    let start = app.sync.log.len().saturating_sub(visible);
-    let lines: Vec<Line> = app.sync.log[start..]
+    let end = app.sync.log.len().saturating_sub(app.sync.log_scroll);
+    let start = end.saturating_sub(visible);
+    let lines: Vec<Line> = app.sync.log[start..end]
         .iter()
         .map(|msg| {
             let style = if msg.contains("FAILED") {
@@ -1416,7 +1417,7 @@ fn build_zip_art<'a>(
                 .unwrap_or(width);
             let break_at = text[..byte_end]
                 .rfind(' ')
-                .unwrap_or(width.min(text.len()));
+                .unwrap_or(byte_end);
             let first = pad(&text[..break_at], width);
             let rest = text[break_at..].trim_start().to_string();
             (first, Some(rest))

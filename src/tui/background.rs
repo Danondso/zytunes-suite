@@ -21,9 +21,7 @@ pub enum BgCommand {
 /// A single item to sync (resolved to a file path).
 #[derive(Clone)]
 pub struct SyncItem {
-    #[allow(dead_code)]
     pub artist: String,
-    #[allow(dead_code)]
     pub album: String,
     pub name: String,
     pub location: String,
@@ -77,6 +75,8 @@ pub enum BgEvent {
         total: usize,
         name: String,
     },
+    DeviceTrackAdded(DeviceEntry),
+    DeviceTrackRemoved(String),
     RemoveComplete {
         success: usize,
         failed: usize,
@@ -179,7 +179,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
 
                                 wire_log_sender(&mut s, &event_tx);
                                 let _ = event_tx.send(BgEvent::SyncMessage(
-                                    "Connected via native IOKit backend".into(),
+                                    "Connected via native MTP backend".into(),
                                 ));
                                 Ok(Box::new(s))
                             }
@@ -305,6 +305,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                         "[{}/{}] Removed \"{}\"",
                                         i + 1, total, name
                                     )));
+                                    let _ = event_tx.send(BgEvent::DeviceTrackRemoved(path.clone()));
                                 }
                                 Err(e) => {
                                     failed += 1;
@@ -346,8 +347,6 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                         }
 
                         let _ = event_tx.send(BgEvent::RemoveComplete { success, failed });
-
-                        reload_device_tracks(s.as_mut(), &event_tx);
                     } else {
                         let _ = event_tx.send(BgEvent::Error("No active session".into()));
                     }
@@ -439,6 +438,21 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                         success: true,
                                         error: None,
                                     });
+                                    // Add to device track list in-memory (avoids full rescan).
+                                    let file_size = std::fs::metadata(&upload_path)
+                                        .map(|m| m.len())
+                                        .unwrap_or(0);
+                                    let entry = DeviceEntry {
+                                        object_id: id,
+                                        storage_id: 0,
+                                        format: "MP3".to_string(),
+                                        size: file_size,
+                                        name: format!(
+                                            "{}/{}/{}",
+                                            item.artist, item.album, item.name
+                                        ),
+                                    };
+                                    let _ = event_tx.send(BgEvent::DeviceTrackAdded(entry));
                                     // Update storage info every 5 tracks (avoid per-track USB overhead).
                                     if (i + 1).is_multiple_of(5) || i + 1 == total {
                                         if let Ok((tot, free)) = s.get_storage_info() {
@@ -478,8 +492,6 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                             success,
                             failed,
                         });
-
-                        reload_device_tracks(s.as_mut(), &event_tx);
                     } else {
                         let _ = event_tx.send(BgEvent::Error("No active session".into()));
                     }
@@ -507,24 +519,6 @@ fn wire_log_sender(
                 let _ = log_event_tx.send(BgEvent::SyncMessage(msg));
             }
         });
-    }
-}
-
-/// Reload device tracks and send the result back to the TUI.
-fn reload_device_tracks(
-    session: &mut dyn DeviceSession,
-    event_tx: &mpsc::Sender<BgEvent>,
-) {
-    let _ = event_tx.send(BgEvent::LoadingDeviceTracks);
-    match session.collect_all_tracks("/Music") {
-        Ok(tracks) => {
-            let _ = event_tx.send(BgEvent::DeviceTracksLoaded(tracks));
-        }
-        Err(e) => {
-            let _ = event_tx.send(BgEvent::Error(
-                format!("Failed to reload tracks: {}", e),
-            ));
-        }
     }
 }
 

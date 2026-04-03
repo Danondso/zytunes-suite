@@ -1,8 +1,8 @@
-//! zune-mtp: Native IOKit MTP/MTPZ library for macOS.
+//! zune-mtp: Native MTP/MTPZ library for USB device communication.
 //!
-//! Provides direct USB communication with MTP devices using Apple's IOKit
-//! framework, bypassing libusb which fails on data-out operations for
-//! MTPZ-authenticated devices like the Microsoft Zune.
+//! On macOS, uses Apple's IOKit framework for USB bulk I/O (bypassing libusb
+//! which fails on data-out operations for MTPZ-authenticated devices).
+//! On Linux, uses libusb (via rusb) which handles bulk I/O natively.
 
 use std::fmt;
 
@@ -48,23 +48,14 @@ impl From<std::io::Error> for MtpError {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-compile_error!("zune-mtp only supports macOS");
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+compile_error!("zune-mtp only supports macOS and Linux");
 
-#[cfg(target_os = "macos")]
 pub mod container;
-#[cfg(target_os = "macos")]
-pub(crate) mod iokit_ffi;
-#[cfg(target_os = "macos")]
 pub mod mtpz;
-#[cfg(target_os = "macos")]
 pub mod proplist;
-#[cfg(target_os = "macos")]
 pub mod session;
-#[cfg(target_os = "macos")]
 pub mod transport;
 
-#[cfg(target_os = "macos")]
 pub use mtpz::MtpzKeys;
-#[cfg(target_os = "macos")]
 pub use session::{MtpSession, ObjectInfo};

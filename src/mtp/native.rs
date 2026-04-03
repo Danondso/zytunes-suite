@@ -1,4 +1,4 @@
-//! Native IOKit MTP session implementing DeviceSession.
+//! Native MTP session implementing DeviceSession.
 //!
 //! Uses the zune-mtp crate for direct USB communication, bypassing aft-mtp-cli.
 
@@ -88,7 +88,6 @@ impl TrackCache {
         Some(dir.join(filename))
     }
 
-    #[cfg(test)]
     fn load(&self) -> Option<Vec<DeviceEntry>> {
         let path = self.cache_path()?;
         let content = std::fs::read_to_string(&path).ok()?;
@@ -149,6 +148,27 @@ impl TrackCache {
     }
 
     fn remove(&self, device_path: &str) {
+        let path_suffix = device_path.trim_start_matches("/Music/");
+        self.filter_cache(|line| {
+            line.splitn(5, '\t')
+                .nth(4)
+                .map(|name| name != path_suffix)
+                .unwrap_or(true)
+        });
+    }
+
+    fn remove_by_id(&self, object_id: u32) {
+        let id_str = object_id.to_string();
+        self.filter_cache(|line| {
+            line.splitn(2, '\t')
+                .next()
+                .map(|id| id != id_str)
+                .unwrap_or(true)
+        });
+    }
+
+    /// Read the cache file, keep only lines matching the predicate, write back.
+    fn filter_cache<F: Fn(&str) -> bool>(&self, keep: F) {
         let path = match self.cache_path() {
             Some(p) => p,
             None => return,
@@ -157,22 +177,16 @@ impl TrackCache {
             Ok(c) => c,
             Err(_) => return,
         };
-        let path_suffix = device_path.trim_start_matches("/Music/");
         let filtered: String = content
             .lines()
-            .filter(|line| {
-                line.splitn(5, '\t')
-                    .nth(4)
-                    .map(|name| name != path_suffix)
-                    .unwrap_or(true)
-            })
+            .filter(|line| keep(line))
             .map(|line| format!("{}\n", line))
             .collect();
         let _ = std::fs::write(path, filtered);
     }
 }
 
-/// Native MTP session using IOKit.
+/// Native MTP session using platform-specific USB transport.
 pub struct NativeSession {
     session: MtpSession,
     storage_id: u32,
@@ -208,36 +222,36 @@ impl NativeSession {
         self.session.get_storage_info(self.storage_id).mtp_err()
     }
 
-    /// Open a native IOKit MTP session to the Zune.
+    /// Open a native MTP session to the Zune.
     /// Performs device detection, MTP session open, and MTPZ authentication.
     /// The `log` callback receives diagnostic messages for each step.
     pub fn open(
         product_id: u16,
         log: &dyn Fn(&str),
     ) -> Result<Self, String> {
-        log("IOKit: Opening USB device...");
+        log("MTP: Opening USB device...");
         let mut session = MtpSession::open(MICROSOFT_VENDOR_ID, product_id)
-            .map_err(|e| format!("IOKit USB open failed: {e}"))?;
-        log("IOKit: USB device opened, MTP session started");
+            .map_err(|e| format!("USB open failed: {e}"))?;
+        log("MTP: USB device opened, MTP session started");
 
-        log("IOKit: Loading MTPZ keys from ~/.mtpz-data...");
+        log("MTP: Loading MTPZ keys from ~/.mtpz-data...");
         let keys = MtpzKeys::load_default()
-            .map_err(|e| format!("IOKit MTPZ keys failed: {e}"))?;
-        log("IOKit: Keys loaded, starting MTPZ handshake...");
+            .map_err(|e| format!("MTPZ keys failed: {e}"))?;
+        log("MTP: Keys loaded, starting MTPZ handshake...");
 
         zune_mtp::mtpz::authenticate(&mut session, &keys, log)
-            .map_err(|e| format!("IOKit MTPZ handshake failed: {e}"))?;
-        log("IOKit: MTPZ handshake complete");
+            .map_err(|e| format!("MTPZ handshake failed: {e}"))?;
+        log("MTP: MTPZ handshake complete");
 
-        log("IOKit: Querying storage...");
+        log("MTP: Querying storage...");
         let storage_ids = session
             .get_storage_ids()
-            .map_err(|e| format!("IOKit get storage failed: {e}"))?;
+            .map_err(|e| format!("MTP get storage failed: {e}"))?;
         let storage_id = storage_ids
             .first()
             .copied()
-            .ok_or("IOKit: No storage found on device")?;
-        log(&format!("IOKit: Using storage {}", storage_id));
+            .ok_or("MTP: No storage found on device")?;
+        log(&format!("MTP: Using storage {}", storage_id));
 
         Ok(NativeSession {
             session,
@@ -354,18 +368,21 @@ impl NativeSession {
         self.log_msg("Initializing device library...");
 
         // Detect device capabilities.
-        let artist_supported = self
-            .session
-            .get_object_props_supported(FORMAT_ARTIST)
-            .map(|props| !props.is_empty())
-            .unwrap_or(false);
-
-        let album_props = self
-            .session
-            .get_object_props_supported(FORMAT_ABSTRACT_AUDIO_ALBUM)
-            .unwrap_or_default();
-        let album_date_supported = album_props.contains(&PROP_DATE_AUTHORED);
-        let album_cover_supported = album_props.contains(&PROP_REPRESENTATIVE_SAMPLE_DATA);
+        // On macOS, we can probe via GetObjectPropsSupported. On Linux, the
+        // Zune rejects these queries (timeout or GeneralError 0x2002) even
+        // though it supports the features. Since we only target the Zune 30,
+        // use known defaults on Linux and probe on macOS.
+        //
+        // artist_supported defaults to false — the safe path uses Music/
+        // subfolders directly. Album date and cover default to true since
+        // the Zune 30 supports them but the probe fails on Linux.
+        let (artist_supported, album_date_supported, album_cover_supported) =
+            if cfg!(target_os = "macos") {
+                self.probe_capabilities().unwrap_or((false, true, true))
+            } else {
+                self.log_msg("Using Zune defaults (artist=false, date=true, cover=true)");
+                (false, true, true)
+            };
 
         self.log_msg(&format!(
             "Caps: artist={} date={} cover={}",
@@ -721,7 +738,9 @@ impl DeviceSession for NativeSession {
     }
 
     fn rm_by_id(&mut self, object_id: u32) -> Result<(), String> {
-        self.session.delete_object(object_id).mtp_err()
+        self.session.delete_object(object_id).mtp_err()?;
+        self.cache.remove_by_id(object_id);
+        Ok(())
     }
 
     fn cleanup_empty_folders(&mut self) -> Result<usize, String> {
@@ -773,7 +792,12 @@ impl DeviceSession for NativeSession {
     }
 
     fn collect_all_tracks(&mut self, path: &str) -> Result<Vec<DeviceEntry>, String> {
-        // Always scan fresh — cache causes stale path issues on delete.
+        // Try disk cache first — avoids slow MTP enumeration on reconnect.
+        if let Some(cached) = self.cache.load() {
+            self.log_msg(&format!("Loaded {} tracks from cache", cached.len()));
+            return Ok(cached);
+        }
+
         let parent = match self.resolve_path(path) {
             Ok(h) => h,
             Err(_) => return Ok(Vec::new()),
@@ -785,7 +809,6 @@ impl DeviceSession for NativeSession {
         let tracks: Vec<DeviceEntry> =
             entries.into_iter().filter(|e| !e.is_dir()).collect();
 
-        // Save to cache for next time.
         self.cache.save(&tracks);
         self.log_msg(&format!("Cached {} tracks", tracks.len()));
 
@@ -838,6 +861,29 @@ impl DeviceSession for NativeSession {
 }
 
 impl NativeSession {
+    /// Probe device capabilities via GetObjectPropsSupported.
+    /// Returns None if any query fails (e.g., on Linux where the Zune may reject these).
+    fn probe_capabilities(&mut self) -> Option<(bool, bool, bool)> {
+        let artist_props = self
+            .session
+            .get_object_props_supported(FORMAT_ARTIST)
+            .ok()?;
+        let artist_supported = !artist_props.is_empty();
+
+        let album_props = self
+            .session
+            .get_object_props_supported(FORMAT_ABSTRACT_AUDIO_ALBUM)
+            .ok()?;
+        let album_date_supported = album_props.contains(&PROP_DATE_AUTHORED);
+        let album_cover_supported = album_props.contains(&PROP_REPRESENTATIVE_SAMPLE_DATA);
+
+        self.log_msg(&format!(
+            "Probed caps: artist={} date={} cover={}",
+            artist_supported, album_date_supported, album_cover_supported
+        ));
+        Some((artist_supported, album_date_supported, album_cover_supported))
+    }
+
     /// Clear the track cache entirely.
     pub fn clear_cache(&self) {
         self.cache.clear();
@@ -847,6 +893,7 @@ impl NativeSession {
     fn try_set_album_art(&mut self, local_path: &str, album_obj_id: u32) {
         let supported = self.library.as_ref().map(|l| l.caps.album_cover_supported).unwrap_or(false);
         if !supported {
+            self.log_msg("Album art not supported by device");
             return;
         }
         let jpeg_data = match extract_album_art(local_path) {

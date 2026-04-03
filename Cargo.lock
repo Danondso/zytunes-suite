@@ -2441,6 +2441,7 @@ dependencies = [
  "hex",
  "num-bigint",
  "rand",
+ "rusb",
  "sha1",
  "tempfile",
 ]

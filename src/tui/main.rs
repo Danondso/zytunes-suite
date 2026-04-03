@@ -103,6 +103,7 @@ fn run_loop(
         while let Ok(ev) = event_rx.try_recv() {
             app.handle_bg_event(ev);
         }
+        app.flush_device_index();
 
         // Process audio events.
         while let Ok(ev) = audio_rx.try_recv() {
@@ -296,6 +297,12 @@ fn run_loop(
                     }
                     KeyCode::Down => {
                         app.move_down();
+                    }
+                    KeyCode::PageUp => {
+                        app.sync.log_scroll_up(10);
+                    }
+                    KeyCode::PageDown => {
+                        app.sync.log_scroll_down(10);
                     }
                     KeyCode::Right => {
                         app.skip_forward();

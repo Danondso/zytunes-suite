@@ -1,10 +1,10 @@
 use crate::container::*;
-use crate::transport::IokitTransport;
+use crate::transport::Transport;
 use crate::MtpError;
 
 /// An active MTP session with a device.
 pub struct MtpSession {
-    pub transport: IokitTransport,
+    pub transport: Transport,
     #[allow(dead_code)]
     session_id: u32,
     transaction_id: u32,
@@ -25,7 +25,7 @@ pub struct ObjectInfo {
 impl MtpSession {
     /// Open an MTP session on the device.
     pub fn open(vendor_id: u16, product_id: u16) -> Result<Self, MtpError> {
-        let transport = IokitTransport::open(vendor_id, product_id)?;
+        let transport = Transport::open(vendor_id, product_id)?;
         let mut session = MtpSession {
             transport,
             session_id: 1,

@@ -48,7 +48,9 @@ impl ItunesLibrary {
     pub fn parse(path: &str) -> Result<Self, String> {
         let file = std::fs::File::open(path).map_err(|e| format!("Cannot open {path}: {e}"))?;
         let reader = std::io::BufReader::new(file);
-        parse_itunes_xml(reader)
+        let mut library = parse_itunes_xml(reader)?;
+        remap_locations(&mut library);
+        Ok(library)
     }
 
     /// Get all tracks belonging to a playlist by name.
@@ -120,6 +122,33 @@ fn decode_location(url: &str) -> String {
     percent_encoding::percent_decode_str(path)
         .decode_utf8_lossy()
         .to_string()
+}
+
+/// Remap track locations from the library's music folder to a local override.
+///
+/// If `ZYTUNES_MUSIC_ROOT` is set, replaces the `music_folder` prefix in each
+/// track's location with the override path. This allows using a macOS iTunes
+/// Library.xml on Linux where the music files are at a different mount point.
+fn remap_locations(library: &mut ItunesLibrary) {
+    let override_root = match std::env::var("ZYTUNES_MUSIC_ROOT") {
+        Ok(val) if !val.is_empty() => val,
+        _ => return,
+    };
+    let original_root = match library.music_folder.as_deref() {
+        Some(folder) => folder.to_string(),
+        None => return,
+    };
+    for track in library.tracks.values_mut() {
+        if let Some(ref loc) = track.location {
+            if let Some(rest) = loc.strip_prefix(&original_root) {
+                track.location = Some(format!(
+                    "{}/{}",
+                    override_root.trim_end_matches('/'),
+                    rest.trim_start_matches('/')
+                ));
+            }
+        }
+    }
 }
 
 /// Which section of the plist we're currently in.

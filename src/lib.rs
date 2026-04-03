@@ -161,14 +161,17 @@ pub fn transcode_to_mp3(input: &str, temp_dir: &Path) -> Result<String, String> 
 
     cmd.args(["-id3v2_version", "3", "-y", &output_str]);
 
-    let result = cmd
+    let output_result = cmd
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
+        .stderr(std::process::Stdio::piped())
+        .output()
         .map_err(|e| format!("ffmpeg failed to start: {e}"))?;
 
-    if !result.success() {
-        return Err("ffmpeg transcode failed".to_string());
+    if !output_result.status.success() {
+        let stderr = String::from_utf8_lossy(&output_result.stderr);
+        // Take the last few lines of stderr — that's where ffmpeg puts the actual error.
+        let tail: String = stderr.lines().rev().take(5).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+        return Err(format!("ffmpeg transcode failed: {tail}"));
     }
 
     Ok(output.to_string_lossy().to_string())
