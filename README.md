@@ -1,5 +1,9 @@
 # zytunes
 
+[![CI](https://github.com/Danondso/zytunes/actions/workflows/ci.yml/badge.svg)](https://github.com/Danondso/zytunes/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.87%2B-orange.svg)](https://www.rust-lang.org)
+
 A Rust CLI tool for syncing music to a Microsoft Zune 30 from macOS.
 
 ## Status
