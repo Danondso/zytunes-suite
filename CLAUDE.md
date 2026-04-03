@@ -68,6 +68,24 @@ CLI commands: `ls [path]`, `push <files...>`, `rm <paths...>`, `sync <type> <nam
 
 **Transcoding:** Non-native formats (FLAC, OGG, WAV, M4A, OPUS, ALAC, AIFF) are automatically transcoded to MP3 via ffmpeg. Native formats (MP3, WMA, AAC) skip transcoding entirely. Album art is resized to 200x200 JPEG (Zune 30 rejects larger art with error `0xa803`).
 
+## Claude Code Skills
+
+Custom skills in `.claude/skills/`:
+
+- `/review` — local code review of the current branch diff. Reviews for correctness, Rust best practices, cleanliness, readability, refactoring opportunities, and security. Posts findings as line-level PR comments via `gh api`, fixes issues in priority order, then replies to each comment with the resolution. Falls back to terminal output if no PR exists.
+- `/fix-ci` — diagnoses failing CI checks on the current branch's PR. Fetches check statuses and failure logs via `gh`, correlates with local source, then enters plan mode with a structured fix plan for approval.
+
+Both skills run `cargo fmt` and `cargo clippy -- -D warnings` as part of their fix workflow to catch formatting and lint issues before code is pushed. They also add meaningful test coverage for changes — regression tests for bugs, edge case tests for new logic — without test theatre or trivial assertions.
+
+## Code Health
+
+Leave the codebase better than you found it. Prefer the maintainable solution over the quick fix — even if it takes longer. When you encounter something that needs attention while working on a task, handle it appropriately:
+
+- **Small improvements** (dead imports, a clearer variable name, a missing error case) — fix them inline as part of the current work.
+- **Larger issues** (deprecated dependencies, structural refactors, API redesigns) — don't let these block the current task. Create a plan, commit it to a dedicated branch, and note it for the user. These deserve their own focused effort, not a drive-by half-fix.
+
+When choosing between approaches, bias toward the one that makes the next change easier, not just the one that closes the current task fastest. Avoid papering over problems with workarounds that will need to be undone later.
+
 ## Zune 30 Constraints
 
 - Only accepts MP3, WMA, AAC formats

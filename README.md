@@ -129,6 +129,17 @@ Selected theme is persisted to `~/.config/zytunes/config.toml`.
 4. Non-native formats are auto-transcoded to MP3, album art resized to 200x200
 5. Progress and results appear in the log panel; device track list auto-refreshes on completion
 
+## Claude Code Skills
+
+This project includes custom [Claude Code](https://claude.ai/code) skills in `.claude/skills/`:
+
+| Skill | Command | What it does |
+|-------|---------|--------------|
+| **Review** | `/review` | Diffs the current branch against main, reviews for correctness, Rust idioms, cleanliness, readability, refactoring opportunities, and security. Posts findings as line-level comments on the PR, fixes them in priority order, and replies to each comment with the resolution commit. |
+| **Fix CI** | `/fix-ci` | Finds the PR for the current branch, pulls failing CI check logs, correlates failures with local code, and produces a structured fix plan for approval before making changes. |
+
+Both skills run `cargo fmt` and `cargo clippy -- -D warnings` as part of their fix workflow, and add meaningful test coverage (regression tests for bugs, edge cases for new logic) without test theatre.
+
 ## What's planned
 
 - **Dump command** — `dump` to pull all music off a Zune to a local directory
