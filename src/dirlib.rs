@@ -12,7 +12,7 @@ use crate::library::{MusicLibrary, Playlist, Track};
 
 /// Audio file extensions recognized by the scanner.
 const AUDIO_EXTENSIONS: &[&str] = &[
-    "mp3", "flac", "m4a", "aac", "ogg", "opus", "wma", "wav", "aiff",
+    "mp3", "flac", "m4a", "aac", "ogg", "opus", "wma", "wav", "aiff", "alac",
 ];
 
 /// A music library built by scanning a directory tree.

@@ -44,6 +44,20 @@ fn needs_transcode_for_playback(path: &str) -> bool {
     !RODIO_NATIVE.contains(&ext.as_str())
 }
 
+/// Extract a format hint for rodio/symphonia from a file path.
+/// ALAC files use the ISO MP4 container, so we hint "m4a" for the container
+/// format rather than "alac" (which symphonia doesn't recognize as a container).
+fn format_hint(path: &str) -> Option<String> {
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())?
+        .to_lowercase();
+    match ext.as_str() {
+        "alac" => Some("m4a".to_string()),
+        other => Some(other.to_string()),
+    }
+}
+
 /// Transcode an unsupported file (e.g. WMA) to WAV via ffmpeg for playback.
 /// Returns the path to the transcoded temp file.
 fn transcode_for_playback(input: &str) -> Result<String, String> {
@@ -144,9 +158,14 @@ pub fn spawn(event_tx: mpsc::Sender<AudioEvent>) -> mpsc::Sender<AudioCommand> {
 
                     // rodio can panic on certain files (seek errors in symphonia)
                     let reader = BufReader::new(file);
+                    let hint = format_hint(&play_path);
                     let source =
                         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            Decoder::new(reader)
+                            let mut builder = Decoder::builder().with_data(reader);
+                            if let Some(ref h) = hint {
+                                builder = builder.with_hint(h);
+                            }
+                            builder.build()
                         })) {
                             Ok(Ok(s)) => s,
                             Ok(Err(e)) => {
@@ -281,6 +300,16 @@ mod tests {
         // Case insensitive
         assert!(!needs_transcode_for_playback("song.FLAC"));
         assert!(!needs_transcode_for_playback("song.M4A"));
+    }
+
+    #[test]
+    fn format_hint_maps_alac_to_m4a() {
+        assert_eq!(format_hint("song.alac"), Some("m4a".to_string()));
+        assert_eq!(format_hint("song.ALAC"), Some("m4a".to_string()));
+        assert_eq!(format_hint("song.m4a"), Some("m4a".to_string()));
+        assert_eq!(format_hint("song.mp3"), Some("mp3".to_string()));
+        assert_eq!(format_hint("song.flac"), Some("flac".to_string()));
+        assert_eq!(format_hint("noext"), None);
     }
 
     #[test]
