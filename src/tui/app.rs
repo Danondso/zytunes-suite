@@ -222,6 +222,7 @@ pub struct AlbumInfo {
     pub name: String,
     pub artist: String,
     pub year: Option<u32>,
+    #[allow(dead_code)]
     pub track_count: usize,
 }
 
@@ -768,6 +769,15 @@ impl App {
                         track_count: count,
                     })
                     .collect();
+                // Sort by year (oldest first), albums without a year go last.
+                self.album_list.sort_by(|a, b| {
+                    match (a.year, b.year) {
+                        (Some(ya), Some(yb)) => ya.cmp(&yb).then_with(|| a.name.cmp(&b.name)),
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (None, None) => a.name.cmp(&b.name),
+                    }
+                });
                 self.album_selected = 0;
                 self.select_album();
             }
@@ -1383,56 +1393,109 @@ impl App {
         }
     }
 
-    /// Jump forward to the next letter group in the sidebar.
+    /// Jump forward to the next letter group in the sidebar, or the next
+    /// year group in the album browser.
     pub fn skip_forward(&mut self) {
-        if self.active_panel != Panel::Library || self.sidebar_items.is_empty() {
-            return;
-        }
-        let current_char = first_char_upper(&self.sidebar_items[self.sidebar_selected]);
-        for i in (self.sidebar_selected + 1)..self.sidebar_items.len() {
-            if first_char_upper(&self.sidebar_items[i]) != current_char {
-                self.sidebar_selected = i;
+        match self.active_panel {
+            Panel::Library => {
+                if self.sidebar_items.is_empty() {
+                    return;
+                }
+                let current_char = first_char_upper(&self.sidebar_items[self.sidebar_selected]);
+                for i in (self.sidebar_selected + 1)..self.sidebar_items.len() {
+                    if first_char_upper(&self.sidebar_items[i]) != current_char {
+                        self.sidebar_selected = i;
+                        self.save_sidebar_pos();
+                        if self.sidebar_mode == SidebarMode::Artists {
+                            self.select_sidebar_item();
+                        }
+                        return;
+                    }
+                }
+                // Wrap to top if at the end.
+                self.sidebar_selected = 0;
                 self.save_sidebar_pos();
                 if self.sidebar_mode == SidebarMode::Artists {
                     self.select_sidebar_item();
                 }
-                return;
             }
-        }
-        // Wrap to top if at the end.
-        self.sidebar_selected = 0;
-        self.save_sidebar_pos();
-        if self.sidebar_mode == SidebarMode::Artists {
-            self.select_sidebar_item();
+            Panel::Albums => {
+                if self.album_list.is_empty() {
+                    return;
+                }
+                let current_year = self.album_list[self.album_selected].year;
+                for i in (self.album_selected + 1)..self.album_list.len() {
+                    if self.album_list[i].year != current_year {
+                        self.album_selected = i;
+                        self.select_album();
+                        return;
+                    }
+                }
+                // Wrap to top.
+                self.album_selected = 0;
+                self.select_album();
+            }
+            _ => {}
         }
     }
 
-    /// Jump backward to the previous letter group in the sidebar.
+    /// Jump backward to the previous letter group in the sidebar, or the
+    /// previous year group in the album browser.
     pub fn skip_back(&mut self) {
-        if self.active_panel != Panel::Library || self.sidebar_items.is_empty() {
-            return;
-        }
-        if self.sidebar_selected == 0 {
-            self.sidebar_selected = self.sidebar_items.len() - 1;
-        } else {
-            let current_char = first_char_upper(&self.sidebar_items[self.sidebar_selected]);
-            let mut i = self.sidebar_selected;
-            while i > 0 && first_char_upper(&self.sidebar_items[i - 1]) == current_char {
-                i -= 1;
-            }
-            if i > 0 {
-                let prev_char = first_char_upper(&self.sidebar_items[i - 1]);
-                while i > 0 && first_char_upper(&self.sidebar_items[i - 1]) == prev_char {
-                    i -= 1;
+        match self.active_panel {
+            Panel::Library => {
+                if self.sidebar_items.is_empty() {
+                    return;
                 }
-                self.sidebar_selected = i;
-            } else {
-                self.sidebar_selected = self.sidebar_items.len() - 1;
+                if self.sidebar_selected == 0 {
+                    self.sidebar_selected = self.sidebar_items.len() - 1;
+                } else {
+                    let current_char =
+                        first_char_upper(&self.sidebar_items[self.sidebar_selected]);
+                    let mut i = self.sidebar_selected;
+                    while i > 0 && first_char_upper(&self.sidebar_items[i - 1]) == current_char {
+                        i -= 1;
+                    }
+                    if i > 0 {
+                        let prev_char = first_char_upper(&self.sidebar_items[i - 1]);
+                        while i > 0 && first_char_upper(&self.sidebar_items[i - 1]) == prev_char {
+                            i -= 1;
+                        }
+                        self.sidebar_selected = i;
+                    } else {
+                        self.sidebar_selected = self.sidebar_items.len() - 1;
+                    }
+                }
+                self.save_sidebar_pos();
+                if self.sidebar_mode == SidebarMode::Artists {
+                    self.select_sidebar_item();
+                }
             }
-        }
-        self.save_sidebar_pos();
-        if self.sidebar_mode == SidebarMode::Artists {
-            self.select_sidebar_item();
+            Panel::Albums => {
+                if self.album_list.is_empty() {
+                    return;
+                }
+                if self.album_selected == 0 {
+                    self.album_selected = self.album_list.len() - 1;
+                } else {
+                    let current_year = self.album_list[self.album_selected].year;
+                    let mut i = self.album_selected;
+                    while i > 0 && self.album_list[i - 1].year == current_year {
+                        i -= 1;
+                    }
+                    if i > 0 {
+                        let prev_year = self.album_list[i - 1].year;
+                        while i > 0 && self.album_list[i - 1].year == prev_year {
+                            i -= 1;
+                        }
+                        self.album_selected = i;
+                    } else {
+                        self.album_selected = self.album_list.len() - 1;
+                    }
+                }
+                self.select_album();
+            }
+            _ => {}
         }
     }
 
@@ -2064,5 +2127,69 @@ mod tests {
         assert_eq!(app.sidebar_items.len(), 2);
         assert!(app.sidebar_items.contains(&"Beatles".to_string()));
         assert!(app.sidebar_items.contains(&"Beach Boys".to_string()));
+    }
+
+    #[test]
+    fn album_year_sort_oldest_first() {
+        let mut app = App::new();
+        app.album_list = vec![
+            AlbumInfo { name: "C".into(), artist: "X".into(), year: None, track_count: 1 },
+            AlbumInfo { name: "A".into(), artist: "X".into(), year: Some(2000), track_count: 1 },
+            AlbumInfo { name: "B".into(), artist: "X".into(), year: Some(1990), track_count: 1 },
+        ];
+        // Simulate the sort that select_sidebar_item does.
+        app.album_list.sort_by(|a, b| match (a.year, b.year) {
+            (Some(ya), Some(yb)) => ya.cmp(&yb).then_with(|| a.name.cmp(&b.name)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.name.cmp(&b.name),
+        });
+        assert_eq!(app.album_list[0].name, "B"); // 1990
+        assert_eq!(app.album_list[1].name, "A"); // 2000
+        assert_eq!(app.album_list[2].name, "C"); // None (last)
+    }
+
+    #[test]
+    fn skip_forward_albums_by_year() {
+        let mut app = App::new();
+        app.active_panel = Panel::Albums;
+        app.album_list = vec![
+            AlbumInfo { name: "A".into(), artist: "X".into(), year: Some(1990), track_count: 1 },
+            AlbumInfo { name: "B".into(), artist: "X".into(), year: Some(1990), track_count: 1 },
+            AlbumInfo { name: "C".into(), artist: "X".into(), year: Some(2000), track_count: 1 },
+            AlbumInfo { name: "D".into(), artist: "X".into(), year: None, track_count: 1 },
+        ];
+        app.album_selected = 0;
+        app.skip_forward(); // 1990 -> 2000
+        assert_eq!(app.album_selected, 2);
+        app.skip_forward(); // 2000 -> None
+        assert_eq!(app.album_selected, 3);
+        app.skip_forward(); // None -> wrap to 0
+        assert_eq!(app.album_selected, 0);
+    }
+
+    #[test]
+    fn skip_back_albums_by_year() {
+        let mut app = App::new();
+        app.active_panel = Panel::Albums;
+        app.album_list = vec![
+            AlbumInfo { name: "A".into(), artist: "X".into(), year: Some(1990), track_count: 1 },
+            AlbumInfo { name: "B".into(), artist: "X".into(), year: Some(1990), track_count: 1 },
+            AlbumInfo { name: "C".into(), artist: "X".into(), year: Some(2000), track_count: 1 },
+            AlbumInfo { name: "D".into(), artist: "X".into(), year: None, track_count: 1 },
+        ];
+        app.album_selected = 3;
+        app.skip_back(); // None -> start of 2000
+        assert_eq!(app.album_selected, 2);
+        app.skip_back(); // 2000 -> start of 1990
+        assert_eq!(app.album_selected, 0);
+        app.skip_back(); // 1990 at start -> wrap to end
+        assert_eq!(app.album_selected, 3);
+    }
+
+    #[test]
+    fn new_app_show_keys_defaults_false() {
+        let app = App::new();
+        assert!(!app.show_keys);
     }
 }

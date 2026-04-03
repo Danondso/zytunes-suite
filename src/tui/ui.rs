@@ -13,7 +13,10 @@ use crate::app::{
 use crate::theme;
 
 /// Responsive layout dimensions computed from terminal size.
-struct LayoutMetrics {
+///
+/// Three width tiers: Compact (<100), Standard (100-139), Full (>=140).
+/// Height tier: now-playing hidden when < 20 rows.
+pub(crate) struct LayoutMetrics {
     device_width: u16,
     sidebar_width: u16,
     album_width: u16,
@@ -62,6 +65,32 @@ impl LayoutMetrics {
                 footer_left_width: 16,
             }
         }
+    }
+
+    /// Returns (device_w, sidebar_w, album_w, keys_w) for album art
+    /// pre-render calculations in the event loop.
+    pub(crate) fn panel_widths(
+        width: u16,
+        show_keys: bool,
+        has_album_browser: bool,
+    ) -> (u16, u16, u16, u16) {
+        if width < 100 {
+            (0, 20, if has_album_browser { 22 } else { 0 }, 0)
+        } else if width < 140 {
+            (28, 24, if has_album_browser { 24 } else { 0 }, 0)
+        } else {
+            (
+                36,
+                if has_album_browser { 24 } else { 28 },
+                if has_album_browser { 30 } else { 0 },
+                if show_keys { 24 } else { 0 },
+            )
+        }
+    }
+
+    /// Whether the now-playing panel should be shown at the given height.
+    pub(crate) fn show_now_playing(height: u16) -> bool {
+        height >= 20
     }
 }
 
@@ -361,37 +390,50 @@ fn draw_album_browser(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let visible_height = inner.height as usize;
-    let scroll = compute_scroll(app.album_selected, visible_height, app.album_list.len());
+    // Build a flat list of rows: year headers interleaved with album items.
+    // Each entry is (optional album index, display line).
+    let mut rows: Vec<(Option<usize>, String, bool)> = Vec::new(); // (album_idx, label, is_header)
+    let mut last_year: Option<Option<u32>> = None;
+    for (i, album) in app.album_list.iter().enumerate() {
+        if last_year != Some(album.year) {
+            let header = match album.year {
+                Some(y) => format!("\u{2500} {} \u{2500}", y),
+                None => "\u{2500} Unknown \u{2500}".to_string(),
+            };
+            rows.push((None, header, true));
+            last_year = Some(album.year);
+        }
+        let prefix = if i == app.album_selected { "> " } else { "  " };
+        let max_name = inner.width.saturating_sub(3) as usize;
+        let label = format!("{}{}", prefix, truncate(&album.name, max_name));
+        rows.push((Some(i), label, false));
+    }
 
-    let items: Vec<ListItem> = app
-        .album_list
+    // Find scroll position: we want the selected album visible.
+    // Find its row index in the flat list.
+    let selected_row = rows
         .iter()
-        .enumerate()
+        .position(|(idx, _, _)| *idx == Some(app.album_selected))
+        .unwrap_or(0);
+    let visible_height = inner.height as usize;
+    let scroll = compute_scroll(selected_row, visible_height, rows.len());
+
+    let items: Vec<ListItem> = rows
+        .iter()
         .skip(scroll)
         .take(visible_height)
-        .map(|(i, album)| {
-            let is_selected = i == app.album_selected;
-            let style = if is_selected {
-                t.sidebar_item_selected()
+        .map(|(idx, label, is_header)| {
+            if *is_header {
+                ListItem::new(label.as_str()).style(t.dim())
             } else {
-                t.sidebar_item()
-            };
-            let prefix = if is_selected { "> " } else { "  " };
-            let meta = match album.year {
-                Some(y) => format!(" ({}, {}t)", y, album.track_count),
-                None => format!(" ({}t)", album.track_count),
-            };
-            let label = format!(
-                "{}{}{}",
-                prefix,
-                truncate(
-                    &album.name,
-                    inner.width.saturating_sub(meta.len() as u16 + 3) as usize
-                ),
-                meta
-            );
-            ListItem::new(label).style(style)
+                let is_selected = *idx == Some(app.album_selected);
+                let style = if is_selected {
+                    t.sidebar_item_selected()
+                } else {
+                    t.sidebar_item()
+                };
+                ListItem::new(label.as_str()).style(style)
+            }
         })
         .collect();
 
@@ -1870,5 +1912,82 @@ mod tests {
         assert_eq!(center_pad("toolong", 4), "tool"); // truncated
         assert_eq!(center_pad("exact", 5), "exact");
         assert_eq!(center_pad("", 4), "    ");
+    }
+
+    #[test]
+    fn layout_metrics_compact_tier() {
+        let area = Rect::new(0, 0, 80, 24);
+        let m = LayoutMetrics::new(area, true, true, true);
+        assert_eq!(m.device_width, 0);
+        assert_eq!(m.sidebar_width, 20);
+        assert_eq!(m.album_width, 22);
+        assert_eq!(m.keys_width, 0); // force-hidden
+        assert!(!m.show_zip_art);
+        assert_eq!(m.footer_left_width, 12);
+    }
+
+    #[test]
+    fn layout_metrics_standard_tier() {
+        let area = Rect::new(0, 0, 120, 30);
+        let m = LayoutMetrics::new(area, true, true, true);
+        assert_eq!(m.device_width, 28);
+        assert_eq!(m.sidebar_width, 24);
+        assert_eq!(m.album_width, 24);
+        assert_eq!(m.keys_width, 0); // force-hidden
+        assert!(m.show_zip_art);
+        assert!(m.show_now_playing);
+    }
+
+    #[test]
+    fn layout_metrics_full_tier() {
+        let area = Rect::new(0, 0, 160, 40);
+        let m = LayoutMetrics::new(area, true, true, true);
+        assert_eq!(m.device_width, 36);
+        assert_eq!(m.sidebar_width, 24);
+        assert_eq!(m.album_width, 30);
+        assert_eq!(m.keys_width, 24); // shown
+        assert!(m.show_zip_art);
+    }
+
+    #[test]
+    fn layout_metrics_full_no_keys() {
+        let area = Rect::new(0, 0, 160, 40);
+        let m = LayoutMetrics::new(area, false, true, true);
+        assert_eq!(m.keys_width, 0);
+    }
+
+    #[test]
+    fn layout_metrics_short_hides_now_playing() {
+        let area = Rect::new(0, 0, 160, 19);
+        let m = LayoutMetrics::new(area, false, false, true);
+        assert!(!m.show_now_playing);
+
+        let area = Rect::new(0, 0, 160, 20);
+        let m = LayoutMetrics::new(area, false, false, true);
+        assert!(m.show_now_playing);
+    }
+
+    #[test]
+    fn layout_metrics_no_album_browser() {
+        let area = Rect::new(0, 0, 160, 40);
+        let m = LayoutMetrics::new(area, false, false, false);
+        assert_eq!(m.album_width, 0);
+        assert_eq!(m.sidebar_width, 28); // wider without album browser
+    }
+
+    #[test]
+    fn layout_panel_widths_matches_metrics() {
+        // Verify the shared helper returns the same values as LayoutMetrics::new.
+        for (w, show_keys, has_albums) in [
+            (80u16, false, true),
+            (120, true, true),
+            (160, true, true),
+            (160, false, false),
+        ] {
+            let area = Rect::new(0, 0, w, 30);
+            let m = LayoutMetrics::new(area, show_keys, has_albums, false);
+            let (dw, sw, aw, kw) = LayoutMetrics::panel_widths(w, show_keys, has_albums);
+            assert_eq!((dw, sw, aw, kw), (m.device_width, m.sidebar_width, m.album_width, m.keys_width));
+        }
     }
 }
