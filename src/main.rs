@@ -1,4 +1,3 @@
-use zytunes::library::{ItunesLibrary, MusicLibrary};
 use zytunes::mtp::DeviceSession;
 use zytunes::{
     collect_music_files, connect, find_matching_tracks, library_xml_path, make_transcode_temp_dir,
@@ -81,11 +80,11 @@ fn run(args: &[String]) -> Result<(), String> {
     }
 }
 
-/// Browse the iTunes library.
+/// Browse the music library.
 fn cmd_library(xml_path: &str, query: Option<&str>) -> Result<(), String> {
-    println!("Parsing iTunes library: {xml_path}");
+    println!("Loading music library...");
     let start = std::time::Instant::now();
-    let lib = ItunesLibrary::parse(xml_path)?;
+    let lib = zytunes::load_library(xml_path, None)?;
     println!(
         "Loaded {} tracks in {:.1}s\n",
         lib.track_count(),
@@ -188,10 +187,10 @@ fn cmd_sync(args: &[String]) -> Result<(), String> {
         .map(|s| s.as_str())
         .unwrap_or(&default);
 
-    // Parse iTunes library.
-    println!("Loading iTunes library...");
+    // Load music library.
+    println!("Loading music library...");
     let start = std::time::Instant::now();
-    let lib = ItunesLibrary::parse(xml_path)?;
+    let lib = zytunes::load_library(xml_path, None)?;
     println!(
         "Loaded {} tracks in {:.1}s\n",
         lib.track_count(),
@@ -199,7 +198,7 @@ fn cmd_sync(args: &[String]) -> Result<(), String> {
     );
 
     // Find matching tracks.
-    let tracks = find_matching_tracks(&lib, sync_type, name)?;
+    let tracks = find_matching_tracks(lib.as_ref(), sync_type, name)?;
 
     // Filter to tracks that have a file location.
     let pushable: Vec<&zytunes::library::Track> = tracks
