@@ -4,6 +4,7 @@ use std::path::PathBuf;
 #[derive(Serialize, Deserialize, Default)]
 pub struct Config {
     pub theme: Option<String>,
+    pub music_dir: Option<String>,
 }
 
 fn config_dir() -> Option<PathBuf> {

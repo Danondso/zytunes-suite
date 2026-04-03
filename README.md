@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.87%2B-orange.svg)](https://www.rust-lang.org)
 
-A Rust CLI tool for syncing music to a Microsoft Zune 30 from macOS.
+A Rust CLI tool for syncing music to a Microsoft Zune 30 from macOS and Linux.
 
 ## Status
 
@@ -17,12 +17,13 @@ A Rust CLI tool for syncing music to a Microsoft Zune 30 from macOS.
 - **File listing** — `ls [path]` enumerates storage and prints the device's directory tree
 - **Music push** — `push <files...>` uploads music files to the Zune with proper metadata via `zune-import`
 - **Music removal** — `rm <device-paths...>` removes files/folders from the device (leaf-first for directories)
-- **iTunes library sync** — `sync <type> <name>` syncs tracks from an iTunes Library.xml by artist, album, playlist, or track name. Detects duplicates already on device and skips them
+- **Music library sync** — `sync <type> <name>` syncs tracks by artist, album, playlist, or track name. Supports iTunes Library.xml and directory scanning (see below). Detects duplicates already on device and skips them
 - **Playlist creation** — `sync playlist <name>` imports tracks and creates the playlist on the device
 - **Auto-transcoding** — non-native formats (FLAC, OGG, WAV, M4A, OPUS, ALAC, AIFF) are transcoded to MP3 via ffmpeg with album art resized to 200x200 (Zune 30 constraint)
 - **MP3 passthrough** — native formats (MP3, WMA, AAC) skip transcoding entirely
-- **Library browsing** — `library [xml] [query]` browses/searches an iTunes Library.xml
-- **Interactive TUI** — `zytunes-tui` launches a terminal UI (ratatui) for browsing your iTunes library, connecting to the device, managing a sync queue, and monitoring sync progress. Library parsing runs in the background on startup. TUI displays sync status on the Zune ASCII art screen including loading spinner, track count, syncing spinner, and queue count
+- **Library browsing** — `library [xml] [query]` browses/searches your music library (iTunes XML or scanned directory)
+- **Directory scanning** — on Linux (or anywhere without iTunes), point zytunes at a music folder. It reads ID3 tags from MP3 files and infers metadata from the directory structure (`Artist/Album/Track.ext`) for other formats. Set `ZYTUNES_MUSIC_DIR` or add `music_dir` to `~/.config/zytunes/config.toml`
+- **Interactive TUI** — `zytunes-tui` launches a terminal UI (ratatui) for browsing your music library, connecting to the device, managing a sync queue, and monitoring sync progress. Library parsing runs in the background on startup. TUI displays sync status on the Zune ASCII art screen including loading spinner, track count, syncing spinner, and queue count
 - **Device content browsing** — the TUI can browse tracks on the connected Zune organized by artist/album, toggled with `v`. The device library is indexed from the device's Music directory structure (`Artist/Album/Track`)
 - **Device track removal** — in device view mode, `a`/`A` removes selected tracks, albums, or artists from the device. Progress is shown during removal and the device track list auto-refreshes afterward
 - **Theming** — the TUI includes 11 built-in color themes (iTunes 2004, Gruvbox Dark/Light, Everforest Dark/Light, Miami Nights, IBM Mainframe, Windows 95, System 7, BIOS, Red Sands). Press `t` to open the theme picker. Selected theme is persisted to `~/.config/zytunes/config.toml`
@@ -166,15 +167,21 @@ cp mtpz-data.example ~/.mtpz-data
 
 These keys originate from the [libmtp-zune](https://github.com/kbhomes/libmtp-zune) project.
 
-### iTunes library path
+### Music library
 
-By default, zytunes looks for your iTunes/Music library at `~/Music/Music/Library.xml`. To use a different location, set the `ZYTUNES_LIBRARY` environment variable:
+zytunes auto-detects your music library in this order:
+
+1. **iTunes Library.xml** — default at `~/Music/Music/Library.xml`, override with `ZYTUNES_LIBRARY` env var or `--library <path>` flag
+2. **Music directory** — set `ZYTUNES_MUSIC_DIR` env var to scan a folder for audio files
+3. **Config file** — add `music_dir = "/path/to/music"` to `~/.config/zytunes/config.toml`
+
+On macOS with iTunes/Music.app, it works out of the box. On Linux, point it at your music folder:
 
 ```
-export ZYTUNES_LIBRARY="/path/to/Library.xml"
+export ZYTUNES_MUSIC_DIR="$HOME/Music"
 ```
 
-You can also pass `--library <path>` to the `sync` and `library` commands.
+The directory scanner reads ID3 tags from MP3 files and infers metadata from the path structure (`Artist/Album/Track.ext`) for other formats (FLAC, M4A, OGG, etc.).
 
 ### Install
 
