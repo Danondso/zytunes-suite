@@ -140,6 +140,11 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                         match NativeSession::open(zune.product_id, &native_log) {
                             Ok(mut s) => {
                                 s.set_serial(zune.serial_number.clone());
+                                // Prefer MTP firmware version over USB bcdDevice.
+                                let fw = s
+                                    .firmware_version
+                                    .clone()
+                                    .or_else(|| zune.firmware_version.clone());
                                 // Query storage for model detection before boxing.
                                 if let Ok((total, free)) = s.get_storage_info() {
                                     let model = zytunes::device::zune_model_from_storage(total);
@@ -151,7 +156,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                     };
                                     let _ = event_tx.send(BgEvent::DeviceDetected(DeviceInfo {
                                         name: model.to_string(),
-                                        firmware_version: zune.firmware_version.clone(),
+                                        firmware_version: fw,
                                         serial_number: zune.serial_number.clone(),
                                         usb_mode: zune.usb_mode.clone(),
                                         manufacturer: Some("Microsoft".to_string()),

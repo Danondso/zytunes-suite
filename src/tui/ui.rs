@@ -7,8 +7,8 @@ use throbber_widgets_tui::{Throbber, ThrobberState, WhichUse};
 
 use crate::anim;
 use crate::app::{
-    format_duration, format_with_commas, App, BrowseMode, DeviceStatus, NowPlaying, Panel,
-    PlaybackState, SidebarMode, SortColumn, SyncStatus,
+    format_duration, format_with_commas, App, BrowseMode, DevicePresence, DeviceStatus, NowPlaying,
+    Panel, PlaybackState, SidebarMode, SortColumn, SyncStatus,
 };
 use crate::theme;
 
@@ -332,6 +332,11 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
         app.sidebar_items.len(),
     );
 
+    // Show device presence indicators in Library Artists mode.
+    let show_device_status = app.browse_mode == BrowseMode::Library
+        && app.sidebar_mode == SidebarMode::Artists
+        && !app.artist_device_status.is_empty();
+
     let items: Vec<ListItem> = app
         .sidebar_items
         .iter()
@@ -344,17 +349,27 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
             } else {
                 t.sidebar_item()
             };
-            let prefix = if i == app.sidebar_selected {
+            let cursor = if i == app.sidebar_selected {
                 "> "
             } else {
                 "  "
             };
-            ListItem::new(format!(
-                "{}{}",
-                prefix,
-                truncate(name, inner.width as usize - 3)
-            ))
-            .style(style)
+            let (icon, icon_style) = if show_device_status {
+                match app.artist_device_status.get(name) {
+                    Some(DevicePresence::Full) => ("✓ ", style.fg(t.selection_bg)),
+                    Some(DevicePresence::Partial) => ("◐ ", style.fg(t.selection_bg)),
+                    _ => ("  ", style),
+                }
+            } else {
+                ("", style)
+            };
+            let max_name = inner.width as usize - cursor.len() - icon.chars().count() - 1;
+            let line = Line::from(vec![
+                Span::styled(cursor, style),
+                Span::styled(icon, icon_style),
+                Span::styled(truncate(name, max_name).to_string(), style),
+            ]);
+            ListItem::new(line)
         })
         .collect();
 
@@ -634,11 +649,17 @@ fn draw_album_track_list(f: &mut Frame, app: &App, area: Rect) {
             .unwrap_or_default();
         let dur = track.duration_ms.map(format_duration).unwrap_or_default();
 
+        let display_name = if track.on_device {
+            format!("✓ {}", track.name)
+        } else {
+            track.name.clone()
+        };
+
         flat_rows.push((
             Some(i),
             Row::new(vec![
                 Cell::from(num),
-                Cell::from(track.name.clone()),
+                Cell::from(display_name),
                 Cell::from(dur),
             ])
             .style(Style::default().bg(bg).fg(fg)),
@@ -757,9 +778,15 @@ fn draw_track_table(f: &mut Frame, app: &App, area: Rect) {
                 .replace(" audio file", "")
                 .replace("MPEG", "MP3");
 
+            let display_name = if track.on_device {
+                format!("✓ {}", track.name)
+            } else {
+                track.name.clone()
+            };
+
             Row::new(vec![
                 Cell::from(num),
-                Cell::from(track.name.clone()),
+                Cell::from(display_name),
                 Cell::from(track.artist.clone()),
                 Cell::from(track.album.clone()),
                 Cell::from(dur),
@@ -1440,9 +1467,11 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect, footer_left_width: u16) {
         }
     };
     let right = if app.browse_mode == BrowseMode::Device {
-        "v:library | a:queue rm | D:delete | C:clr | ?:help"
+        "v:library | a:queue rm | D:delete | C:clr | ?:help".to_string()
+    } else if app.device.status == DeviceStatus::Connected {
+        "✓=synced ◐=partial | v:device | a:add | S:sync | q:quit | ?:help".to_string()
     } else {
-        "v:device | a:add | S:sync | q:quit | ?:help"
+        "v:device | a:add | S:sync | q:quit | ?:help".to_string()
     };
 
     let chunks = Layout::default()
