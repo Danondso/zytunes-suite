@@ -1,9 +1,10 @@
 pub mod device;
+pub mod dirlib;
 pub mod library;
 pub mod mtp;
 
 use device::ZuneDevice;
-use library::ItunesLibrary;
+use library::MusicLibrary;
 use mtp::{DeviceSession, NativeSession};
 use std::collections::HashMap;
 use std::fmt;
@@ -56,6 +57,48 @@ pub fn library_xml_path() -> String {
         return format!("{home}/Music/Music/Library.xml");
     }
     "/Music/Music/Library.xml".to_string()
+}
+
+/// Load a music library with auto-detection.
+///
+/// Tries sources in order:
+/// 1. iTunes Library.xml at `xml_path` (if the file exists)
+/// 2. `ZYTUNES_MUSIC_DIR` environment variable (directory scan)
+/// 3. `music_dir` from config.toml (directory scan)
+///
+/// Returns a boxed trait object so callers are backend-agnostic.
+pub fn load_library(
+    xml_path: &str,
+    music_dir: Option<&str>,
+) -> Result<Box<dyn MusicLibrary + Send>, String> {
+    // 1. Try iTunes XML if the file exists.
+    if Path::new(xml_path).exists() {
+        return library::ItunesLibrary::parse(xml_path)
+            .map(|l| Box::new(l) as Box<dyn MusicLibrary + Send>);
+    }
+
+    // 2. Try ZYTUNES_MUSIC_DIR env var.
+    if let Ok(dir) = std::env::var("ZYTUNES_MUSIC_DIR") {
+        if Path::new(&dir).is_dir() {
+            return dirlib::DirectoryLibrary::scan(&dir)
+                .map(|l| Box::new(l) as Box<dyn MusicLibrary + Send>);
+        }
+    }
+
+    // 3. Try music_dir from config.
+    if let Some(dir) = music_dir {
+        if Path::new(dir).is_dir() {
+            return dirlib::DirectoryLibrary::scan(dir)
+                .map(|l| Box::new(l) as Box<dyn MusicLibrary + Send>);
+        }
+    }
+
+    Err(
+        "No music library found. Set ZYTUNES_LIBRARY to an iTunes XML path, \
+         or ZYTUNES_MUSIC_DIR to a music folder, \
+         or add music_dir to ~/.config/zytunes/config.toml"
+            .into(),
+    )
 }
 
 /// Formats the Zune 30 natively supports (no transcoding needed).
@@ -196,7 +239,7 @@ pub fn transcode_to_mp3(input: &str, temp_dir: &Path) -> Result<String, String> 
 
 /// Find matching tracks from the library for the given sync type and name.
 pub fn find_matching_tracks<'a>(
-    lib: &'a ItunesLibrary,
+    lib: &'a dyn MusicLibrary,
     sync_type: SyncType,
     name: &str,
 ) -> Result<Vec<&'a library::Track>, String> {
@@ -223,11 +266,7 @@ pub fn find_matching_tracks<'a>(
             Ok(tracks)
         }
         SyncType::Album => {
-            let tracks: Vec<&library::Track> = lib
-                .tracks
-                .values()
-                .filter(|t| t.album.eq_ignore_ascii_case(name))
-                .collect();
+            let tracks = lib.album_tracks(name);
             if tracks.is_empty() {
                 return Err(format!("No tracks found for album \"{}\"", name));
             }
@@ -251,11 +290,7 @@ pub fn find_matching_tracks<'a>(
             Ok(tracks)
         }
         SyncType::Track => {
-            let tracks: Vec<&library::Track> = lib
-                .tracks
-                .values()
-                .filter(|t| t.name.eq_ignore_ascii_case(name))
-                .collect();
+            let tracks = lib.tracks_by_name(name);
             if tracks.is_empty() {
                 return Err(format!("No track found matching \"{}\"", name));
             }
@@ -535,6 +570,7 @@ pub fn collect_music_files_recursive(dir: &Path, extensions: &[&str], files: &mu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::library::ItunesLibrary;
 
     #[test]
     fn needs_transcoding_by_extension() {
@@ -629,7 +665,7 @@ mod tests {
                 name: "Road Trip".into(),
                 track_ids: vec![1, 3],
             }],
-            music_folder: None,
+            music_folder_path: None,
         }
     }
 

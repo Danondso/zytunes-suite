@@ -71,7 +71,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let audio_cmd_tx = audio::spawn(audio_event_tx);
 
     // Kick off async library load.
-    let _ = cmd_tx.send(BgCommand::LoadLibrary(library_path.to_string()));
+    let _ = cmd_tx.send(BgCommand::LoadLibrary {
+        xml_path: library_path.to_string(),
+        music_dir: cfg.music_dir.clone(),
+    });
 
     // Main event loop.
     let result = run_loop(

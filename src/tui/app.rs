@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use image::DynamicImage;
 use throbber_widgets_tui::ThrobberState;
-use zytunes::library::{ItunesLibrary, Track};
+use zytunes::library::{MusicLibrary, Track};
 use zytunes::mtp::parse::DeviceEntry;
 
 use crate::audio::{AudioCommand, AudioEvent};
@@ -169,7 +169,7 @@ impl SyncState {
 
 pub struct App {
     pub active_panel: Panel,
-    pub library: Option<ItunesLibrary>,
+    pub library: Option<Box<dyn MusicLibrary>>,
     pub sidebar_mode: SidebarMode,
     pub sidebar_items: Vec<String>,
     pub sidebar_selected: usize,
@@ -303,9 +303,8 @@ impl App {
     pub fn theme_picker_confirm(&mut self) {
         self.show_theme_picker = false;
         // Save to config.
-        let config = crate::config::Config {
-            theme: Some(self.theme().name.to_string()),
-        };
+        let mut config = crate::config::load();
+        config.theme = Some(self.theme().name.to_string());
         crate::config::save(&config);
     }
 
@@ -775,12 +774,7 @@ impl App {
             SidebarMode::Albums => {
                 self.album_list.clear();
                 self.track_list = if let Some((_, album)) = item.split_once(" \u{2014} ") {
-                    let tracks: Vec<&Track> = lib
-                        .tracks
-                        .values()
-                        .filter(|t| t.album.eq_ignore_ascii_case(album))
-                        .collect();
-                    tracks_to_info(tracks)
+                    tracks_to_info(lib.album_tracks(album))
                 } else {
                     Vec::new()
                 };
@@ -875,15 +869,7 @@ impl App {
             None => return,
         };
 
-        let tracks: Vec<&Track> = lib
-            .tracks
-            .values()
-            .filter(|t| {
-                t.album.eq_ignore_ascii_case(&album.name)
-                    && t.artist.eq_ignore_ascii_case(&album.artist)
-            })
-            .collect();
-        self.track_list = tracks_to_info(tracks);
+        self.track_list = tracks_to_info(lib.album_tracks_by_artist(&album.artist, &album.name));
         // Sort by track number for album views.
         self.track_list
             .sort_by(|a, b| a.track_number.cmp(&b.track_number));
@@ -1318,7 +1304,7 @@ impl App {
     }
 
     pub fn track_count(&self) -> usize {
-        self.library.as_ref().map(|l| l.tracks.len()).unwrap_or(0)
+        self.library.as_ref().map(|l| l.track_count()).unwrap_or(0)
     }
 
     pub fn total_queue_tracks(&self) -> usize {
@@ -1879,12 +1865,12 @@ mod tests {
 
     use std::collections::HashMap;
 
-    fn make_minimal_library() -> zytunes::library::ItunesLibrary {
-        zytunes::library::ItunesLibrary {
+    fn make_minimal_library() -> Box<dyn zytunes::library::MusicLibrary + Send> {
+        Box::new(zytunes::library::ItunesLibrary {
             tracks: HashMap::new(),
             playlists: Vec::new(),
-            music_folder: None,
-        }
+            music_folder_path: None,
+        })
     }
 
     #[test]

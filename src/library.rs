@@ -36,11 +36,39 @@ pub struct Playlist {
     pub track_ids: Vec<u64>,
 }
 
+/// Trait abstracting a music library backend.
+///
+/// Implemented by `ItunesLibrary` (iTunes XML) and `DirectoryLibrary` (folder scan).
+pub trait MusicLibrary {
+    /// All unique artist names, sorted.
+    fn artists(&self) -> Vec<&str>;
+    /// All unique (artist, album) pairs, sorted.
+    fn albums(&self) -> Vec<(&str, &str)>;
+    /// User-visible playlists (excludes system playlists).
+    fn user_playlists(&self) -> Vec<&Playlist>;
+    /// All tracks by a given artist (case-insensitive).
+    fn artist_tracks(&self, artist: &str) -> Vec<&Track>;
+    /// All tracks in a playlist by name (case-insensitive).
+    fn playlist_tracks(&self, name: &str) -> Vec<&Track>;
+    /// All tracks matching an album name (case-insensitive).
+    fn album_tracks(&self, album: &str) -> Vec<&Track>;
+    /// All tracks matching artist AND album (case-insensitive).
+    fn album_tracks_by_artist(&self, artist: &str, album: &str) -> Vec<&Track>;
+    /// All tracks matching a track name (case-insensitive).
+    fn tracks_by_name(&self, name: &str) -> Vec<&Track>;
+    /// Total number of tracks.
+    fn track_count(&self) -> usize;
+    /// All tracks in the library.
+    fn all_tracks(&self) -> Vec<&Track>;
+    /// The music folder path, if known.
+    fn music_folder(&self) -> Option<&str>;
+}
+
 /// The parsed iTunes library.
 pub struct ItunesLibrary {
     pub tracks: HashMap<u64, Track>,
     pub playlists: Vec<Playlist>,
-    pub music_folder: Option<String>,
+    pub music_folder_path: Option<String>,
 }
 
 impl ItunesLibrary {
@@ -52,9 +80,10 @@ impl ItunesLibrary {
         remap_locations(&mut library);
         Ok(library)
     }
+}
 
-    /// Get all tracks belonging to a playlist by name.
-    pub fn playlist_tracks(&self, name: &str) -> Vec<&Track> {
+impl MusicLibrary for ItunesLibrary {
+    fn playlist_tracks(&self, name: &str) -> Vec<&Track> {
         for pl in &self.playlists {
             if pl.name.eq_ignore_ascii_case(name) {
                 return pl
@@ -67,16 +96,14 @@ impl ItunesLibrary {
         vec![]
     }
 
-    /// Get all tracks by a given artist.
-    pub fn artist_tracks(&self, artist: &str) -> Vec<&Track> {
+    fn artist_tracks(&self, artist: &str) -> Vec<&Track> {
         self.tracks
             .values()
             .filter(|t| t.artist.eq_ignore_ascii_case(artist))
             .collect()
     }
 
-    /// Get all unique artist names, sorted.
-    pub fn artists(&self) -> Vec<&str> {
+    fn artists(&self) -> Vec<&str> {
         let mut artists: Vec<&str> = self
             .tracks
             .values()
@@ -88,8 +115,7 @@ impl ItunesLibrary {
         artists
     }
 
-    /// Get all unique (artist, album) pairs, sorted.
-    pub fn albums(&self) -> Vec<(&str, &str)> {
+    fn albums(&self) -> Vec<(&str, &str)> {
         let mut albums: Vec<(&str, &str)> = self
             .tracks
             .values()
@@ -101,12 +127,46 @@ impl ItunesLibrary {
         albums
     }
 
-    /// Get user-visible playlists (exclude system playlists).
-    pub fn user_playlists(&self) -> Vec<&Playlist> {
+    fn user_playlists(&self) -> Vec<&Playlist> {
         self.playlists
             .iter()
             .filter(|p| !is_system_playlist(&p.name))
             .collect()
+    }
+
+    fn album_tracks(&self, album: &str) -> Vec<&Track> {
+        self.tracks
+            .values()
+            .filter(|t| t.album.eq_ignore_ascii_case(album))
+            .collect()
+    }
+
+    fn album_tracks_by_artist(&self, artist: &str, album: &str) -> Vec<&Track> {
+        self.tracks
+            .values()
+            .filter(|t| {
+                t.album.eq_ignore_ascii_case(album) && t.artist.eq_ignore_ascii_case(artist)
+            })
+            .collect()
+    }
+
+    fn tracks_by_name(&self, name: &str) -> Vec<&Track> {
+        self.tracks
+            .values()
+            .filter(|t| t.name.eq_ignore_ascii_case(name))
+            .collect()
+    }
+
+    fn track_count(&self) -> usize {
+        self.tracks.len()
+    }
+
+    fn all_tracks(&self) -> Vec<&Track> {
+        self.tracks.values().collect()
+    }
+
+    fn music_folder(&self) -> Option<&str> {
+        self.music_folder_path.as_deref()
     }
 }
 
@@ -134,7 +194,7 @@ fn remap_locations(library: &mut ItunesLibrary) {
         Ok(val) if !val.is_empty() => val,
         _ => return,
     };
-    let original_root = match library.music_folder.as_deref() {
+    let original_root = match library.music_folder_path.as_deref() {
         Some(folder) => folder.to_string(),
         None => return,
     };
@@ -170,7 +230,7 @@ fn parse_itunes_xml<R: BufRead>(reader: R) -> Result<ItunesLibrary, String> {
     let mut library = ItunesLibrary {
         tracks: HashMap::new(),
         playlists: Vec::new(),
-        music_folder: None,
+        music_folder_path: None,
     };
 
     let mut buf = Vec::with_capacity(4096);
@@ -268,7 +328,7 @@ fn parse_itunes_xml<R: BufRead>(reader: R) -> Result<ItunesLibrary, String> {
                 {
                     match section {
                         Section::Root if last_key == "Music Folder" => {
-                            library.music_folder = Some(decode_location(&text));
+                            library.music_folder_path = Some(decode_location(&text));
                         }
                         Section::TrackEntry => {
                             track_fields.insert(last_key.clone(), text);
@@ -484,7 +544,7 @@ mod tests {
                     track_ids: vec![1, 3],
                 },
             ],
-            music_folder: None,
+            music_folder_path: None,
         }
     }
 
@@ -596,7 +656,7 @@ mod tests {
 </plist>"#;
 
         let lib = parse_xml_str(xml).unwrap();
-        assert_eq!(lib.music_folder.as_deref(), Some("/Users/me/Music/"));
+        assert_eq!(lib.music_folder_path.as_deref(), Some("/Users/me/Music/"));
     }
 
     #[test]

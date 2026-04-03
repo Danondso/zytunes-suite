@@ -1,4 +1,4 @@
-use zytunes::library::ItunesLibrary;
+use zytunes::library::{ItunesLibrary, MusicLibrary};
 use zytunes::mtp::DeviceSession;
 use zytunes::{
     collect_music_files, connect, find_matching_tracks, library_xml_path, make_transcode_temp_dir,
@@ -87,13 +87,12 @@ fn cmd_library(xml_path: &str, query: Option<&str>) -> Result<(), String> {
     let start = std::time::Instant::now();
     let lib = ItunesLibrary::parse(xml_path)?;
     println!(
-        "Loaded {} tracks, {} playlists in {:.1}s\n",
-        lib.tracks.len(),
-        lib.playlists.len(),
+        "Loaded {} tracks in {:.1}s\n",
+        lib.track_count(),
         start.elapsed().as_secs_f64()
     );
 
-    if let Some(music_folder) = &lib.music_folder {
+    if let Some(music_folder) = lib.music_folder() {
         println!("Music folder: {music_folder}");
     }
 
@@ -117,14 +116,14 @@ fn cmd_library(xml_path: &str, query: Option<&str>) -> Result<(), String> {
             let albums = lib.albums();
             let playlists = lib.user_playlists();
             println!("\nStats:");
-            println!("  {} tracks", lib.tracks.len());
+            println!("  {} tracks", lib.track_count());
             println!("  {} artists", artists.len());
             println!("  {} albums", albums.len());
             println!("  {} playlists", playlists.len());
 
             // Format breakdown.
             let mut formats: HashMap<String, usize> = HashMap::new();
-            for t in lib.tracks.values() {
+            for t in lib.all_tracks() {
                 let kind = t.kind.as_deref().unwrap_or("Unknown");
                 *formats.entry(kind.to_string()).or_default() += 1;
             }
@@ -195,7 +194,7 @@ fn cmd_sync(args: &[String]) -> Result<(), String> {
     let lib = ItunesLibrary::parse(xml_path)?;
     println!(
         "Loaded {} tracks in {:.1}s\n",
-        lib.tracks.len(),
+        lib.track_count(),
         start.elapsed().as_secs_f64()
     );
 
