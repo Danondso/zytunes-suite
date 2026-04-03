@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::mpsc;
 use std::time::Instant;
 
@@ -236,6 +236,7 @@ pub struct TrackInfo {
     pub location: Option<String>,
     pub track_number: Option<u32>,
     pub disc_number: Option<u32>,
+    pub on_device: bool,
 }
 
 impl App {
@@ -449,6 +450,8 @@ impl App {
             self.build_device_index();
             if self.browse_mode == BrowseMode::Device {
                 self.refresh_sidebar();
+            } else {
+                tag_on_device(&mut self.track_list, &self.device);
             }
         }
     }
@@ -788,6 +791,7 @@ impl App {
                     Vec::new()
                 };
                 self.sort_tracks();
+                tag_on_device(&mut self.track_list, &self.device);
                 self.track_selected = 0;
                 self.track_scroll = 0;
                 self.refresh_album_art();
@@ -798,6 +802,7 @@ impl App {
                 let tracks = lib.playlist_tracks(name);
                 self.track_list = tracks_to_info(tracks);
                 self.sort_tracks();
+                tag_on_device(&mut self.track_list, &self.device);
                 self.track_selected = 0;
                 self.track_scroll = 0;
                 self.refresh_album_art();
@@ -885,6 +890,7 @@ impl App {
                 .cmp(&b.disc_number)
                 .then(a.track_number.cmp(&b.track_number))
         });
+        tag_on_device(&mut self.track_list, &self.device);
         self.track_selected = 0;
         self.track_scroll = 0;
         self.refresh_album_art();
@@ -1214,6 +1220,9 @@ impl App {
                 self.device.status = DeviceStatus::Disconnected;
                 self.connection_anim_start = None;
                 self.set_toast(format!("Connection failed: {}", e), true);
+                if self.browse_mode == BrowseMode::Library {
+                    tag_on_device(&mut self.track_list, &self.device);
+                }
             }
             BgEvent::LoadingDeviceTracks => {
                 self.device.loading_tracks = true;
@@ -1229,6 +1238,9 @@ impl App {
                 );
                 if self.browse_mode == BrowseMode::Device {
                     self.refresh_sidebar();
+                }
+                if self.browse_mode == BrowseMode::Library {
+                    tag_on_device(&mut self.track_list, &self.device);
                 }
             }
             BgEvent::DeviceTrackAdded(entry) => {
@@ -1554,6 +1566,7 @@ fn tracks_to_info(tracks: Vec<&Track>) -> Vec<TrackInfo> {
             location: t.location.clone(),
             track_number: t.track_number,
             disc_number: t.disc_number,
+            on_device: false,
         })
         .collect()
 }
@@ -1570,8 +1583,63 @@ fn device_tracks_to_info(tracks: &[DeviceTrackInfo]) -> Vec<TrackInfo> {
             location: None,
             track_number: None,
             disc_number: None,
+            on_device: false,
         })
         .collect()
+}
+
+/// Build a set of (lowercase artist, lowercase track name) from device tracks.
+/// Inserts both the raw filename stem and the version with a leading track number
+/// prefix stripped, so we match regardless of naming convention.
+fn device_track_set(device: &DeviceState) -> HashSet<(String, String)> {
+    let mut set = HashSet::new();
+    for dt in device.album_tracks.values().flatten() {
+        let artist = dt.artist.trim().to_lowercase();
+        let raw = dt.name.trim().to_lowercase();
+        let stripped = zytunes::strip_track_number(dt.name.trim()).to_lowercase();
+        set.insert((artist.clone(), raw.clone()));
+        if stripped != raw {
+            set.insert((artist, stripped));
+        }
+    }
+    set
+}
+
+/// Tag each TrackInfo with whether it exists on the connected device.
+/// First tries exact match on (artist, name), then falls back to checking
+/// if the library title is contained in any device filename for that artist
+/// (handles cases where the filename differs from the metadata title).
+fn tag_on_device(tracks: &mut [TrackInfo], device: &DeviceState) {
+    if device.status != DeviceStatus::Connected || device.album_tracks.is_empty() {
+        for t in tracks.iter_mut() {
+            t.on_device = false;
+        }
+        return;
+    }
+    let set = device_track_set(device);
+    // Build per-artist list of device filenames for fuzzy fallback.
+    let mut artist_names: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for dt in device.album_tracks.values().flatten() {
+        artist_names
+            .entry(dt.artist.trim().to_lowercase())
+            .or_default()
+            .push(dt.name.trim().to_lowercase());
+    }
+    for t in tracks.iter_mut() {
+        let artist_key = t.artist.trim().to_lowercase();
+        let name_key = t.name.trim().to_lowercase();
+        if set.contains(&(artist_key.clone(), name_key.clone())) {
+            t.on_device = true;
+        } else if let Some(device_names) = artist_names.get(&artist_key) {
+            // Fallback: check if any device filename contains the library title
+            // or the library title contains the device filename stem.
+            t.on_device = device_names
+                .iter()
+                .any(|dn| dn.contains(&name_key) || name_key.contains(dn));
+        } else {
+            t.on_device = false;
+        }
+    }
 }
 
 pub fn format_with_commas(n: usize) -> String {
@@ -2249,5 +2317,76 @@ mod tests {
     fn new_app_show_keys_defaults_false() {
         let app = App::new();
         assert!(!app.show_keys);
+    }
+
+    #[test]
+    fn tag_on_device_marks_matching_tracks() {
+        let mut device = DeviceState::new();
+        device.status = DeviceStatus::Connected;
+        device.album_tracks.insert(
+            ("Queen".into(), "A Night at the Opera".into()),
+            vec![DeviceTrackInfo {
+                name: "01 Bohemian Rhapsody".into(),
+                device_path: "/Music/Queen/A Night at the Opera/01 Bohemian Rhapsody.mp3".into(),
+                size: 1000,
+                object_id: 1,
+                artist: "Queen".into(),
+                album: "A Night at the Opera".into(),
+            }],
+        );
+
+        let mut tracks = vec![
+            TrackInfo {
+                name: "Bohemian Rhapsody".into(),
+                artist: "Queen".into(),
+                album: "A Night at the Opera".into(),
+                duration_ms: None,
+                kind: None,
+                location: None,
+                track_number: Some(1),
+                disc_number: None,
+                on_device: false,
+            },
+            TrackInfo {
+                name: "Somebody to Love".into(),
+                artist: "Queen".into(),
+                album: "A Day at the Races".into(),
+                duration_ms: None,
+                kind: None,
+                location: None,
+                track_number: Some(1),
+                disc_number: None,
+                on_device: false,
+            },
+        ];
+
+        tag_on_device(&mut tracks, &device);
+        assert!(tracks[0].on_device, "Bohemian Rhapsody should be on device");
+        assert!(
+            !tracks[1].on_device,
+            "Somebody to Love should not be on device"
+        );
+    }
+
+    #[test]
+    fn tag_on_device_clears_when_disconnected() {
+        let device = DeviceState::new(); // status = Disconnected
+        let mut tracks = vec![TrackInfo {
+            name: "Test".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            duration_ms: None,
+            kind: None,
+            location: None,
+            track_number: None,
+            disc_number: None,
+            on_device: true, // pre-set to true
+        }];
+
+        tag_on_device(&mut tracks, &device);
+        assert!(
+            !tracks[0].on_device,
+            "should clear on_device when disconnected"
+        );
     }
 }
