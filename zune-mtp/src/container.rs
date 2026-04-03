@@ -37,7 +37,7 @@ pub enum OperationCode {
     DisableTrustedFilesOperations = 0x9215,
     EndTrustedAppSession = 0x9216,
     /// Retrieve the Zune's internal metadata database (ZMDB).
-    /// Param[0]: content type (1 = music library).
+    /// First parameter is the content type (1 = music library).
     GetZuneMetadataDatabase = 0x9217,
 }
 

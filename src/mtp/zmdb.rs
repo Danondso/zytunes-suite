@@ -18,8 +18,10 @@
 use super::parse::DeviceEntry;
 use std::collections::HashMap;
 
-fn u32_at(data: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+/// Read a little-endian u32, returning None if out of bounds.
+fn u32_at(data: &[u8], off: usize) -> Option<u32> {
+    let bytes = data.get(off..off + 4)?;
+    Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
 /// Extract the type byte and record ID from a ZMDB reference value.
@@ -39,7 +41,9 @@ fn read_cstring(data: &[u8], off: usize) -> (String, usize) {
         }
         i += 1;
     }
-    (s, i + 1)
+    // Clamp to data.len() to avoid returning an offset past the buffer.
+    let next = (i + 1).min(data.len());
+    (s, next)
 }
 
 struct ZmdbTrack {
@@ -89,8 +93,8 @@ impl Zmdb {
         if &data[0x38..0x3C] != b"ZArr" {
             return Err("Missing ZArr at expected offset".into());
         }
-        let idx_count = u32_at(data, 0x40) as usize;
-        let idx_data_off = u32_at(data, 0x48) as usize;
+        let idx_count = u32_at(data, 0x40).ok_or("ZMDB truncated at ZArr count")? as usize;
+        let idx_data_off = u32_at(data, 0x48).ok_or("ZMDB truncated at ZArr data offset")? as usize;
 
         let mut tracks = Vec::new();
         let mut albums = Vec::new();
@@ -99,27 +103,35 @@ impl Zmdb {
 
         for i in 0..idx_count {
             let entry_off = idx_data_off + i * 8;
-            if entry_off + 8 > data.len() {
-                break;
-            }
-            let type_id = u32_at(data, entry_off);
-            let rec_off = u32_at(data, entry_off + 4) as usize;
+            let type_id = match u32_at(data, entry_off) {
+                Some(v) => v,
+                None => break,
+            };
+            let rec_off = match u32_at(data, entry_off + 4) {
+                Some(v) => v as usize,
+                None => break,
+            };
             let (type_byte, rec_id) = parse_ref(type_id);
-
-            if rec_off + 16 > data.len() {
-                continue;
-            }
 
             match type_byte {
                 0x01 => {
                     // Track: [album_ref 4][artist_ref 4][genre_ref 4][folder_ref 4]
                     //        [file_size 4][track_number 4][format 4][title cstring]
+                    let album_id = match u32_at(data, rec_off) {
+                        Some(v) => parse_ref(v).1,
+                        None => continue,
+                    };
+                    let artist_id = match u32_at(data, rec_off + 4) {
+                        Some(v) => parse_ref(v).1,
+                        None => continue,
+                    };
+                    let file_size = match u32_at(data, rec_off + 16) {
+                        Some(v) => v,
+                        None => continue,
+                    };
                     if rec_off + 28 > data.len() {
                         continue;
                     }
-                    let (_, album_id) = parse_ref(u32_at(data, rec_off));
-                    let (_, artist_id) = parse_ref(u32_at(data, rec_off + 4));
-                    let file_size = u32_at(data, rec_off + 16);
                     let (title, _) = read_cstring(data, rec_off + 28);
 
                     if !title.is_empty() {
@@ -143,6 +155,9 @@ impl Zmdb {
                 }
                 0x08 => {
                     // Artist: [0x00][name cstring]
+                    if rec_off + 1 > data.len() {
+                        continue;
+                    }
                     let (name, _) = read_cstring(data, rec_off + 1);
                     if !name.is_empty() {
                         artists.push(ZmdbArtist { id: rec_id, name });
@@ -150,6 +165,9 @@ impl Zmdb {
                 }
                 0x09 => {
                     // Genre: [0x00][name cstring]
+                    if rec_off + 1 > data.len() {
+                        continue;
+                    }
                     let (name, _) = read_cstring(data, rec_off + 1);
                     if !name.is_empty() {
                         genres.push(ZmdbGenre { name });
@@ -389,5 +407,20 @@ mod tests {
     fn too_short_rejected() {
         assert!(Zmdb::parse(&[]).is_err());
         assert!(Zmdb::parse(&[0; 10]).is_err());
+    }
+
+    #[test]
+    fn unresolvable_refs_fall_back_to_unknown() {
+        // Track references artist_id=99 and album_id=99, which don't exist.
+        let track_rec = make_track_record(99, 99, 99, 1_000_000, 1, "Orphan Track");
+
+        let data = make_zmdb(&[(0x01000001, 0)], &track_rec);
+
+        let zmdb = Zmdb::parse(&data).unwrap();
+        assert_eq!(zmdb.tracks.len(), 1);
+
+        let entries = zmdb.to_device_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "Unknown Artist/Unknown Album/Orphan Track");
     }
 }
