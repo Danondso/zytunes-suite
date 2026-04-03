@@ -306,6 +306,43 @@ impl MtpSession {
         Ok(())
     }
 
+    /// Read a string device property (e.g., DeviceFirmwareVersion 0xD404).
+    pub fn get_device_prop_string(&mut self, prop: u32) -> Result<String, MtpError> {
+        let data = self.execute_data_in(OperationCode::GetDevicePropValue, &[prop])?;
+        let mut offset = 0;
+        Ok(read_mtp_string(&data, &mut offset))
+    }
+
+    /// Read the Device Version string from GetDeviceInfo (the firmware version).
+    pub fn get_device_version(&mut self) -> Result<String, MtpError> {
+        let data = self.execute_data_in(OperationCode::GetDeviceInfo, &[])?;
+        if data.len() < 8 {
+            return Err(MtpError::Protocol("DeviceInfo too short".to_string()));
+        }
+        let mut offset = 8; // skip: u16 standard ver + u32 vendor ext id + u16 vendor ext ver
+                            // Skip: vendor extension description string
+        read_mtp_string(&data, &mut offset);
+        if offset + 2 > data.len() {
+            return Err(MtpError::Protocol("DeviceInfo truncated".to_string()));
+        }
+        offset += 2; // skip: u16 functional mode
+                     // Skip 5 u16-element arrays: operations, events, device props, capture formats, playback formats.
+                     // Each array is: u32 count + count * u16 elements.
+        for _ in 0..5 {
+            if offset + 4 > data.len() {
+                return Err(MtpError::Protocol("DeviceInfo truncated".to_string()));
+            }
+            let count = le_u32(&data, offset) as usize;
+            offset += 4 + count * 2;
+        }
+        // Skip: manufacturer string, model string
+        read_mtp_string(&data, &mut offset);
+        read_mtp_string(&data, &mut offset);
+        // Device Version string (firmware)
+        let version = read_mtp_string(&data, &mut offset);
+        Ok(version)
+    }
+
     /// Set a string device property (e.g., SessionInitiatorVersionInfo 0xD406).
     pub fn set_device_prop_string(&mut self, prop: u32, value: &str) -> Result<(), MtpError> {
         let tid = self.next_transaction();

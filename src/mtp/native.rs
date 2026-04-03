@@ -200,6 +200,7 @@ pub struct NativeSession {
     log: Option<std::sync::mpsc::Sender<String>>,
     library: Option<DeviceLibrary>,
     cache: TrackCache,
+    pub firmware_version: Option<String>,
 }
 
 impl NativeSession {
@@ -248,6 +249,22 @@ impl NativeSession {
             .map_err(|e| format!("MTPZ handshake failed: {e}"))?;
         log("MTP: MTPZ handshake complete");
 
+        // Try to read firmware version via GetDeviceInfo (post-handshake),
+        // then fall back to MTP property 0xD404.
+        let firmware_version = session
+            .get_device_version()
+            .ok()
+            .filter(|v| !v.is_empty())
+            .or_else(|| {
+                session
+                    .get_device_prop_string(0xD404)
+                    .ok()
+                    .filter(|v| !v.is_empty())
+            });
+        if let Some(ref v) = firmware_version {
+            log(&format!("MTP: Firmware version: {}", v));
+        }
+
         log("MTP: Querying storage...");
         let storage_ids = session
             .get_storage_ids()
@@ -264,6 +281,7 @@ impl NativeSession {
             log: None,
             library: None,
             cache: TrackCache::new(None),
+            firmware_version,
         })
     }
 

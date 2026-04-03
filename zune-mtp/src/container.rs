@@ -23,6 +23,7 @@ pub enum OperationCode {
     SendObjectInfo = 0x100c,
     SendObject = 0x100d,
     DeleteObject = 0x100b,
+    GetDevicePropValue = 0x1015,
     SetDevicePropValue = 0x1016,
     SetObjectPropValue = 0x9804,
     GetObjectPropList = 0x9805,

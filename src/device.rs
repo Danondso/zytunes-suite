@@ -84,19 +84,15 @@ impl ZuneDevice {
                     .ok()
                     .and_then(|h| h.read_serial_number_string_ascii(&desc).ok());
 
-                // bcdDevice encodes firmware version as BCD (e.g. 0x0310 = 3.10).
-                let bcd = desc.device_version();
-                let firmware_version = Some(format!(
-                    "{}.{:02}",
-                    bcd.major(),
-                    bcd.minor() * 10 + bcd.sub_minor()
-                ));
+                // bcdDevice reports USB device revision, not Zune firmware.
+                // Real firmware version is read via MTP property 0xD404 after
+                // the MTPZ handshake (see NativeSession::open).
 
                 return Ok(ZuneDevice {
                     vendor_id: MICROSOFT_VENDOR_ID,
                     product_id,
                     product_name,
-                    firmware_version,
+                    firmware_version: None,
                     serial_number,
                     usb_mode: Some(mode_label.to_string()),
                 });
