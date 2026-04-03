@@ -10,7 +10,6 @@ use zune_mtp::proplist::*;
 use zune_mtp::session::ObjectInfo;
 use zune_mtp::{MtpError, MtpSession, MtpzKeys};
 
-use id3::TagLike;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -1038,35 +1037,21 @@ fn format_name(format: u16) -> String {
     }
 }
 
-/// Read metadata from an audio file (ID3 tags for MP3).
-/// Returns (artist, album, title, track_number, genre).
 /// Extract album art from an audio file, resized to 200x200 JPEG.
-/// Uses ffmpeg for reliable extraction from any format.
+/// Uses lofty for extraction and image crate for resizing. Works entirely in-memory.
 fn extract_album_art(path: &str) -> Option<Vec<u8>> {
-    let temp = std::env::temp_dir().join("zytunes-art.jpg");
-    let result = std::process::Command::new("ffmpeg")
-        .args([
-            "-y",
-            "-i",
-            path,
-            "-an", // no audio
-            "-vf",
-            "scale=200:200", // resize to 200x200
-            "-codec:v",
-            "mjpeg", // output JPEG
-            "-q:v",
-            "5", // quality
-        ])
-        .arg(temp.as_os_str())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
+    use lofty::file::TaggedFileExt;
+
+    let tagged = lofty::probe::read_from_path(path).ok()?;
+    let tag = tagged.primary_tag().or_else(|| tagged.first_tag())?;
+    let pic = tag.pictures().first()?;
+    let img = image::load_from_memory(pic.data()).ok()?;
+    let resized = img.resize_exact(200, 200, image::imageops::FilterType::Lanczos3);
+    let mut jpeg_buf = std::io::Cursor::new(Vec::new());
+    resized
+        .write_to(&mut jpeg_buf, image::ImageFormat::Jpeg)
         .ok()?;
-    if !result.success() {
-        return None;
-    }
-    let data = std::fs::read(&temp).ok()?;
-    let _ = std::fs::remove_file(&temp);
+    let data = jpeg_buf.into_inner();
     if data.is_empty() {
         None
     } else {
@@ -1074,18 +1059,30 @@ fn extract_album_art(path: &str) -> Option<Vec<u8>> {
     }
 }
 
+/// Read metadata from an audio file using lofty (supports all formats).
+/// Returns (artist, album, title, track_number, genre).
 fn read_metadata(path: &str, filename: &str) -> (String, String, String, u16, String) {
-    // Try ID3 tags first.
-    if let Ok(tag) = id3::Tag::read_from_path(path) {
-        let artist = tag.artist().unwrap_or("Unknown Artist").to_string();
-        let album = tag.album().unwrap_or("Unknown Album").to_string();
-        let title = tag.title().unwrap_or_else(|| stem(filename)).to_string();
-        let track_num = tag.track().unwrap_or(0) as u16;
-        let genre = tag
-            .genre_parsed()
-            .map(|g| g.to_string())
-            .unwrap_or_default();
-        return (artist, album, title, track_num, genre);
+    use lofty::file::TaggedFileExt;
+    use lofty::tag::Accessor;
+
+    if let Ok(tagged) = lofty::probe::read_from_path(path) {
+        if let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) {
+            let artist = tag
+                .artist()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "Unknown Artist".to_string());
+            let album = tag
+                .album()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "Unknown Album".to_string());
+            let title = tag
+                .title()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| stem(filename).to_string());
+            let track_num = tag.track().unwrap_or(0) as u16;
+            let genre = tag.genre().map(|g| g.to_string()).unwrap_or_default();
+            return (artist, album, title, track_num, genre);
+        }
     }
 
     // Fallback: parse from filename.
@@ -1389,5 +1386,154 @@ mod tests {
         if let Some(p) = cache.cache_path() {
             let _ = std::fs::remove_file(p);
         }
+    }
+
+    // -- extract_album_art tests --
+
+    /// Generate a minimal valid WAV file for testing.
+    fn make_test_wav(path: &std::path::Path) {
+        use std::io::Write;
+        let channels: u16 = 2;
+        let sample_rate: u32 = 44100;
+        let bits_per_sample: u16 = 16;
+        let num_samples: usize = 1000;
+        let byte_rate = sample_rate * u32::from(channels) * u32::from(bits_per_sample) / 8;
+        let block_align = channels * bits_per_sample / 8;
+        let data_size =
+            (num_samples * usize::from(channels) * usize::from(bits_per_sample) / 8) as u32;
+        let file_size = 36 + data_size;
+
+        let mut f = std::fs::File::create(path).unwrap();
+        f.write_all(b"RIFF").unwrap();
+        f.write_all(&file_size.to_le_bytes()).unwrap();
+        f.write_all(b"WAVE").unwrap();
+        f.write_all(b"fmt ").unwrap();
+        f.write_all(&16u32.to_le_bytes()).unwrap();
+        f.write_all(&1u16.to_le_bytes()).unwrap();
+        f.write_all(&channels.to_le_bytes()).unwrap();
+        f.write_all(&sample_rate.to_le_bytes()).unwrap();
+        f.write_all(&byte_rate.to_le_bytes()).unwrap();
+        f.write_all(&block_align.to_le_bytes()).unwrap();
+        f.write_all(&bits_per_sample.to_le_bytes()).unwrap();
+        f.write_all(b"data").unwrap();
+        f.write_all(&data_size.to_le_bytes()).unwrap();
+        f.write_all(&vec![0u8; data_size as usize]).unwrap();
+    }
+
+    /// Generate a minimal JPEG image of given dimensions.
+    fn make_test_jpeg(width: u32, height: u32) -> Vec<u8> {
+        use image::{ImageBuffer, Rgb};
+        let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::new(width, height);
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, image::ImageFormat::Jpeg).unwrap();
+        buf.into_inner()
+    }
+
+    /// Create a WAV file with embedded album art via lofty.
+    fn make_wav_with_art(path: &std::path::Path, art_width: u32, art_height: u32) {
+        use lofty::file::TaggedFileExt;
+        use lofty::picture::{MimeType, Picture, PictureType};
+        use lofty::tag::{Accessor, Tag, TagExt};
+
+        make_test_wav(path);
+        let art_data = make_test_jpeg(art_width, art_height);
+        let mut tagged = lofty::probe::read_from_path(path).unwrap();
+        let tag_type = tagged.primary_tag_type();
+        if tagged.primary_tag().is_none() {
+            tagged.insert_tag(Tag::new(tag_type));
+        }
+        let tag = tagged.primary_tag_mut().unwrap();
+        tag.set_artist("Test Artist".to_string());
+        let pic = Picture::new_unchecked(
+            PictureType::CoverFront,
+            Some(MimeType::Jpeg),
+            None,
+            art_data,
+        );
+        tag.push_picture(pic);
+        tag.save_to_path(path, lofty::config::WriteOptions::default())
+            .unwrap();
+    }
+
+    #[test]
+    fn extract_art_returns_jpeg_200x200() {
+        let dir = std::env::temp_dir().join("zytunes-test-extract-art");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let wav_path = dir.join("art.wav");
+        make_wav_with_art(&wav_path, 400, 400);
+
+        let result = extract_album_art(wav_path.to_str().unwrap());
+        assert!(result.is_some(), "expected album art");
+
+        let jpeg_data = result.unwrap();
+        let img = image::load_from_memory(&jpeg_data).unwrap();
+        assert_eq!(img.width(), 200);
+        assert_eq!(img.height(), 200);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_art_no_art_returns_none() {
+        let dir = std::env::temp_dir().join("zytunes-test-extract-noart");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let wav_path = dir.join("noart.wav");
+        make_test_wav(&wav_path);
+
+        let result = extract_album_art(wav_path.to_str().unwrap());
+        assert!(result.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_art_bad_path_returns_none() {
+        let result = extract_album_art("/nonexistent/path/song.mp3");
+        assert!(result.is_none());
+    }
+
+    // -- read_metadata tests --
+
+    #[test]
+    fn read_metadata_from_tagged_file() {
+        let dir = std::env::temp_dir().join("zytunes-test-read-meta");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let wav_path = dir.join("tagged.wav");
+        make_test_wav(&wav_path);
+
+        // Write tags with lofty
+        {
+            use lofty::file::TaggedFileExt;
+            use lofty::tag::{Accessor, Tag, TagExt};
+            let mut tagged = lofty::probe::read_from_path(&wav_path).unwrap();
+            let tag_type = tagged.primary_tag_type();
+            if tagged.primary_tag().is_none() {
+                tagged.insert_tag(Tag::new(tag_type));
+            }
+            let tag = tagged.primary_tag_mut().unwrap();
+            tag.set_artist("Radiohead".to_string());
+            tag.set_album("OK Computer".to_string());
+            tag.set_title("Karma Police".to_string());
+            tag.set_track(5);
+            tag.set_genre("Alternative".to_string());
+            tag.save_to_path(&wav_path, lofty::config::WriteOptions::default())
+                .unwrap();
+        }
+
+        let (artist, album, title, track_num, genre) =
+            read_metadata(wav_path.to_str().unwrap(), "tagged.wav");
+        assert_eq!(artist, "Radiohead");
+        assert_eq!(album, "OK Computer");
+        assert_eq!(title, "Karma Police");
+        assert_eq!(track_num, 5);
+        assert_eq!(genre, "Alternative");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

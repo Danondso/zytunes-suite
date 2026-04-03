@@ -6,12 +6,13 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rodio::{Decoder, OutputStream, Sink};
+use rodio::{Decoder, DeviceSinkBuilder, Player};
 
-/// Formats that rodio + symphonia can decode directly.
-/// M4A excluded — symphonia panics on some M4A files (ALAC-encoded, seek errors).
-/// AAC excluded too — raw .aac files are rare and M4A container is more common.
-const RODIO_NATIVE: &[&str] = &["mp3", "wav", "flac", "ogg"];
+/// Formats that rodio + symphonia can decode directly (with expanded codec features).
+/// WMA is the only common format not supported by symphonia.
+const RODIO_NATIVE: &[&str] = &[
+    "mp3", "wav", "flac", "ogg", "m4a", "aac", "aiff", "alac", "opus",
+];
 
 pub enum AudioCommand {
     Play {
@@ -33,7 +34,7 @@ pub enum AudioEvent {
     Position { elapsed_ms: u64 },
 }
 
-/// Returns true if the file extension requires ffmpeg transcoding before playback.
+/// Returns true if the file extension requires transcoding before playback.
 fn needs_transcode_for_playback(path: &str) -> bool {
     let ext = Path::new(path)
         .extension()
@@ -43,7 +44,7 @@ fn needs_transcode_for_playback(path: &str) -> bool {
     !RODIO_NATIVE.contains(&ext.as_str())
 }
 
-/// Transcode an unsupported file to WAV via ffmpeg for playback.
+/// Transcode an unsupported file (e.g. WMA) to WAV via ffmpeg for playback.
 /// Returns the path to the transcoded temp file.
 fn transcode_for_playback(input: &str) -> Result<String, String> {
     let temp_dir = std::env::temp_dir().join("zytunes-playback");
@@ -99,7 +100,7 @@ pub fn spawn(event_tx: mpsc::Sender<AudioEvent>) -> mpsc::Sender<AudioCommand> {
     let (cmd_tx, cmd_rx) = mpsc::channel::<AudioCommand>();
 
     thread::spawn(move || {
-        let (_stream, stream_handle) = match OutputStream::try_default() {
+        let device_sink = match DeviceSinkBuilder::open_default_sink() {
             Ok(s) => s,
             Err(e) => {
                 let _ = event_tx.send(AudioEvent::PlaybackError(format!("Audio output: {}", e)));
@@ -107,7 +108,7 @@ pub fn spawn(event_tx: mpsc::Sender<AudioEvent>) -> mpsc::Sender<AudioCommand> {
             }
         };
 
-        let mut sink: Option<Sink> = None;
+        let mut player: Option<Player> = None;
         let mut playing = false;
         let mut play_start = Instant::now();
         let mut paused_elapsed = Duration::ZERO;
@@ -116,8 +117,8 @@ pub fn spawn(event_tx: mpsc::Sender<AudioEvent>) -> mpsc::Sender<AudioCommand> {
         loop {
             match cmd_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(AudioCommand::Play { path }) => {
-                    // Stop and drop any existing sink
-                    if let Some(old) = sink.take() {
+                    // Stop and drop any existing player
+                    if let Some(old) = player.take() {
                         old.stop();
                     }
 
@@ -130,14 +131,7 @@ pub fn spawn(event_tx: mpsc::Sender<AudioEvent>) -> mpsc::Sender<AudioCommand> {
                         }
                     };
 
-                    let new_sink = match Sink::try_new(&stream_handle) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            let _ =
-                                event_tx.send(AudioEvent::PlaybackError(format!("Sink: {}", e)));
-                            continue;
-                        }
-                    };
+                    let new_player = Player::connect_new(device_sink.mixer());
 
                     let file = match File::open(&play_path) {
                         Ok(f) => f,
@@ -168,23 +162,23 @@ pub fn spawn(event_tx: mpsc::Sender<AudioEvent>) -> mpsc::Sender<AudioCommand> {
                             }
                         };
 
-                    new_sink.append(source);
+                    new_player.append(source);
                     play_start = Instant::now();
                     paused_elapsed = Duration::ZERO;
                     playing = true;
                     current_path = Some(play_path);
-                    sink = Some(new_sink);
+                    player = Some(new_player);
                 }
                 Ok(AudioCommand::Stop) => {
-                    if let Some(s) = sink.take() {
-                        s.stop();
+                    if let Some(p) = player.take() {
+                        p.stop();
                     }
                     playing = false;
                     paused_elapsed = Duration::ZERO;
                 }
                 Ok(AudioCommand::Pause) => {
-                    if let Some(ref s) = sink {
-                        s.pause();
+                    if let Some(ref p) = player {
+                        p.pause();
                     }
                     if playing {
                         paused_elapsed += play_start.elapsed();
@@ -192,8 +186,8 @@ pub fn spawn(event_tx: mpsc::Sender<AudioEvent>) -> mpsc::Sender<AudioCommand> {
                     playing = false;
                 }
                 Ok(AudioCommand::Resume) => {
-                    if let Some(ref s) = sink {
-                        s.play();
+                    if let Some(ref p) = player {
+                        p.play();
                     }
                     play_start = Instant::now();
                     playing = true;
@@ -221,34 +215,33 @@ pub fn spawn(event_tx: mpsc::Sender<AudioEvent>) -> mpsc::Sender<AudioCommand> {
 
                     // Re-open file and skip to new position
                     if let Some(ref path) = current_path {
-                        if let Some(old) = sink.take() {
+                        if let Some(old) = player.take() {
                             old.stop();
                         }
-                        if let Ok(new_sink) = Sink::try_new(&stream_handle) {
-                            if let Ok(file) = File::open(path) {
-                                let reader = BufReader::new(file);
-                                if let Ok(Ok(source)) =
-                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                        Decoder::new(reader)
-                                    }))
-                                {
-                                    use rodio::Source;
-                                    new_sink.append(source.skip_duration(new_pos));
-                                    if !playing {
-                                        new_sink.pause();
-                                    }
-                                    paused_elapsed = new_pos;
-                                    play_start = Instant::now();
-                                    sink = Some(new_sink);
+                        let new_player = Player::connect_new(device_sink.mixer());
+                        if let Ok(file) = File::open(path) {
+                            let reader = BufReader::new(file);
+                            if let Ok(Ok(source)) =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    Decoder::new(reader)
+                                }))
+                            {
+                                use rodio::Source;
+                                new_player.append(source.skip_duration(new_pos));
+                                if !playing {
+                                    new_player.pause();
                                 }
+                                paused_elapsed = new_pos;
+                                play_start = Instant::now();
+                                player = Some(new_player);
                             }
                         }
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if playing {
-                        if let Some(ref s) = sink {
-                            if s.empty() {
+                        if let Some(ref p) = player {
+                            if p.empty() {
                                 playing = false;
                                 paused_elapsed = Duration::ZERO;
                                 let _ = event_tx.send(AudioEvent::TrackEnded);
@@ -257,8 +250,8 @@ pub fn spawn(event_tx: mpsc::Sender<AudioEvent>) -> mpsc::Sender<AudioCommand> {
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    if let Some(s) = sink.take() {
-                        s.stop();
+                    if let Some(p) = player.take() {
+                        p.stop();
                     }
                     return;
                 }
@@ -267,4 +260,34 @@ pub fn spawn(event_tx: mpsc::Sender<AudioEvent>) -> mpsc::Sender<AudioCommand> {
     });
 
     cmd_tx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn needs_transcode_expanded_formats_are_native() {
+        // All these should now be playable natively via symphonia
+        assert!(!needs_transcode_for_playback("song.mp3"));
+        assert!(!needs_transcode_for_playback("song.wav"));
+        assert!(!needs_transcode_for_playback("song.flac"));
+        assert!(!needs_transcode_for_playback("song.ogg"));
+        assert!(!needs_transcode_for_playback("song.m4a"));
+        assert!(!needs_transcode_for_playback("song.aac"));
+        assert!(!needs_transcode_for_playback("song.aiff"));
+        assert!(!needs_transcode_for_playback("song.alac"));
+        assert!(!needs_transcode_for_playback("song.opus"));
+        // Case insensitive
+        assert!(!needs_transcode_for_playback("song.FLAC"));
+        assert!(!needs_transcode_for_playback("song.M4A"));
+    }
+
+    #[test]
+    fn needs_transcode_unsupported_formats() {
+        // WMA and unknown formats still need transcode
+        assert!(needs_transcode_for_playback("song.wma"));
+        assert!(needs_transcode_for_playback("song.xyz"));
+        assert!(needs_transcode_for_playback("noext"));
+    }
 }
