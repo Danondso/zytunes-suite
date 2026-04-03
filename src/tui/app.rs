@@ -556,22 +556,8 @@ impl App {
 
     /// Re-tag the currently displayed track list using precomputed device sets.
     fn retag_on_device(&mut self) {
-        self.sync.log.push(format!(
-            "[on-device] retag: dev={} lib={}",
-            self.device.track_set.len(),
-            self.track_list.len()
-        ));
         for t in &mut self.track_list {
-            let was = t.on_device;
             t.on_device = is_on_device(&t.artist, &t.name, &self.device);
-            if t.on_device != was {
-                self.sync.log.push(format!(
-                    "[on-device] {} {:?} - {:?}",
-                    if t.on_device { "MATCH" } else { "MISS" },
-                    t.artist,
-                    t.name
-                ));
-            }
         }
     }
 
@@ -586,24 +572,24 @@ impl App {
         if self.device.status != DeviceStatus::Connected || self.device.track_set.is_empty() {
             return;
         }
-        for artist in lib.artists() {
-            let tracks = lib.artist_tracks(artist);
-            if tracks.is_empty() {
-                continue;
+        let mut counts: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+        for t in lib.all_tracks() {
+            let entry = counts.entry(t.artist.clone()).or_default();
+            entry.1 += 1;
+            if is_on_device(&t.artist, &t.name, &self.device) {
+                entry.0 += 1;
             }
-            let on_device_count = tracks
-                .iter()
-                .filter(|t| is_on_device(&t.artist, &t.name, &self.device))
-                .count();
-            let status = if on_device_count == 0 {
+        }
+        for (artist, (on_device, total)) in counts {
+            let status = if on_device == 0 {
                 DevicePresence::None
-            } else if on_device_count >= tracks.len() {
+            } else if on_device >= total {
                 DevicePresence::Full
             } else {
                 DevicePresence::Partial
             };
             if status != DevicePresence::None {
-                self.artist_device_status.insert(artist.to_string(), status);
+                self.artist_device_status.insert(artist, status);
             }
         }
     }
@@ -612,6 +598,9 @@ impl App {
         self.device.artists.clear();
         self.device.albums.clear();
         self.device.album_tracks.clear();
+        self.device.track_set.clear();
+        self.device.artist_track_names.clear();
+        self.artist_device_status.clear();
         if self.browse_mode == BrowseMode::Device {
             self.browse_mode = BrowseMode::Library;
             self.refresh_sidebar();
@@ -868,7 +857,7 @@ impl App {
             SidebarMode::Albums => {
                 self.album_list.clear();
                 self.track_list = if let Some((_, album)) = item.split_once(" \u{2014} ") {
-                    tracks_to_info(lib.album_tracks(album), &self.device, &mut self.sync.log)
+                    tracks_to_info(lib.album_tracks(album), &self.device)
                 } else {
                     Vec::new()
                 };
@@ -881,7 +870,7 @@ impl App {
                 self.album_list.clear();
                 let name = item.rfind(" (").map(|pos| &item[..pos]).unwrap_or(&item);
                 let tracks = lib.playlist_tracks(name);
-                self.track_list = tracks_to_info(tracks, &self.device, &mut self.sync.log);
+                self.track_list = tracks_to_info(tracks, &self.device);
                 self.sort_tracks();
                 self.track_selected = 0;
                 self.track_scroll = 0;
@@ -966,7 +955,6 @@ impl App {
         self.track_list = tracks_to_info(
             lib.album_tracks_by_artist(&album.artist, &album.name),
             &self.device,
-            &mut self.sync.log,
         );
         // Sort by disc number then track number for album views.
         self.track_list.sort_by(|a, b| {
@@ -1639,24 +1627,11 @@ fn first_char_upper(s: &str) -> char {
         .unwrap_or(' ')
 }
 
-fn tracks_to_info(
-    tracks: Vec<&Track>,
-    device: &DeviceState,
-    log: &mut Vec<String>,
-) -> Vec<TrackInfo> {
-    log.push(format!(
-        "[on-device] tracks_to_info: {} tracks, set={}, status={:?}",
-        tracks.len(),
-        device.track_set.len(),
-        device.status
-    ));
+fn tracks_to_info(tracks: Vec<&Track>, device: &DeviceState) -> Vec<TrackInfo> {
     tracks
         .into_iter()
         .map(|t| {
             let on_device = is_on_device(&t.artist, &t.name, device);
-            if on_device {
-                log.push(format!("[on-device] MATCH: {} - {}", t.artist, t.name));
-            }
             TrackInfo {
                 name: t.name.clone(),
                 artist: t.artist.clone(),

@@ -363,7 +363,7 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
             } else {
                 ("", style)
             };
-            let max_name = inner.width as usize - cursor.len() - icon.len() - 1;
+            let max_name = inner.width as usize - cursor.len() - icon.chars().count() - 1;
             let line = Line::from(vec![
                 Span::styled(cursor, style),
                 Span::styled(icon, icon_style),
@@ -1469,7 +1469,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect, footer_left_width: u16) {
     let right = if app.browse_mode == BrowseMode::Device {
         "v:library | a:queue rm | D:delete | C:clr | ?:help".to_string()
     } else if app.device.status == DeviceStatus::Connected {
-        "✓ = on device | v:device | a:add | S:sync | q:quit | ?:help".to_string()
+        "✓=synced ◐=partial | v:device | a:add | S:sync | q:quit | ?:help".to_string()
     } else {
         "v:device | a:add | S:sync | q:quit | ?:help".to_string()
     };
