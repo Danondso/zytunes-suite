@@ -1,5 +1,5 @@
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::block::BorderType;
+use ratatui::widgets::BorderType;
 use ratatui::widgets::{Block, Borders};
 
 // Modifier bit constants for const-compatible theme presets.
