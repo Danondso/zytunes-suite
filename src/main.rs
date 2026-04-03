@@ -1,8 +1,8 @@
 use zytunes::library::ItunesLibrary;
 use zytunes::mtp::DeviceSession;
 use zytunes::{
-    collect_music_files, connect, find_matching_tracks, library_xml_path,
-    make_transcode_temp_dir, needs_transcoding, sync_to_device, transcode_and_import,
+    collect_music_files, connect, find_matching_tracks, library_xml_path, make_transcode_temp_dir,
+    needs_transcoding, sync_to_device, transcode_and_import,
 };
 
 use std::collections::HashMap;
@@ -36,10 +36,7 @@ fn run(args: &[String]) -> Result<(), String> {
         }
         "library" => {
             let default = library_xml_path();
-            let xml_path = args
-                .get(2)
-                .map(|s| s.as_str())
-                .unwrap_or(&default);
+            let xml_path = args.get(2).map(|s| s.as_str()).unwrap_or(&default);
             cmd_library(xml_path, args.get(3).map(|s| s.as_str()))
         }
         "sync" => {

@@ -16,7 +16,10 @@ fn main() {
     eprintln!("Root: {} objects", root_handles.len());
     for h in &root_handles {
         if let Ok(info) = session.get_object_info(*h) {
-            eprintln!("  {} (0x{:04x}) {}", info.filename, info.object_format, info.compressed_size);
+            eprintln!(
+                "  {} (0x{:04x}) {}",
+                info.filename, info.object_format, info.compressed_size
+            );
         }
     }
 

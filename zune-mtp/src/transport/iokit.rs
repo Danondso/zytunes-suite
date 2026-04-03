@@ -51,8 +51,16 @@ impl IokitTransport {
             kCFNumberSInt32Type,
             &(product_id as i32) as *const i32 as *const c_void,
         );
-        CFDictionarySetValue(matching, vendor_key as *const c_void, vendor_num as *const c_void);
-        CFDictionarySetValue(matching, product_key as *const c_void, product_num as *const c_void);
+        CFDictionarySetValue(
+            matching,
+            vendor_key as *const c_void,
+            vendor_num as *const c_void,
+        );
+        CFDictionarySetValue(
+            matching,
+            product_key as *const c_void,
+            product_num as *const c_void,
+        );
         CFRelease(vendor_key as CFTypeRef);
         CFRelease(product_key as CFTypeRef);
         CFRelease(vendor_num as CFTypeRef);
@@ -65,7 +73,9 @@ impl IokitTransport {
             &mut iterator,
         );
         if kr != kIOReturnSuccess {
-            return Err(MtpError::Usb(format!("IOServiceGetMatchingServices failed: {kr}")));
+            return Err(MtpError::Usb(format!(
+                "IOServiceGetMatchingServices failed: {kr}"
+            )));
         }
 
         let service = IOIteratorNext(iterator);
@@ -94,7 +104,9 @@ impl IokitTransport {
         CFRelease(plugin_iface_id as CFTypeRef);
 
         if kr != kIOReturnSuccess || plugin.is_null() {
-            return Err(MtpError::Usb(format!("IOCreatePlugInInterfaceForService failed: {kr}")));
+            return Err(MtpError::Usb(format!(
+                "IOCreatePlugInInterfaceForService failed: {kr}"
+            )));
         }
 
         // Query for the device interface.
@@ -108,7 +120,9 @@ impl IokitTransport {
         ((**plugin).Release)(plugin);
 
         if hr != 0 || device.is_null() {
-            return Err(MtpError::Usb(format!("QueryInterface for device failed: {hr}")));
+            return Err(MtpError::Usb(format!(
+                "QueryInterface for device failed: {hr}"
+            )));
         }
 
         // Open the device.
@@ -140,7 +154,9 @@ impl IokitTransport {
         if kr != kIOReturnSuccess {
             ((**device).USBDeviceClose)(device);
             ((**device).Release)(device);
-            return Err(MtpError::Usb(format!("CreateInterfaceIterator failed: 0x{kr:08x}")));
+            return Err(MtpError::Usb(format!(
+                "CreateInterfaceIterator failed: 0x{kr:08x}"
+            )));
         }
 
         let iface_service = IOIteratorNext(iface_iterator);
@@ -154,18 +170,23 @@ impl IokitTransport {
                 bAlternateSetting: 0xFFFF,
             };
             let mut iface_iterator2: io_iterator_t = 0;
-            let kr = ((**device).CreateInterfaceIterator)(device, &request_any, &mut iface_iterator2);
+            let kr =
+                ((**device).CreateInterfaceIterator)(device, &request_any, &mut iface_iterator2);
             if kr != kIOReturnSuccess {
                 ((**device).USBDeviceClose)(device);
                 ((**device).Release)(device);
-                return Err(MtpError::Usb("No USB interfaces found on device".to_string()));
+                return Err(MtpError::Usb(
+                    "No USB interfaces found on device".to_string(),
+                ));
             }
             let iface_service2 = IOIteratorNext(iface_iterator2);
             IOObjectRelease(iface_iterator2);
             if iface_service2 == 0 {
                 ((**device).USBDeviceClose)(device);
                 ((**device).Release)(device);
-                return Err(MtpError::Usb("No USB interfaces found on device".to_string()));
+                return Err(MtpError::Usb(
+                    "No USB interfaces found on device".to_string(),
+                ));
             }
             return Self::open_interface(device, iface_service2);
         }
@@ -197,7 +218,9 @@ impl IokitTransport {
         if kr != kIOReturnSuccess || plugin.is_null() {
             ((**device).USBDeviceClose)(device);
             ((**device).Release)(device);
-            return Err(MtpError::Usb(format!("IOCreatePlugInInterfaceForService (interface) failed: {kr}")));
+            return Err(MtpError::Usb(format!(
+                "IOCreatePlugInInterfaceForService (interface) failed: {kr}"
+            )));
         }
 
         // Query for the interface interface.
@@ -213,7 +236,9 @@ impl IokitTransport {
         if hr != 0 || interface.is_null() {
             ((**device).USBDeviceClose)(device);
             ((**device).Release)(device);
-            return Err(MtpError::Usb(format!("QueryInterface for interface failed: {hr}")));
+            return Err(MtpError::Usb(format!(
+                "QueryInterface for interface failed: {hr}"
+            )));
         }
 
         // Open the interface.
@@ -222,7 +247,9 @@ impl IokitTransport {
             ((**interface).Release)(interface);
             ((**device).USBDeviceClose)(device);
             ((**device).Release)(device);
-            return Err(MtpError::Usb(format!("USBInterfaceOpen failed: 0x{kr:08x}")));
+            return Err(MtpError::Usb(format!(
+                "USBInterfaceOpen failed: 0x{kr:08x}"
+            )));
         }
 
         // Discover bulk endpoints.
@@ -268,7 +295,9 @@ impl IokitTransport {
             ((**interface).Release)(interface);
             ((**device).USBDeviceClose)(device);
             ((**device).Release)(device);
-            return Err(MtpError::Usb("Could not find bulk IN/OUT endpoints".to_string()));
+            return Err(MtpError::Usb(
+                "Could not find bulk IN/OUT endpoints".to_string(),
+            ));
         }
 
         Ok(IokitTransport {
@@ -378,12 +407,7 @@ impl IokitTransport {
             let mut locked = buf_clone.lock().unwrap();
             let mut size = locked.len() as UInt32;
             let kr = unsafe {
-                ((**iface).ReadPipe)(
-                    iface,
-                    pipe,
-                    locked.as_mut_ptr() as *mut c_void,
-                    &mut size,
-                )
+                ((**iface).ReadPipe)(iface, pipe, locked.as_mut_ptr() as *mut c_void, &mut size)
             };
             let r = if kr != kIOReturnSuccess {
                 Err(kr)
@@ -401,7 +425,9 @@ impl IokitTransport {
                     ((**self.interface).AbortPipe)(self.interface, self.pipe_in);
                 }
                 let _ = handle.join();
-                return Err(MtpError::Usb(format!("ReadPipe timed out ({timeout_secs}s)")));
+                return Err(MtpError::Usb(format!(
+                    "ReadPipe timed out ({timeout_secs}s)"
+                )));
             }
             if let Some(r) = result.lock().unwrap().take() {
                 let _ = handle.join();

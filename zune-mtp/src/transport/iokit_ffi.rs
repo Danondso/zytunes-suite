@@ -4,7 +4,13 @@
 //! IOKit USB uses COM-like vtable interfaces: each "interface" is a pointer
 //! to a pointer to a vtable of function pointers.
 
-#![allow(non_camel_case_types, non_upper_case_globals, non_snake_case, dead_code, improper_ctypes)]
+#![allow(
+    non_camel_case_types,
+    non_upper_case_globals,
+    non_snake_case,
+    dead_code,
+    improper_ctypes
+)]
 
 use std::os::raw::{c_char, c_int, c_void};
 
@@ -79,12 +85,9 @@ pub struct IOUSBDeviceInterface {
         unsafe extern "C" fn(*mut *mut IOUSBDeviceInterface) -> CFRunLoopSourceRef,
     pub CreateDeviceAsyncPort:
         unsafe extern "C" fn(*mut *mut IOUSBDeviceInterface, *mut mach_port_t) -> IOReturn,
-    pub GetDeviceAsyncPort:
-        unsafe extern "C" fn(*mut *mut IOUSBDeviceInterface) -> mach_port_t,
-    pub USBDeviceOpen:
-        unsafe extern "C" fn(*mut *mut IOUSBDeviceInterface) -> IOReturn,
-    pub USBDeviceClose:
-        unsafe extern "C" fn(*mut *mut IOUSBDeviceInterface) -> IOReturn,
+    pub GetDeviceAsyncPort: unsafe extern "C" fn(*mut *mut IOUSBDeviceInterface) -> mach_port_t,
+    pub USBDeviceOpen: unsafe extern "C" fn(*mut *mut IOUSBDeviceInterface) -> IOReturn,
+    pub USBDeviceClose: unsafe extern "C" fn(*mut *mut IOUSBDeviceInterface) -> IOReturn,
     pub GetDeviceClass:
         unsafe extern "C" fn(*mut *mut IOUSBDeviceInterface, *mut UInt8) -> IOReturn,
     pub GetDeviceSubClass:
@@ -111,28 +114,23 @@ pub struct IOUSBDeviceInterface {
         unsafe extern "C" fn(*mut *mut IOUSBDeviceInterface, UInt8, *mut *const c_void) -> IOReturn,
     pub GetConfiguration:
         unsafe extern "C" fn(*mut *mut IOUSBDeviceInterface, *mut UInt8) -> IOReturn,
-    pub SetConfiguration:
-        unsafe extern "C" fn(*mut *mut IOUSBDeviceInterface, UInt8) -> IOReturn,
+    pub SetConfiguration: unsafe extern "C" fn(*mut *mut IOUSBDeviceInterface, UInt8) -> IOReturn,
     pub GetBusFrameNumber:
         unsafe extern "C" fn(*mut *mut IOUSBDeviceInterface, *mut u64, *mut u64) -> IOReturn,
-    pub ResetDevice:
-        unsafe extern "C" fn(*mut *mut IOUSBDeviceInterface) -> IOReturn,
+    pub ResetDevice: unsafe extern "C" fn(*mut *mut IOUSBDeviceInterface) -> IOReturn,
     pub DeviceRequest:
         unsafe extern "C" fn(*mut *mut IOUSBDeviceInterface, *mut IOUSBDevRequest) -> IOReturn,
     pub DeviceRequestAsync: *const c_void,
-    pub CreateInterfaceIterator:
-        unsafe extern "C" fn(
-            *mut *mut IOUSBDeviceInterface,
-            *const IOUSBFindInterfaceRequest,
-            *mut io_iterator_t,
-        ) -> IOReturn,
+    pub CreateInterfaceIterator: unsafe extern "C" fn(
+        *mut *mut IOUSBDeviceInterface,
+        *const IOUSBFindInterfaceRequest,
+        *mut io_iterator_t,
+    ) -> IOReturn,
     // IOUSBDeviceInterface182 extension methods:
-    pub USBDeviceOpenSeize:
-        unsafe extern "C" fn(*mut *mut IOUSBDeviceInterface) -> IOReturn,
+    pub USBDeviceOpenSeize: unsafe extern "C" fn(*mut *mut IOUSBDeviceInterface) -> IOReturn,
     pub DeviceRequestTO: *const c_void,
     pub DeviceRequestAsyncTO: *const c_void,
-    pub USBDeviceSuspend:
-        unsafe extern "C" fn(*mut *mut IOUSBDeviceInterface, u8) -> IOReturn,
+    pub USBDeviceSuspend: unsafe extern "C" fn(*mut *mut IOUSBDeviceInterface, u8) -> IOReturn,
 }
 
 #[repr(C)]
@@ -167,18 +165,18 @@ pub struct IOUSBInterfaceInterface {
     pub AddRef: unsafe extern "C" fn(*mut *mut IOUSBInterfaceInterface) -> u32,
     pub Release: unsafe extern "C" fn(*mut *mut IOUSBInterfaceInterface) -> u32,
     // IOUSBInterfaceInterface methods (no IOCFPLUGINBASE)
-    pub CreateInterfaceAsyncEventSource:
-        unsafe extern "C" fn(*mut *mut IOUSBInterfaceInterface, *mut CFRunLoopSourceRef) -> IOReturn,
+    pub CreateInterfaceAsyncEventSource: unsafe extern "C" fn(
+        *mut *mut IOUSBInterfaceInterface,
+        *mut CFRunLoopSourceRef,
+    ) -> IOReturn,
     pub GetInterfaceAsyncEventSource:
         unsafe extern "C" fn(*mut *mut IOUSBInterfaceInterface) -> CFRunLoopSourceRef,
     pub CreateInterfaceAsyncPort:
         unsafe extern "C" fn(*mut *mut IOUSBInterfaceInterface, *mut mach_port_t) -> IOReturn,
     pub GetInterfaceAsyncPort:
         unsafe extern "C" fn(*mut *mut IOUSBInterfaceInterface) -> mach_port_t,
-    pub USBInterfaceOpen:
-        unsafe extern "C" fn(*mut *mut IOUSBInterfaceInterface) -> IOReturn,
-    pub USBInterfaceClose:
-        unsafe extern "C" fn(*mut *mut IOUSBInterfaceInterface) -> IOReturn,
+    pub USBInterfaceOpen: unsafe extern "C" fn(*mut *mut IOUSBInterfaceInterface) -> IOReturn,
+    pub USBInterfaceClose: unsafe extern "C" fn(*mut *mut IOUSBInterfaceInterface) -> IOReturn,
     pub GetInterfaceClass:
         unsafe extern "C" fn(*mut *mut IOUSBInterfaceInterface, *mut UInt8) -> IOReturn,
     pub GetInterfaceSubClass:
@@ -207,37 +205,36 @@ pub struct IOUSBInterfaceInterface {
         unsafe extern "C" fn(*mut *mut IOUSBInterfaceInterface, UInt8) -> IOReturn,
     pub GetBusFrameNumber:
         unsafe extern "C" fn(*mut *mut IOUSBInterfaceInterface, *mut u64, *mut u64) -> IOReturn,
-    pub ControlRequest:
-        unsafe extern "C" fn(*mut *mut IOUSBInterfaceInterface, UInt8, *mut IOUSBDevRequest) -> IOReturn,
+    pub ControlRequest: unsafe extern "C" fn(
+        *mut *mut IOUSBInterfaceInterface,
+        UInt8,
+        *mut IOUSBDevRequest,
+    ) -> IOReturn,
     pub ControlRequestAsync: *const c_void,
     pub GetPipeProperties: unsafe extern "C" fn(
         *mut *mut IOUSBInterfaceInterface,
-        UInt8,          // pipe ref (1-based)
-        *mut UInt8,     // direction
-        *mut UInt8,     // number
-        *mut UInt8,     // transfer type
-        *mut UInt16,    // max packet size
-        *mut UInt8,     // interval
+        UInt8,       // pipe ref (1-based)
+        *mut UInt8,  // direction
+        *mut UInt8,  // number
+        *mut UInt8,  // transfer type
+        *mut UInt16, // max packet size
+        *mut UInt8,  // interval
     ) -> IOReturn,
-    pub GetPipeStatus:
-        unsafe extern "C" fn(*mut *mut IOUSBInterfaceInterface, UInt8) -> IOReturn,
-    pub AbortPipe:
-        unsafe extern "C" fn(*mut *mut IOUSBInterfaceInterface, UInt8) -> IOReturn,
-    pub ResetPipe:
-        unsafe extern "C" fn(*mut *mut IOUSBInterfaceInterface, UInt8) -> IOReturn,
-    pub ClearPipeStall:
-        unsafe extern "C" fn(*mut *mut IOUSBInterfaceInterface, UInt8) -> IOReturn,
+    pub GetPipeStatus: unsafe extern "C" fn(*mut *mut IOUSBInterfaceInterface, UInt8) -> IOReturn,
+    pub AbortPipe: unsafe extern "C" fn(*mut *mut IOUSBInterfaceInterface, UInt8) -> IOReturn,
+    pub ResetPipe: unsafe extern "C" fn(*mut *mut IOUSBInterfaceInterface, UInt8) -> IOReturn,
+    pub ClearPipeStall: unsafe extern "C" fn(*mut *mut IOUSBInterfaceInterface, UInt8) -> IOReturn,
     pub ReadPipe: unsafe extern "C" fn(
         *mut *mut IOUSBInterfaceInterface,
-        UInt8,          // pipe ref
-        *mut c_void,    // buffer
-        *mut UInt32,    // size (in/out)
+        UInt8,       // pipe ref
+        *mut c_void, // buffer
+        *mut UInt32, // size (in/out)
     ) -> IOReturn,
     pub WritePipe: unsafe extern "C" fn(
         *mut *mut IOUSBInterfaceInterface,
-        UInt8,          // pipe ref
-        *const c_void,  // buffer
-        UInt32,         // size
+        UInt8,         // pipe ref
+        *const c_void, // buffer
+        UInt32,        // size
     ) -> IOReturn,
 }
 

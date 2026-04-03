@@ -1,5 +1,5 @@
-use zune_mtp::{MtpSession, MtpzKeys};
 use std::time::Instant;
+use zune_mtp::{MtpSession, MtpzKeys};
 
 fn main() {
     let log = |msg: &str| eprintln!("  {msg}");
@@ -16,13 +16,20 @@ fn main() {
     let root = session.get_object_handles(sid, 0xFFFFFFFF).unwrap();
     let music_handle = root.iter().find_map(|h| {
         session.get_object_info(*h).ok().and_then(|info| {
-            if info.filename == "Music" { Some(*h) } else { None }
+            if info.filename == "Music" {
+                Some(*h)
+            } else {
+                None
+            }
         })
     });
 
     let music = match music_handle {
         Some(h) => h,
-        None => { eprintln!("No Music folder found"); return; }
+        None => {
+            eprintln!("No Music folder found");
+            return;
+        }
     };
 
     eprintln!("Found Music folder (handle {}), listing tracks...", music);
@@ -38,13 +45,17 @@ fn main() {
             Ok(i) => i,
             Err(_) => continue,
         };
-        let albums = session.get_object_handles(sid, *artist_handle).unwrap_or_default();
+        let albums = session
+            .get_object_handles(sid, *artist_handle)
+            .unwrap_or_default();
         for album_handle in &albums {
             let album_info = match session.get_object_info(*album_handle) {
                 Ok(i) => i,
                 Err(_) => continue,
             };
-            let tracks = session.get_object_handles(sid, *album_handle).unwrap_or_default();
+            let tracks = session
+                .get_object_handles(sid, *album_handle)
+                .unwrap_or_default();
             for track_handle in &tracks {
                 let track_info = match session.get_object_info(*track_handle) {
                     Ok(i) => i,
@@ -55,8 +66,10 @@ fn main() {
                     if total_tracks <= 3 {
                         eprintln!(
                             "  {}/{}/{} ({})",
-                            artist_info.filename, album_info.filename,
-                            track_info.filename, track_info.compressed_size
+                            artist_info.filename,
+                            album_info.filename,
+                            track_info.filename,
+                            track_info.compressed_size
                         );
                     }
                 }
@@ -68,5 +81,9 @@ fn main() {
     }
 
     let elapsed = start.elapsed();
-    eprintln!("\n{} tracks found in {:.1}s", total_tracks, elapsed.as_secs_f64());
+    eprintln!(
+        "\n{} tracks found in {:.1}s",
+        total_tracks,
+        elapsed.as_secs_f64()
+    );
 }

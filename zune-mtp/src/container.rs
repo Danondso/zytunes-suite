@@ -115,8 +115,7 @@ impl ContainerHeader {
 
     /// Returns true if the response code indicates success.
     pub fn is_ok(&self) -> bool {
-        self.code == ResponseCode::Ok as u16
-            || self.code == ResponseCode::SessionAlreadyOpen as u16
+        self.code == ResponseCode::Ok as u16 || self.code == ResponseCode::SessionAlreadyOpen as u16
     }
 }
 
@@ -188,22 +187,32 @@ mod tests {
     fn build_command_zero_params_bytes() {
         let cmd = build_command(OperationCode::GetDeviceInfo, 7, &[]);
         // 12 bytes: length(4) + type(2) + code(2) + tid(4)
-        assert_eq!(cmd, [
-            12, 0, 0, 0,       // length = 12
-            0x01, 0x00,        // type = Command (1)
-            0x01, 0x10,        // code = GetDeviceInfo (0x1001)
-            7, 0, 0, 0,        // transaction_id = 7
-        ]);
+        assert_eq!(
+            cmd,
+            [
+                12, 0, 0, 0, // length = 12
+                0x01, 0x00, // type = Command (1)
+                0x01, 0x10, // code = GetDeviceInfo (0x1001)
+                7, 0, 0, 0, // transaction_id = 7
+            ]
+        );
     }
 
     #[test]
     fn build_command_two_params_bytes() {
-        let cmd = build_command(OperationCode::GetObjectHandles, 3, &[0x00010001, 0x00000000]);
+        let cmd = build_command(
+            OperationCode::GetObjectHandles,
+            3,
+            &[0x00010001, 0x00000000],
+        );
         assert_eq!(cmd.len(), 20); // 12 header + 8 params
-        // Header
+                                   // Header
         assert_eq!(&cmd[0..4], &20u32.to_le_bytes());
         assert_eq!(&cmd[4..6], &(ContainerType::Command as u16).to_le_bytes());
-        assert_eq!(&cmd[6..8], &(OperationCode::GetObjectHandles as u16).to_le_bytes());
+        assert_eq!(
+            &cmd[6..8],
+            &(OperationCode::GetObjectHandles as u16).to_le_bytes()
+        );
         assert_eq!(&cmd[8..12], &3u32.to_le_bytes());
         // Params
         assert_eq!(&cmd[12..16], &0x00010001u32.to_le_bytes());
@@ -214,13 +223,16 @@ mod tests {
     fn build_data_bytes() {
         let payload = [0xDE, 0xAD, 0xBE, 0xEF];
         let data = build_data(OperationCode::SendObject, 10, &payload);
-        assert_eq!(data, [
-            16, 0, 0, 0,       // length = 16 (12 + 4)
-            0x02, 0x00,        // type = Data (2)
-            0x0d, 0x10,        // code = SendObject (0x100d)
-            10, 0, 0, 0,       // transaction_id = 10
-            0xDE, 0xAD, 0xBE, 0xEF, // payload
-        ]);
+        assert_eq!(
+            data,
+            [
+                16, 0, 0, 0, // length = 16 (12 + 4)
+                0x02, 0x00, // type = Data (2)
+                0x0d, 0x10, // code = SendObject (0x100d)
+                10, 0, 0, 0, // transaction_id = 10
+                0xDE, 0xAD, 0xBE, 0xEF, // payload
+            ]
+        );
     }
 
     #[test]

@@ -79,7 +79,11 @@ impl PropListBuilder {
     /// Format: [u8 num_chars_including_null] [u16 chars...] [u16 null]
     fn write_mtp_string(&mut self, s: &str) {
         let chars: Vec<u16> = s.encode_utf16().collect();
-        debug_assert!(chars.len() < 255, "MTP string too long ({} chars), would truncate on cast to u8", chars.len());
+        debug_assert!(
+            chars.len() < 255,
+            "MTP string too long ({} chars), would truncate on cast to u8",
+            chars.len()
+        );
         let num_chars = (chars.len() + 1) as u8; // +1 for null terminator
         self.data.push(num_chars);
         for ch in &chars {
@@ -112,8 +116,14 @@ mod tests {
         assert_eq!(pl.len(), 16);
         assert_eq!(u32::from_le_bytes(pl[0..4].try_into().unwrap()), 1); // count
         assert_eq!(u32::from_le_bytes(pl[4..8].try_into().unwrap()), 0); // handle
-        assert_eq!(u16::from_le_bytes(pl[8..10].try_into().unwrap()), PROP_ARTIST_ID);
-        assert_eq!(u16::from_le_bytes(pl[10..12].try_into().unwrap()), DATATYPE_UINT32);
+        assert_eq!(
+            u16::from_le_bytes(pl[8..10].try_into().unwrap()),
+            PROP_ARTIST_ID
+        );
+        assert_eq!(
+            u16::from_le_bytes(pl[10..12].try_into().unwrap()),
+            DATATYPE_UINT32
+        );
         assert_eq!(u32::from_le_bytes(pl[12..16].try_into().unwrap()), 42);
     }
 

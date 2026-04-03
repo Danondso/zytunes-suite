@@ -55,7 +55,8 @@ impl MtpzKeys {
 
     /// Load from the default location ~/.mtpz-data.
     pub fn load_default() -> Result<Self, MtpError> {
-        let home = std::env::var("HOME").map_err(|_| MtpError::KeyLoad("HOME not set".to_string()))?;
+        let home =
+            std::env::var("HOME").map_err(|_| MtpError::KeyLoad("HOME not set".to_string()))?;
         Self::load(&format!("{home}/.mtpz-data"))
     }
 
@@ -145,7 +146,10 @@ impl MtpzKeys {
 
     fn aes_decrypt(key: &[u8], data: &[u8]) -> Result<Vec<u8>, MtpError> {
         if key.len() != 16 {
-            return Err(MtpError::Crypto(format!("AES key must be 16 bytes, got {}", key.len())));
+            return Err(MtpError::Crypto(format!(
+                "AES key must be 16 bytes, got {}",
+                key.len()
+            )));
         }
         let iv = [0u8; 16];
         let mut buf = data.to_vec();
@@ -185,7 +189,9 @@ impl MtpzKeys {
         let sig_size = ((response[pos] as usize) << 8) | (response[pos + 1] as usize);
         pos += 2;
         if sig_size < 0x80 || sig_size != rsa_size {
-            return Err(MtpError::Crypto(format!("Invalid signature size: {sig_size}")));
+            return Err(MtpError::Crypto(format!(
+                "Invalid signature size: {sig_size}"
+            )));
         }
 
         let sig_data = &response[pos..pos + sig_size];
@@ -206,7 +212,9 @@ impl MtpzKeys {
         let aes_key: Vec<u8> = signature[0x70..].to_vec();
 
         if pos + 4 > response.len() {
-            return Err(MtpError::Crypto("Response too short for payload header".to_string()));
+            return Err(MtpError::Crypto(
+                "Response too short for payload header".to_string(),
+            ));
         }
         if response[pos] != 0 || response[pos + 1] != 0 {
             return Err(MtpError::Crypto("Invalid payload record".to_string()));
@@ -216,19 +224,25 @@ impl MtpzKeys {
         pos += 2;
 
         if pos + payload_size > response.len() {
-            return Err(MtpError::Crypto("Response too short for payload".to_string()));
+            return Err(MtpError::Crypto(
+                "Response too short for payload".to_string(),
+            ));
         }
 
         let payload = Self::aes_decrypt(&aes_key, &response[pos..pos + payload_size])?;
 
         let mut pp = 0;
         if payload.is_empty() || payload[pp] != 1 {
-            return Err(MtpError::Crypto("Decryption failed (bad payload marker)".to_string()));
+            return Err(MtpError::Crypto(
+                "Decryption failed (bad payload marker)".to_string(),
+            ));
         }
         pp += 1;
 
         if pp + 4 > payload.len() {
-            return Err(MtpError::Crypto("Payload too short for cert size".to_string()));
+            return Err(MtpError::Crypto(
+                "Payload too short for cert size".to_string(),
+            ));
         }
         let cert_size = ((payload[pp] as usize) << 24)
             | ((payload[pp + 1] as usize) << 16)
@@ -238,15 +252,21 @@ impl MtpzKeys {
         pp += cert_size;
 
         if pp + 2 > payload.len() {
-            return Err(MtpError::Crypto("Payload too short for challenge size".to_string()));
+            return Err(MtpError::Crypto(
+                "Payload too short for challenge size".to_string(),
+            ));
         }
         let challenge_size = ((payload[pp] as usize) << 8) | (payload[pp + 1] as usize);
         pp += 2;
         if challenge_size != original_challenge.len() {
-            return Err(MtpError::Crypto(format!("Challenge size mismatch: {challenge_size}")));
+            return Err(MtpError::Crypto(format!(
+                "Challenge size mismatch: {challenge_size}"
+            )));
         }
         if pp + challenge_size > payload.len() {
-            return Err(MtpError::Crypto("Payload too short for challenge".to_string()));
+            return Err(MtpError::Crypto(
+                "Payload too short for challenge".to_string(),
+            ));
         }
         if &payload[pp..pp + challenge_size] != original_challenge {
             return Err(MtpError::Crypto("Challenge does not match!".to_string()));
@@ -254,17 +274,24 @@ impl MtpzKeys {
         pp += challenge_size;
 
         if pp + 2 > payload.len() {
-            return Err(MtpError::Crypto("Payload too short for device challenge".to_string()));
+            return Err(MtpError::Crypto(
+                "Payload too short for device challenge".to_string(),
+            ));
         }
         let dev_challenge_size = ((payload[pp] as usize) << 8) | (payload[pp + 1] as usize);
         pp += 2;
         pp += dev_challenge_size;
 
         if pp + 3 > payload.len() {
-            return Err(MtpError::Crypto("Payload too short for signature header".to_string()));
+            return Err(MtpError::Crypto(
+                "Payload too short for signature header".to_string(),
+            ));
         }
         if payload[pp] != 1 {
-            return Err(MtpError::Crypto(format!("Invalid signature marker: 0x{:02x} at pp={}", payload[pp], pp)));
+            return Err(MtpError::Crypto(format!(
+                "Invalid signature marker: 0x{:02x} at pp={}",
+                payload[pp], pp
+            )));
         }
         pp += 1;
         let dev_sig_size = ((payload[pp] as usize) << 8) | (payload[pp + 1] as usize);
@@ -272,16 +299,23 @@ impl MtpzKeys {
         pp += dev_sig_size;
 
         if pp + 3 > payload.len() {
-            return Err(MtpError::Crypto("Payload too short for CMAC header".to_string()));
+            return Err(MtpError::Crypto(
+                "Payload too short for CMAC header".to_string(),
+            ));
         }
         if payload[pp] != 1 {
-            return Err(MtpError::Crypto(format!("Invalid CMAC record marker: 0x{:02x} at pp={}", payload[pp], pp)));
+            return Err(MtpError::Crypto(format!(
+                "Invalid CMAC record marker: 0x{:02x} at pp={}",
+                payload[pp], pp
+            )));
         }
         pp += 1;
         let cmac_size = ((payload[pp] as usize) << 8) | (payload[pp + 1] as usize);
         pp += 2;
         if pp + cmac_size > payload.len() {
-            return Err(MtpError::Crypto("Payload too short for CMAC key".to_string()));
+            return Err(MtpError::Crypto(
+                "Payload too short for CMAC key".to_string(),
+            ));
         }
 
         Ok(payload[pp..pp + cmac_size].to_vec())
@@ -340,8 +374,7 @@ pub fn authenticate(
     session.generic_operation_send(OperationCode::SendWMDRMPDAppRequest, &cert_message, log)?;
 
     log("MTPZ: Getting device response...");
-    let response =
-        session.generic_operation_receive(OperationCode::GetWMDRMPDAppResponse, log)?;
+    let response = session.generic_operation_receive(OperationCode::GetWMDRMPDAppResponse, log)?;
 
     log("MTPZ: Verifying response...");
     let cmac_key = keys.verify_response(&response, &challenge)?;
@@ -377,7 +410,10 @@ mod tests {
 
         let keys = MtpzKeys::load(tmp.path().to_str().unwrap()).unwrap();
         assert_eq!(keys.public_exp, BigUint::from(0x10001u32));
-        assert_eq!(keys.session_key, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+        assert_eq!(
+            keys.session_key,
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        );
         assert_eq!(keys.modulus, BigUint::from(0xDEADBEEFu32));
         assert_eq!(keys.private_exp, BigUint::from(0xCAFEBABEu32));
         assert_eq!(keys.certificate, vec![0xFF, 0x00, 0xFF, 0x00]);
@@ -411,10 +447,8 @@ mod tests {
     #[test]
     fn sign_response_matches_openssl() {
         // Verified against: echo -ne '\x00...\x01' | openssl mac -macopt hexkey:... CMAC
-        let key = hex::decode(
-            "5b77ddd5e97c73b5524874232e1919e109f873d31797a048e733d30bf6e0b6e3",
-        )
-        .unwrap();
+        let key = hex::decode("5b77ddd5e97c73b5524874232e1919e109f873d31797a048e733d30bf6e0b6e3")
+            .unwrap();
         let sig = MtpzKeys::sign_response(&key).unwrap();
         // OpenSSL gives A12CFFDD28A2D859152C5736129B7FFC
         assert_eq!(hex::encode(&sig[4..]), "a12cffdd28a2d859152c5736129b7ffc");
@@ -449,7 +483,7 @@ mod tests {
     fn aes_decrypt_roundtrip() {
         let key = [0x42u8; 16];
         let plaintext = [0u8; 16]; // One AES block
-        // Encrypt: we don't have encrypt, but decrypt of zeros with zero IV is deterministic
+                                   // Encrypt: we don't have encrypt, but decrypt of zeros with zero IV is deterministic
         let result = MtpzKeys::aes_decrypt(&key, &plaintext).unwrap();
         assert_eq!(result.len(), 16);
     }
@@ -466,9 +500,6 @@ mod tests {
         let key = hex::decode("2b7e151628aed2a6abf7158809cf4f3c").unwrap();
         let msg = hex::decode("6bc1bee22e409f96e93d7e117393172a").unwrap();
         let result = MtpzKeys::cmac(&key, &msg).unwrap();
-        assert_eq!(
-            hex::encode(&result),
-            "070a16b46b4d4144f79bdd9dd04a287c"
-        );
+        assert_eq!(hex::encode(&result), "070a16b46b4d4144f79bdd9dd04a287c");
     }
 }

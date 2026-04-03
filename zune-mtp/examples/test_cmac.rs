@@ -14,7 +14,10 @@ fn main() {
 
     println!("CMAC result: {}", hex_result);
     println!("Expected:    070a16b46b4d4144f79bdd9dd04a287c");
-    println!("Match: {}", hex_result == "070a16b46b4d4144f79bdd9dd04a287c");
+    println!(
+        "Match: {}",
+        hex_result == "070a16b46b4d4144f79bdd9dd04a287c"
+    );
 
     // Also test with the same pattern as SignResponse: CMAC of [0..0, 1] with arbitrary key
     let test_key = hex::decode("d2c4208cbb038aa4081644fcf21ba915").unwrap();

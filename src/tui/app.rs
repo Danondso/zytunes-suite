@@ -55,10 +55,7 @@ pub enum DeviceStatus {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SyncStatus {
     Idle,
-    Running {
-        current: usize,
-        total: usize,
-    },
+    Running { current: usize, total: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -214,6 +211,7 @@ pub struct App {
     /// Key used to avoid re-extracting art (e.g. "artist/album").
     album_art_key: String,
     /// Cached halfblock art lines: (char, fg_rgb, bg_rgb) per cell.
+    #[allow(clippy::type_complexity)]
     pub album_art_lines: Vec<Vec<(char, [u8; 3], [u8; 3])>>,
     /// Dimensions (w, h) the cached ASCII art was rendered for.
     album_art_size: (u16, u16),
@@ -285,7 +283,6 @@ impl App {
         }
     }
 
-
     pub fn theme(&self) -> &'static Theme {
         &THEMES[self.theme_index.min(THEMES.len() - 1)]
     }
@@ -298,7 +295,8 @@ impl App {
 
     pub fn theme_picker_move(&mut self, delta: isize) {
         let len = THEMES.len();
-        self.theme_picker_index = (self.theme_picker_index as isize + delta).rem_euclid(len as isize) as usize;
+        self.theme_picker_index =
+            (self.theme_picker_index as isize + delta).rem_euclid(len as isize) as usize;
         self.theme_index = self.theme_picker_index;
     }
 
@@ -426,11 +424,7 @@ impl App {
         });
     }
 
-    pub fn handle_audio_event(
-        &mut self,
-        event: AudioEvent,
-        audio_tx: &mpsc::Sender<AudioCommand>,
-    ) {
+    pub fn handle_audio_event(&mut self, event: AudioEvent, audio_tx: &mpsc::Sender<AudioCommand>) {
         match event {
             AudioEvent::Position { elapsed_ms } => {
                 if let Some(ref mut np) = self.now_playing {
@@ -498,13 +492,15 @@ impl App {
 
             artist_set.insert(artist.clone());
 
-            self.device.albums
+            self.device
+                .albums
                 .entry(artist.clone())
                 .or_default()
                 .push(album.clone());
 
             let key = (artist.clone(), album.clone());
-            self.device.album_tracks
+            self.device
+                .album_tracks
                 .entry(key)
                 .or_default()
                 .push(DeviceTrackInfo {
@@ -571,7 +567,10 @@ impl App {
                 if let Some(album_info) = self.album_list.get(self.album_selected) {
                     let key = (album_info.artist.clone(), album_info.name.clone());
                     if let Some(tracks) = self.device.album_tracks.get(&key) {
-                        return tracks.iter().map(|t| (t.device_path.clone(), t.object_id)).collect();
+                        return tracks
+                            .iter()
+                            .map(|t| (t.device_path.clone(), t.object_id))
+                            .collect();
                     }
                 }
                 Vec::new()
@@ -604,9 +603,15 @@ impl App {
             }
             SidebarMode::Albums => {
                 let (artist, album) = self.resolve_device_artist_album(item);
-                self.device.album_tracks
+                self.device
+                    .album_tracks
                     .get(&(artist, album))
-                    .map(|tracks| tracks.iter().map(|t| (t.device_path.clone(), t.object_id)).collect())
+                    .map(|tracks| {
+                        tracks
+                            .iter()
+                            .map(|t| (t.device_path.clone(), t.object_id))
+                            .collect()
+                    })
                     .unwrap_or_default()
             }
             SidebarMode::Playlists => Vec::new(),
@@ -616,7 +621,9 @@ impl App {
     fn resolve_device_artist_album(&self, item: &str) -> (String, String) {
         match self.sidebar_mode {
             SidebarMode::Artists => {
-                let album = self.album_list.get(self.album_selected)
+                let album = self
+                    .album_list
+                    .get(self.album_selected)
                     .map(|a| a.name.clone())
                     .unwrap_or_default();
                 (item.to_string(), album)
@@ -767,17 +774,16 @@ impl App {
             }
             SidebarMode::Albums => {
                 self.album_list.clear();
-                self.track_list =
-                    if let Some((_, album)) = item.split_once(" \u{2014} ") {
-                        let tracks: Vec<&Track> = lib
-                            .tracks
-                            .values()
-                            .filter(|t| t.album.eq_ignore_ascii_case(album))
-                            .collect();
-                        tracks_to_info(tracks)
-                    } else {
-                        Vec::new()
-                    };
+                self.track_list = if let Some((_, album)) = item.split_once(" \u{2014} ") {
+                    let tracks: Vec<&Track> = lib
+                        .tracks
+                        .values()
+                        .filter(|t| t.album.eq_ignore_ascii_case(album))
+                        .collect();
+                    tracks_to_info(tracks)
+                } else {
+                    Vec::new()
+                };
                 self.sort_tracks();
                 self.track_selected = 0;
                 self.track_scroll = 0;
@@ -804,7 +810,8 @@ impl App {
                         .iter()
                         .map(|album_name| {
                             let count = self
-                                .device.album_tracks
+                                .device
+                                .album_tracks
                                 .get(&(item.to_string(), album_name.clone()))
                                 .map(|t| t.len())
                                 .unwrap_or(0);
@@ -949,11 +956,7 @@ impl App {
         let px_h = ((ih as f64 * scale).round() as u32).max(2);
         let rows = px_h / 2;
 
-        let resized = img.resize_exact(
-            cols,
-            rows * 2,
-            image::imageops::FilterType::Lanczos3,
-        );
+        let resized = img.resize_exact(cols, rows * 2, image::imageops::FilterType::Lanczos3);
         let rgba = resized.to_rgba8();
 
         for row in 0..rows {
@@ -1147,7 +1150,11 @@ impl App {
         let count = items.len();
         // Deduplicate by object_id
         for item in items {
-            if !self.removal_queue.iter().any(|(_, id)| *id == item.1 && item.1 > 0) {
+            if !self
+                .removal_queue
+                .iter()
+                .any(|(_, id)| *id == item.1 && item.1 > 0)
+            {
                 self.removal_queue.push(item);
             }
         }
@@ -1168,7 +1175,8 @@ impl App {
         }
         self.sync.log.clear();
         let items: Vec<SyncItem> = self
-            .sync.queue
+            .sync
+            .queue
             .iter()
             .flat_map(|q| q.tracks.clone())
             .collect();
@@ -1263,10 +1271,7 @@ impl App {
                     );
                 }
             }
-            BgEvent::SyncComplete {
-                success,
-                failed,
-            } => {
+            BgEvent::SyncComplete { success, failed } => {
                 self.sync.status = SyncStatus::Idle;
                 self.sync.queue.clear();
                 self.sync.queue_selected = 0;
@@ -1705,7 +1710,8 @@ mod tests {
         );
 
         let ok_tracks = app
-            .device.album_tracks
+            .device
+            .album_tracks
             .get(&("Radiohead".into(), "OK Computer".into()))
             .unwrap();
         assert_eq!(ok_tracks.len(), 2);
@@ -1724,7 +1730,8 @@ mod tests {
 
         assert_eq!(app.device.artists, vec!["Artist"]);
         let tracks = app
-            .device.album_tracks
+            .device
+            .album_tracks
             .get(&("Artist".into(), "Unknown Album".into()))
             .unwrap();
         assert_eq!(tracks.len(), 1);
@@ -1739,7 +1746,8 @@ mod tests {
 
         assert_eq!(app.device.artists, vec!["Unknown Artist"]);
         let tracks = app
-            .device.album_tracks
+            .device
+            .album_tracks
             .get(&("Unknown Artist".into(), "Unknown Album".into()))
             .unwrap();
         assert_eq!(tracks[0].name, "loose_track");
@@ -1759,7 +1767,8 @@ mod tests {
         assert_eq!(albums, &vec!["Album".to_string()]);
 
         let tracks = app
-            .device.album_tracks
+            .device
+            .album_tracks
             .get(&("Artist".into(), "Album".into()))
             .unwrap();
         assert_eq!(tracks.len(), 3);
@@ -1804,9 +1813,7 @@ mod tests {
     #[test]
     fn collect_removal_paths_device_mode_track() {
         let mut app = App::new();
-        app.device.tracks = vec![
-            make_device_entry("Art/Alb/song.mp3", 1000),
-        ];
+        app.device.tracks = vec![make_device_entry("Art/Alb/song.mp3", 1000)];
         app.build_device_index();
         app.browse_mode = BrowseMode::Device;
         app.sidebar_mode = SidebarMode::Artists;
