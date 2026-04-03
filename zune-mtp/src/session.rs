@@ -498,9 +498,10 @@ impl MtpSession {
         }
         Ok(())
     }
+}
 
-    /// Close the MTP session and release the device.
-    pub fn close(mut self) {
+impl Drop for MtpSession {
+    fn drop(&mut self) {
         let _ = self.execute_simple(OperationCode::CloseSession, &[]);
     }
 }

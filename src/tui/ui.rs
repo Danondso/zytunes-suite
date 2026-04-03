@@ -24,6 +24,7 @@ pub(crate) struct LayoutMetrics {
     show_now_playing: bool,
     show_zip_art: bool,
     footer_left_width: u16,
+    player_art_width: u16,
 }
 
 impl LayoutMetrics {
@@ -41,6 +42,7 @@ impl LayoutMetrics {
                 show_now_playing: has_player && h >= 20,
                 show_zip_art: false,
                 footer_left_width: 12,
+                player_art_width: 0,
             }
         } else if w < 140 {
             // Standard: narrower device panel, force-hide keys.
@@ -52,6 +54,7 @@ impl LayoutMetrics {
                 show_now_playing: has_player && h >= 20,
                 show_zip_art: true,
                 footer_left_width: 16,
+                player_art_width: 14,
             }
         } else {
             // Full: current behavior.
@@ -63,6 +66,7 @@ impl LayoutMetrics {
                 show_now_playing: has_player && h >= 20,
                 show_zip_art: true,
                 footer_left_width: 16,
+                player_art_width: 16,
             }
         }
     }
@@ -178,7 +182,7 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     if m.show_now_playing {
         if let Some(ref np) = app.now_playing {
-            draw_now_playing(f, app, np, middle[1]);
+            draw_now_playing(f, app, np, middle[1], m.player_art_width);
         }
     }
     let footer_idx = if m.show_now_playing { 2 } else { 1 };
@@ -1211,7 +1215,7 @@ fn key_line<'a>(app: &App, key: &'a str, desc: &'a str) -> Line<'a> {
     ])
 }
 
-fn draw_now_playing(f: &mut Frame, app: &App, np: &NowPlaying, area: Rect) {
+fn draw_now_playing(f: &mut Frame, app: &App, np: &NowPlaying, area: Rect, art_width: u16) {
     let t = app.theme();
     let skin = anim::player_skin(app.theme_index);
 
@@ -1233,56 +1237,65 @@ fn draw_now_playing(f: &mut Frame, app: &App, np: &NowPlaying, area: Rect) {
         t.border
     };
 
-    // Horizontal split: info + controls (left) | art panel (right)
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(20), Constraint::Length(18)])
-        .split(area);
-
-    // --- Left: track info + controls ---
+    // Single unified block for the entire now-playing panel.
     let title = format!(" {} Now Playing ", state_icon);
-    let info_block = t
+    let block = t
         .block()
         .border_style(Style::default().fg(border_color))
         .title(title)
         .style(Style::default().bg(t.main_bg));
-    let info_inner = info_block.inner(cols[0]);
-    f.render_widget(info_block, cols[0]);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
 
-    // --- Right: art sub-panel ---
-    let art_block = t
-        .block()
-        .border_style(Style::default().fg(border_color))
-        .style(Style::default().bg(t.main_bg));
-    let art_inner = art_block.inner(cols[1]);
-    f.render_widget(art_block, cols[1]);
-
-    let art_frame = np.paused_frame.unwrap_or(app.anim_frame);
-    let art_lines = (skin.art_fn)(true, art_frame);
-    let art_color = if np.state == PlaybackState::Playing {
-        anim::animated_accent(
-            t.accent_color(),
-            t.accent_secondary,
-            t.accent_anim,
-            app.anim_frame,
-            40,
-        )
+    // Split inner area: info (left) | art (right), art hidden at Compact.
+    let show_art = art_width > 0 && inner.width > art_width + 20;
+    let (info_area, art_area) = if show_art {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(20), Constraint::Length(art_width)])
+            .split(inner);
+        (cols[0], Some(cols[1]))
     } else {
-        t.accent_color()
+        (inner, None)
     };
-    let inner_w = art_inner.width as usize;
-    let art_text: Vec<Line> = art_lines
-        .iter()
-        .map(|l| {
-            let pad = inner_w.saturating_sub(l.len());
+
+    // --- Art (right side, inside the shared block) ---
+    if let Some(art_rect) = art_area {
+        let art_frame = np.paused_frame.unwrap_or(app.anim_frame);
+        let art_lines = (skin.art_fn)(true, art_frame);
+        let art_color = if np.state == PlaybackState::Playing {
+            anim::animated_accent(
+                t.accent_color(),
+                t.accent_secondary,
+                t.accent_anim,
+                app.anim_frame,
+                40,
+            )
+        } else {
+            t.accent_color()
+        };
+        let aw = art_rect.width as usize;
+        let ah = art_rect.height as usize;
+        // Vertically center the art within the available height.
+        let v_pad = ah.saturating_sub(art_lines.len()) / 2;
+        let mut art_text: Vec<Line> = Vec::with_capacity(ah);
+        for _ in 0..v_pad {
+            art_text.push(Line::from(""));
+        }
+        for l in &art_lines {
+            let pad = aw.saturating_sub(l.len());
             let left = pad / 2;
             let right = pad - left;
             let padded = format!("{}{}{}", " ".repeat(left), l, " ".repeat(right));
-            Line::from(Span::styled(padded, Style::default().fg(art_color)))
-        })
-        .collect();
-    f.render_widget(Paragraph::new(art_text), art_inner);
+            art_text.push(Line::from(Span::styled(
+                padded,
+                Style::default().fg(art_color),
+            )));
+        }
+        f.render_widget(Paragraph::new(art_text), art_rect);
+    }
 
+    // --- Info (left side) ---
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1293,7 +1306,7 @@ fn draw_now_playing(f: &mut Frame, app: &App, np: &NowPlaying, area: Rect) {
             Constraint::Length(1), // time + hints
             Constraint::Min(0),    // absorb extra
         ])
-        .split(info_inner);
+        .split(info_area);
 
     // Track name
     f.render_widget(
@@ -1968,6 +1981,7 @@ mod tests {
         assert_eq!(m.keys_width, 0); // force-hidden
         assert!(!m.show_zip_art);
         assert_eq!(m.footer_left_width, 12);
+        assert_eq!(m.player_art_width, 0); // hidden at compact
     }
 
     #[test]
@@ -1980,6 +1994,7 @@ mod tests {
         assert_eq!(m.keys_width, 0); // force-hidden
         assert!(m.show_zip_art);
         assert!(m.show_now_playing);
+        assert_eq!(m.player_art_width, 14);
     }
 
     #[test]
@@ -1991,6 +2006,7 @@ mod tests {
         assert_eq!(m.album_width, 30);
         assert_eq!(m.keys_width, 24); // shown
         assert!(m.show_zip_art);
+        assert_eq!(m.player_art_width, 16);
     }
 
     #[test]
