@@ -1588,15 +1588,25 @@ fn device_tracks_to_info(tracks: &[DeviceTrackInfo]) -> Vec<TrackInfo> {
         .collect()
 }
 
-/// Build a set of (lowercase artist, lowercase track name) from device tracks.
+/// Normalize a string for fuzzy matching: lowercase, trim, strip leading/trailing
+/// non-alphanumeric characters (handles `*NSYNC` vs `NSYNC`, etc.).
+fn normalize_for_match(s: &str) -> String {
+    let trimmed = s.trim().to_lowercase();
+    trimmed
+        .trim_start_matches(|c: char| !c.is_alphanumeric())
+        .trim_end_matches(|c: char| !c.is_alphanumeric())
+        .to_string()
+}
+
+/// Build a set of (normalized artist, normalized track name) from device tracks.
 /// Inserts both the raw filename stem and the version with a leading track number
 /// prefix stripped, so we match regardless of naming convention.
 fn device_track_set(device: &DeviceState) -> HashSet<(String, String)> {
     let mut set = HashSet::new();
     for dt in device.album_tracks.values().flatten() {
-        let artist = dt.artist.trim().to_lowercase();
-        let raw = dt.name.trim().to_lowercase();
-        let stripped = zytunes::strip_track_number(dt.name.trim()).to_lowercase();
+        let artist = normalize_for_match(&dt.artist);
+        let raw = normalize_for_match(&dt.name);
+        let stripped = normalize_for_match(zytunes::strip_track_number(dt.name.trim()));
         set.insert((artist.clone(), raw.clone()));
         if stripped != raw {
             set.insert((artist, stripped));
@@ -1621,13 +1631,13 @@ fn tag_on_device(tracks: &mut [TrackInfo], device: &DeviceState) {
     let mut artist_names: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for dt in device.album_tracks.values().flatten() {
         artist_names
-            .entry(dt.artist.trim().to_lowercase())
+            .entry(normalize_for_match(&dt.artist))
             .or_default()
-            .push(dt.name.trim().to_lowercase());
+            .push(normalize_for_match(&dt.name));
     }
     for t in tracks.iter_mut() {
-        let artist_key = t.artist.trim().to_lowercase();
-        let name_key = t.name.trim().to_lowercase();
+        let artist_key = normalize_for_match(&t.artist);
+        let name_key = normalize_for_match(&t.name);
         if set.contains(&(artist_key.clone(), name_key.clone())) {
             t.on_device = true;
         } else if let Some(device_names) = artist_names.get(&artist_key) {
@@ -2388,5 +2398,38 @@ mod tests {
             !tracks[0].on_device,
             "should clear on_device when disconnected"
         );
+    }
+
+    #[test]
+    fn tag_on_device_normalizes_special_chars() {
+        let mut device = DeviceState::new();
+        device.status = DeviceStatus::Connected;
+        // Device strips * from artist name (FAT32-unsafe char).
+        device.album_tracks.insert(
+            ("NSYNC".into(), "No Strings Attached".into()),
+            vec![DeviceTrackInfo {
+                name: "Bye Bye Bye".into(),
+                device_path: "/Music/NSYNC/No Strings Attached/Bye Bye Bye.mp3".into(),
+                size: 5000,
+                object_id: 10,
+                artist: "NSYNC".into(),
+                album: "No Strings Attached".into(),
+            }],
+        );
+
+        let mut tracks = vec![TrackInfo {
+            name: "Bye Bye Bye".into(),
+            artist: "*NSYNC".into(), // library has the asterisk
+            album: "No Strings Attached".into(),
+            duration_ms: None,
+            kind: None,
+            location: None,
+            track_number: Some(1),
+            disc_number: None,
+            on_device: false,
+        }];
+
+        tag_on_device(&mut tracks, &device);
+        assert!(tracks[0].on_device, "*NSYNC should match NSYNC on device");
     }
 }
