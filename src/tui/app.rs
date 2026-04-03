@@ -940,15 +940,18 @@ impl App {
         };
 
         // Terminal chars are roughly 1:2 (w:h), so 1 cell = 1 pixel wide, 2 pixels tall.
-        // For a square image: pixel_w = cols, pixel_h = rows * 2.
-        // Pick the largest square that fits: side = min(width, height * 2).
-        let side = (width as u32).min(height as u32 * 2);
-        let cols = side;
-        let rows = side / 2;
+        // Fit the image within the available area preserving aspect ratio.
+        let (iw, ih) = (img.width(), img.height());
+        let max_px_w = width as u32;
+        let max_px_h = height as u32 * 2; // 2 pixel rows per terminal row
+        let scale = (max_px_w as f64 / iw as f64).min(max_px_h as f64 / ih as f64);
+        let cols = ((iw as f64 * scale).round() as u32).max(1);
+        let px_h = ((ih as f64 * scale).round() as u32).max(2);
+        let rows = px_h / 2;
 
         let resized = img.resize_exact(
             cols,
-            rows * 2, // 2 pixel rows per terminal row
+            rows * 2,
             image::imageops::FilterType::Lanczos3,
         );
         let rgba = resized.to_rgba8();

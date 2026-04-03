@@ -110,7 +110,7 @@ fn run_loop(
             let overhead = 2 + 3 + if has_player { 9 } else { 0 }; // borders + footer + player
             let browser_h = size.height.saturating_sub(overhead as u16);
             let track_min = 4u16.min(app.track_list.len() as u16);
-            let art_h = browser_h.saturating_sub(track_min).min(18);
+            let art_h = browser_h.saturating_sub(track_min).min(26);
             if right_w >= 6 && art_h >= 3 {
                 app.render_album_art(right_w, art_h);
             }

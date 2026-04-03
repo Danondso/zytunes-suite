@@ -407,6 +407,9 @@ fn draw_album_art_inline(f: &mut Frame, app: &App, area: Rect) {
     let art_w = app.album_art_lines.first().map(|r| r.len()).unwrap_or(0) as u16;
     let x_offset = area.width.saturating_sub(art_w) / 2;
 
+    let pad: String = " ".repeat(x_offset as usize);
+    let pad_style = Style::default().bg(app.theme().main_bg);
+
     let lines: Vec<Line> = app
         .album_art_lines
         .iter()
@@ -414,14 +417,11 @@ fn draw_album_art_inline(f: &mut Frame, app: &App, area: Rect) {
         .map(|row| {
             let mut spans: Vec<Span> = Vec::with_capacity(row.len() + 1);
             if x_offset > 0 {
-                spans.push(Span::styled(
-                    " ".repeat(x_offset as usize),
-                    Style::default().bg(app.theme().main_bg),
-                ));
+                spans.push(Span::styled(pad.as_str(), pad_style));
             }
-            for &(ch, fg, bg) in row.iter().take(area.width.saturating_sub(x_offset) as usize) {
+            for &(_, fg, bg) in row.iter().take(area.width.saturating_sub(x_offset) as usize) {
                 spans.push(Span::styled(
-                    ch.to_string(),
+                    "▀",
                     Style::default()
                         .fg(Color::Rgb(fg[0], fg[1], fg[2]))
                         .bg(Color::Rgb(bg[0], bg[1], bg[2])),
