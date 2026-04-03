@@ -12,6 +12,92 @@ use crate::app::{
 };
 use crate::theme;
 
+/// Responsive layout dimensions computed from terminal size.
+///
+/// Three width tiers: Compact (<100), Standard (100-139), Full (>=140).
+/// Height tier: now-playing hidden when < 20 rows.
+pub(crate) struct LayoutMetrics {
+    device_width: u16,
+    sidebar_width: u16,
+    album_width: u16,
+    keys_width: u16,
+    show_now_playing: bool,
+    show_zip_art: bool,
+    footer_left_width: u16,
+    player_art_width: u16,
+}
+
+impl LayoutMetrics {
+    fn new(area: Rect, show_keys: bool, has_album_browser: bool, has_player: bool) -> Self {
+        let w = area.width;
+        let h = area.height;
+
+        if w < 100 {
+            // Compact: hide device panel, force-hide keys, narrow sidebar.
+            LayoutMetrics {
+                device_width: 0,
+                sidebar_width: 20,
+                album_width: if has_album_browser { 22 } else { 0 },
+                keys_width: 0,
+                show_now_playing: has_player && h >= 20,
+                show_zip_art: false,
+                footer_left_width: 12,
+                player_art_width: 0,
+            }
+        } else if w < 140 {
+            // Standard: narrower device panel, force-hide keys.
+            LayoutMetrics {
+                device_width: 28,
+                sidebar_width: 24,
+                album_width: if has_album_browser { 24 } else { 0 },
+                keys_width: 0,
+                show_now_playing: has_player && h >= 20,
+                show_zip_art: true,
+                footer_left_width: 16,
+                player_art_width: 14,
+            }
+        } else {
+            // Full: current behavior.
+            LayoutMetrics {
+                device_width: 36,
+                sidebar_width: if has_album_browser { 24 } else { 28 },
+                album_width: if has_album_browser { 30 } else { 0 },
+                keys_width: if show_keys { 24 } else { 0 },
+                show_now_playing: has_player && h >= 20,
+                show_zip_art: true,
+                footer_left_width: 16,
+                player_art_width: 16,
+            }
+        }
+    }
+
+    /// Returns (device_w, sidebar_w, album_w, keys_w) for album art
+    /// pre-render calculations in the event loop.
+    pub(crate) fn panel_widths(
+        width: u16,
+        show_keys: bool,
+        has_album_browser: bool,
+    ) -> (u16, u16, u16, u16) {
+        if width < 100 {
+            (0, 20, if has_album_browser { 22 } else { 0 }, 0)
+        } else if width < 140 {
+            (28, 24, if has_album_browser { 24 } else { 0 }, 0)
+        } else {
+            (
+                36,
+                if has_album_browser { 24 } else { 28 },
+                if has_album_browser { 30 } else { 0 },
+                if show_keys { 24 } else { 0 },
+            )
+        }
+    }
+
+    /// Whether the now-playing panel should be shown at the given height.
+    pub(crate) fn show_now_playing(height: u16) -> bool {
+        height >= 20
+    }
+}
+
 fn throbber_symbol(state: &ThrobberState, theme_index: usize) -> String {
     Throbber::default()
         .throbber_set(anim::spinner_set_for_theme(theme_index))
@@ -30,23 +116,30 @@ pub fn draw(f: &mut Frame, app: &App) {
         return;
     }
 
+    let m = LayoutMetrics::new(
+        size,
+        app.show_keys,
+        app.has_album_browser(),
+        app.now_playing.is_some(),
+    );
+
     // Outer horizontal: device left | middle content | keys right
-    let keys_width = if app.show_keys { 24 } else { 0 };
     let outer = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(36),
+            Constraint::Length(m.device_width),
             Constraint::Min(40),
-            Constraint::Length(keys_width),
+            Constraint::Length(m.keys_width),
         ])
         .split(size);
 
     // Left column: device info + sync queue + log
-    draw_device_left_panel(f, app, outer[0]);
+    if m.device_width > 0 {
+        draw_device_left_panel(f, app, outer[0]);
+    }
 
     // Middle: browser area + optional now-playing + footer
-    let has_player = app.now_playing.is_some();
-    let middle = if has_player {
+    let middle = if m.show_now_playing {
         Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -63,37 +156,39 @@ pub fn draw(f: &mut Frame, app: &App) {
     };
 
     // Browser columns: sidebar | optional albums | tracks
-    let browser = if app.has_album_browser() {
+    let browser = if m.album_width > 0 {
         Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Length(24),
-                Constraint::Length(30),
+                Constraint::Length(m.sidebar_width),
+                Constraint::Length(m.album_width),
                 Constraint::Min(20),
             ])
             .split(middle[0])
     } else {
         Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(28), Constraint::Min(30)])
+            .constraints([Constraint::Length(m.sidebar_width), Constraint::Min(30)])
             .split(middle[0])
     };
 
     draw_sidebar(f, app, browser[0]);
-    if app.has_album_browser() {
+    if m.album_width > 0 {
         draw_album_browser(f, app, browser[1]);
-        draw_track_list(f, app, browser[2]);
+        draw_track_list(f, app, browser[2], m.show_zip_art);
     } else {
-        draw_track_list(f, app, browser[1]);
+        draw_track_list(f, app, browser[1], m.show_zip_art);
     }
 
-    if let Some(ref np) = app.now_playing {
-        draw_now_playing(f, app, np, middle[1]);
+    if m.show_now_playing {
+        if let Some(ref np) = app.now_playing {
+            draw_now_playing(f, app, np, middle[1], m.player_art_width);
+        }
     }
-    let footer_idx = if has_player { 2 } else { 1 };
-    draw_footer(f, app, middle[footer_idx]);
+    let footer_idx = if m.show_now_playing { 2 } else { 1 };
+    draw_footer(f, app, middle[footer_idx], m.footer_left_width);
 
-    if app.show_keys {
+    if m.keys_width > 0 {
         draw_keys_panel(f, app, outer[2]);
     }
 
@@ -299,37 +394,56 @@ fn draw_album_browser(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let visible_height = inner.height as usize;
-    let scroll = compute_scroll(app.album_selected, visible_height, app.album_list.len());
+    // Build a flat list of rows: year headers interleaved with album items.
+    // Each entry is (optional album index, display line).
+    let mut rows: Vec<(Option<usize>, String, bool)> = Vec::new(); // (album_idx, label, is_header)
+    let mut last_year: Option<Option<u32>> = None;
+    for (i, album) in app.album_list.iter().enumerate() {
+        if last_year != Some(album.year) {
+            let header = match album.year {
+                Some(y) => format!("\u{2500} {} \u{2500}", y),
+                None => "\u{2500} Unknown \u{2500}".to_string(),
+            };
+            rows.push((None, header, true));
+            last_year = Some(album.year);
+        }
+        let is_selected = i == app.album_selected;
+        let prefix = if is_selected { "> " } else { "  " };
+        let max_name = inner.width.saturating_sub(3) as usize;
+        let display_name = if is_selected && album.name.len() > max_name && max_name > 0 {
+            marquee(&album.name, max_name, app.anim_frame)
+        } else {
+            truncate(&album.name, max_name).to_string()
+        };
+        let label = format!("{}{}", prefix, display_name);
+        rows.push((Some(i), label, false));
+    }
 
-    let items: Vec<ListItem> = app
-        .album_list
+    // Find scroll position: we want the selected album visible.
+    // Find its row index in the flat list.
+    let selected_row = rows
         .iter()
-        .enumerate()
+        .position(|(idx, _, _)| *idx == Some(app.album_selected))
+        .unwrap_or(0);
+    let visible_height = inner.height as usize;
+    let scroll = compute_scroll(selected_row, visible_height, rows.len());
+
+    let items: Vec<ListItem> = rows
+        .iter()
         .skip(scroll)
         .take(visible_height)
-        .map(|(i, album)| {
-            let is_selected = i == app.album_selected;
-            let style = if is_selected {
-                t.sidebar_item_selected()
+        .map(|(idx, label, is_header)| {
+            if *is_header {
+                ListItem::new(label.as_str()).style(t.dim())
             } else {
-                t.sidebar_item()
-            };
-            let prefix = if is_selected { "> " } else { "  " };
-            let meta = match album.year {
-                Some(y) => format!(" ({}, {}t)", y, album.track_count),
-                None => format!(" ({}t)", album.track_count),
-            };
-            let label = format!(
-                "{}{}{}",
-                prefix,
-                truncate(
-                    &album.name,
-                    inner.width.saturating_sub(meta.len() as u16 + 3) as usize
-                ),
-                meta
-            );
-            ListItem::new(label).style(style)
+                let is_selected = *idx == Some(app.album_selected);
+                let style = if is_selected {
+                    t.sidebar_item_selected()
+                } else {
+                    t.sidebar_item()
+                };
+                ListItem::new(label.as_str()).style(style)
+            }
         })
         .collect();
 
@@ -337,15 +451,15 @@ fn draw_album_browser(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(list, inner);
 }
 
-fn draw_track_list(f: &mut Frame, app: &App, area: Rect) {
+fn draw_track_list(f: &mut Frame, app: &App, area: Rect, show_zip_art: bool) {
     if app.has_album_browser() {
-        draw_album_detail(f, app, area);
+        draw_album_detail(f, app, area, show_zip_art);
     } else {
         draw_track_table(f, app, area);
     }
 }
 
-fn draw_album_detail(f: &mut Frame, app: &App, area: Rect) {
+fn draw_album_detail(f: &mut Frame, app: &App, area: Rect, show_zip_art: bool) {
     let t = app.theme();
     let is_active = app.active_panel == Panel::TrackList;
     let border_style = if is_active {
@@ -388,35 +502,40 @@ fn draw_album_detail(f: &mut Frame, app: &App, area: Rect) {
         .map(|y| y.to_string())
         .unwrap_or_default();
 
-    // Zip disk ASCII art by mga — https://www.asciiart.eu/art/324546af3173c962
-    // Album/artist/track info embedded into the disk body and label.
-    let art_lines = build_zip_art(
-        app,
-        album_name,
-        album_artist,
-        &year_str,
-        track_count,
-        &dur_str,
-    );
+    if show_zip_art {
+        // Zip disk ASCII art by mga — https://www.asciiart.eu/art/324546af3173c962
+        // Album/artist/track info embedded into the disk body and label.
+        let art_lines = build_zip_art(
+            app,
+            album_name,
+            album_artist,
+            &year_str,
+            track_count,
+            &dur_str,
+        );
 
-    // Side-by-side: zip art on the left, track listing + album art on the right.
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(31), Constraint::Min(12)])
-        .split(inner);
+        // Side-by-side: zip art on the left, track listing + album art on the right.
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(31), Constraint::Min(12)])
+            .split(inner);
 
-    let art = Paragraph::new(art_lines);
-    f.render_widget(art, cols[0]);
+        let art = Paragraph::new(art_lines);
+        f.render_widget(art, cols[0]);
 
-    // Split right column: tracks on top, album art below.
-    let art_rows = app.album_art_lines.len() as u16;
-    let right_split = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(4), Constraint::Length(art_rows)])
-        .split(cols[1]);
+        // Split right column: tracks on top, album art below.
+        let art_rows = app.album_art_lines.len() as u16;
+        let right_split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(4), Constraint::Length(art_rows)])
+            .split(cols[1]);
 
-    draw_album_track_list(f, app, right_split[0]);
-    draw_album_art_inline(f, app, right_split[1]);
+        draw_album_track_list(f, app, right_split[0]);
+        draw_album_art_inline(f, app, right_split[1]);
+    } else {
+        // Compact: full-width track list, no zip art.
+        draw_album_track_list(f, app, inner);
+    }
 }
 
 fn draw_album_art_inline(f: &mut Frame, app: &App, area: Rect) {
@@ -788,7 +907,7 @@ fn draw_device_info_connected(f: &mut Frame, app: &App, area: Rect) {
             " {:.1}/{:.1} GB ({:.1} free)",
             used_gb, total_gb, free_gb
         )));
-        let bar_width = 26usize;
+        let bar_width = (area.width as usize).saturating_sub(8).min(26);
         let filled = (bar_width as f64 * storage.used_percent as f64 / 100.0) as usize;
         let empty = bar_width.saturating_sub(filled);
         let bar_chars = anim::progress_bar_with_shine(filled, empty, app.anim_frame);
@@ -1096,7 +1215,7 @@ fn key_line<'a>(app: &App, key: &'a str, desc: &'a str) -> Line<'a> {
     ])
 }
 
-fn draw_now_playing(f: &mut Frame, app: &App, np: &NowPlaying, area: Rect) {
+fn draw_now_playing(f: &mut Frame, app: &App, np: &NowPlaying, area: Rect, art_width: u16) {
     let t = app.theme();
     let skin = anim::player_skin(app.theme_index);
 
@@ -1118,56 +1237,65 @@ fn draw_now_playing(f: &mut Frame, app: &App, np: &NowPlaying, area: Rect) {
         t.border
     };
 
-    // Horizontal split: info + controls (left) | art panel (right)
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(20), Constraint::Length(18)])
-        .split(area);
-
-    // --- Left: track info + controls ---
+    // Single unified block for the entire now-playing panel.
     let title = format!(" {} Now Playing ", state_icon);
-    let info_block = t
+    let block = t
         .block()
         .border_style(Style::default().fg(border_color))
         .title(title)
         .style(Style::default().bg(t.main_bg));
-    let info_inner = info_block.inner(cols[0]);
-    f.render_widget(info_block, cols[0]);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
 
-    // --- Right: art sub-panel ---
-    let art_block = t
-        .block()
-        .border_style(Style::default().fg(border_color))
-        .style(Style::default().bg(t.main_bg));
-    let art_inner = art_block.inner(cols[1]);
-    f.render_widget(art_block, cols[1]);
-
-    let art_frame = np.paused_frame.unwrap_or(app.anim_frame);
-    let art_lines = (skin.art_fn)(true, art_frame);
-    let art_color = if np.state == PlaybackState::Playing {
-        anim::animated_accent(
-            t.accent_color(),
-            t.accent_secondary,
-            t.accent_anim,
-            app.anim_frame,
-            40,
-        )
+    // Split inner area: info (left) | art (right), art hidden at Compact.
+    let show_art = art_width > 0 && inner.width > art_width + 20;
+    let (info_area, art_area) = if show_art {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(20), Constraint::Length(art_width)])
+            .split(inner);
+        (cols[0], Some(cols[1]))
     } else {
-        t.accent_color()
+        (inner, None)
     };
-    let inner_w = art_inner.width as usize;
-    let art_text: Vec<Line> = art_lines
-        .iter()
-        .map(|l| {
-            let pad = inner_w.saturating_sub(l.len());
+
+    // --- Art (right side, inside the shared block) ---
+    if let Some(art_rect) = art_area {
+        let art_frame = np.paused_frame.unwrap_or(app.anim_frame);
+        let art_lines = (skin.art_fn)(true, art_frame);
+        let art_color = if np.state == PlaybackState::Playing {
+            anim::animated_accent(
+                t.accent_color(),
+                t.accent_secondary,
+                t.accent_anim,
+                app.anim_frame,
+                40,
+            )
+        } else {
+            t.accent_color()
+        };
+        let aw = art_rect.width as usize;
+        let ah = art_rect.height as usize;
+        // Vertically center the art within the available height.
+        let v_pad = ah.saturating_sub(art_lines.len()) / 2;
+        let mut art_text: Vec<Line> = Vec::with_capacity(ah);
+        for _ in 0..v_pad {
+            art_text.push(Line::from(""));
+        }
+        for l in &art_lines {
+            let pad = aw.saturating_sub(l.len());
             let left = pad / 2;
             let right = pad - left;
             let padded = format!("{}{}{}", " ".repeat(left), l, " ".repeat(right));
-            Line::from(Span::styled(padded, Style::default().fg(art_color)))
-        })
-        .collect();
-    f.render_widget(Paragraph::new(art_text), art_inner);
+            art_text.push(Line::from(Span::styled(
+                padded,
+                Style::default().fg(art_color),
+            )));
+        }
+        f.render_widget(Paragraph::new(art_text), art_rect);
+    }
 
+    // --- Info (left side) ---
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1178,7 +1306,7 @@ fn draw_now_playing(f: &mut Frame, app: &App, np: &NowPlaying, area: Rect) {
             Constraint::Length(1), // time + hints
             Constraint::Min(0),    // absorb extra
         ])
-        .split(info_inner);
+        .split(info_area);
 
     // Track name
     f.render_widget(
@@ -1254,7 +1382,7 @@ fn draw_now_playing(f: &mut Frame, app: &App, np: &NowPlaying, area: Rect) {
     f.render_widget(Paragraph::new(time_line).style(t.dim()), rows[4]);
 }
 
-fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
+fn draw_footer(f: &mut Frame, app: &App, area: Rect, footer_left_width: u16) {
     let t = app.theme();
     let block = t.block().style(t.footer());
     let inner = block.inner(area);
@@ -1283,7 +1411,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
 
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(16), Constraint::Min(20)])
+        .constraints([Constraint::Length(footer_left_width), Constraint::Min(20)])
         .split(inner);
 
     f.render_widget(Paragraph::new(left).style(t.footer()), chunks[0]);
@@ -1651,6 +1779,28 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// Marquee-scroll a string that's longer than `width`. Scrolls through
+/// `text   text` seamlessly, advancing one character every 4 frames, with
+/// a pause at the start.
+fn marquee(text: &str, width: usize, frame: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= width || width == 0 {
+        return truncate(text, width);
+    }
+    let gap = 3;
+    let cycle_len = chars.len() + gap;
+    // Pause at the start for 12 frames before scrolling.
+    let scroll_frame = frame.saturating_sub(12);
+    let offset = (scroll_frame / 4) % cycle_len;
+    let padded: Vec<char> = chars
+        .iter()
+        .chain(std::iter::repeat_n(&' ', gap))
+        .chain(chars.iter())
+        .copied()
+        .collect();
+    padded[offset..offset + width].iter().collect()
+}
+
 /// Pad/center a string to exactly `w` chars.
 fn center_pad(s: &str, w: usize) -> String {
     let len = s.chars().count();
@@ -1803,5 +1953,104 @@ mod tests {
         assert_eq!(center_pad("toolong", 4), "tool"); // truncated
         assert_eq!(center_pad("exact", 5), "exact");
         assert_eq!(center_pad("", 4), "    ");
+    }
+
+    #[test]
+    fn marquee_short_text_no_scroll() {
+        assert_eq!(marquee("Hi", 10, 0), "Hi");
+    }
+
+    #[test]
+    fn marquee_pauses_then_scrolls() {
+        let text = "Hello World";
+        let width = 5;
+        // During pause (first 12 frames), shows start of text.
+        assert_eq!(marquee(text, width, 0), "Hello");
+        assert_eq!(marquee(text, width, 11), "Hello");
+        // After pause, starts scrolling (every 4 frames).
+        assert_eq!(marquee(text, width, 16), "ello ");
+    }
+
+    #[test]
+    fn layout_metrics_compact_tier() {
+        let area = Rect::new(0, 0, 80, 24);
+        let m = LayoutMetrics::new(area, true, true, true);
+        assert_eq!(m.device_width, 0);
+        assert_eq!(m.sidebar_width, 20);
+        assert_eq!(m.album_width, 22);
+        assert_eq!(m.keys_width, 0); // force-hidden
+        assert!(!m.show_zip_art);
+        assert_eq!(m.footer_left_width, 12);
+        assert_eq!(m.player_art_width, 0); // hidden at compact
+    }
+
+    #[test]
+    fn layout_metrics_standard_tier() {
+        let area = Rect::new(0, 0, 120, 30);
+        let m = LayoutMetrics::new(area, true, true, true);
+        assert_eq!(m.device_width, 28);
+        assert_eq!(m.sidebar_width, 24);
+        assert_eq!(m.album_width, 24);
+        assert_eq!(m.keys_width, 0); // force-hidden
+        assert!(m.show_zip_art);
+        assert!(m.show_now_playing);
+        assert_eq!(m.player_art_width, 14);
+    }
+
+    #[test]
+    fn layout_metrics_full_tier() {
+        let area = Rect::new(0, 0, 160, 40);
+        let m = LayoutMetrics::new(area, true, true, true);
+        assert_eq!(m.device_width, 36);
+        assert_eq!(m.sidebar_width, 24);
+        assert_eq!(m.album_width, 30);
+        assert_eq!(m.keys_width, 24); // shown
+        assert!(m.show_zip_art);
+        assert_eq!(m.player_art_width, 16);
+    }
+
+    #[test]
+    fn layout_metrics_full_no_keys() {
+        let area = Rect::new(0, 0, 160, 40);
+        let m = LayoutMetrics::new(area, false, true, true);
+        assert_eq!(m.keys_width, 0);
+    }
+
+    #[test]
+    fn layout_metrics_short_hides_now_playing() {
+        let area = Rect::new(0, 0, 160, 19);
+        let m = LayoutMetrics::new(area, false, false, true);
+        assert!(!m.show_now_playing);
+
+        let area = Rect::new(0, 0, 160, 20);
+        let m = LayoutMetrics::new(area, false, false, true);
+        assert!(m.show_now_playing);
+    }
+
+    #[test]
+    fn layout_metrics_no_album_browser() {
+        let area = Rect::new(0, 0, 160, 40);
+        let m = LayoutMetrics::new(area, false, false, false);
+        assert_eq!(m.album_width, 0);
+        assert_eq!(m.sidebar_width, 28); // wider without album browser
+    }
+
+    #[test]
+    fn layout_panel_widths_matches_metrics() {
+        // Verify the shared helper returns the same values as LayoutMetrics::new.
+        for (w, show_keys, has_albums) in [
+            (80u16, false, true),
+            (120, true, true),
+            (160, true, true),
+            (160, false, false),
+        ] {
+            let area = Rect::new(0, 0, w, 30);
+            let m = LayoutMetrics::new(area, show_keys, has_albums, false);
+            let (dw, sw, aw, kw) = LayoutMetrics::panel_widths(w, show_keys, has_albums);
+            assert_eq!(
+                (dw, sw, aw, kw),
+                (m.device_width, m.sidebar_width, m.album_width, m.keys_width)
+            );
+        }
     }
 }

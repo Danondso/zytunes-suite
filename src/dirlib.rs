@@ -78,7 +78,7 @@ fn build_track(path: &Path, id: u64) -> Track {
 
 /// Read metadata from any audio file using lofty.
 fn track_from_lofty(path: &Path, id: u64) -> Option<Track> {
-    use lofty::file::TaggedFileExt;
+    use lofty::file::{AudioFile, TaggedFileExt};
     use lofty::tag::Accessor;
 
     let tagged = lofty::probe::read_from_path(path).ok()?;
@@ -113,7 +113,14 @@ fn track_from_lofty(path: &Path, id: u64) -> Option<Track> {
         year: tag.year(),
         track_number: tag.track(),
         disc_number: tag.disk(),
-        total_time_ms: None, // lofty tags don't include duration
+        total_time_ms: {
+            let dur = tagged.properties().duration();
+            if dur.is_zero() {
+                None
+            } else {
+                Some(dur.as_millis() as u64)
+            }
+        },
         location: Some(path.to_string_lossy().to_string()),
         kind: Some(format!(
             "{} audio file",
