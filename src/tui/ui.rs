@@ -403,9 +403,15 @@ fn draw_album_browser(f: &mut Frame, app: &App, area: Rect) {
             rows.push((None, header, true));
             last_year = Some(album.year);
         }
-        let prefix = if i == app.album_selected { "> " } else { "  " };
+        let is_selected = i == app.album_selected;
+        let prefix = if is_selected { "> " } else { "  " };
         let max_name = inner.width.saturating_sub(3) as usize;
-        let label = format!("{}{}", prefix, truncate(&album.name, max_name));
+        let display_name = if is_selected && album.name.len() > max_name && max_name > 0 {
+            marquee(&album.name, max_name, app.anim_frame)
+        } else {
+            truncate(&album.name, max_name).to_string()
+        };
+        let label = format!("{}{}", prefix, display_name);
         rows.push((Some(i), label, false));
     }
 
@@ -1760,6 +1766,28 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// Marquee-scroll a string that's longer than `width`. Scrolls through
+/// `text   text` seamlessly, advancing one character every 4 frames, with
+/// a pause at the start.
+fn marquee(text: &str, width: usize, frame: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= width || width == 0 {
+        return truncate(text, width);
+    }
+    let gap = 3;
+    let cycle_len = chars.len() + gap;
+    // Pause at the start for 12 frames before scrolling.
+    let scroll_frame = frame.saturating_sub(12);
+    let offset = (scroll_frame / 4) % cycle_len;
+    let padded: Vec<char> = chars
+        .iter()
+        .chain(std::iter::repeat_n(&' ', gap))
+        .chain(chars.iter())
+        .copied()
+        .collect();
+    padded[offset..offset + width].iter().collect()
+}
+
 /// Pad/center a string to exactly `w` chars.
 fn center_pad(s: &str, w: usize) -> String {
     let len = s.chars().count();
@@ -1912,6 +1940,22 @@ mod tests {
         assert_eq!(center_pad("toolong", 4), "tool"); // truncated
         assert_eq!(center_pad("exact", 5), "exact");
         assert_eq!(center_pad("", 4), "    ");
+    }
+
+    #[test]
+    fn marquee_short_text_no_scroll() {
+        assert_eq!(marquee("Hi", 10, 0), "Hi");
+    }
+
+    #[test]
+    fn marquee_pauses_then_scrolls() {
+        let text = "Hello World";
+        let width = 5;
+        // During pause (first 12 frames), shows start of text.
+        assert_eq!(marquee(text, width, 0), "Hello");
+        assert_eq!(marquee(text, width, 11), "Hello");
+        // After pause, starts scrolling (every 4 frames).
+        assert_eq!(marquee(text, width, 16), "ello ");
     }
 
     #[test]
