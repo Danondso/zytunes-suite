@@ -1,10 +1,10 @@
 //! MTP ObjectPropList builder for SendObjectPropList (0x9808).
 //!
 //! Binary format:
-//! [u32 count] [properties...]
+//! \[u32 count\] \[properties...\]
 //!
 //! Each property:
-//! [u32 object_handle] [u16 prop_code] [u16 data_type] [value]
+//! \[u32 object_handle\] \[u16 prop_code\] \[u16 data_type\] \[value\]
 
 // MTP data type codes.
 const DATATYPE_UINT16: u16 = 0x0004;

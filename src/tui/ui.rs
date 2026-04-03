@@ -1495,7 +1495,7 @@ fn compute_scroll(selected: usize, visible: usize, total: usize) -> usize {
 }
 
 /// Build zip disk ASCII art with album info embedded.
-/// Art by mga — https://www.asciiart.eu/art/324546af3173c962
+/// Art by mga — <https://www.asciiart.eu/art/324546af3173c962>
 fn build_zip_art<'a>(
     app: &App,
     album: &'a str,
