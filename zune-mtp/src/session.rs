@@ -506,6 +506,18 @@ impl MtpSession {
         self.execute_data_in(OperationCode::GetZuneMetadataDatabase, &[content_type])
     }
 
+    /// Query the number of items the device acquired on its own
+    /// (podcast downloads, Zune-to-Zune sharing).
+    /// Sends vendor operation 0x9219 (GetAcquiredItems) with no parameters.
+    /// The data payload is a u32 count of acquired item IDs.
+    pub fn get_acquired_items_count(&mut self) -> Result<u32, MtpError> {
+        let data = self.execute_data_in(OperationCode::GetAcquiredItems, &[])?;
+        if data.len() < 4 {
+            return Ok(0);
+        }
+        Ok(le_u32(&data, 0))
+    }
+
     /// Retrieve the device's sync progress state (vendor op 0x922f).
     /// Returns the raw 1036-byte payload. The first u32 is a version/status flag;
     /// the remainder contains sync counters and timestamps (mostly zeros when idle).

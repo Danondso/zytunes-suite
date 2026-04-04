@@ -232,6 +232,12 @@ impl NativeSession {
         self.session.get_storage_info(self.storage_id).mtp_err()
     }
 
+    /// Query the number of items the device acquired on its own
+    /// (podcast downloads, Zune-to-Zune sharing).
+    pub fn get_acquired_items_count(&mut self) -> Result<u32, String> {
+        self.session.get_acquired_items_count().mtp_err()
+    }
+
     /// Query device sync progress (vendor op 0x922f). Returns raw payload bytes.
     pub fn get_sync_progress(&mut self) -> Result<Vec<u8>, String> {
         self.session.get_sync_progress().mtp_err()

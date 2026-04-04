@@ -121,6 +121,8 @@ pub struct DeviceState {
     pub track_set: HashSet<(String, String)>,
     /// Per-artist list of normalized device track names for substring fallback.
     pub artist_track_names: BTreeMap<String, Vec<String>>,
+    /// Number of items the device acquired on its own (podcasts, Zune-to-Zune shares).
+    pub acquired_items: u32,
     /// Sync progress status string from MTP vendor op 0x922f.
     pub sync_status: Option<String>,
 }
@@ -144,6 +146,7 @@ impl DeviceState {
             album_tracks: BTreeMap::new(),
             track_set: HashSet::new(),
             artist_track_names: BTreeMap::new(),
+            acquired_items: 0,
             sync_status: None,
         }
     }
@@ -603,6 +606,7 @@ impl App {
         self.device.album_tracks.clear();
         self.device.track_set.clear();
         self.device.artist_track_names.clear();
+        self.device.acquired_items = 0;
         self.artist_device_status.clear();
         if self.browse_mode == BrowseMode::Device {
             self.browse_mode = BrowseMode::Library;
@@ -1387,6 +1391,9 @@ impl App {
             }
             BgEvent::StorageUpdated(storage) => {
                 self.device.storage = Some(storage);
+            }
+            BgEvent::AcquiredItemsCount(count) => {
+                self.device.acquired_items = count;
             }
         }
     }

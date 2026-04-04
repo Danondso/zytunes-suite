@@ -84,6 +84,7 @@ pub enum BgEvent {
         success: usize,
         failed: usize,
     },
+    AcquiredItemsCount(u32),
     /// Parsed sync progress status from MTP vendor op 0x922f.
     DeviceSyncStatus(Option<String>),
 }
@@ -171,6 +172,19 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                             used_bytes: used,
                                             used_percent: pct,
                                         })));
+                                }
+
+                                // Query acquired items (podcasts, Zune-to-Zune shares).
+                                match s.get_acquired_items_count() {
+                                    Ok(count) => {
+                                        let _ = event_tx.send(BgEvent::AcquiredItemsCount(count));
+                                    }
+                                    Err(e) => {
+                                        let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                                            "Could not query acquired items: {}",
+                                            e
+                                        )));
+                                    }
                                 }
 
                                 // Query sync progress (vendor op 0x922f).
