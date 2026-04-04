@@ -3,7 +3,7 @@ members = [".", "zune-mtp"]
 
 [package]
 name = "zytunes"
-version = "0.10.0"
+version = "0.10.1"
 edition = "2021"
 rust-version = "1.94"
 description = "A CLI tool for syncing music to a Microsoft Zune 30 on macOS"
