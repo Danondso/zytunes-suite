@@ -960,6 +960,22 @@ fn draw_device_info_connected(f: &mut Frame, app: &App, area: Rect) {
         ]));
     }
 
+    // Acquired items (only shown when > 0).
+    if app.device.acquired_items > 0 {
+        lines.push(Line::from(vec![
+            Span::styled(" Acquired: ", t.dim()),
+            Span::raw(format!(
+                "{} item{}",
+                app.device.acquired_items,
+                if app.device.acquired_items == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            )),
+        ]));
+    }
+
     // Storage info.
     if let Some(ref storage) = app.device.storage {
         let total_gb = storage.total_bytes as f64 / 1_073_741_824.0;

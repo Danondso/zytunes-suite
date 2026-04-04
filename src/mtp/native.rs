@@ -232,6 +232,12 @@ impl NativeSession {
         self.session.get_storage_info(self.storage_id).mtp_err()
     }
 
+    /// Query the number of items the device acquired on its own
+    /// (podcast downloads, Zune-to-Zune sharing).
+    pub fn get_acquired_items_count(&mut self) -> Result<u32, String> {
+        self.session.get_acquired_items_count().mtp_err()
+    }
+
     /// Open a native MTP session to the Zune.
     /// Performs device detection, MTP session open, and MTPZ authentication.
     /// The `log` callback receives diagnostic messages for each step.

@@ -39,6 +39,9 @@ pub enum OperationCode {
     /// Retrieve the Zune's internal metadata database (ZMDB).
     /// First parameter is the content type (1 = music library).
     GetZuneMetadataDatabase = 0x9217,
+    /// Retrieve items the device acquired on its own (podcast downloads,
+    /// Zune-to-Zune sharing). Returns a u32 count followed by PUOIDs.
+    GetAcquiredItems = 0x9219,
 }
 
 /// MTP response codes.
