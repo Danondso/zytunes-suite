@@ -6,7 +6,9 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use rayon::prelude::*;
 
 use crate::library::{MusicLibrary, Playlist, Track};
 
@@ -23,13 +25,39 @@ pub struct DirectoryLibrary {
 
 impl DirectoryLibrary {
     /// Recursively scan a directory for audio files and build a library.
+    ///
+    /// Uses a disk cache (`~/.cache/zytunes/`) to skip metadata reads when no
+    /// files have been added or modified since the last run. When the cache is
+    /// stale, metadata reads are parallelized with rayon.
     pub fn scan(path: &str) -> Result<Self, String> {
         let root = Path::new(path);
         if !root.is_dir() {
             return Err(format!("Not a directory: {path}"));
         }
-        let mut tracks = HashMap::new();
-        scan_dir(root, &mut tracks);
+
+        // Try cache first.
+        if let Some(tracks) = crate::cache::load_dirlib_cached(path) {
+            return Ok(DirectoryLibrary {
+                tracks,
+                root: path.to_string(),
+            });
+        }
+
+        // Collect all audio file paths first (fast directory walk).
+        let mut paths = Vec::new();
+        collect_audio_paths(root, &mut paths);
+        // Read metadata in parallel using rayon.
+        let tracks: HashMap<u64, Track> = paths
+            .par_iter()
+            .map(|p| {
+                let id = hash_path(p);
+                (id, build_track(p, id))
+            })
+            .collect();
+
+        // Save to cache for next startup.
+        crate::cache::save_dirlib_cache(path, &tracks);
+
         Ok(DirectoryLibrary {
             tracks,
             root: path.to_string(),
@@ -37,7 +65,7 @@ impl DirectoryLibrary {
     }
 }
 
-fn scan_dir(dir: &Path, tracks: &mut HashMap<u64, Track>) {
+fn collect_audio_paths(dir: &Path, out: &mut Vec<PathBuf>) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return,
@@ -45,11 +73,9 @@ fn scan_dir(dir: &Path, tracks: &mut HashMap<u64, Track>) {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            scan_dir(&path, tracks);
+            collect_audio_paths(&path, out);
         } else if is_audio_file(&path) {
-            let id = hash_path(&path);
-            let track = build_track(&path, id);
-            tracks.insert(id, track);
+            out.push(path);
         }
     }
 }
