@@ -1293,6 +1293,7 @@ impl App {
             }
             BgEvent::SessionFailed(e) => {
                 self.device.status = DeviceStatus::Disconnected;
+                self.device.sync_status = None;
                 self.connection_anim_start = None;
                 self.set_toast(format!("Connection failed: {}", e), true);
                 if self.browse_mode == BrowseMode::Library {
