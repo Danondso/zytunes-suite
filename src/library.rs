@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::io::BufRead;
 
 /// A track from the iTunes library.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Track {
     pub id: u64,
     pub name: String,
@@ -30,7 +30,7 @@ pub struct Track {
 }
 
 /// A playlist from the iTunes library.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Playlist {
     pub name: String,
     pub track_ids: Vec<u64>,
@@ -73,11 +73,34 @@ pub struct ItunesLibrary {
 
 impl ItunesLibrary {
     /// Parse an iTunes Library.xml file.
+    ///
+    /// Uses a disk cache (`~/.cache/zytunes/`) to skip XML parsing when the
+    /// file hasn't changed since the last run.
     pub fn parse(path: &str) -> Result<Self, String> {
+        // Try cache first.
+        if let Some(cached) = crate::cache::load_itunes_cached(path) {
+            let mut library = ItunesLibrary {
+                tracks: cached.tracks,
+                playlists: cached.playlists,
+                music_folder_path: cached.music_folder_path,
+            };
+            remap_locations(&mut library);
+            return Ok(library);
+        }
+
         let file = std::fs::File::open(path).map_err(|e| format!("Cannot open {path}: {e}"))?;
         let reader = std::io::BufReader::new(file);
         let mut library = parse_itunes_xml(reader)?;
         remap_locations(&mut library);
+
+        // Save to cache for next startup.
+        crate::cache::save_itunes_cache(
+            path,
+            &library.tracks,
+            &library.playlists,
+            library.music_folder_path.as_deref(),
+        );
+
         Ok(library)
     }
 }
