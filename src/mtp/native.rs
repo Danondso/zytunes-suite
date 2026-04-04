@@ -66,6 +66,103 @@ struct DeviceLibrary {
     albums: HashMap<(String, String), AlbumInfo>,
 }
 
+impl DeviceLibrary {
+    /// Serialize to a simple text format for disk caching.
+    fn serialize(&self) -> String {
+        let mut s = String::new();
+        // Header: folder handles and caps
+        s.push_str(&format!(
+            "HDR\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            self.music_folder,
+            self.artists_folder,
+            self.albums_folder,
+            self.caps.artist_supported as u8,
+            self.caps.album_date_supported as u8,
+            self.caps.album_cover_supported as u8,
+        ));
+        for (name, info) in &self.artists {
+            s.push_str(&format!(
+                "ART\t{}\t{}\t{}\n",
+                name.replace('\t', " "),
+                info.id,
+                info.music_folder_id
+            ));
+        }
+        for ((artist, album), info) in &self.albums {
+            s.push_str(&format!(
+                "ALB\t{}\t{}\t{}\t{}\n",
+                artist.replace('\t', " "),
+                album.replace('\t', " "),
+                info.id,
+                info.music_folder_id
+            ));
+        }
+        s
+    }
+
+    /// Deserialize from the text format. Returns None on any parse failure.
+    fn deserialize(data: &str) -> Option<Self> {
+        let mut music_folder = 0u32;
+        let mut artists_folder = 0u32;
+        let mut albums_folder = 0u32;
+        let mut caps = DeviceCaps {
+            artist_supported: false,
+            album_date_supported: true,
+            album_cover_supported: true,
+        };
+        let mut artists = HashMap::new();
+        let mut albums = HashMap::new();
+        let mut has_header = false;
+
+        for line in data.lines() {
+            let parts: Vec<&str> = line.splitn(7, '\t').collect();
+            match parts.first() {
+                Some(&"HDR") if parts.len() >= 7 => {
+                    music_folder = parts[1].parse().ok()?;
+                    artists_folder = parts[2].parse().ok()?;
+                    albums_folder = parts[3].parse().ok()?;
+                    caps.artist_supported = parts[4] == "1";
+                    caps.album_date_supported = parts[5] == "1";
+                    caps.album_cover_supported = parts[6] == "1";
+                    has_header = true;
+                }
+                Some(&"ART") if parts.len() >= 4 => {
+                    artists.insert(
+                        parts[1].to_string(),
+                        ArtistInfo {
+                            id: parts[2].parse().ok()?,
+                            music_folder_id: parts[3].parse().ok()?,
+                        },
+                    );
+                }
+                Some(&"ALB") if parts.len() >= 5 => {
+                    albums.insert(
+                        (parts[1].to_string(), parts[2].to_string()),
+                        AlbumInfo {
+                            id: parts[3].parse().ok()?,
+                            music_folder_id: parts[4].parse().ok()?,
+                        },
+                    );
+                }
+                _ => continue,
+            }
+        }
+
+        if !has_header {
+            return None;
+        }
+
+        Some(DeviceLibrary {
+            music_folder,
+            artists_folder,
+            albums_folder,
+            caps,
+            artists,
+            albums,
+        })
+    }
+}
+
 /// Track cache for persisting device track lists across sessions.
 pub struct TrackCache {
     serial: Option<String>,
@@ -408,6 +505,17 @@ impl NativeSession {
             return Ok(());
         }
 
+        // Try loading from disk cache first.
+        if let Some(cached_lib) = self.load_library_cache() {
+            self.log_msg(&format!(
+                "Loaded library cache ({} artists, {} albums)",
+                cached_lib.artists.len(),
+                cached_lib.albums.len()
+            ));
+            self.library = Some(cached_lib);
+            return Ok(());
+        }
+
         self.log_msg("Initializing device library...");
 
         // Detect device capabilities.
@@ -557,6 +665,8 @@ impl NativeSession {
             albums,
         });
 
+        self.save_library_cache();
+
         Ok(())
     }
 
@@ -630,6 +740,7 @@ impl NativeSession {
                 },
             );
         }
+        self.save_library_cache();
 
         Ok((artist_id, folder_id))
     }
@@ -718,6 +829,7 @@ impl NativeSession {
                 },
             );
         }
+        self.save_library_cache();
 
         Ok((album_id, folder_id))
     }
@@ -1013,6 +1125,32 @@ impl DeviceSession for NativeSession {
 
 impl NativeSession {
     /// Path for the sync progress cache file.
+    /// Path for the device library cache file.
+    fn library_cache_path(&self) -> Option<PathBuf> {
+        let home = std::env::var("HOME").ok()?;
+        let filename = match &self.sync_cache_serial {
+            Some(s) => format!(".zytunes-library-cache-{s}"),
+            None => ".zytunes-library-cache".to_string(),
+        };
+        Some(PathBuf::from(home).join(filename))
+    }
+
+    /// Save the device library state to disk.
+    fn save_library_cache(&self) {
+        if let Some(ref lib) = self.library {
+            if let Some(path) = self.library_cache_path() {
+                let _ = std::fs::write(path, lib.serialize());
+            }
+        }
+    }
+
+    /// Load the device library state from disk cache.
+    fn load_library_cache(&self) -> Option<DeviceLibrary> {
+        let path = self.library_cache_path()?;
+        let data = std::fs::read_to_string(path).ok()?;
+        DeviceLibrary::deserialize(&data)
+    }
+
     fn sync_cache_path(&self) -> Option<PathBuf> {
         let home = std::env::var("HOME").ok()?;
         let filename = match &self.sync_cache_serial {
