@@ -42,6 +42,10 @@ pub enum OperationCode {
     /// Retrieve items the device acquired on its own (podcast downloads,
     /// Zune-to-Zune sharing). Returns a u32 count followed by PUOIDs.
     GetAcquiredItems = 0x9219,
+    /// Write sync progress state to the device (530-byte payload).
+    SetDeviceSyncProgress = 0x922a,
+    /// Read sync progress state from the device (returns 1036 bytes).
+    GetDeviceSyncProgress = 0x922f,
 }
 
 /// MTP response codes.

@@ -26,4 +26,7 @@ pub trait DeviceSession {
     fn collect_all_tracks(&mut self, path: &str) -> Result<Vec<DeviceEntry>, String>;
     /// Create a playlist on the device with the given name and track object IDs.
     fn create_playlist(&mut self, name: &str, track_ids: &[u64]) -> Result<(), String>;
+    /// Save the device's sync progress to a local cache file.
+    /// Called after a successful sync session. Default is a no-op.
+    fn save_sync_progress(&mut self) {}
 }
