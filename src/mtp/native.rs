@@ -201,6 +201,7 @@ pub struct NativeSession {
     library: Option<DeviceLibrary>,
     cache: TrackCache,
     sync_cache_serial: Option<String>,
+    sync_restored: bool,
     pub firmware_version: Option<String>,
 }
 
@@ -290,6 +291,7 @@ impl NativeSession {
             library: None,
             cache: TrackCache::new(None),
             sync_cache_serial: None,
+            sync_restored: false,
             firmware_version,
         })
     }
@@ -990,22 +992,8 @@ impl DeviceSession for NativeSession {
     fn get_storage_info(&mut self) -> Result<(u64, u64), String> {
         self.session.get_storage_info(self.storage_id).mtp_err()
     }
-}
 
-impl NativeSession {
-    /// Path for the sync progress cache file.
-    fn sync_cache_path(&self) -> Option<PathBuf> {
-        let home = std::env::var("HOME").ok()?;
-        let filename = match &self.sync_cache_serial {
-            Some(s) => format!(".zytunes-sync-progress-{s}"),
-            None => ".zytunes-sync-progress".to_string(),
-        };
-        Some(PathBuf::from(home).join(filename))
-    }
-
-    /// Save the device's current sync progress to a local cache file.
-    /// Called after a successful sync session.
-    pub fn save_sync_progress(&mut self) {
+    fn save_sync_progress(&mut self) {
         let data = match self.session.get_sync_progress() {
             Ok(d) => d,
             Err(e) => {
@@ -1019,10 +1007,26 @@ impl NativeSession {
             }
         }
     }
+}
+
+impl NativeSession {
+    /// Path for the sync progress cache file.
+    fn sync_cache_path(&self) -> Option<PathBuf> {
+        let home = std::env::var("HOME").ok()?;
+        let filename = match &self.sync_cache_serial {
+            Some(s) => format!(".zytunes-sync-progress-{s}"),
+            None => ".zytunes-sync-progress".to_string(),
+        };
+        Some(PathBuf::from(home).join(filename))
+    }
 
     /// Restore cached sync progress to the device.
-    /// Called on connect, before loading tracks. Best-effort — failures are silent.
-    pub fn restore_sync_progress(&mut self) {
+    /// Called once on connect, before loading tracks. Best-effort — failures are silent.
+    fn restore_sync_progress(&mut self) {
+        if self.sync_restored {
+            return;
+        }
+        self.sync_restored = true;
         let path = match self.sync_cache_path() {
             Some(p) => p,
             None => return,
