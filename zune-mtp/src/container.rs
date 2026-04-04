@@ -44,6 +44,9 @@ pub enum OperationCode {
     GetAcquiredItems = 0x9219,
     /// Retrieve the Zune's sync progress state (1036-byte struct).
     /// No parameters required. Returns version/status flags and sync counters.
+    /// Write sync progress state to the device (530-byte payload).
+    SetDeviceSyncProgress = 0x922a,
+    /// Read sync progress state from the device (returns 1036 bytes).
     GetDeviceSyncProgress = 0x922f,
 }
 

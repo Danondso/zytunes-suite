@@ -501,6 +501,12 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
 
                         let _ = std::fs::remove_dir_all(&temp_dir);
 
+                        // Save sync progress to disk so the device can skip
+                        // re-enumerating already-synced content on next connect.
+                        if success > 0 {
+                            s.save_sync_progress();
+                        }
+
                         let _ = event_tx.send(BgEvent::SyncMessage(format!(
                             "Done: {} synced, {} failed",
                             success, failed

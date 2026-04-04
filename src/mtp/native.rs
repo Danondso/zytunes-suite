@@ -66,6 +66,103 @@ struct DeviceLibrary {
     albums: HashMap<(String, String), AlbumInfo>,
 }
 
+impl DeviceLibrary {
+    /// Serialize to a simple text format for disk caching.
+    fn serialize(&self) -> String {
+        let mut s = String::new();
+        // Header: folder handles and caps
+        s.push_str(&format!(
+            "HDR\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            self.music_folder,
+            self.artists_folder,
+            self.albums_folder,
+            self.caps.artist_supported as u8,
+            self.caps.album_date_supported as u8,
+            self.caps.album_cover_supported as u8,
+        ));
+        for (name, info) in &self.artists {
+            s.push_str(&format!(
+                "ART\t{}\t{}\t{}\n",
+                name.replace('\t', " "),
+                info.id,
+                info.music_folder_id
+            ));
+        }
+        for ((artist, album), info) in &self.albums {
+            s.push_str(&format!(
+                "ALB\t{}\t{}\t{}\t{}\n",
+                artist.replace('\t', " "),
+                album.replace('\t', " "),
+                info.id,
+                info.music_folder_id
+            ));
+        }
+        s
+    }
+
+    /// Deserialize from the text format. Returns None on any parse failure.
+    fn deserialize(data: &str) -> Option<Self> {
+        let mut music_folder = 0u32;
+        let mut artists_folder = 0u32;
+        let mut albums_folder = 0u32;
+        let mut caps = DeviceCaps {
+            artist_supported: false,
+            album_date_supported: true,
+            album_cover_supported: true,
+        };
+        let mut artists = HashMap::new();
+        let mut albums = HashMap::new();
+        let mut has_header = false;
+
+        for line in data.lines() {
+            let parts: Vec<&str> = line.splitn(7, '\t').collect();
+            match parts.first() {
+                Some(&"HDR") if parts.len() >= 7 => {
+                    music_folder = parts[1].parse().ok()?;
+                    artists_folder = parts[2].parse().ok()?;
+                    albums_folder = parts[3].parse().ok()?;
+                    caps.artist_supported = parts[4] == "1";
+                    caps.album_date_supported = parts[5] == "1";
+                    caps.album_cover_supported = parts[6] == "1";
+                    has_header = true;
+                }
+                Some(&"ART") if parts.len() >= 4 => {
+                    artists.insert(
+                        parts[1].to_string(),
+                        ArtistInfo {
+                            id: parts[2].parse().ok()?,
+                            music_folder_id: parts[3].parse().ok()?,
+                        },
+                    );
+                }
+                Some(&"ALB") if parts.len() >= 5 => {
+                    albums.insert(
+                        (parts[1].to_string(), parts[2].to_string()),
+                        AlbumInfo {
+                            id: parts[3].parse().ok()?,
+                            music_folder_id: parts[4].parse().ok()?,
+                        },
+                    );
+                }
+                _ => continue,
+            }
+        }
+
+        if !has_header {
+            return None;
+        }
+
+        Some(DeviceLibrary {
+            music_folder,
+            artists_folder,
+            albums_folder,
+            caps,
+            artists,
+            albums,
+        })
+    }
+}
+
 /// Track cache for persisting device track lists across sessions.
 pub struct TrackCache {
     serial: Option<String>,
@@ -200,6 +297,8 @@ pub struct NativeSession {
     log: Option<std::sync::mpsc::Sender<String>>,
     library: Option<DeviceLibrary>,
     cache: TrackCache,
+    sync_cache_serial: Option<String>,
+    sync_restored: bool,
     pub firmware_version: Option<String>,
 }
 
@@ -216,9 +315,10 @@ impl NativeSession {
         self.log = Some(tx);
     }
 
-    /// Set the device serial number (used to key the track cache per-device).
+    /// Set the device serial number (used to key caches per-device).
     pub fn set_serial(&mut self, serial: Option<String>) {
-        self.cache = TrackCache::new(serial);
+        self.cache = TrackCache::new(serial.clone());
+        self.sync_cache_serial = serial;
     }
 
     fn log_msg(&self, msg: &str) {
@@ -292,6 +392,8 @@ impl NativeSession {
             log: None,
             library: None,
             cache: TrackCache::new(None),
+            sync_cache_serial: None,
+            sync_restored: false,
             firmware_version,
         })
     }
@@ -405,6 +507,17 @@ impl NativeSession {
     /// and scan existing artists+albums.
     fn ensure_library(&mut self) -> Result<(), String> {
         if self.library.is_some() {
+            return Ok(());
+        }
+
+        // Try loading from disk cache first.
+        if let Some(cached_lib) = self.load_library_cache() {
+            self.log_msg(&format!(
+                "Loaded library cache ({} artists, {} albums)",
+                cached_lib.artists.len(),
+                cached_lib.albums.len()
+            ));
+            self.library = Some(cached_lib);
             return Ok(());
         }
 
@@ -557,6 +670,8 @@ impl NativeSession {
             albums,
         });
 
+        self.save_library_cache();
+
         Ok(())
     }
 
@@ -630,6 +745,7 @@ impl NativeSession {
                 },
             );
         }
+        self.save_library_cache();
 
         Ok((artist_id, folder_id))
     }
@@ -718,6 +834,7 @@ impl NativeSession {
                 },
             );
         }
+        self.save_library_cache();
 
         Ok((album_id, folder_id))
     }
@@ -910,10 +1027,15 @@ impl DeviceSession for NativeSession {
 
     fn collect_all_tracks(&mut self, path: &str) -> Result<Vec<DeviceEntry>, String> {
         // Try disk cache first — avoids slow MTP enumeration on reconnect.
+        self.log_msg("Checking track cache...");
         if let Some(cached) = self.cache.load() {
             self.log_msg(&format!("Loaded {} tracks from cache", cached.len()));
             return Ok(cached);
         }
+        self.log_msg("No cache, querying device...");
+
+        // Restore sync progress before device queries (only on cache miss).
+        self.restore_sync_progress();
 
         // Try ZMDB — single MTP call for the entire device library.
         match self.try_zmdb() {
@@ -989,9 +1111,85 @@ impl DeviceSession for NativeSession {
     fn get_storage_info(&mut self) -> Result<(u64, u64), String> {
         self.session.get_storage_info(self.storage_id).mtp_err()
     }
+
+    fn save_sync_progress(&mut self) {
+        let data = match self.session.get_sync_progress() {
+            Ok(d) => d,
+            Err(e) => {
+                self.log_msg(&format!("Could not read sync progress: {e}"));
+                return;
+            }
+        };
+        if let Some(path) = self.sync_cache_path() {
+            if std::fs::write(&path, &data).is_ok() {
+                self.log_msg(&format!("Saved sync progress ({} bytes)", data.len()));
+            }
+        }
+    }
 }
 
 impl NativeSession {
+    /// Path for the sync progress cache file.
+    /// Path for the device library cache file.
+    fn library_cache_path(&self) -> Option<PathBuf> {
+        let home = std::env::var("HOME").ok()?;
+        let filename = match &self.sync_cache_serial {
+            Some(s) => format!(".zytunes-library-cache-{s}"),
+            None => ".zytunes-library-cache".to_string(),
+        };
+        Some(PathBuf::from(home).join(filename))
+    }
+
+    /// Save the device library state to disk.
+    fn save_library_cache(&self) {
+        if let Some(ref lib) = self.library {
+            if let Some(path) = self.library_cache_path() {
+                let _ = std::fs::write(path, lib.serialize());
+            }
+        }
+    }
+
+    /// Load the device library state from disk cache.
+    fn load_library_cache(&self) -> Option<DeviceLibrary> {
+        let path = self.library_cache_path()?;
+        let data = std::fs::read_to_string(path).ok()?;
+        DeviceLibrary::deserialize(&data)
+    }
+
+    fn sync_cache_path(&self) -> Option<PathBuf> {
+        let home = std::env::var("HOME").ok()?;
+        let filename = match &self.sync_cache_serial {
+            Some(s) => format!(".zytunes-sync-progress-{s}"),
+            None => ".zytunes-sync-progress".to_string(),
+        };
+        Some(PathBuf::from(home).join(filename))
+    }
+
+    /// Restore cached sync progress to the device.
+    /// Called once on connect, before loading tracks. Best-effort — failures are silent.
+    fn restore_sync_progress(&mut self) {
+        if self.sync_restored {
+            return;
+        }
+        self.sync_restored = true;
+        let path = match self.sync_cache_path() {
+            Some(p) => p,
+            None => return,
+        };
+        let cached = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(_) => return, // No cache file — normal on first connect
+        };
+        // The SET payload is 530 bytes (first 530 of the 1036-byte GET response).
+        let payload_len = 530.min(cached.len());
+        if payload_len < 530 {
+            return; // Corrupted cache — skip
+        }
+        if self.session.set_sync_progress(&cached[..530]).is_ok() {
+            self.log_msg("Restored sync progress from cache");
+        }
+    }
+
     /// Probe device capabilities via GetObjectPropsSupported.
     /// Returns None if any query fails (e.g., on Linux where the Zune may reject these).
     fn probe_capabilities(&mut self) -> Option<(bool, bool, bool)> {
