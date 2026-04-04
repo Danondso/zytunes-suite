@@ -909,14 +909,16 @@ impl DeviceSession for NativeSession {
     }
 
     fn collect_all_tracks(&mut self, path: &str) -> Result<Vec<DeviceEntry>, String> {
-        // Restore sync progress from cache — tells the device where we left off.
-        self.restore_sync_progress();
-
         // Try disk cache first — avoids slow MTP enumeration on reconnect.
+        self.log_msg("Checking track cache...");
         if let Some(cached) = self.cache.load() {
             self.log_msg(&format!("Loaded {} tracks from cache", cached.len()));
             return Ok(cached);
         }
+        self.log_msg("No cache, querying device...");
+
+        // Restore sync progress before device queries (only on cache miss).
+        self.restore_sync_progress();
 
         // Try ZMDB — single MTP call for the entire device library.
         match self.try_zmdb() {
