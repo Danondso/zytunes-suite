@@ -200,6 +200,7 @@ pub struct NativeSession {
     log: Option<std::sync::mpsc::Sender<String>>,
     library: Option<DeviceLibrary>,
     cache: TrackCache,
+    sync_cache_serial: Option<String>,
     pub firmware_version: Option<String>,
 }
 
@@ -216,9 +217,10 @@ impl NativeSession {
         self.log = Some(tx);
     }
 
-    /// Set the device serial number (used to key the track cache per-device).
+    /// Set the device serial number (used to key caches per-device).
     pub fn set_serial(&mut self, serial: Option<String>) {
-        self.cache = TrackCache::new(serial);
+        self.cache = TrackCache::new(serial.clone());
+        self.sync_cache_serial = serial;
     }
 
     fn log_msg(&self, msg: &str) {
@@ -287,6 +289,7 @@ impl NativeSession {
             log: None,
             library: None,
             cache: TrackCache::new(None),
+            sync_cache_serial: None,
             firmware_version,
         })
     }
@@ -904,6 +907,9 @@ impl DeviceSession for NativeSession {
     }
 
     fn collect_all_tracks(&mut self, path: &str) -> Result<Vec<DeviceEntry>, String> {
+        // Restore sync progress from cache — tells the device where we left off.
+        self.restore_sync_progress();
+
         // Try disk cache first — avoids slow MTP enumeration on reconnect.
         if let Some(cached) = self.cache.load() {
             self.log_msg(&format!("Loaded {} tracks from cache", cached.len()));
@@ -987,6 +993,54 @@ impl DeviceSession for NativeSession {
 }
 
 impl NativeSession {
+    /// Path for the sync progress cache file.
+    fn sync_cache_path(&self) -> Option<PathBuf> {
+        let home = std::env::var("HOME").ok()?;
+        let filename = match &self.sync_cache_serial {
+            Some(s) => format!(".zytunes-sync-progress-{s}"),
+            None => ".zytunes-sync-progress".to_string(),
+        };
+        Some(PathBuf::from(home).join(filename))
+    }
+
+    /// Save the device's current sync progress to a local cache file.
+    /// Called after a successful sync session.
+    pub fn save_sync_progress(&mut self) {
+        let data = match self.session.get_sync_progress() {
+            Ok(d) => d,
+            Err(e) => {
+                self.log_msg(&format!("Could not read sync progress: {e}"));
+                return;
+            }
+        };
+        if let Some(path) = self.sync_cache_path() {
+            if std::fs::write(&path, &data).is_ok() {
+                self.log_msg(&format!("Saved sync progress ({} bytes)", data.len()));
+            }
+        }
+    }
+
+    /// Restore cached sync progress to the device.
+    /// Called on connect, before loading tracks. Best-effort — failures are silent.
+    pub fn restore_sync_progress(&mut self) {
+        let path = match self.sync_cache_path() {
+            Some(p) => p,
+            None => return,
+        };
+        let cached = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(_) => return, // No cache file — normal on first connect
+        };
+        // The SET payload is 530 bytes (first 530 of the 1036-byte GET response).
+        let payload_len = 530.min(cached.len());
+        if payload_len < 530 {
+            return; // Corrupted cache — skip
+        }
+        if self.session.set_sync_progress(&cached[..530]).is_ok() {
+            self.log_msg("Restored sync progress from cache");
+        }
+    }
+
     /// Probe device capabilities via GetObjectPropsSupported.
     /// Returns None if any query fails (e.g., on Linux where the Zune may reject these).
     fn probe_capabilities(&mut self) -> Option<(bool, bool, bool)> {

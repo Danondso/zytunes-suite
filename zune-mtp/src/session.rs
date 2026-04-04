@@ -518,6 +518,31 @@ impl MtpSession {
         Ok(le_u32(&data, 0))
     }
 
+    /// Read the device's sync progress state (1036 bytes).
+    pub fn get_sync_progress(&mut self) -> Result<Vec<u8>, MtpError> {
+        self.execute_data_in(OperationCode::GetDeviceSyncProgress, &[])
+    }
+
+    /// Write sync progress state back to the device.
+    /// Payload must be exactly 530 bytes. The device validates the content
+    /// and rejects arbitrary data — only data previously read from the device
+    /// (or minor modifications) is accepted.
+    pub fn set_sync_progress(&mut self, data: &[u8]) -> Result<(), MtpError> {
+        if data.len() != 530 {
+            return Err(MtpError::Protocol(format!(
+                "Sync progress payload must be 530 bytes, got {}",
+                data.len()
+            )));
+        }
+        let resp = self.execute_data_out(OperationCode::SetDeviceSyncProgress, data)?;
+        if resp != ResponseCode::Ok as u16 {
+            return Err(MtpError::Protocol(format!(
+                "SetDeviceSyncProgress failed: 0x{resp:04x}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Get object references (linked objects like album tracks).
     pub fn get_object_references(&mut self, object_id: u32) -> Result<Vec<u32>, MtpError> {
         let data = self.execute_data_in(OperationCode::GetObjectReferences, &[object_id])?;
