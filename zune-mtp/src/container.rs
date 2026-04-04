@@ -39,6 +39,9 @@ pub enum OperationCode {
     /// Retrieve the Zune's internal metadata database (ZMDB).
     /// First parameter is the content type (1 = music library).
     GetZuneMetadataDatabase = 0x9217,
+    /// Retrieve the Zune's sync progress state (1036-byte struct).
+    /// No parameters required. Returns version/status flags and sync counters.
+    GetDeviceSyncProgress = 0x922f,
 }
 
 /// MTP response codes.

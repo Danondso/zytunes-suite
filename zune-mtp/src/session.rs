@@ -506,6 +506,13 @@ impl MtpSession {
         self.execute_data_in(OperationCode::GetZuneMetadataDatabase, &[content_type])
     }
 
+    /// Retrieve the device's sync progress state (vendor op 0x922f).
+    /// Returns the raw 1036-byte payload. The first u32 is a version/status flag;
+    /// the remainder contains sync counters and timestamps (mostly zeros when idle).
+    pub fn get_sync_progress(&mut self) -> Result<Vec<u8>, MtpError> {
+        self.execute_data_in(OperationCode::GetDeviceSyncProgress, &[])
+    }
+
     /// Get object references (linked objects like album tracks).
     pub fn get_object_references(&mut self, object_id: u32) -> Result<Vec<u32>, MtpError> {
         let data = self.execute_data_in(OperationCode::GetObjectReferences, &[object_id])?;

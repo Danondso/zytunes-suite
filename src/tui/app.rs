@@ -121,6 +121,8 @@ pub struct DeviceState {
     pub track_set: HashSet<(String, String)>,
     /// Per-artist list of normalized device track names for substring fallback.
     pub artist_track_names: BTreeMap<String, Vec<String>>,
+    /// Sync progress status string from MTP vendor op 0x922f.
+    pub sync_status: Option<String>,
 }
 
 impl DeviceState {
@@ -142,6 +144,7 @@ impl DeviceState {
             album_tracks: BTreeMap::new(),
             track_set: HashSet::new(),
             artist_track_names: BTreeMap::new(),
+            sync_status: None,
         }
     }
 }
@@ -1295,6 +1298,9 @@ impl App {
                 if self.browse_mode == BrowseMode::Library {
                     self.retag_on_device();
                 }
+            }
+            BgEvent::DeviceSyncStatus(status) => {
+                self.device.sync_status = status;
             }
             BgEvent::LoadingDeviceTracks => {
                 self.device.loading_tracks = true;

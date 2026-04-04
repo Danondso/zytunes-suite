@@ -959,6 +959,12 @@ fn draw_device_info_connected(f: &mut Frame, app: &App, area: Rect) {
             Span::raw(display),
         ]));
     }
+    if let Some(ref sync_status) = app.device.sync_status {
+        lines.push(Line::from(vec![
+            Span::styled(" Sync: ", t.dim()),
+            Span::raw(sync_status.as_str()),
+        ]));
+    }
 
     // Storage info.
     if let Some(ref storage) = app.device.storage {

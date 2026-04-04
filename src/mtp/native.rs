@@ -232,6 +232,11 @@ impl NativeSession {
         self.session.get_storage_info(self.storage_id).mtp_err()
     }
 
+    /// Query device sync progress (vendor op 0x922f). Returns raw payload bytes.
+    pub fn get_sync_progress(&mut self) -> Result<Vec<u8>, String> {
+        self.session.get_sync_progress().mtp_err()
+    }
+
     /// Open a native MTP session to the Zune.
     /// Performs device detection, MTP session open, and MTPZ authentication.
     /// The `log` callback receives diagnostic messages for each step.
