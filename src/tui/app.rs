@@ -603,6 +603,7 @@ impl App {
         self.device.album_tracks.clear();
         self.device.track_set.clear();
         self.device.artist_track_names.clear();
+        self.device.acquired_items = 0;
         self.artist_device_status.clear();
         if self.browse_mode == BrowseMode::Device {
             self.browse_mode = BrowseMode::Library;
