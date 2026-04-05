@@ -184,11 +184,20 @@ impl TrackCache {
         Some(dir.join(filename))
     }
 
-    fn load(&self) -> Option<Vec<DeviceEntry>> {
+    /// Load cached tracks. Returns `(cached_free_bytes, tracks)`.
+    fn load(&self) -> Option<(u64, Vec<DeviceEntry>)> {
         let path = self.cache_path()?;
         let content = std::fs::read_to_string(&path).ok()?;
         let mut entries = Vec::new();
+        let mut free_bytes = 0u64;
         for line in content.lines() {
+            if let Some(val) = line.strip_prefix("#free_bytes:") {
+                free_bytes = val.parse().unwrap_or(0);
+                continue;
+            }
+            if line.starts_with('#') {
+                continue;
+            }
             let parts: Vec<&str> = line.splitn(5, '\t').collect();
             if parts.len() < 5 {
                 continue;
@@ -204,16 +213,16 @@ impl TrackCache {
         if entries.is_empty() {
             None
         } else {
-            Some(entries)
+            Some((free_bytes, entries))
         }
     }
 
-    fn save(&self, tracks: &[DeviceEntry]) {
+    fn save(&self, tracks: &[DeviceEntry], free_bytes: u64) {
         let path = match self.cache_path() {
             Some(p) => p,
             None => return,
         };
-        let mut content = String::new();
+        let mut content = format!("#free_bytes:{free_bytes}\n");
         for t in tracks {
             let safe_name = t.name.replace('\t', " ");
             content.push_str(&format!(
@@ -476,6 +485,23 @@ impl NativeSession {
         Ok(None)
     }
 
+    /// Find an existing folder by name under `parent`, or create it.
+    fn find_or_create_folder(&mut self, parent: u32, name: &str) -> Result<u32, String> {
+        if let Some(h) = self.find_object(parent, name)? {
+            return Ok(h);
+        }
+        self.log_msg(&format!("Creating folder: {name}"));
+        let props = PropListBuilder::new()
+            .add_string(PROP_OBJECT_FILENAME, name)
+            .build();
+        let (_, _, id) = self
+            .session
+            .send_object_prop_list(self.storage_id, parent, ASSOCIATION_FORMAT, 0, &props)
+            .mtp_err()?;
+        let _ = self.session.send_object(&[]);
+        Ok(id)
+    }
+
     /// Resolve a path like "/Music/Artist/Album" to an object handle.
     fn resolve_path(&mut self, path: &str) -> Result<u32, String> {
         let parts: Vec<&str> = path
@@ -566,7 +592,10 @@ impl NativeSession {
             }
         }
 
-        let music_folder = music_folder.ok_or("Music folder not found on device")?;
+        let music_folder = match music_folder {
+            Some(h) => h,
+            None => self.find_or_create_folder(MTP_ROOT, "Music")?,
+        };
         let artists_folder = artists_folder.unwrap_or(music_folder);
         let albums_folder = albums_folder.unwrap_or(music_folder);
 
@@ -690,27 +719,7 @@ impl NativeSession {
         let artist_supported = lib.caps.artist_supported;
 
         // Create music subfolder: /Music/{Artist}/
-        let folder_id = match self.find_object(music_folder, name)? {
-            Some(h) => h,
-            None => {
-                self.log_msg(&format!("Creating folder: Music/{}", name));
-                let props = PropListBuilder::new()
-                    .add_string(PROP_OBJECT_FILENAME, name)
-                    .build();
-                let (_, _, id) = self
-                    .session
-                    .send_object_prop_list(
-                        self.storage_id,
-                        music_folder,
-                        ASSOCIATION_FORMAT,
-                        0,
-                        &props,
-                    )
-                    .mtp_err()?;
-                let _ = self.session.send_object(&[]);
-                id
-            }
-        };
+        let folder_id = self.find_or_create_folder(music_folder, name)?;
 
         // Create Artist MTP object if supported.
         let artist_id = if artist_supported {
@@ -774,27 +783,7 @@ impl NativeSession {
             .unwrap_or(lib.music_folder);
 
         // Create music subfolder: /Music/{Artist}/{Album}/
-        let folder_id = match self.find_object(artist_folder, album_name)? {
-            Some(h) => h,
-            None => {
-                self.log_msg(&format!("Creating folder: {}/{}", artist_name, album_name));
-                let props = PropListBuilder::new()
-                    .add_string(PROP_OBJECT_FILENAME, album_name)
-                    .build();
-                let (_, _, id) = self
-                    .session
-                    .send_object_prop_list(
-                        self.storage_id,
-                        artist_folder,
-                        ASSOCIATION_FORMAT,
-                        0,
-                        &props,
-                    )
-                    .mtp_err()?;
-                let _ = self.session.send_object(&[]);
-                id
-            }
-        };
+        let folder_id = self.find_or_create_folder(artist_folder, album_name)?;
 
         // Create AbstractAudioAlbum MTP object.
         let mut props = PropListBuilder::new();
@@ -1026,11 +1015,30 @@ impl DeviceSession for NativeSession {
     }
 
     fn collect_all_tracks(&mut self, path: &str) -> Result<Vec<DeviceEntry>, String> {
+        // Query current storage to validate cache freshness.
+        let current_free = self
+            .session
+            .get_storage_info(self.storage_id)
+            .ok()
+            .map(|(_, free)| free)
+            .unwrap_or(0);
+
         // Try disk cache first — avoids slow MTP enumeration on reconnect.
         self.log_msg("Checking track cache...");
-        if let Some(cached) = self.cache.load() {
-            self.log_msg(&format!("Loaded {} tracks from cache", cached.len()));
-            return Ok(cached);
+        if let Some((cached_free, cached)) = self.cache.load() {
+            let diff = current_free.abs_diff(cached_free);
+            if diff > 1_000_000 {
+                self.log_msg(&format!(
+                    "Storage changed (free: {} → {}), invalidating caches",
+                    cached_free, current_free
+                ));
+                self.cache.clear();
+                self.clear_library_cache();
+                self.library = None;
+            } else {
+                self.log_msg(&format!("Loaded {} tracks from cache", cached.len()));
+                return Ok(cached);
+            }
         }
         self.log_msg("No cache, querying device...");
 
@@ -1040,7 +1048,7 @@ impl DeviceSession for NativeSession {
         // Try ZMDB — single MTP call for the entire device library.
         match self.try_zmdb() {
             Ok(tracks) => {
-                self.cache.save(&tracks);
+                self.cache.save(&tracks, current_free);
                 return Ok(tracks);
             }
             Err(e) => {
@@ -1059,7 +1067,7 @@ impl DeviceSession for NativeSession {
         self.list_recursive(parent, "", &mut entries)?;
         let tracks: Vec<DeviceEntry> = entries.into_iter().filter(|e| !e.is_dir()).collect();
 
-        self.cache.save(&tracks);
+        self.cache.save(&tracks, current_free);
         self.log_msg(&format!("Cached {} tracks", tracks.len()));
 
         Ok(tracks)
@@ -1146,6 +1154,13 @@ impl NativeSession {
             if let Some(path) = self.library_cache_path() {
                 let _ = std::fs::write(path, lib.serialize());
             }
+        }
+    }
+
+    /// Delete the device library cache file.
+    fn clear_library_cache(&self) {
+        if let Some(path) = self.library_cache_path() {
+            let _ = std::fs::remove_file(path);
         }
     }
 
@@ -1554,9 +1569,10 @@ mod tests {
             sample_entry("Artist/Album/track1.mp3", 100),
             sample_entry("Artist/Album/track2.mp3", 101),
         ];
-        cache.save(&entries);
+        cache.save(&entries, 5_000_000);
 
-        let loaded = cache.load().unwrap();
+        let (free_bytes, loaded) = cache.load().unwrap();
+        assert_eq!(free_bytes, 5_000_000);
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0].name, "Artist/Album/track1.mp3");
         assert_eq!(loaded[0].object_id, 100);
@@ -1572,11 +1588,11 @@ mod tests {
     fn track_cache_append() {
         let cache = make_cache(Some("append"));
         let entries = vec![sample_entry("first.mp3", 1)];
-        cache.save(&entries);
+        cache.save(&entries, 0);
 
         cache.append(&sample_entry("second.mp3", 2));
 
-        let loaded = cache.load().unwrap();
+        let (_, loaded) = cache.load().unwrap();
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[1].name, "second.mp3");
 
@@ -1592,11 +1608,11 @@ mod tests {
             sample_entry("Artist/Album/keep.mp3", 1),
             sample_entry("Artist/Album/delete.mp3", 2),
         ];
-        cache.save(&entries);
+        cache.save(&entries, 0);
 
         cache.remove("/Music/Artist/Album/delete.mp3");
 
-        let loaded = cache.load().unwrap();
+        let (_, loaded) = cache.load().unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].name, "Artist/Album/keep.mp3");
 
@@ -1608,7 +1624,7 @@ mod tests {
     #[test]
     fn track_cache_clear() {
         let cache = make_cache(Some("clear"));
-        cache.save(&[sample_entry("x.mp3", 1)]);
+        cache.save(&[sample_entry("x.mp3", 1)], 0);
         assert!(cache.cache_path().unwrap().exists());
 
         cache.clear();
@@ -1622,12 +1638,51 @@ mod tests {
     }
 
     #[test]
+    fn track_cache_free_bytes_round_trips() {
+        let cache = make_cache(Some("free-bytes"));
+        let entries = vec![sample_entry("track.mp3", 1)];
+        cache.save(&entries, 28_000_000_000);
+
+        let (free, loaded) = cache.load().unwrap();
+        assert_eq!(free, 28_000_000_000);
+        assert_eq!(loaded.len(), 1);
+
+        if let Some(p) = cache.cache_path() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn track_cache_header_only_returns_none() {
+        let cache = make_cache(Some("header-only"));
+        // A cache with just the header and no tracks should return None.
+        if let Some(p) = cache.cache_path() {
+            let _ = std::fs::write(&p, "#free_bytes:5000000\n");
+            assert!(cache.load().is_none());
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn track_cache_legacy_format_defaults_free_bytes_zero() {
+        let cache = make_cache(Some("legacy"));
+        // Simulate an old cache file without the #free_bytes header.
+        if let Some(p) = cache.cache_path() {
+            let _ = std::fs::write(&p, "1\t1\tmp3\t1000\tArtist/Album/track.mp3\n");
+            let (free, loaded) = cache.load().unwrap();
+            assert_eq!(free, 0);
+            assert_eq!(loaded.len(), 1);
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
     fn track_cache_tabs_in_name_handled() {
         let cache = make_cache(Some("tabs"));
         let entries = vec![sample_entry("Art\tist/Album/track.mp3", 1)];
-        cache.save(&entries);
+        cache.save(&entries, 0);
 
-        let loaded = cache.load().unwrap();
+        let (_, loaded) = cache.load().unwrap();
         // Tab should be replaced with space in saved format.
         assert_eq!(loaded[0].name, "Art ist/Album/track.mp3");
 
