@@ -42,8 +42,6 @@ pub enum OperationCode {
     /// Retrieve items the device acquired on its own (podcast downloads,
     /// Zune-to-Zune sharing). Returns a u32 count followed by PUOIDs.
     GetAcquiredItems = 0x9219,
-    /// Retrieve the Zune's sync progress state (1036-byte struct).
-    /// No parameters required. Returns version/status flags and sync counters.
     /// Write sync progress state to the device (530-byte payload).
     SetDeviceSyncProgress = 0x922a,
     /// Read sync progress state from the device (returns 1036 bytes).
