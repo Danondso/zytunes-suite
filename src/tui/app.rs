@@ -123,6 +123,8 @@ pub struct DeviceState {
     pub artist_track_names: BTreeMap<String, Vec<String>>,
     /// Number of items the device acquired on its own (podcasts, Zune-to-Zune shares).
     pub acquired_items: u32,
+    /// Sync progress status string from MTP vendor op 0x922f.
+    pub sync_status: Option<String>,
 }
 
 impl DeviceState {
@@ -145,6 +147,7 @@ impl DeviceState {
             track_set: HashSet::new(),
             artist_track_names: BTreeMap::new(),
             acquired_items: 0,
+            sync_status: None,
         }
     }
 }
@@ -1294,11 +1297,15 @@ impl App {
             }
             BgEvent::SessionFailed(e) => {
                 self.device.status = DeviceStatus::Disconnected;
+                self.device.sync_status = None;
                 self.connection_anim_start = None;
                 self.set_toast(format!("Connection failed: {}", e), true);
                 if self.browse_mode == BrowseMode::Library {
                     self.retag_on_device();
                 }
+            }
+            BgEvent::DeviceSyncStatus(status) => {
+                self.device.sync_status = status;
             }
             BgEvent::LoadingDeviceTracks => {
                 self.device.loading_tracks = true;

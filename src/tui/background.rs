@@ -85,6 +85,8 @@ pub enum BgEvent {
         failed: usize,
     },
     AcquiredItemsCount(u32),
+    /// Parsed sync progress status from MTP vendor op 0x922f.
+    DeviceSyncStatus(Option<String>),
 }
 
 /// Spawn the background worker thread. Returns a sender for commands.
@@ -184,6 +186,19 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                         )));
                                     }
                                 }
+
+                                // Query sync progress (vendor op 0x922f).
+                                let sync_status = match s.get_sync_progress() {
+                                    Ok(raw) => Some(parse_sync_progress(&raw)),
+                                    Err(e) => {
+                                        let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                                            "Sync progress query failed: {}",
+                                            e
+                                        )));
+                                        None
+                                    }
+                                };
+                                let _ = event_tx.send(BgEvent::DeviceSyncStatus(sync_status));
 
                                 wire_log_sender(&mut s, &event_tx);
                                 let _ = event_tx.send(BgEvent::SyncMessage(
@@ -524,6 +539,25 @@ fn wire_log_sender(session: &mut dyn std::any::Any, event_tx: &mpsc::Sender<BgEv
     }
 }
 
+/// Parse the raw sync progress payload from MTP vendor op 0x922f.
+/// The 1036-byte struct has a u32 version/status at offset 0; the rest is
+/// sync counters and timestamps that are all zeros on a never-synced device.
+fn parse_sync_progress(data: &[u8]) -> String {
+    if data.len() < 4 {
+        return "Unknown".to_string();
+    }
+    let status = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+
+    // Check whether any byte beyond the first 4 is non-zero.
+    let has_body = data.len() > 4 && data[4..].iter().any(|&b| b != 0);
+
+    match (status, has_body) {
+        (0, _) => "No sync history".to_string(),
+        (_, true) => "Sync data available".to_string(),
+        (_, false) => "No sync history".to_string(),
+    }
+}
+
 #[cfg(test)]
 fn parse_storage_line(line: &str) -> Option<StorageInfo> {
     // "used 12345678 (45%), free 15000000 bytes of 27345678"
@@ -582,5 +616,31 @@ mod tests {
     #[test]
     fn parse_storage_line_non_numeric() {
         assert!(parse_storage_line("used abc (0%), free 100 bytes of 200").is_none());
+    }
+
+    #[test]
+    fn sync_progress_all_zeros() {
+        let data = vec![0u8; 1036];
+        assert_eq!(parse_sync_progress(&data), "No sync history");
+    }
+
+    #[test]
+    fn sync_progress_status_one_body_zeros() {
+        let mut data = vec![0u8; 1036];
+        data[0..4].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(parse_sync_progress(&data), "No sync history");
+    }
+
+    #[test]
+    fn sync_progress_status_one_body_nonzero() {
+        let mut data = vec![0u8; 1036];
+        data[0..4].copy_from_slice(&1u32.to_le_bytes());
+        data[8] = 0x42; // some non-zero byte in the body
+        assert_eq!(parse_sync_progress(&data), "Sync data available");
+    }
+
+    #[test]
+    fn sync_progress_too_short() {
+        assert_eq!(parse_sync_progress(&[0, 1]), "Unknown");
     }
 }

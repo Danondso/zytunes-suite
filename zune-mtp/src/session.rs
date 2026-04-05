@@ -518,15 +518,15 @@ impl MtpSession {
         Ok(le_u32(&data, 0))
     }
 
-    /// Read the device's sync progress state (1036 bytes).
+    /// Retrieve the device's sync progress state (vendor op 0x922f).
+    /// Returns the raw 1036-byte payload. The first u32 is a version/status flag;
+    /// the remainder contains sync counters and timestamps (mostly zeros when idle).
     pub fn get_sync_progress(&mut self) -> Result<Vec<u8>, MtpError> {
         self.execute_data_in(OperationCode::GetDeviceSyncProgress, &[])
     }
 
     /// Write sync progress state back to the device.
-    /// Payload must be exactly 530 bytes. The device validates the content
-    /// and rejects arbitrary data — only data previously read from the device
-    /// (or minor modifications) is accepted.
+    /// Payload must be exactly 530 bytes.
     pub fn set_sync_progress(&mut self, data: &[u8]) -> Result<(), MtpError> {
         if data.len() != 530 {
             return Err(MtpError::Protocol(format!(

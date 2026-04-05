@@ -22,6 +22,19 @@
   - Commands have been made organically
   - Audit mappings
   - Suggest improvements / redundant / confusing
+- ** One Offs **
+  - Initiating sync clears device
+  - logs truncate so you can read whole line, can't be scrolled, should copy log dump location to clipboard
+  - perf: batch transcoding
+  - UI: more bespoke panel for album art, have it resize instead of clip when it's responsive
+  - ascii art album covers again, make it toggleable via a key
+- ** Code Audit**
+  - Rule of threes should be observed, what code is duplicated > 3 times or two even if the code block is large
+  - Rust best practices
+  - files too big? 
+- ** iPod Support **
+  - What's it take? I bet we can, pure rust like the zune is gonna be the route first
+  - 
 
 ## Done
 
