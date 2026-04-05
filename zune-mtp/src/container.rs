@@ -46,6 +46,16 @@ pub enum OperationCode {
     SetDeviceSyncProgress = 0x922a,
     /// Read sync progress state from the device (returns 1036 bytes).
     GetDeviceSyncProgress = 0x922f,
+    /// Reboot and apply pending firmware update.
+    CommitFirmware = 0x9204,
+    /// Set WiFi sync profile on the device (324-byte payload).
+    SetDeviceWlanProfiles = 0x9227,
+    /// Test WiFi hardware capability. Params: 0=test, 1=disassoc?, 2=reset?.
+    AsyncTestDeviceWlan = 0x9228,
+    /// Control wireless/cloud sync.
+    CloudSyncControl = 0x9230,
+    /// Format a storage area.
+    FormatStore = 0x100f,
 }
 
 /// MTP response codes.
