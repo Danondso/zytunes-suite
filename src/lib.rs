@@ -691,6 +691,65 @@ pub fn collect_music_files(paths: &[&str]) -> Vec<String> {
 }
 
 pub fn collect_music_files_recursive(dir: &Path, extensions: &[&str], files: &mut Vec<String>) {
+    collect_files_recursive(dir, extensions, files);
+}
+
+/// Expand paths into a list of photo files.
+/// If a path is a directory, recursively find photo files in it.
+pub fn collect_photo_files(paths: &[&str]) -> Vec<String> {
+    let photo_extensions = ["jpg", "jpeg", "png", "bmp", "gif", "tiff", "webp"];
+    let mut files = Vec::new();
+
+    for path in paths {
+        let p = Path::new(path);
+        if p.is_file() {
+            if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+                if photo_extensions.contains(&ext.to_lowercase().as_str()) {
+                    files.push(path.to_string());
+                } else {
+                    eprintln!("Skipping non-photo file: {}", path);
+                }
+            }
+        } else if p.is_dir() {
+            collect_files_recursive(p, &photo_extensions, &mut files);
+        } else {
+            eprintln!("Not found: {}", path);
+        }
+    }
+
+    files.sort();
+    files
+}
+
+/// Expand paths into a list of video files.
+/// If a path is a directory, recursively find video files in it.
+pub fn collect_video_files(paths: &[&str]) -> Vec<String> {
+    let video_extensions = ["wmv", "mp4", "avi", "mpeg", "mpg"];
+    let mut files = Vec::new();
+
+    for path in paths {
+        let p = Path::new(path);
+        if p.is_file() {
+            if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+                if video_extensions.contains(&ext.to_lowercase().as_str()) {
+                    files.push(path.to_string());
+                } else {
+                    eprintln!("Skipping non-video file: {}", path);
+                }
+            }
+        } else if p.is_dir() {
+            collect_files_recursive(p, &video_extensions, &mut files);
+        } else {
+            eprintln!("Not found: {}", path);
+        }
+    }
+
+    files.sort();
+    files
+}
+
+/// Generic recursive file collection by extension list.
+fn collect_files_recursive(dir: &Path, extensions: &[&str], files: &mut Vec<String>) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) => {
@@ -702,7 +761,7 @@ pub fn collect_music_files_recursive(dir: &Path, extensions: &[&str], files: &mu
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            collect_music_files_recursive(&path, extensions, files);
+            collect_files_recursive(&path, extensions, files);
         } else if path.is_file() {
             if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                 if extensions.contains(&ext.to_lowercase().as_str()) {
@@ -711,6 +770,22 @@ pub fn collect_music_files_recursive(dir: &Path, extensions: &[&str], files: &mu
             }
         }
     }
+}
+
+/// Resize a photo to fit within the Zune 30 screen (240x320) and encode as JPEG.
+/// Preserves aspect ratio using Lanczos3 downsampling.
+pub fn resize_photo_for_zune(path: &str) -> Result<Vec<u8>, String> {
+    let img = image::open(path).map_err(|e| format!("Cannot open image {}: {}", path, e))?;
+    let resized = img.resize(240, 320, image::imageops::FilterType::Lanczos3);
+    let mut jpeg_buf = std::io::Cursor::new(Vec::new());
+    resized
+        .write_to(&mut jpeg_buf, image::ImageFormat::Jpeg)
+        .map_err(|e| format!("Failed to encode JPEG: {}", e))?;
+    let data = jpeg_buf.into_inner();
+    if data.is_empty() {
+        return Err("Encoded JPEG is empty".into());
+    }
+    Ok(data)
 }
 
 #[cfg(test)]
@@ -902,6 +977,156 @@ mod tests {
 
         assert_eq!(collect_music_files(&[f.to_str().unwrap()]).len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- collect_photo_files --
+
+    #[test]
+    fn collect_photo_files_filters_and_recurses() {
+        let dir = std::env::temp_dir().join("zune-test-collect-photos");
+        let _ = std::fs::remove_dir_all(&dir);
+        let sub = dir.join("subdir");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        std::fs::write(dir.join("wallpaper.jpg"), b"fake").unwrap();
+        std::fs::write(dir.join("photo.png"), b"fake").unwrap();
+        std::fs::write(dir.join("notes.txt"), b"fake").unwrap();
+        std::fs::write(dir.join("song.mp3"), b"fake").unwrap();
+        std::fs::write(sub.join("deep.bmp"), b"fake").unwrap();
+
+        let files = collect_photo_files(&[dir.to_str().unwrap()]);
+        assert_eq!(files.len(), 3);
+        assert!(files.iter().any(|f| f.ends_with("wallpaper.jpg")));
+        assert!(files.iter().any(|f| f.ends_with("photo.png")));
+        assert!(files.iter().any(|f| f.ends_with("deep.bmp")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn collect_photo_files_accepts_single_file() {
+        let dir = std::env::temp_dir().join("zune-test-collect-photo-single");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("pic.jpeg");
+        std::fs::write(&f, b"fake").unwrap();
+
+        assert_eq!(collect_photo_files(&[f.to_str().unwrap()]).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn collect_photo_files_rejects_non_photo() {
+        let dir = std::env::temp_dir().join("zune-test-collect-photo-reject");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("song.mp3");
+        std::fs::write(&f, b"fake").unwrap();
+
+        assert_eq!(collect_photo_files(&[f.to_str().unwrap()]).len(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- collect_video_files --
+
+    #[test]
+    fn collect_video_files_filters_and_recurses() {
+        let dir = std::env::temp_dir().join("zune-test-collect-videos");
+        let _ = std::fs::remove_dir_all(&dir);
+        let sub = dir.join("subdir");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        std::fs::write(dir.join("clip.wmv"), b"fake").unwrap();
+        std::fs::write(dir.join("movie.mp4"), b"fake").unwrap();
+        std::fs::write(dir.join("notes.txt"), b"fake").unwrap();
+        std::fs::write(sub.join("deep.avi"), b"fake").unwrap();
+
+        let files = collect_video_files(&[dir.to_str().unwrap()]);
+        assert_eq!(files.len(), 3);
+        assert!(files.iter().any(|f| f.ends_with("clip.wmv")));
+        assert!(files.iter().any(|f| f.ends_with("movie.mp4")));
+        assert!(files.iter().any(|f| f.ends_with("deep.avi")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn collect_video_files_rejects_non_video() {
+        let dir = std::env::temp_dir().join("zune-test-collect-video-reject");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("photo.jpg");
+        std::fs::write(&f, b"fake").unwrap();
+
+        assert_eq!(collect_video_files(&[f.to_str().unwrap()]).len(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- resize_photo_for_zune --
+
+    #[test]
+    fn resize_photo_landscape_fits_within_bounds() {
+        let dir = std::env::temp_dir().join("zune-test-resize-landscape");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let img_path = dir.join("landscape.png");
+        let img: image::ImageBuffer<image::Rgb<u8>, Vec<u8>> = image::ImageBuffer::new(640, 480);
+        img.save(&img_path).unwrap();
+
+        let jpeg_data = resize_photo_for_zune(img_path.to_str().unwrap()).unwrap();
+        assert!(!jpeg_data.is_empty());
+
+        let resized = image::load_from_memory(&jpeg_data).unwrap();
+        assert!(resized.width() <= 240);
+        assert!(resized.height() <= 320);
+        assert_eq!(resized.width(), 240);
+        assert_eq!(resized.height(), 180);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resize_photo_portrait_fits_within_bounds() {
+        let dir = std::env::temp_dir().join("zune-test-resize-portrait");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let img_path = dir.join("portrait.png");
+        let img: image::ImageBuffer<image::Rgb<u8>, Vec<u8>> = image::ImageBuffer::new(480, 640);
+        img.save(&img_path).unwrap();
+
+        let jpeg_data = resize_photo_for_zune(img_path.to_str().unwrap()).unwrap();
+        let resized = image::load_from_memory(&jpeg_data).unwrap();
+        assert!(resized.width() <= 240);
+        assert!(resized.height() <= 320);
+        assert_eq!(resized.height(), 320);
+        assert_eq!(resized.width(), 240);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resize_photo_produces_valid_jpeg() {
+        let dir = std::env::temp_dir().join("zune-test-resize-jpeg");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let img_path = dir.join("test.png");
+        let img: image::ImageBuffer<image::Rgb<u8>, Vec<u8>> = image::ImageBuffer::new(100, 100);
+        img.save(&img_path).unwrap();
+
+        let jpeg_data = resize_photo_for_zune(img_path.to_str().unwrap()).unwrap();
+        assert!(jpeg_data.len() >= 2);
+        assert_eq!(jpeg_data[0], 0xFF);
+        assert_eq!(jpeg_data[1], 0xD8);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resize_photo_nonexistent_file_errors() {
+        assert!(resize_photo_for_zune("/nonexistent/photo.jpg").is_err());
     }
 
     // -- Sync engine (MockSession) --
