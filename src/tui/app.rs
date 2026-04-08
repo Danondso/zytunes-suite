@@ -236,6 +236,8 @@ pub struct App {
     pub album_art_lines: Vec<Vec<(char, [u8; 3], [u8; 3])>>,
     /// Dimensions (w, h) the cached ASCII art was rendered for.
     album_art_size: (u16, u16),
+    /// Background commands to send after event handling (main loop flushes these).
+    pub pending_bg_commands: Vec<BgCommand>,
 }
 
 #[derive(Clone)]
@@ -305,6 +307,7 @@ impl App {
             album_art_key: String::new(),
             album_art_lines: Vec::new(),
             album_art_size: (0, 0),
+            pending_bg_commands: Vec::new(),
         }
     }
 
@@ -1294,6 +1297,19 @@ impl App {
                 self.connection_anim_start = None;
                 self.device.storage = storage;
                 self.set_toast("Device connected".into(), false);
+
+                // Auto-sync photos/videos if configured.
+                let cfg = crate::config::load();
+                if let Some(photo_dir) = std::env::var("ZYTUNES_PHOTOS_DIR").ok().or(cfg.photo_dir)
+                {
+                    self.pending_bg_commands
+                        .push(BgCommand::SyncPhotos { dir: photo_dir });
+                }
+                if let Some(video_dir) = std::env::var("ZYTUNES_VIDEOS_DIR").ok().or(cfg.video_dir)
+                {
+                    self.pending_bg_commands
+                        .push(BgCommand::SyncVideos { dir: video_dir });
+                }
             }
             BgEvent::SessionFailed(e) => {
                 self.device.status = DeviceStatus::Disconnected;
@@ -1391,6 +1407,22 @@ impl App {
             }
             BgEvent::StorageUpdated(storage) => {
                 self.device.storage = Some(storage);
+            }
+            BgEvent::PhotoSyncComplete { success, failed } => {
+                if success > 0 || failed > 0 {
+                    self.set_toast(
+                        format!("Photo sync: {} done, {} failed", success, failed),
+                        failed > 0,
+                    );
+                }
+            }
+            BgEvent::VideoSyncComplete { success, failed } => {
+                if success > 0 || failed > 0 {
+                    self.set_toast(
+                        format!("Video sync: {} done, {} failed", success, failed),
+                        failed > 0,
+                    );
+                }
             }
             BgEvent::AcquiredItemsCount(count) => {
                 self.device.acquired_items = count;

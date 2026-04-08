@@ -35,6 +35,8 @@ const FORMAT_AAC: u16 = 0xB903;
 const FORMAT_ARTIST: u16 = 0xB218;
 const FORMAT_ABSTRACT_AUDIO_ALBUM: u16 = 0xBA03;
 const FORMAT_ABSTRACT_AV_PLAYLIST: u16 = 0xBA05;
+const FORMAT_EXIF_JPEG: u16 = 0x3801;
+const FORMAT_WMV: u16 = 0xB981;
 
 /// Cached artist info.
 struct ArtistInfo {
@@ -1134,6 +1136,56 @@ impl DeviceSession for NativeSession {
             }
         }
     }
+
+    fn import_photo(&mut self, filename: &str, jpeg_data: &[u8]) -> Result<u64, String> {
+        let photos_folder = self.find_or_create_folder(MTP_ROOT, "Photos")?;
+
+        let props = PropListBuilder::new()
+            .add_string(PROP_OBJECT_FILENAME, filename)
+            .add_string(PROP_NAME, stem(filename))
+            .build();
+
+        self.log_msg(&format!("Importing photo: {}", filename));
+        let (_, _, obj_id) = self
+            .session
+            .send_object_prop_list(
+                self.storage_id,
+                photos_folder,
+                FORMAT_EXIF_JPEG,
+                jpeg_data.len() as u64,
+                &props,
+            )
+            .mtp_err()?;
+
+        self.session.send_object(jpeg_data).mtp_err()?;
+        Ok(obj_id as u64)
+    }
+
+    fn import_video(&mut self, filename: &str, data: &[u8]) -> Result<u64, String> {
+        let videos_folder = self.find_or_create_folder(MTP_ROOT, "Videos")?;
+
+        let format = detect_video_format(filename);
+
+        let props = PropListBuilder::new()
+            .add_string(PROP_OBJECT_FILENAME, filename)
+            .add_string(PROP_NAME, stem(filename))
+            .build();
+
+        self.log_msg(&format!("Importing video: {}", filename));
+        let (_, _, obj_id) = self
+            .session
+            .send_object_prop_list(
+                self.storage_id,
+                videos_folder,
+                format,
+                data.len() as u64,
+                &props,
+            )
+            .mtp_err()?;
+
+        self.session.send_object(data).mtp_err()?;
+        Ok(obj_id as u64)
+    }
 }
 
 impl NativeSession {
@@ -1293,7 +1345,9 @@ fn format_name(format: u16) -> String {
         0x300A => "AVI".to_string(),
         0x300B => "MPEG".to_string(),
         0x300C => "ASF".to_string(),
+        0x3801 => "JPEG".to_string(),
         0xB901 => "WMA".to_string(),
+        0xB981 => "WMV".to_string(),
         0xB903 => "AAC".to_string(),
         0xBA05 => "AbstractAudioVideoPlaylist".to_string(),
         _ => format!("0x{:04x}", format),
@@ -1375,6 +1429,18 @@ fn detect_format(filename: &str) -> u16 {
         "wma" => FORMAT_WMA,
         "aac" | "m4a" => FORMAT_AAC,
         _ => FORMAT_MP3, // Default to MP3.
+    }
+}
+
+/// Detect MTP video format code from filename extension.
+fn detect_video_format(filename: &str) -> u16 {
+    let ext = filename.rsplit('.').next().unwrap_or("").to_lowercase();
+    match ext.as_str() {
+        "wmv" => FORMAT_WMV,
+        "avi" => 0x300A,          // AVI
+        "mpeg" | "mpg" => 0x300B, // MPEG
+        "mp4" => 0x300C,          // ASF (closest standard MTP format for MP4)
+        _ => FORMAT_WMV,          // Default to WMV.
     }
 }
 
@@ -1504,6 +1570,50 @@ mod tests {
     fn detect_format_defaults_to_mp3() {
         assert_eq!(detect_format("track.flac"), FORMAT_MP3);
         assert_eq!(detect_format("noext"), FORMAT_MP3);
+    }
+
+    #[test]
+    fn format_exif_jpeg_constant() {
+        assert_eq!(FORMAT_EXIF_JPEG, 0x3801);
+    }
+
+    #[test]
+    fn format_wmv_constant() {
+        assert_eq!(FORMAT_WMV, 0xB981);
+    }
+
+    #[test]
+    fn detect_video_format_wmv() {
+        assert_eq!(detect_video_format("clip.wmv"), FORMAT_WMV);
+        assert_eq!(detect_video_format("CLIP.WMV"), FORMAT_WMV);
+    }
+
+    #[test]
+    fn detect_video_format_avi() {
+        assert_eq!(detect_video_format("clip.avi"), 0x300A);
+    }
+
+    #[test]
+    fn detect_video_format_mpeg() {
+        assert_eq!(detect_video_format("clip.mpeg"), 0x300B);
+        assert_eq!(detect_video_format("clip.mpg"), 0x300B);
+    }
+
+    #[test]
+    fn detect_video_format_mp4() {
+        assert_eq!(detect_video_format("clip.mp4"), 0x300C);
+    }
+
+    #[test]
+    fn detect_video_format_defaults_to_wmv() {
+        assert_eq!(detect_video_format("clip.unknown"), FORMAT_WMV);
+        assert_eq!(detect_video_format("noext"), FORMAT_WMV);
+    }
+
+    #[test]
+    fn format_name_includes_jpeg_and_wmv() {
+        assert_eq!(format_name(0x3801), "JPEG");
+        assert_eq!(format_name(0xB981), "WMV");
     }
 
     #[test]

@@ -7,7 +7,10 @@ use zytunes::device::{
 use zytunes::mtp::native::NativeSession;
 use zytunes::mtp::parse::DeviceEntry;
 use zytunes::mtp::DeviceSession;
-use zytunes::{make_transcode_temp_dir, needs_transcoding, transcode_to_mp3};
+use zytunes::{
+    collect_photo_files, collect_video_files, make_transcode_temp_dir, needs_transcoding,
+    resize_photo_for_zune, transcode_to_mp3,
+};
 
 /// Commands sent from the main TUI thread to the background worker.
 pub enum BgCommand {
@@ -20,6 +23,12 @@ pub enum BgCommand {
     Disconnect,
     ExecuteSyncQueue(Vec<SyncItem>),
     RemoveFromDevice(Vec<(String, u64)>),
+    SyncPhotos {
+        dir: String,
+    },
+    SyncVideos {
+        dir: String,
+    },
     CancelSync,
 }
 
@@ -82,6 +91,14 @@ pub enum BgEvent {
     },
     DeviceTrackAdded(DeviceEntry),
     DeviceTrackRemoved(String),
+    PhotoSyncComplete {
+        success: usize,
+        failed: usize,
+    },
+    VideoSyncComplete {
+        success: usize,
+        failed: usize,
+    },
     RemoveComplete {
         success: usize,
         failed: usize,
@@ -387,6 +404,208 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                         }
 
                         let _ = event_tx.send(BgEvent::RemoveComplete { success, failed });
+                    } else {
+                        let _ = event_tx.send(BgEvent::Error("No active session".into()));
+                    }
+                }
+                BgCommand::SyncPhotos { dir } => {
+                    if let Some(ref mut s) = session {
+                        let files = collect_photo_files(&[dir.as_str()]);
+                        if files.is_empty() {
+                            let _ = event_tx
+                                .send(BgEvent::SyncMessage("No photos found to sync".into()));
+                            let _ = event_tx.send(BgEvent::PhotoSyncComplete {
+                                success: 0,
+                                failed: 0,
+                            });
+                            continue;
+                        }
+
+                        let existing: std::collections::HashSet<String> = s
+                            .ls("/Photos")
+                            .unwrap_or_default()
+                            .iter()
+                            .map(|e| e.name.clone())
+                            .collect();
+
+                        let total = files.len();
+                        let mut success = 0usize;
+                        let mut failed = 0usize;
+
+                        let _ = event_tx
+                            .send(BgEvent::SyncMessage(format!("Syncing {} photos...", total)));
+
+                        for (i, file) in files.iter().enumerate() {
+                            if let Ok(BgCommand::CancelSync) = cmd_rx.try_recv() {
+                                let _ = event_tx
+                                    .send(BgEvent::SyncMessage("Photo sync cancelled".into()));
+                                break;
+                            }
+
+                            let filename = std::path::Path::new(file)
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy();
+                            let device_filename = format!(
+                                "{}.jpg",
+                                std::path::Path::new(&*filename)
+                                    .file_stem()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                            );
+
+                            if existing.contains(&device_filename) {
+                                let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                                    "[{}/{}] {} skipped (on device)",
+                                    i + 1,
+                                    total,
+                                    filename
+                                )));
+                                continue;
+                            }
+
+                            let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                                "[{}/{}] Syncing photo: {}",
+                                i + 1,
+                                total,
+                                filename
+                            )));
+
+                            match resize_photo_for_zune(file) {
+                                Ok(jpeg_data) => {
+                                    match s.import_photo(&device_filename, &jpeg_data) {
+                                        Ok(_) => success += 1,
+                                        Err(e) => {
+                                            failed += 1;
+                                            let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                                                "  FAILED: {}",
+                                                e
+                                            )));
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    failed += 1;
+                                    let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                                        "  FAILED (resize): {}",
+                                        e
+                                    )));
+                                }
+                            }
+                        }
+
+                        if let Ok((tot, free)) = s.get_storage_info() {
+                            let used = tot.saturating_sub(free);
+                            let pct = if tot > 0 { (used * 100 / tot) as u8 } else { 0 };
+                            let _ = event_tx.send(BgEvent::StorageUpdated(StorageInfo {
+                                total_bytes: tot,
+                                free_bytes: free,
+                                used_bytes: used,
+                                used_percent: pct,
+                            }));
+                        }
+
+                        let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                            "Photo sync done: {} synced, {} failed",
+                            success, failed
+                        )));
+                        let _ = event_tx.send(BgEvent::PhotoSyncComplete { success, failed });
+                    } else {
+                        let _ = event_tx.send(BgEvent::Error("No active session".into()));
+                    }
+                }
+                BgCommand::SyncVideos { dir } => {
+                    if let Some(ref mut s) = session {
+                        let files = collect_video_files(&[dir.as_str()]);
+                        if files.is_empty() {
+                            let _ = event_tx
+                                .send(BgEvent::SyncMessage("No videos found to sync".into()));
+                            let _ = event_tx.send(BgEvent::VideoSyncComplete {
+                                success: 0,
+                                failed: 0,
+                            });
+                            continue;
+                        }
+
+                        let existing: std::collections::HashSet<String> = s
+                            .ls("/Videos")
+                            .unwrap_or_default()
+                            .iter()
+                            .map(|e| e.name.clone())
+                            .collect();
+
+                        let total = files.len();
+                        let mut success = 0usize;
+                        let mut failed = 0usize;
+
+                        let _ = event_tx
+                            .send(BgEvent::SyncMessage(format!("Syncing {} videos...", total)));
+
+                        for (i, file) in files.iter().enumerate() {
+                            if let Ok(BgCommand::CancelSync) = cmd_rx.try_recv() {
+                                let _ = event_tx
+                                    .send(BgEvent::SyncMessage("Video sync cancelled".into()));
+                                break;
+                            }
+
+                            let filename = std::path::Path::new(file)
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .to_string();
+
+                            if existing.contains(&filename) {
+                                let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                                    "[{}/{}] {} skipped (on device)",
+                                    i + 1,
+                                    total,
+                                    filename
+                                )));
+                                continue;
+                            }
+
+                            let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                                "[{}/{}] Syncing video: {}",
+                                i + 1,
+                                total,
+                                filename
+                            )));
+
+                            match std::fs::read(file) {
+                                Ok(data) => match s.import_video(&filename, &data) {
+                                    Ok(_) => success += 1,
+                                    Err(e) => {
+                                        failed += 1;
+                                        let _ = event_tx
+                                            .send(BgEvent::SyncMessage(format!("  FAILED: {}", e)));
+                                    }
+                                },
+                                Err(e) => {
+                                    failed += 1;
+                                    let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                                        "  FAILED (read): {}",
+                                        e
+                                    )));
+                                }
+                            }
+                        }
+
+                        if let Ok((tot, free)) = s.get_storage_info() {
+                            let used = tot.saturating_sub(free);
+                            let pct = if tot > 0 { (used * 100 / tot) as u8 } else { 0 };
+                            let _ = event_tx.send(BgEvent::StorageUpdated(StorageInfo {
+                                total_bytes: tot,
+                                free_bytes: free,
+                                used_bytes: used,
+                                used_percent: pct,
+                            }));
+                        }
+
+                        let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                            "Video sync done: {} synced, {} failed",
+                            success, failed
+                        )));
+                        let _ = event_tx.send(BgEvent::VideoSyncComplete { success, failed });
                     } else {
                         let _ = event_tx.send(BgEvent::Error("No active session".into()));
                     }

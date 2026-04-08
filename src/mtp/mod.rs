@@ -29,4 +29,14 @@ pub trait DeviceSession {
     /// Save the device's sync progress to a local cache file.
     /// Called after a successful sync session. Default is a no-op.
     fn save_sync_progress(&mut self) {}
+    /// Import a photo to the device. Takes filename and pre-resized JPEG bytes.
+    /// Returns the new MTP object ID.
+    fn import_photo(&mut self, _filename: &str, _jpeg_data: &[u8]) -> Result<u64, String> {
+        Err("Photo import not supported".into())
+    }
+    /// Import a video file to the device. Takes filename and raw file bytes.
+    /// Returns the new MTP object ID.
+    fn import_video(&mut self, _filename: &str, _data: &[u8]) -> Result<u64, String> {
+        Err("Video import not supported".into())
+    }
 }
