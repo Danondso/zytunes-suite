@@ -135,6 +135,10 @@ fn run_loop(
         while let Ok(ev) = event_rx.try_recv() {
             app.handle_bg_event(ev);
         }
+        // Flush any pending background commands queued during event handling.
+        for cmd in app.pending_bg_commands.drain(..) {
+            let _ = cmd_tx.send(cmd);
+        }
         app.flush_device_index();
 
         // Process audio events.

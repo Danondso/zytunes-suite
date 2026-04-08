@@ -1,7 +1,8 @@
 use zytunes::mtp::DeviceSession;
 use zytunes::{
-    collect_music_files, connect, find_matching_tracks, library_xml_path, make_transcode_temp_dir,
-    needs_transcoding, sync_to_device, transcode_and_import,
+    collect_music_files, collect_photo_files, collect_video_files, connect, find_matching_tracks,
+    library_xml_path, make_transcode_temp_dir, needs_transcoding, resize_photo_for_zune,
+    sync_to_device, transcode_and_import,
 };
 
 use std::collections::HashMap;
@@ -13,6 +14,18 @@ fn main() {
         eprintln!("{e}");
         std::process::exit(1);
     }
+}
+
+/// Load a field from the TOML config file at ~/.config/zytunes/config.toml.
+fn load_config_field(field: &str) -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let path = Path::new(&home)
+        .join(".config")
+        .join("zytunes")
+        .join("config.toml");
+    let contents = std::fs::read_to_string(path).ok()?;
+    let table: toml::Table = contents.parse().ok()?;
+    table.get(field)?.as_str().map(|s| s.to_string())
 }
 
 fn run(args: &[String]) -> Result<(), String> {
@@ -47,6 +60,28 @@ fn run(args: &[String]) -> Result<(), String> {
             }
             cmd_sync(&args[2..])
         }
+        "photo-sync" => {
+            let dir = args
+                .get(2)
+                .map(|s| s.to_string())
+                .or_else(|| std::env::var("ZYTUNES_PHOTOS_DIR").ok())
+                .or_else(|| load_config_field("photo_dir"))
+                .ok_or("No photo directory configured.\n\
+                    Set ZYTUNES_PHOTOS_DIR env var, add photo_dir to ~/.config/zytunes/config.toml,\n\
+                    or pass a directory: zytunes photo-sync <dir>")?;
+            cmd_photo_sync(&dir)
+        }
+        "video-sync" => {
+            let dir = args
+                .get(2)
+                .map(|s| s.to_string())
+                .or_else(|| std::env::var("ZYTUNES_VIDEOS_DIR").ok())
+                .or_else(|| load_config_field("video_dir"))
+                .ok_or("No video directory configured.\n\
+                    Set ZYTUNES_VIDEOS_DIR env var, add video_dir to ~/.config/zytunes/config.toml,\n\
+                    or pass a directory: zytunes video-sync <dir>")?;
+            cmd_video_sync(&dir)
+        }
         "help" | "--help" | "-h" => {
             println!("zytunes v0.3.0 — sync music to a Zune 30\n");
             println!("Usage: zytunes <command> [args...]\n");
@@ -55,6 +90,8 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("  push <files...>        Push music files to the Zune");
             println!("  rm <device-paths...>   Remove files/folders from the Zune");
             println!("  sync <type> <name>     Sync from iTunes library to Zune");
+            println!("  photo-sync [dir]       Sync photos to the Zune");
+            println!("  video-sync [dir]       Sync videos to the Zune");
             println!("  library [xml] [query]  Browse iTunes library");
             println!("  help                   Show this help");
             println!("\nSync types:");
@@ -64,11 +101,14 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("  sync track <name>      Sync a single track by name");
             println!("\nUnsupported formats (FLAC, OGG, WAV, M4A, OPUS, etc.)");
             println!("are auto-transcoded to MP3 with album art.");
+            println!("\nPhotos are resized to fit the Zune 30 screen (240x320).");
             println!("\nExamples:");
             println!("  zytunes sync artist \"Radiohead\"");
             println!("  zytunes sync playlist \"Classic Rock\"");
             println!("  zytunes sync album \"OK Computer\"");
             println!("  zytunes push song.mp3");
+            println!("  zytunes photo-sync ~/Pictures/zune-wallpapers");
+            println!("  zytunes video-sync ~/Videos/zune");
             println!("  zytunes ls /Music");
             println!("  zytunes rm \"/Music/Artist/Album\"");
             Ok(())
@@ -340,6 +380,153 @@ fn cmd_push(paths: &[String]) -> Result<(), String> {
     let _ = std::fs::remove_dir_all(&temp_dir);
 
     println!("\nDone: {} uploaded, {} failed", success, failed);
+    Ok(())
+}
+
+/// Sync photos from a directory to the Zune.
+/// Photos are resized to fit within 240x320 and encoded as JPEG.
+fn cmd_photo_sync(dir: &str) -> Result<(), String> {
+    let files = collect_photo_files(&[dir]);
+    if files.is_empty() {
+        return Err(format!("No photo files found in {}", dir));
+    }
+
+    println!("Found {} photo(s) to sync", files.len());
+
+    let mut session = connect()?;
+    println!();
+
+    // Get existing photos on device to skip duplicates.
+    let existing: std::collections::HashSet<String> = session
+        .ls("/Photos")
+        .unwrap_or_default()
+        .iter()
+        .map(|e| e.name.clone())
+        .collect();
+
+    let mut success = 0;
+    let mut skipped = 0;
+    let mut failed = 0;
+    let total = files.len();
+
+    for (i, file) in files.iter().enumerate() {
+        let filename = Path::new(file)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy();
+
+        // Convert filename to JPEG extension for the device.
+        let device_filename = format!(
+            "{}.jpg",
+            Path::new(&*filename)
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+        );
+
+        if existing.contains(&device_filename) {
+            println!(
+                "[{}/{}] {} ... skipped (already on device)",
+                i + 1,
+                total,
+                filename
+            );
+            skipped += 1;
+            continue;
+        }
+
+        print!("[{}/{}] {} ... ", i + 1, total, filename);
+        match resize_photo_for_zune(file) {
+            Ok(jpeg_data) => match session.import_photo(&device_filename, &jpeg_data) {
+                Ok(_id) => {
+                    println!("OK");
+                    success += 1;
+                }
+                Err(e) => {
+                    println!("FAILED: {}", e);
+                    failed += 1;
+                }
+            },
+            Err(e) => {
+                println!("FAILED (resize): {}", e);
+                failed += 1;
+            }
+        }
+    }
+
+    println!(
+        "\nDone: {} synced, {} skipped, {} failed",
+        success, skipped, failed
+    );
+    Ok(())
+}
+
+/// Sync videos from a directory to the Zune.
+fn cmd_video_sync(dir: &str) -> Result<(), String> {
+    let files = collect_video_files(&[dir]);
+    if files.is_empty() {
+        return Err(format!("No video files found in {}", dir));
+    }
+
+    println!("Found {} video(s) to sync", files.len());
+
+    let mut session = connect()?;
+    println!();
+
+    // Get existing videos on device to skip duplicates.
+    let existing: std::collections::HashSet<String> = session
+        .ls("/Videos")
+        .unwrap_or_default()
+        .iter()
+        .map(|e| e.name.clone())
+        .collect();
+
+    let mut success = 0;
+    let mut skipped = 0;
+    let mut failed = 0;
+    let total = files.len();
+
+    for (i, file) in files.iter().enumerate() {
+        let filename = Path::new(file)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+
+        if existing.contains(&filename) {
+            println!(
+                "[{}/{}] {} ... skipped (already on device)",
+                i + 1,
+                total,
+                filename
+            );
+            skipped += 1;
+            continue;
+        }
+
+        print!("[{}/{}] {} ... ", i + 1, total, filename);
+        match std::fs::read(file) {
+            Ok(data) => match session.import_video(&filename, &data) {
+                Ok(_id) => {
+                    println!("OK");
+                    success += 1;
+                }
+                Err(e) => {
+                    println!("FAILED: {}", e);
+                    failed += 1;
+                }
+            },
+            Err(e) => {
+                println!("FAILED (read): {}", e);
+                failed += 1;
+            }
+        }
+    }
+
+    println!(
+        "\nDone: {} synced, {} skipped, {} failed",
+        success, skipped, failed
+    );
     Ok(())
 }
 
