@@ -1,4 +1,3 @@
-use zytunes::mtp::DeviceSession;
 use zytunes::{
     collect_music_files, collect_photo_files, collect_video_files, connect, find_matching_tracks,
     library_xml_path, make_transcode_temp_dir, needs_transcoding, resize_photo_for_zune,
@@ -258,13 +257,17 @@ fn cmd_sync(args: &[String]) -> Result<(), String> {
         return Err("No tracks with accessible files to sync.".into());
     }
 
+    // Connect to device.
+    let (mut session, caps, _detected) = connect()?;
+    println!();
+
     // Check which need transcoding.
     let to_transcode = pushable
         .iter()
         .filter(|t| {
             t.location
                 .as_ref()
-                .is_some_and(|loc| needs_transcoding(loc))
+                .is_some_and(|loc| needs_transcoding(loc, caps.supported_formats))
         })
         .count();
     println!(
@@ -273,10 +276,6 @@ fn cmd_sync(args: &[String]) -> Result<(), String> {
         to_transcode
     );
 
-    // Connect to Zune.
-    let mut session = connect()?;
-    println!();
-
     // Create temp dir for transcoded files.
     let temp_dir = make_transcode_temp_dir();
     if to_transcode > 0 {
@@ -284,7 +283,14 @@ fn cmd_sync(args: &[String]) -> Result<(), String> {
             .map_err(|e| format!("Failed to create temp directory: {e}"))?;
     }
 
-    let result = sync_to_device(&mut session, &pushable, sync_type, name.as_str(), &temp_dir)?;
+    let result = sync_to_device(
+        session.as_mut(),
+        &pushable,
+        sync_type,
+        name.as_str(),
+        &temp_dir,
+        &caps,
+    )?;
 
     // Clean up temp files.
     let _ = std::fs::remove_dir_all(&temp_dir);
@@ -302,7 +308,7 @@ fn cmd_sync(args: &[String]) -> Result<(), String> {
 
 /// List device contents at the given path.
 fn cmd_ls(path: &str) -> Result<(), String> {
-    let mut session = connect()?;
+    let (mut session, _caps, _detected) = connect()?;
     println!();
 
     let entries = session.ls(path)?;
@@ -331,19 +337,23 @@ fn cmd_push(paths: &[String]) -> Result<(), String> {
         return Err("No music files found.".into());
     }
 
+    // Connect to device.
+    let (mut session, caps, _detected) = connect()?;
+    println!();
+
     // Check which files need transcoding.
-    let needs_transcode = files.iter().filter(|f| needs_transcoding(f)).count();
+    let needs_transcode = files
+        .iter()
+        .filter(|f| needs_transcoding(f, caps.supported_formats))
+        .count();
 
     println!("Found {} music file(s) to push", files.len());
     if needs_transcode > 0 {
         println!(
-            "  {} file(s) will be transcoded to MP3 (Zune doesn't support FLAC/OGG/etc.)",
+            "  {} file(s) will be transcoded to MP3 (device doesn't support FLAC/OGG/etc.)",
             needs_transcode
         );
     }
-    println!();
-
-    let mut session = connect()?;
     println!();
 
     // Create temp dir for transcoded files.
@@ -364,7 +374,7 @@ fn cmd_push(paths: &[String]) -> Result<(), String> {
             .to_string_lossy();
         println!("[{}/{}] {}", i + 1, total, filename);
 
-        match transcode_and_import(&mut session, file, &temp_dir) {
+        match transcode_and_import(session.as_mut(), file, &temp_dir, &caps) {
             Ok(_id) => {
                 println!("  OK");
                 success += 1;
@@ -393,7 +403,7 @@ fn cmd_photo_sync(dir: &str) -> Result<(), String> {
 
     println!("Found {} photo(s) to sync", files.len());
 
-    let mut session = connect()?;
+    let (mut session, _caps, _detected) = connect()?;
     println!();
 
     // Get existing photos on device to skip duplicates.
@@ -470,7 +480,7 @@ fn cmd_video_sync(dir: &str) -> Result<(), String> {
 
     println!("Found {} video(s) to sync", files.len());
 
-    let mut session = connect()?;
+    let (mut session, _caps, _detected) = connect()?;
     println!();
 
     // Get existing videos on device to skip duplicates.
@@ -530,9 +540,9 @@ fn cmd_video_sync(dir: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Remove files/folders from the Zune.
+/// Remove files/folders from the device.
 fn cmd_rm(paths: &[String]) -> Result<(), String> {
-    let mut session = connect()?;
+    let (mut session, _caps, _detected) = connect()?;
     println!();
 
     for path in paths {

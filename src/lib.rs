@@ -4,9 +4,9 @@ pub mod dirlib;
 pub mod library;
 pub mod mtp;
 
-use device::ZuneDevice;
+use device::{DetectedDevice, DeviceBackend, DeviceCapabilities, DeviceFamily, ZuneBackend};
 use library::MusicLibrary;
-use mtp::{DeviceSession, NativeSession};
+use mtp::DeviceSession;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
@@ -104,29 +104,52 @@ pub fn load_library(
 /// Formats the Zune 30 natively supports (no transcoding needed).
 pub const ZUNE_NATIVE_FORMATS: &[&str] = &["mp3", "wma", "aac"];
 
-/// Connect to the Zune and return an active session.
-pub fn connect() -> Result<NativeSession, String> {
-    let zune = ZuneDevice::find().map_err(|e| format!("{}", e))?;
-    println!(
-        "Zune detected: {}",
-        zune.product_name.as_deref().unwrap_or("Zune")
-    );
+/// Connect to a supported device using the backend registry.
+///
+/// Tries each registered backend in order, returning the first successful
+/// session along with the device's capabilities and detection info.
+pub fn connect() -> Result<
+    (
+        Box<dyn DeviceSession + Send>,
+        DeviceCapabilities,
+        DetectedDevice,
+    ),
+    String,
+> {
+    let backends: Vec<Box<dyn DeviceBackend>> = vec![Box::new(ZuneBackend)];
 
-    print!("Connecting (MTPZ handshake)... ");
-    let log = |msg: &str| {
-        eprintln!("{}", msg);
-    };
-    match NativeSession::open(zune.product_id, &log) {
-        Ok(mut s) => {
-            s.set_serial(zune.serial_number);
-            println!("OK");
-            Ok(s)
-        }
-        Err(e) => {
-            println!("FAILED");
-            Err(e)
+    let mut last_err = String::from("No device backends available");
+    for backend in &backends {
+        match backend.detect() {
+            Ok(detected) => {
+                println!(
+                    "{} detected: {}",
+                    detected.name,
+                    match detected.family {
+                        DeviceFamily::Zune => "Zune",
+                    }
+                );
+
+                print!("Connecting... ");
+                match backend.open_session(&detected, None) {
+                    Ok(session) => {
+                        println!("OK");
+                        let caps = backend.capabilities();
+                        return Ok((session, caps, detected));
+                    }
+                    Err(e) => {
+                        println!("FAILED");
+                        last_err = e;
+                    }
+                }
+            }
+            Err(e) => {
+                last_err = e;
+            }
         }
     }
+
+    Err(last_err)
 }
 
 /// Create a unique temp directory for transcoded files (includes PID to avoid collisions).
@@ -134,14 +157,14 @@ pub fn make_transcode_temp_dir() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("zytunes-transcode-{}", std::process::id()))
 }
 
-/// Check if a file needs transcoding for the Zune.
-pub fn needs_transcoding(path: &str) -> bool {
+/// Check if a file needs transcoding for the target device.
+pub fn needs_transcoding(path: &str, supported_formats: &[&str]) -> bool {
     let ext = Path::new(path)
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
-    !ZUNE_NATIVE_FORMATS.contains(&ext.as_str())
+    !supported_formats.contains(&ext.as_str())
 }
 
 /// Strip leading track number from a filename stem.
@@ -160,18 +183,23 @@ pub fn transcode_and_import(
     session: &mut dyn DeviceSession,
     local_path: &str,
     temp_dir: &Path,
+    caps: &DeviceCapabilities,
 ) -> Result<u64, String> {
-    let upload_path = if needs_transcoding(local_path) {
-        transcode_to_mp3(local_path, temp_dir)?
+    let upload_path = if needs_transcoding(local_path, caps.supported_formats) {
+        transcode_to_mp3(local_path, temp_dir, caps.max_art_dimensions)?
     } else {
         local_path.to_string()
     };
-    session.zune_import(&upload_path)
+    session.import_track(&upload_path)
 }
 
 /// Transcode a file to MP3 using pure Rust libraries.
-/// Preserves metadata and resizes album art to 200x200 (Zune rejects larger art with 0xa803).
-pub fn transcode_to_mp3(input: &str, temp_dir: &Path) -> Result<String, String> {
+/// Preserves metadata and resizes album art to the given dimensions (or 200x200 by default).
+pub fn transcode_to_mp3(
+    input: &str,
+    temp_dir: &Path,
+    max_art_dimensions: Option<(u32, u32)>,
+) -> Result<String, String> {
     use id3::TagLike;
     use symphonia::core::audio::SampleBuffer;
     use symphonia::core::codecs::DecoderOptions;
@@ -305,10 +333,11 @@ pub fn transcode_to_mp3(input: &str, temp_dir: &Path) -> Result<String, String> 
         tag.set_genre(&meta.genre);
     }
 
-    // Resize and embed album art (200x200 JPEG for Zune)
+    // Resize and embed album art (dimensions from device capabilities, default 200x200)
     if let Some(art_data) = meta.album_art {
         if let Ok(img) = image::load_from_memory(&art_data) {
-            let resized = img.resize_exact(200, 200, image::imageops::FilterType::Lanczos3);
+            let (art_w, art_h) = max_art_dimensions.unwrap_or((200, 200));
+            let resized = img.resize_exact(art_w, art_h, image::imageops::FilterType::Lanczos3);
             let mut jpeg_buf = std::io::Cursor::new(Vec::new());
             if resized
                 .write_to(&mut jpeg_buf, image::ImageFormat::Jpeg)
@@ -460,10 +489,13 @@ pub fn sync_to_device(
     sync_type: SyncType,
     name: &str,
     temp_dir: &Path,
+    caps: &DeviceCapabilities,
 ) -> Result<SyncResult, String> {
     // Scan device for existing tracks to avoid duplicates.
     print!("Scanning device for existing tracks... ");
-    let existing_tracks = session.collect_all_tracks("/Music").unwrap_or_default();
+    let existing_tracks = session
+        .collect_all_tracks(caps.music_root)
+        .unwrap_or_default();
     let existing_names: std::collections::HashSet<String> = existing_tracks
         .iter()
         .map(|t| {
@@ -519,7 +551,7 @@ pub fn sync_to_device(
         let display = format!("{} - {} - {}", track.artist, track.album, track.name);
         println!("[{}/{}] {}", i + 1, total, display);
 
-        match transcode_and_import(session, loc, temp_dir) {
+        match transcode_and_import(session, loc, temp_dir, caps) {
             Ok(object_id) => {
                 println!("  OK (id: {})", object_id);
                 imported_ids.insert(track.name.to_lowercase(), object_id);
@@ -534,7 +566,14 @@ pub fn sync_to_device(
 
     // For playlist syncs, create a playlist on the device.
     if sync_type == SyncType::Playlist {
-        create_device_playlist(session, name, pushable, &imported_ids, &existing_tracks)?;
+        create_device_playlist(
+            session,
+            name,
+            pushable,
+            &imported_ids,
+            &existing_tracks,
+            caps.music_root,
+        )?;
     }
 
     Ok(SyncResult {
@@ -551,6 +590,7 @@ pub fn create_device_playlist(
     pushable: &[&library::Track],
     imported_ids: &HashMap<String, u64>,
     existing_device_tracks: &[mtp::parse::DeviceEntry],
+    music_root: &str,
 ) -> Result<(), String> {
     println!("\nCreating playlist \"{}\" on device...", name);
 
@@ -580,7 +620,7 @@ pub fn create_device_playlist(
         let device_tracks = if imported_ids.is_empty() {
             existing_device_tracks
         } else {
-            fresh_tracks = session.collect_all_tracks("/Music").unwrap_or_default();
+            fresh_tracks = session.collect_all_tracks(music_root).unwrap_or_default();
             &fresh_tracks
         };
         let mut used_ids: std::collections::HashSet<u64> = all_ids.values().copied().collect();
@@ -794,17 +834,30 @@ mod tests {
     use crate::library::ItunesLibrary;
     use id3::TagLike;
 
+    const ZUNE_FORMATS: &[&str] = &["mp3", "wma", "aac"];
+
+    fn test_caps() -> DeviceCapabilities {
+        DeviceCapabilities {
+            family: DeviceFamily::Zune,
+            supported_formats: ZUNE_FORMATS,
+            transcode_target: "mp3",
+            music_root: "/Music",
+            max_art_dimensions: Some((200, 200)),
+            playlist_support: true,
+        }
+    }
+
     #[test]
     fn needs_transcoding_by_extension() {
         // Native formats — no transcoding
-        assert!(!needs_transcoding("song.mp3"));
-        assert!(!needs_transcoding("song.wma"));
-        assert!(!needs_transcoding("song.aac"));
+        assert!(!needs_transcoding("song.mp3", ZUNE_FORMATS));
+        assert!(!needs_transcoding("song.wma", ZUNE_FORMATS));
+        assert!(!needs_transcoding("song.aac", ZUNE_FORMATS));
         // Non-native — needs transcoding
-        assert!(needs_transcoding("song.flac"));
-        assert!(needs_transcoding("song.m4a"));
-        assert!(needs_transcoding("song.ogg"));
-        assert!(needs_transcoding("song.wav"));
+        assert!(needs_transcoding("song.flac", ZUNE_FORMATS));
+        assert!(needs_transcoding("song.m4a", ZUNE_FORMATS));
+        assert!(needs_transcoding("song.ogg", ZUNE_FORMATS));
+        assert!(needs_transcoding("song.wav", ZUNE_FORMATS));
     }
 
     #[test]
@@ -1186,7 +1239,7 @@ mod tests {
         fn ls(&mut self, _path: &str) -> Result<Vec<mtp::parse::DeviceEntry>, String> {
             Ok(vec![])
         }
-        fn zune_import(&mut self, local_path: &str) -> Result<u64, String> {
+        fn import_track(&mut self, local_path: &str) -> Result<u64, String> {
             self.import_calls.push(local_path.to_string());
             let id = self.next_import_id;
             self.next_import_id += 1;
@@ -1244,8 +1297,16 @@ mod tests {
         let tracks: Vec<&library::Track> = vec![&t1, &t2, &t3, &t4, &t5];
 
         let mut mock = MockSession::new();
-        let result =
-            sync_to_device(&mut mock, &tracks, SyncType::Artist, "Artist", &temp_dir).unwrap();
+        let caps = test_caps();
+        let result = sync_to_device(
+            &mut mock,
+            &tracks,
+            SyncType::Artist,
+            "Artist",
+            &temp_dir,
+            &caps,
+        )
+        .unwrap();
 
         assert_eq!(result.success, 5);
         assert_eq!(result.skipped, 0);
@@ -1266,12 +1327,14 @@ mod tests {
         let tracks: Vec<&library::Track> = vec![&t1, &t2, &t3, &t4];
 
         let mut mock = MockSession::new();
+        let caps = test_caps();
         let result = sync_to_device(
             &mut mock,
             &tracks,
             SyncType::Playlist,
             "Road Trip",
             &temp_dir,
+            &caps,
         )
         .unwrap();
 
@@ -1297,8 +1360,16 @@ mod tests {
         mock.device_tracks
             .push(make_device_entry(50, "Artist/Album/Song 2.mp3"));
 
-        let result =
-            sync_to_device(&mut mock, &tracks, SyncType::Artist, "Artist", &temp_dir).unwrap();
+        let caps = test_caps();
+        let result = sync_to_device(
+            &mut mock,
+            &tracks,
+            SyncType::Artist,
+            "Artist",
+            &temp_dir,
+            &caps,
+        )
+        .unwrap();
 
         assert_eq!(result.success, 2);
         assert_eq!(result.skipped, 1);
@@ -1311,27 +1382,27 @@ mod tests {
 
     #[test]
     fn needs_transcoding_native_formats() {
-        assert!(!needs_transcoding("song.mp3"));
-        assert!(!needs_transcoding("song.wma"));
-        assert!(!needs_transcoding("song.aac"));
-        assert!(!needs_transcoding("SONG.MP3")); // case insensitive
+        assert!(!needs_transcoding("song.mp3", ZUNE_FORMATS));
+        assert!(!needs_transcoding("song.wma", ZUNE_FORMATS));
+        assert!(!needs_transcoding("song.aac", ZUNE_FORMATS));
+        assert!(!needs_transcoding("SONG.MP3", ZUNE_FORMATS)); // case insensitive
     }
 
     #[test]
     fn needs_transcoding_non_native_formats() {
-        assert!(needs_transcoding("song.flac"));
-        assert!(needs_transcoding("song.ogg"));
-        assert!(needs_transcoding("song.wav"));
-        assert!(needs_transcoding("song.m4a"));
-        assert!(needs_transcoding("song.opus"));
-        assert!(needs_transcoding("song.alac"));
-        assert!(needs_transcoding("song.aiff"));
+        assert!(needs_transcoding("song.flac", ZUNE_FORMATS));
+        assert!(needs_transcoding("song.ogg", ZUNE_FORMATS));
+        assert!(needs_transcoding("song.wav", ZUNE_FORMATS));
+        assert!(needs_transcoding("song.m4a", ZUNE_FORMATS));
+        assert!(needs_transcoding("song.opus", ZUNE_FORMATS));
+        assert!(needs_transcoding("song.alac", ZUNE_FORMATS));
+        assert!(needs_transcoding("song.aiff", ZUNE_FORMATS));
     }
 
     #[test]
     fn needs_transcoding_no_extension() {
-        assert!(needs_transcoding("noext"));
-        assert!(needs_transcoding(""));
+        assert!(needs_transcoding("noext", ZUNE_FORMATS));
+        assert!(needs_transcoding("", ZUNE_FORMATS));
     }
 
     // -- Sync dedup key tests (artist-based dedup) --
@@ -1349,8 +1420,16 @@ mod tests {
         mock.device_tracks
             .push(make_device_entry(50, "Artist A/Album/Song.mp3"));
 
-        let result =
-            sync_to_device(&mut mock, &tracks, SyncType::Artist, "Test", &temp_dir).unwrap();
+        let caps = test_caps();
+        let result = sync_to_device(
+            &mut mock,
+            &tracks,
+            SyncType::Artist,
+            "Test",
+            &temp_dir,
+            &caps,
+        )
+        .unwrap();
 
         assert_eq!(result.success, 1); // Only Artist B's track imported
         assert_eq!(result.skipped, 1); // Artist A's track skipped
@@ -1433,7 +1512,7 @@ mod tests {
         let out_dir = dir.join("out");
         std::fs::create_dir_all(&out_dir).unwrap();
 
-        let result = transcode_to_mp3(wav_path.to_str().unwrap(), &out_dir);
+        let result = transcode_to_mp3(wav_path.to_str().unwrap(), &out_dir, Some((200, 200)));
         assert!(result.is_ok(), "transcode failed: {:?}", result.err());
 
         let mp3_path = result.unwrap();
@@ -1482,7 +1561,8 @@ mod tests {
         let out_dir = dir.join("out");
         std::fs::create_dir_all(&out_dir).unwrap();
 
-        let mp3_path = transcode_to_mp3(wav_path.to_str().unwrap(), &out_dir).unwrap();
+        let mp3_path =
+            transcode_to_mp3(wav_path.to_str().unwrap(), &out_dir, Some((200, 200))).unwrap();
 
         // Read back the ID3 tags from the output MP3
         let tag = id3::Tag::read_from_path(&mp3_path).unwrap();
@@ -1531,7 +1611,8 @@ mod tests {
         let out_dir = dir.join("out");
         std::fs::create_dir_all(&out_dir).unwrap();
 
-        let mp3_path = transcode_to_mp3(wav_path.to_str().unwrap(), &out_dir).unwrap();
+        let mp3_path =
+            transcode_to_mp3(wav_path.to_str().unwrap(), &out_dir, Some((200, 200))).unwrap();
 
         // Read the embedded art from the output MP3 and check dimensions
         let tag = id3::Tag::read_from_path(&mp3_path).unwrap();
@@ -1557,7 +1638,7 @@ mod tests {
         let out_dir = dir.join("out");
         std::fs::create_dir_all(&out_dir).unwrap();
 
-        let result = transcode_to_mp3(wav_path.to_str().unwrap(), &out_dir);
+        let result = transcode_to_mp3(wav_path.to_str().unwrap(), &out_dir, Some((200, 200)));
         assert!(result.is_ok(), "transcode failed: {:?}", result.err());
 
         // Verify no art embedded
@@ -1576,7 +1657,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&out_dir);
         std::fs::create_dir_all(&out_dir).unwrap();
 
-        let result = transcode_to_mp3("/nonexistent/path/song.flac", &out_dir);
+        let result = transcode_to_mp3("/nonexistent/path/song.flac", &out_dir, Some((200, 200)));
         assert!(result.is_err());
 
         let _ = std::fs::remove_dir_all(&out_dir);

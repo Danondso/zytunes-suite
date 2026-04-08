@@ -477,14 +477,27 @@ impl NativeSession {
             .session
             .get_object_handles(self.storage_id, parent)
             .mtp_err()?;
+        let mut stem_match = None;
         for handle in handles {
             if let Ok(info) = self.session.get_object_info(handle) {
                 if info.filename == name {
                     return Ok(Some(handle));
                 }
+                // Fall back to fuzzy match for ZMDB titles which lack
+                // file extensions and track number prefixes.
+                if stem_match.is_none() {
+                    let stem = info
+                        .filename
+                        .rfind('.')
+                        .map(|pos| &info.filename[..pos])
+                        .unwrap_or(&info.filename);
+                    if stem == name || stem.ends_with(&format!(" {}", name)) {
+                        stem_match = Some(handle);
+                    }
+                }
             }
         }
-        Ok(None)
+        Ok(stem_match)
     }
 
     /// Find an existing folder by name under `parent`, or create it.
@@ -850,7 +863,7 @@ impl DeviceSession for NativeSession {
         Ok(entries)
     }
 
-    fn zune_import(&mut self, local_path: &str) -> Result<u64, String> {
+    fn import_track(&mut self, local_path: &str) -> Result<u64, String> {
         let file_data =
             std::fs::read(local_path).map_err(|e| format!("Cannot read {}: {}", local_path, e))?;
 
@@ -1027,7 +1040,9 @@ impl DeviceSession for NativeSession {
 
         // Try disk cache first — avoids slow MTP enumeration on reconnect.
         self.log_msg("Checking track cache...");
-        if let Some((cached_free, cached)) = self.cache.load() {
+        // Keep old cache entries so we can preserve real object IDs after ZMDB reload.
+        let old_cached = self.cache.load();
+        if let Some((cached_free, ref cached)) = old_cached {
             let diff = current_free.abs_diff(cached_free);
             if diff > 1_000_000 {
                 self.log_msg(&format!(
@@ -1039,7 +1054,7 @@ impl DeviceSession for NativeSession {
                 self.library = None;
             } else {
                 self.log_msg(&format!("Loaded {} tracks from cache", cached.len()));
-                return Ok(cached);
+                return Ok(cached.clone());
             }
         }
         self.log_msg("No cache, querying device...");
@@ -1047,9 +1062,38 @@ impl DeviceSession for NativeSession {
         // Restore sync progress before device queries (only on cache miss).
         self.restore_sync_progress();
 
+        // Build a map of known object IDs from the old cache (before invalidation).
+        let known_ids: std::collections::HashMap<String, u64> = old_cached
+            .map(|(_, entries)| {
+                entries
+                    .into_iter()
+                    .filter(|e| e.object_id > 0)
+                    .map(|e| (e.name, e.object_id))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         // Try ZMDB — single MTP call for the entire device library.
         match self.try_zmdb() {
-            Ok(tracks) => {
+            Ok(mut tracks) => {
+                // Merge in real object IDs from the old cache where names match.
+                if !known_ids.is_empty() {
+                    let mut restored = 0usize;
+                    for t in &mut tracks {
+                        if t.object_id == 0 {
+                            if let Some(&id) = known_ids.get(&t.name) {
+                                t.object_id = id;
+                                restored += 1;
+                            }
+                        }
+                    }
+                    if restored > 0 {
+                        self.log_msg(&format!(
+                            "Restored {} object IDs from previous cache",
+                            restored
+                        ));
+                    }
+                }
                 self.cache.save(&tracks, current_free);
                 return Ok(tracks);
             }

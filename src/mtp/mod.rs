@@ -13,7 +13,7 @@ pub trait DeviceSession {
     /// List files and directories at `path` on the device.
     fn ls(&mut self, path: &str) -> Result<Vec<DeviceEntry>, String>;
     /// Import a local audio file to the device. Returns the new MTP object ID.
-    fn zune_import(&mut self, local_path: &str) -> Result<u64, String>;
+    fn import_track(&mut self, local_path: &str) -> Result<u64, String>;
     /// Remove a file or folder by device path (e.g., `/Music/Artist/Album/track.mp3`).
     fn rm(&mut self, device_path: &str) -> Result<(), String>;
     /// Remove an object by its MTP object ID.
