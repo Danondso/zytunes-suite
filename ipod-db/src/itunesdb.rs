@@ -3,7 +3,11 @@ use std::io::{Cursor, Read, Seek, SeekFrom};
 
 use crate::{IpodDatabase, IpodDbError, IpodPlaylist, IpodTrack};
 
-/// Mhod type constants for string data objects.
+/// Mhod type constants for data objects.
+///
+/// String types (1-18) contain UTF-16LE encoded text with a 16-byte sub-header.
+/// Higher-numbered types (22+) are binary data (smart playlists, sort keys, etc.)
+/// and are skipped during parsing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum MhodType {
@@ -15,7 +19,12 @@ pub enum MhodType {
     Filetype = 6,
     Comment = 7,
     Composer = 8,
+    Grouping = 12,
     AlbumArtist = 14,
+    SortArtist = 15,
+    SortTitle = 16,
+    SortAlbum = 17,
+    SortAlbumArtist = 18,
 }
 
 impl MhodType {
@@ -29,7 +38,12 @@ impl MhodType {
             6 => Some(Self::Filetype),
             7 => Some(Self::Comment),
             8 => Some(Self::Composer),
+            12 => Some(Self::Grouping),
             14 => Some(Self::AlbumArtist),
+            15 => Some(Self::SortArtist),
+            16 => Some(Self::SortTitle),
+            17 => Some(Self::SortAlbum),
+            18 => Some(Self::SortAlbumArtist),
             _ => None,
         }
     }
@@ -107,37 +121,70 @@ fn parse_string_mhod(
 }
 
 /// Parse an mhit (track item) and its child mhods.
+///
+/// mhit field layout (offsets from chunk start):
+///   +0   magic "mhit"          +96  bookmark_time_ms
+///   +4   header_size           +100 sort_order
+///   +8   total_size            +104 date_added (Mac timestamp)
+///   +12  num_mhods             +108 date_released (Mac timestamp)
+///   +16  track_id              +112 dbid (persistent ID, u64)
+///   +20  visible               +120 checked (0xffff0001 = yes)
+///   +24  filetype              +124 app_rating
+///   +28  type|compilation|     +128 bpm
+///        rating|padding        +136 sample_rate (fixed-point, dup)
+///   +32  date_modified         +144 explicit_flag
+///   +36  file_size             +164 remember_playback_pos
+///   +40  total_time_ms         +168 dbid2 (duplicate of +112)
+///   +44  track_number          +176 lyrics_flag
+///   +48  total_tracks          +184 mark_unplayed
+///   +52  year                  +188 size_on_disk
+///   +56  bitrate               +200 media_type
+///   +60  sample_rate           +204 season_number|episode_number
+///   +64  volume_adjust         +208 has_gapless_data
+///   +68  start_time            +248 gapless_encoding_delay
+///   +72  stop_time             +256 gapless_track_flag
+///   +76  sound_check           +288 album_id
+///   +80  play_count            +300 file_size2 (>4GB support)
+///   +84  play_count2
+///   +88  disc_number
+///   +92  disc_total
 fn parse_mhit(cur: &mut Cursor<&[u8]>, start: u64) -> crate::Result<IpodTrack> {
-    let header_size = cur.read_u32::<LittleEndian>()?;
-    let total_size = cur.read_u32::<LittleEndian>()?;
-    let num_mhods = cur.read_u32::<LittleEndian>()?;
-    let track_id = cur.read_u32::<LittleEndian>()?;
-    let _visible = cur.read_u32::<LittleEndian>()?;
-    let filetype = cur.read_u32::<LittleEndian>()?;
-    let _type_byte = cur.read_u8()?;
-    let _compilation = cur.read_u8()?;
-    let _rating = cur.read_u8()?;
-    let _padding = cur.read_u8()?;
-    let _date_modified = cur.read_u32::<LittleEndian>()?;
-    let file_size = cur.read_u32::<LittleEndian>()?;
-    let total_time = cur.read_u32::<LittleEndian>()?;
-    let track_number = cur.read_u32::<LittleEndian>()?;
-    let _total_tracks = cur.read_u32::<LittleEndian>()?;
-    let year = cur.read_u32::<LittleEndian>()?;
-    let bitrate = cur.read_u32::<LittleEndian>()?;
-    let sample_rate_raw = cur.read_u32::<LittleEndian>()?;
+    let header_size = cur.read_u32::<LittleEndian>()?; // +4
+    let total_size = cur.read_u32::<LittleEndian>()?; // +8
+    let num_mhods = cur.read_u32::<LittleEndian>()?; // +12
+    let track_id = cur.read_u32::<LittleEndian>()?; // +16
+    let _visible = cur.read_u32::<LittleEndian>()?; // +20
+    let filetype = cur.read_u32::<LittleEndian>()?; // +24
+    let _type_byte = cur.read_u8()?; // +28
+    let _compilation = cur.read_u8()?; // +29
+    let _rating = cur.read_u8()?; // +30
+    let _padding = cur.read_u8()?; // +31
+    let _date_modified = cur.read_u32::<LittleEndian>()?; // +32
+    let file_size = cur.read_u32::<LittleEndian>()?; // +36
+    let total_time = cur.read_u32::<LittleEndian>()?; // +40
+    let track_number = cur.read_u32::<LittleEndian>()?; // +44
+    let _total_tracks = cur.read_u32::<LittleEndian>()?; // +48
+    let year = cur.read_u32::<LittleEndian>()?; // +52
+    let bitrate = cur.read_u32::<LittleEndian>()?; // +56
+    let sample_rate_raw = cur.read_u32::<LittleEndian>()?; // +60
     let sample_rate = (sample_rate_raw >> 16) as u16;
-    // Skip to disc_number at offset 88 from chunk start.
-    cur.seek(SeekFrom::Start(start + 88))?;
-    let disc_number = cur.read_u32::<LittleEndian>()?;
-    let _total_discs = cur.read_u32::<LittleEndian>()?;
+    let _volume_adjust = cur.read_u32::<LittleEndian>()?; // +64
+    let _start_time = cur.read_u32::<LittleEndian>()?; // +68
+    let _stop_time = cur.read_u32::<LittleEndian>()?; // +72
+    let _sound_check = cur.read_u32::<LittleEndian>()?; // +76
+    let _play_count = cur.read_u32::<LittleEndian>()?; // +80
+    let _play_count2 = cur.read_u32::<LittleEndian>()?; // +84
+    let disc_number = cur.read_u32::<LittleEndian>()?; // +88
+    let _disc_total = cur.read_u32::<LittleEndian>()?; // +92
+    let _bookmark_time_ms = cur.read_u32::<LittleEndian>()?; // +96
+    let _sort_order = cur.read_u32::<LittleEndian>()?; // +100
+    let _date_added = cur.read_u32::<LittleEndian>()?; // +104
+    let _date_released = cur.read_u32::<LittleEndian>()?; // +108
 
-    // dbid (persistent ID) at offset 112 from chunk start.
-    // Older specs listed offset 120, but real-world iTunesDB v0x75+ uses 112.
+    // dbid (persistent ID) at offset 112.
     // Guard: only read if header is large enough to contain the field.
     let dbid = if header_size >= 120 {
-        cur.seek(SeekFrom::Start(start + 112))?;
-        cur.read_u64::<LittleEndian>()?
+        cur.read_u64::<LittleEndian>()? // +112
     } else {
         0
     };

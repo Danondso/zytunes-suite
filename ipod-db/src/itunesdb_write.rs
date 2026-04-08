@@ -82,53 +82,68 @@ fn write_mhit(track: &IpodTrack) -> Vec<u8> {
     let total_size = header_size + mhods.len() as u32;
 
     let mut buf = Vec::with_capacity(total_size as usize);
-    buf.write_all(b"mhit").unwrap();
-    buf.write_u32::<LittleEndian>(header_size).unwrap();
-    buf.write_u32::<LittleEndian>(total_size).unwrap();
-    buf.write_u32::<LittleEndian>(num_mhods).unwrap();
-    buf.write_u32::<LittleEndian>(track.track_id).unwrap(); // track_id
-    buf.write_u32::<LittleEndian>(1).unwrap(); // visible
-    buf.write_u32::<LittleEndian>(track.filetype).unwrap();
-    buf.write_u8(0).unwrap(); // type (audio)
-    buf.write_u8(0).unwrap(); // compilation
-    buf.write_u8(0).unwrap(); // rating
-    buf.write_u8(0).unwrap(); // padding
-    buf.write_u32::<LittleEndian>(0).unwrap(); // date_modified
-    buf.write_u32::<LittleEndian>(track.file_size).unwrap();
+    buf.write_all(b"mhit").unwrap(); // +0
+    buf.write_u32::<LittleEndian>(header_size).unwrap(); // +4
+    buf.write_u32::<LittleEndian>(total_size).unwrap(); // +8
+    buf.write_u32::<LittleEndian>(num_mhods).unwrap(); // +12
+    buf.write_u32::<LittleEndian>(track.track_id).unwrap(); // +16
+    buf.write_u32::<LittleEndian>(1).unwrap(); // +20  visible
+    buf.write_u32::<LittleEndian>(track.filetype).unwrap(); // +24
+    buf.write_u8(0).unwrap(); // +28  type (audio)
+    buf.write_u8(0).unwrap(); // +29  compilation
+    buf.write_u8(0).unwrap(); // +30  rating
+    buf.write_u8(0).unwrap(); // +31  padding
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +32  date_modified
+    buf.write_u32::<LittleEndian>(track.file_size).unwrap(); // +36
     buf.write_u32::<LittleEndian>(track.total_time_ms.unwrap_or(0))
-        .unwrap();
+        .unwrap(); // +40
     buf.write_u32::<LittleEndian>(track.track_number.unwrap_or(0) as u32)
-        .unwrap();
-    buf.write_u32::<LittleEndian>(0).unwrap(); // total_tracks
+        .unwrap(); // +44
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +48  total_tracks
     buf.write_u32::<LittleEndian>(track.year.unwrap_or(0) as u32)
-        .unwrap();
+        .unwrap(); // +52
     buf.write_u32::<LittleEndian>(track.bitrate.unwrap_or(0) as u32)
-        .unwrap();
-    // Sample rate: upper 16 bits = Hz, lower 16 = 0.
+        .unwrap(); // +56
     let sr = (track.sample_rate.unwrap_or(0) as u32) << 16;
-    buf.write_u32::<LittleEndian>(sr).unwrap();
-    buf.write_u32::<LittleEndian>(0).unwrap(); // volume_adjust
-    buf.write_u32::<LittleEndian>(0).unwrap(); // start_time
-    buf.write_u32::<LittleEndian>(0).unwrap(); // stop_time
-
-    // Pad with zeros: we've written 76 bytes so far, need to reach offset 80.
-    buf.write_u32::<LittleEndian>(0).unwrap(); // padding to offset 80
-
-    buf.write_u32::<LittleEndian>(0).unwrap(); // play_count
-    buf.write_u32::<LittleEndian>(0).unwrap(); // last_played
+    buf.write_u32::<LittleEndian>(sr).unwrap(); // +60  sample_rate
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +64  volume_adjust
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +68  start_time
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +72  stop_time
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +76  sound_check
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +80  play_count
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +84  play_count2
     buf.write_u32::<LittleEndian>(track.disc_number.unwrap_or(0) as u32)
-        .unwrap();
-    buf.write_u32::<LittleEndian>(0).unwrap(); // total_discs
+        .unwrap(); // +88
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +92  disc_total
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +96  bookmark_time_ms
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +100 sort_order
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +104 date_added
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +108 date_released
+    buf.write_u64::<LittleEndian>(track.dbid).unwrap(); // +112 dbid
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +120 checked
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +124 app_rating
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +128 bpm
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +132 artwork_count
+    buf.write_u32::<LittleEndian>(sr).unwrap(); // +136 sample_rate (dup)
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +140 date_released2
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +144 explicit_flag
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +148 skip_count
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +152 last_skipped
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +156 has_artwork
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +160 skip_shuffling
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +164 remember_playback_pos
+    buf.write_u64::<LittleEndian>(track.dbid).unwrap(); // +168 dbid2 (duplicate)
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +176 lyrics_flag
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +180 movie_flag
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +184 mark_unplayed
+    buf.write_u32::<LittleEndian>(track.file_size).unwrap(); // +188 size_on_disk
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +192 date_modified2
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +196 hash
+    buf.write_u32::<LittleEndian>(1).unwrap(); // +200 media_type (audio)
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +204 season|episode
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +208 has_gapless_data
 
-    // Pad from offset 96 to offset 112 (16 bytes = 4 u32s).
-    for _ in 0..4 {
-        buf.write_u32::<LittleEndian>(0).unwrap();
-    }
-
-    // dbid (persistent ID) at offset 112.
-    buf.write_u64::<LittleEndian>(track.dbid).unwrap();
-
-    // Pad rest to header_size. We've written 120 bytes.
+    // Pad rest to header_size. We've written 212 bytes.
     let written = buf.len();
     for _ in 0..(header_size as usize - written) {
         buf.write_u8(0).unwrap();

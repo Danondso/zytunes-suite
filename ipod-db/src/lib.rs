@@ -1,3 +1,64 @@
+//! Pure Rust library for reading and writing the iPod iTunesDB binary database format.
+//!
+//! Classic iPods store their music library in a proprietary binary file at
+//! `iPod_Control/iTunes/iTunesDB`. This crate parses that format into an in-memory
+//! [`IpodDatabase`] and can serialize it back to disk.
+//!
+//! # Modules
+//!
+//! - [`detect`] — Scan filesystem mount points for connected iPods
+//! - [`fs`] — Manage the iPod's F00-F49 music directory structure
+//! - [`itunesdb`] — Parse iTunesDB binary format into [`IpodDatabase`]
+//! - [`itunesdb_write`] — Serialize [`IpodDatabase`] back to binary, with atomic writes
+//!
+//! # iTunesDB format overview
+//!
+//! The database is a tree of length-prefixed chunks, each identified by a 4-byte magic:
+//!
+//! ```text
+//! mhbd (database header)
+//! ├── mhsd type=1 (track dataset)
+//! │   └── mhlt (track list)
+//! │       └── mhit (track) ×N
+//! │           └── mhod (string: title, artist, album, path, ...) ×M
+//! ├── mhsd type=2 (playlist dataset)
+//! │   └── mhlp (playlist list)
+//! │       └── mhyp (playlist) ×N
+//! │           ├── mhod (string: playlist name) ×M
+//! │           └── mhip (playlist item: track reference) ×K
+//! └── mhsd type=3,4,5 (podcasts, albums, smart playlists — skipped)
+//! ```
+//!
+//! All integers are little-endian. Strings are UTF-16LE. Each chunk's header_size
+//! field allows skipping unknown fields for forward compatibility across iPod
+//! generations (tested: iPod Video, Classic, Mini).
+//!
+//! # Example
+//!
+//! ```no_run
+//! use ipod_db::{itunesdb, itunesdb_write, IpodDatabase, IpodTrack};
+//! use std::path::PathBuf;
+//!
+//! // Parse an existing database
+//! let mount = PathBuf::from("/mnt/ipod");
+//! let raw = std::fs::read(mount.join("iPod_Control/iTunes/iTunesDB")).unwrap();
+//! let mut db = itunesdb::parse(&raw, mount).unwrap();
+//!
+//! // Add a track
+//! db.add_track(IpodTrack {
+//!     dbid: 0, track_id: 0, // assigned by add_track
+//!     title: "Song".into(), artist: "Artist".into(), album: "Album".into(),
+//!     album_artist: None, genre: None, track_number: Some(1), disc_number: None,
+//!     total_time_ms: Some(180000), year: Some(2024), file_size: 5_000_000,
+//!     bitrate: Some(320), sample_rate: Some(44100),
+//!     ipod_path: ":iPod_Control:Music:F00:ABCD.mp3".into(),
+//!     filetype: 0x4d503320,
+//! });
+//!
+//! // Write back to disk (atomic, with .bak backup)
+//! itunesdb_write::write_to_disk(&db).unwrap();
+//! ```
+
 pub mod detect;
 pub mod fs;
 pub mod itunesdb;
