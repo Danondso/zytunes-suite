@@ -848,7 +848,7 @@ impl DeviceSession for NativeSession {
         Ok(entries)
     }
 
-    fn zune_import(&mut self, local_path: &str) -> Result<u64, String> {
+    fn import_track(&mut self, local_path: &str) -> Result<u64, String> {
         let file_data =
             std::fs::read(local_path).map_err(|e| format!("Cannot read {}: {}", local_path, e))?;
 

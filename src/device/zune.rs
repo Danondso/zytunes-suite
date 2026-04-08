@@ -1,6 +1,10 @@
 use rusb::{Context, UsbContext};
 use std::fmt;
 
+use crate::mtp::DeviceSession;
+
+use super::{DetectedDevice, DeviceBackend, DeviceCapabilities, DeviceFamily};
+
 /// Microsoft's USB vendor ID.
 const MICROSOFT_VENDOR_ID: u16 = 0x045e;
 
@@ -21,6 +25,14 @@ pub struct ZuneDevice {
     pub product_name: Option<String>,
     pub firmware_version: Option<String>,
     pub serial_number: Option<String>,
+    pub usb_mode: Option<String>,
+}
+
+/// Backend-specific data stored in `DetectedDevice::backend_data`.
+pub struct ZuneDeviceData {
+    pub product_id: u16,
+    pub serial_number: Option<String>,
+    pub firmware_version: Option<String>,
     pub usb_mode: Option<String>,
 }
 
@@ -148,6 +160,66 @@ impl fmt::Display for ZuneDetectError {
 
 impl std::error::Error for ZuneDetectError {}
 
+/// Zune device backend implementing the `DeviceBackend` trait.
+pub struct ZuneBackend;
+
+impl DeviceBackend for ZuneBackend {
+    fn detect(&self) -> Result<DetectedDevice, String> {
+        let zune = ZuneDevice::find().map_err(|e| format!("{}", e))?;
+        let name = zune
+            .product_name
+            .clone()
+            .unwrap_or_else(|| "Zune".to_string());
+        Ok(DetectedDevice {
+            family: DeviceFamily::Zune,
+            name,
+            model: None,
+            serial: zune.serial_number.clone(),
+            firmware: zune.firmware_version.clone(),
+            backend_data: Box::new(ZuneDeviceData {
+                product_id: zune.product_id,
+                serial_number: zune.serial_number,
+                firmware_version: zune.firmware_version,
+                usb_mode: zune.usb_mode,
+            }),
+        })
+    }
+
+    fn capabilities(&self) -> DeviceCapabilities {
+        DeviceCapabilities {
+            family: DeviceFamily::Zune,
+            supported_formats: &["mp3", "wma", "aac"],
+            transcode_target: "mp3",
+            music_root: "/Music",
+            max_art_dimensions: Some((200, 200)),
+            playlist_support: true,
+        }
+    }
+
+    fn open_session(
+        &self,
+        detected: &DetectedDevice,
+        log: Option<std::sync::mpsc::Sender<String>>,
+    ) -> Result<Box<dyn DeviceSession + Send>, String> {
+        let data = detected
+            .backend_data
+            .downcast_ref::<ZuneDeviceData>()
+            .ok_or_else(|| "Invalid backend data for Zune".to_string())?;
+
+        let log_fn = move |msg: &str| {
+            if let Some(ref tx) = log {
+                let _ = tx.send(msg.to_string());
+            } else {
+                eprintln!("{}", msg);
+            }
+        };
+
+        let mut session = crate::mtp::NativeSession::open(data.product_id, &log_fn)?;
+        session.set_serial(data.serial_number.clone());
+        Ok(Box::new(session))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,5 +254,17 @@ mod tests {
             hint: "device not found".into(),
         };
         assert_eq!(format!("{}", not_found), "device not found");
+    }
+
+    #[test]
+    fn zune_backend_capabilities() {
+        let backend = ZuneBackend;
+        let caps = backend.capabilities();
+        assert_eq!(caps.family, DeviceFamily::Zune);
+        assert_eq!(caps.supported_formats, &["mp3", "wma", "aac"]);
+        assert_eq!(caps.transcode_target, "mp3");
+        assert_eq!(caps.music_root, "/Music");
+        assert_eq!(caps.max_art_dimensions, Some((200, 200)));
+        assert!(caps.playlist_support);
     }
 }

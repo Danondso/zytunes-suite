@@ -1,7 +1,9 @@
 use std::sync::mpsc;
 use std::thread;
 
-use zytunes::device::ZuneDevice;
+use zytunes::device::{
+    DeviceBackend, DeviceCapabilities, DeviceFamily, ZuneBackend, ZuneDeviceData,
+};
 use zytunes::mtp::native::NativeSession;
 use zytunes::mtp::parse::DeviceEntry;
 use zytunes::mtp::DeviceSession;
@@ -95,6 +97,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
 
     thread::spawn(move || {
         let mut session: Option<Box<dyn DeviceSession>> = None;
+        let mut caps: Option<DeviceCapabilities> = None;
 
         while let Ok(cmd) = cmd_rx.recv() {
             match cmd {
@@ -106,29 +109,33 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                     let _ = event_tx.send(BgEvent::LibraryLoaded(result));
                 }
                 BgCommand::Connect => {
-                    // Detect device first via USB.
-                    let _ = event_tx.send(BgEvent::SyncMessage("Scanning USB for Zune...".into()));
-                    let zune = match ZuneDevice::find() {
-                        Ok(z) => z,
+                    // Use the backend registry to detect and connect.
+                    let _ =
+                        event_tx.send(BgEvent::SyncMessage("Scanning USB for device...".into()));
+
+                    let backend = ZuneBackend;
+                    let detected = match backend.detect() {
+                        Ok(d) => d,
                         Err(e) => {
                             let _ = event_tx
                                 .send(BgEvent::SyncMessage(format!("Device not found: {}", e)));
-                            let _ = event_tx.send(BgEvent::SessionFailed(format!("{}", e)));
+                            let _ = event_tx.send(BgEvent::SessionFailed(e));
                             continue;
                         }
                     };
 
-                    let dev_name = zune
-                        .product_name
-                        .clone()
-                        .unwrap_or_else(|| "Zune".to_string());
-                    let _ = event_tx.send(BgEvent::SyncMessage(format!("Detected: {}", dev_name)));
+                    let _ =
+                        event_tx.send(BgEvent::SyncMessage(format!("Detected: {}", detected.name)));
 
+                    let backend_caps = backend.capabilities();
+
+                    // Build initial DeviceInfo from detection data.
+                    let zune_data = detected.backend_data.downcast_ref::<ZuneDeviceData>();
                     let device_info = DeviceInfo {
-                        name: dev_name,
-                        firmware_version: zune.firmware_version.clone(),
-                        serial_number: zune.serial_number.clone(),
-                        usb_mode: zune.usb_mode.clone(),
+                        name: detected.name.clone(),
+                        firmware_version: detected.firmware.clone(),
+                        serial_number: detected.serial.clone(),
+                        usb_mode: zune_data.and_then(|d| d.usb_mode.clone()),
                         manufacturer: None,
                         model: None,
                     };
@@ -139,15 +146,19 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                     let native_log = move |msg: &str| {
                         let _ = native_log_tx.send(BgEvent::SyncMessage(msg.to_string()));
                     };
+
+                    // Open session via NativeSession directly so we can do
+                    // Zune-specific vendor ops before boxing.
+                    let zune_product_id = zune_data.map(|d| d.product_id).unwrap_or(0x0710);
                     let connect_result: Result<Box<dyn DeviceSession>, String> =
-                        match NativeSession::open(zune.product_id, &native_log) {
+                        match NativeSession::open(zune_product_id, &native_log) {
                             Ok(mut s) => {
-                                s.set_serial(zune.serial_number.clone());
+                                s.set_serial(detected.serial.clone());
                                 // Prefer MTP firmware version over USB bcdDevice.
                                 let fw = s
                                     .firmware_version
                                     .clone()
-                                    .or_else(|| zune.firmware_version.clone());
+                                    .or_else(|| detected.firmware.clone());
                                 // Query storage for model detection before boxing.
                                 if let Ok((total, free)) = s.get_storage_info() {
                                     let model = zytunes::device::zune_model_from_storage(total);
@@ -160,8 +171,8 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                     let _ = event_tx.send(BgEvent::DeviceDetected(DeviceInfo {
                                         name: model.to_string(),
                                         firmware_version: fw,
-                                        serial_number: zune.serial_number.clone(),
-                                        usb_mode: zune.usb_mode.clone(),
+                                        serial_number: detected.serial.clone(),
+                                        usb_mode: zune_data.and_then(|d| d.usb_mode.clone()),
                                         manufacturer: Some("Microsoft".to_string()),
                                         model: Some(model.to_string()),
                                     }));
@@ -174,31 +185,35 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                         })));
                                 }
 
-                                // Query acquired items (podcasts, Zune-to-Zune shares).
-                                match s.get_acquired_items_count() {
-                                    Ok(count) => {
-                                        let _ = event_tx.send(BgEvent::AcquiredItemsCount(count));
+                                // Zune-specific vendor operations.
+                                if detected.family == DeviceFamily::Zune {
+                                    // Query acquired items (podcasts, Zune-to-Zune shares).
+                                    match s.get_acquired_items_count() {
+                                        Ok(count) => {
+                                            let _ =
+                                                event_tx.send(BgEvent::AcquiredItemsCount(count));
+                                        }
+                                        Err(e) => {
+                                            let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                                                "Could not query acquired items: {}",
+                                                e
+                                            )));
+                                        }
                                     }
-                                    Err(e) => {
-                                        let _ = event_tx.send(BgEvent::SyncMessage(format!(
-                                            "Could not query acquired items: {}",
-                                            e
-                                        )));
-                                    }
-                                }
 
-                                // Query sync progress (vendor op 0x922f).
-                                let sync_status = match s.get_sync_progress() {
-                                    Ok(raw) => Some(parse_sync_progress(&raw)),
-                                    Err(e) => {
-                                        let _ = event_tx.send(BgEvent::SyncMessage(format!(
-                                            "Sync progress query failed: {}",
-                                            e
-                                        )));
-                                        None
-                                    }
-                                };
-                                let _ = event_tx.send(BgEvent::DeviceSyncStatus(sync_status));
+                                    // Query sync progress (vendor op 0x922f).
+                                    let sync_status = match s.get_sync_progress() {
+                                        Ok(raw) => Some(parse_sync_progress(&raw)),
+                                        Err(e) => {
+                                            let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                                                "Sync progress query failed: {}",
+                                                e
+                                            )));
+                                            None
+                                        }
+                                    };
+                                    let _ = event_tx.send(BgEvent::DeviceSyncStatus(sync_status));
+                                }
 
                                 wire_log_sender(&mut s, &event_tx);
                                 let _ = event_tx.send(BgEvent::SyncMessage(
@@ -215,13 +230,17 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                 event_tx.send(BgEvent::SyncMessage("Session established".into()));
 
                             session = Some(s);
+                            caps = Some(backend_caps);
+
+                            let music_root =
+                                caps.as_ref().map(|c| c.music_root).unwrap_or("/Music");
 
                             // Auto-load device tracks after connection.
                             let _ = event_tx
                                 .send(BgEvent::SyncMessage("Loading device library...".into()));
                             let _ = event_tx.send(BgEvent::LoadingDeviceTracks);
                             if let Some(ref mut s) = session {
-                                match s.collect_all_tracks("/Music") {
+                                match s.collect_all_tracks(music_root) {
                                     Ok(tracks) => {
                                         let _ = event_tx.send(BgEvent::SyncMessage(format!(
                                             "Loaded {} tracks from device",
@@ -248,10 +267,11 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                 }
                 BgCommand::LoadDeviceTracks => {
                     if let Some(ref mut s) = session {
+                        let music_root = caps.as_ref().map(|c| c.music_root).unwrap_or("/Music");
                         let _ = event_tx
                             .send(BgEvent::SyncMessage("Refreshing device library...".into()));
                         let _ = event_tx.send(BgEvent::LoadingDeviceTracks);
-                        match s.collect_all_tracks("/Music") {
+                        match s.collect_all_tracks(music_root) {
                             Ok(tracks) => {
                                 let _ = event_tx.send(BgEvent::SyncMessage(format!(
                                     "Loaded {} tracks from device",
@@ -373,6 +393,13 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                 }
                 BgCommand::ExecuteSyncQueue(items) => {
                     if let Some(ref mut s) = session {
+                        let cur_caps = caps.clone();
+                        let supported_formats = cur_caps
+                            .as_ref()
+                            .map(|c| c.supported_formats)
+                            .unwrap_or(&["mp3", "wma", "aac"]);
+                        let max_art_dims = cur_caps.as_ref().and_then(|c| c.max_art_dimensions);
+
                         let total = items.len();
                         let mut success = 0usize;
                         let mut failed = 0usize;
@@ -382,7 +409,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
 
                         let to_transcode = items
                             .iter()
-                            .filter(|it| needs_transcoding(&it.location))
+                            .filter(|it| needs_transcoding(&it.location, supported_formats))
                             .count();
                         let _ = event_tx.send(BgEvent::SyncMessage(format!(
                             "Starting sync: {} tracks ({} need transcoding)",
@@ -402,40 +429,42 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                 track_name: item.name.clone(),
                             });
 
-                            let upload_path = if needs_transcoding(&item.location) {
-                                let _ = event_tx.send(BgEvent::SyncMessage(format!(
-                                    "[{}/{}] Transcoding \"{}\" to MP3...",
-                                    i + 1,
-                                    total,
-                                    item.name
-                                )));
-                                match transcode_to_mp3(&item.location, &temp_dir) {
-                                    Ok(p) => {
-                                        let size =
-                                            std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
-                                        let _ = event_tx.send(BgEvent::SyncMessage(format!(
-                                            "  Transcoded ({:.1} MB)",
-                                            size as f64 / 1_048_576.0
-                                        )));
-                                        p
+                            let upload_path =
+                                if needs_transcoding(&item.location, supported_formats) {
+                                    let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                                        "[{}/{}] Transcoding \"{}\" to MP3...",
+                                        i + 1,
+                                        total,
+                                        item.name
+                                    )));
+                                    match transcode_to_mp3(&item.location, &temp_dir, max_art_dims)
+                                    {
+                                        Ok(p) => {
+                                            let size =
+                                                std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+                                            let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                                                "  Transcoded ({:.1} MB)",
+                                                size as f64 / 1_048_576.0
+                                            )));
+                                            p
+                                        }
+                                        Err(e) => {
+                                            failed += 1;
+                                            let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                                                "  Transcode FAILED: {}",
+                                                e
+                                            )));
+                                            let _ = event_tx.send(BgEvent::SyncTrackDone {
+                                                track_name: item.name.clone(),
+                                                success: false,
+                                                error: Some(e),
+                                            });
+                                            continue;
+                                        }
                                     }
-                                    Err(e) => {
-                                        failed += 1;
-                                        let _ = event_tx.send(BgEvent::SyncMessage(format!(
-                                            "  Transcode FAILED: {}",
-                                            e
-                                        )));
-                                        let _ = event_tx.send(BgEvent::SyncTrackDone {
-                                            track_name: item.name.clone(),
-                                            success: false,
-                                            error: Some(e),
-                                        });
-                                        continue;
-                                    }
-                                }
-                            } else {
-                                item.location.clone()
-                            };
+                                } else {
+                                    item.location.clone()
+                                };
 
                             let _ = event_tx.send(BgEvent::SyncMessage(format!(
                                 "[{}/{}] Uploading \"{}\"...",
@@ -444,7 +473,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                 item.name
                             )));
 
-                            match s.zune_import(&upload_path) {
+                            match s.import_track(&upload_path) {
                                 Ok(id) => {
                                     success += 1;
                                     let _ = event_tx
