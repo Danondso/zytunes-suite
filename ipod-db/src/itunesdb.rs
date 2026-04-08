@@ -83,10 +83,10 @@ fn parse_string_mhod(
     // Position ourselves at offset 24 from chunk start.
     cur.seek(SeekFrom::Start(start + 24))?;
 
-    let _position = cur.read_u32::<LittleEndian>()?;
+    let _string_position = cur.read_u32::<LittleEndian>()?;
     let string_byte_len = cur.read_u32::<LittleEndian>()?;
-    let _unknown1 = cur.read_u32::<LittleEndian>()?;
-    let _unknown2 = cur.read_u32::<LittleEndian>()?;
+    let _encoding = cur.read_u32::<LittleEndian>()?; // 1 = UTF-16LE, 2 = UTF-8
+    let _padding = cur.read_u32::<LittleEndian>()?;
 
     // Guard against corrupted DB claiming absurd string lengths.
     if string_byte_len > 10 * 1024 * 1024 {
@@ -117,7 +117,7 @@ fn parse_mhit(cur: &mut Cursor<&[u8]>, start: u64) -> crate::Result<IpodTrack> {
     let _type_byte = cur.read_u8()?;
     let _compilation = cur.read_u8()?;
     let _rating = cur.read_u8()?;
-    let _pad = cur.read_u8()?;
+    let _padding = cur.read_u8()?;
     let _date_modified = cur.read_u32::<LittleEndian>()?;
     let file_size = cur.read_u32::<LittleEndian>()?;
     let total_time = cur.read_u32::<LittleEndian>()?;
@@ -272,7 +272,7 @@ pub fn parse(data: &[u8], mount_point: std::path::PathBuf) -> crate::Result<Ipod
     expect_magic(&mut cur, b"mhbd")?;
     let mhbd_header_size = cur.read_u32::<LittleEndian>()?;
     let _mhbd_total_size = cur.read_u32::<LittleEndian>()?;
-    let _unknown1 = cur.read_u32::<LittleEndian>()?;
+    let _db_type = cur.read_u32::<LittleEndian>()?; // 1 = iTunesDB, 2 = podcast DB
     let db_version = cur.read_u32::<LittleEndian>()?;
     let num_datasets = cur.read_u32::<LittleEndian>()?;
 

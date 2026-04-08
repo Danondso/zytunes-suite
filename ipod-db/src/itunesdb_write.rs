@@ -24,15 +24,15 @@ fn write_mhod(mhod_type: u32, value: &str) -> Vec<u8> {
     buf.write_u32::<LittleEndian>(header_size).unwrap();
     buf.write_u32::<LittleEndian>(total_size).unwrap();
     buf.write_u32::<LittleEndian>(mhod_type).unwrap();
-    buf.write_u32::<LittleEndian>(0).unwrap(); // unknown
-    buf.write_u32::<LittleEndian>(0).unwrap(); // unknown
+    buf.write_u32::<LittleEndian>(0).unwrap(); // padding
+    buf.write_u32::<LittleEndian>(0).unwrap(); // padding
 
     // String sub-header.
-    buf.write_u32::<LittleEndian>(0).unwrap(); // position
+    buf.write_u32::<LittleEndian>(0).unwrap(); // string_position
     buf.write_u32::<LittleEndian>(string_bytes.len() as u32)
         .unwrap();
     buf.write_u32::<LittleEndian>(1).unwrap(); // encoding (1 = UTF-16LE)
-    buf.write_u32::<LittleEndian>(0).unwrap(); // unknown
+    buf.write_u32::<LittleEndian>(0).unwrap(); // padding
 
     buf.write_all(&string_bytes).unwrap();
     buf
@@ -289,7 +289,7 @@ pub fn serialize(db: &IpodDatabase) -> Vec<u8> {
     result.write_all(b"mhbd").unwrap();
     result.write_u32::<LittleEndian>(mhbd_header_size).unwrap();
     result.write_u32::<LittleEndian>(mhbd_total_size).unwrap();
-    result.write_u32::<LittleEndian>(1).unwrap(); // unknown
+    result.write_u32::<LittleEndian>(1).unwrap(); // db_type (1 = iTunesDB)
     result.write_u32::<LittleEndian>(db.db_version).unwrap();
     result.write_u32::<LittleEndian>(num_datasets).unwrap();
     result.write_u64::<LittleEndian>(0).unwrap(); // db_id
