@@ -477,14 +477,23 @@ impl NativeSession {
             .session
             .get_object_handles(self.storage_id, parent)
             .mtp_err()?;
+        let mut stem_match = None;
         for handle in handles {
             if let Ok(info) = self.session.get_object_info(handle) {
                 if info.filename == name {
                     return Ok(Some(handle));
                 }
+                // Fall back to stem match (ZMDB titles lack file extensions).
+                if stem_match.is_none() {
+                    if let Some(pos) = info.filename.rfind('.') {
+                        if &info.filename[..pos] == name {
+                            stem_match = Some(handle);
+                        }
+                    }
+                }
             }
         }
-        Ok(None)
+        Ok(stem_match)
     }
 
     /// Find an existing folder by name under `parent`, or create it.
