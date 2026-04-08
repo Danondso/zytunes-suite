@@ -483,12 +483,16 @@ impl NativeSession {
                 if info.filename == name {
                     return Ok(Some(handle));
                 }
-                // Fall back to stem match (ZMDB titles lack file extensions).
+                // Fall back to fuzzy match for ZMDB titles which lack
+                // file extensions and track number prefixes.
                 if stem_match.is_none() {
-                    if let Some(pos) = info.filename.rfind('.') {
-                        if &info.filename[..pos] == name {
-                            stem_match = Some(handle);
-                        }
+                    let stem = info
+                        .filename
+                        .rfind('.')
+                        .map(|pos| &info.filename[..pos])
+                        .unwrap_or(&info.filename);
+                    if stem == name || stem.ends_with(&format!(" {}", name)) {
+                        stem_match = Some(handle);
                     }
                 }
             }
