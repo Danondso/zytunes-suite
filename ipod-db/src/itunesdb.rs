@@ -703,13 +703,24 @@ mod tests {
         // Replace old mhit and fix parent container sizes.
         let size_diff = old_total as i64 - new_total as i64;
         bytes.splice(mhit_pos..mhit_pos + old_total, new_mhit);
+        // Fix mhbd total_size.
         let mhbd_total = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as i64 - size_diff;
         bytes[8..12].copy_from_slice(&(mhbd_total as u32).to_le_bytes());
+        // Find the tracks mhsd (type=1) and fix its total_size.
         let mhbd_hdr = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
-        let mhsd_total = u32::from_le_bytes(bytes[mhbd_hdr + 8..mhbd_hdr + 12].try_into().unwrap())
-            as i64
-            - size_diff;
-        bytes[mhbd_hdr + 8..mhbd_hdr + 12].copy_from_slice(&(mhsd_total as u32).to_le_bytes());
+        let num_ds = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
+        let mut ds_pos = mhbd_hdr;
+        for _ in 0..num_ds {
+            let ds_type = u32::from_le_bytes(bytes[ds_pos + 12..ds_pos + 16].try_into().unwrap());
+            let ds_total = u32::from_le_bytes(bytes[ds_pos + 8..ds_pos + 12].try_into().unwrap());
+            if ds_type == 1 {
+                let new_ds_total = ds_total as i64 - size_diff;
+                bytes[ds_pos + 8..ds_pos + 12]
+                    .copy_from_slice(&(new_ds_total as u32).to_le_bytes());
+                break;
+            }
+            ds_pos += ds_total as usize;
+        }
 
         let parsed = parse(&bytes, PathBuf::from("/mnt/IPOD")).unwrap();
         assert_eq!(parsed.tracks.len(), 1);
@@ -726,9 +737,9 @@ mod tests {
         let db = IpodDatabase::new(PathBuf::from("/mnt/IPOD"));
         let mut bytes = itunesdb_write::serialize(&db);
 
-        // The mhbd says num_datasets=2. We'll change it to 3 and insert a dummy mhsd.
-        // mhbd num_datasets is at offset 20.
-        bytes[20..24].copy_from_slice(&3u32.to_le_bytes());
+        // Increment num_datasets by 1 and insert a dummy mhsd.
+        let num_ds = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
+        bytes[20..24].copy_from_slice(&(num_ds + 1).to_le_bytes());
 
         // Build a minimal fake mhsd (type=99, header=96, total=96).
         let mut fake_mhsd = vec![0u8; 96];

@@ -61,6 +61,7 @@
 
 pub mod detect;
 pub mod fs;
+pub mod hash;
 pub mod itunesdb;
 pub mod itunesdb_write;
 

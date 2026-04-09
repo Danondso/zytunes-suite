@@ -40,8 +40,8 @@ fn write_mhod(mhod_type: u32, value: &str) -> Vec<u8> {
 
 /// Write an mhit chunk with its child mhods. Returns the serialized bytes.
 fn write_mhit(track: &IpodTrack) -> Vec<u8> {
-    // We use a fixed header size of 0x148 (328) which is compatible with most iPod models.
-    let header_size: u32 = 0x148;
+    // Header size 0x270 (624) matches iPod Classic/Video/Mini (db versions 0x73-0x75).
+    let header_size: u32 = 0x270;
 
     // Build child mhods.
     let mut mhods = Vec::new();
@@ -136,10 +136,10 @@ fn write_mhit(track: &IpodTrack) -> Vec<u8> {
     buf.write_u32::<LittleEndian>(0).unwrap(); // +176 lyrics_flag
     buf.write_u32::<LittleEndian>(0).unwrap(); // +180 movie_flag
     buf.write_u32::<LittleEndian>(0).unwrap(); // +184 mark_unplayed
-    buf.write_u32::<LittleEndian>(track.file_size).unwrap(); // +188 size_on_disk
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +188 size_on_disk (0 = let firmware calculate)
     buf.write_u32::<LittleEndian>(0).unwrap(); // +192 date_modified2
     buf.write_u32::<LittleEndian>(0).unwrap(); // +196 hash
-    buf.write_u32::<LittleEndian>(1).unwrap(); // +200 media_type (audio)
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +200 (not media_type; per-track audio property)
     buf.write_u32::<LittleEndian>(0).unwrap(); // +204 season|episode
     buf.write_u32::<LittleEndian>(0).unwrap(); // +208 has_gapless_data
 
@@ -176,13 +176,76 @@ fn write_mhip(track_id: u32) -> Vec<u8> {
     buf
 }
 
+/// Sort type constants for mhod type 52 (sort index).
+/// Each corresponds to a browse category on the iPod.
+/// Mapping from libgpod: 3=title, 4=album, 5=artist, 7=genre, 18=composer.
+const SORT_TYPES: &[u32] = &[3, 4, 5, 7, 18];
+
+/// Build a type-52 sort index mhod for a given sort type.
+///
+/// The index is a permutation array: entry[i] = index of track that belongs at
+/// position i when sorted by the given field. The firmware uses this to build
+/// the browse UI without re-sorting on device.
+///
+/// Layout: mhod header (24) + sort_type (4) + count (4) + padding (40) + entries (count*4).
+/// The 40-byte padding block comes BEFORE entries — the firmware skips it.
+fn write_sort_index(tracks: &[IpodTrack], sort_type: u32) -> Vec<u8> {
+    let count = tracks.len();
+
+    let mut indices: Vec<usize> = (0..count).collect();
+    indices.sort_by(|&a, &b| {
+        let key_a = sort_key(&tracks[a], sort_type);
+        let key_b = sort_key(&tracks[b], sort_type);
+        key_a.cmp(&key_b)
+    });
+
+    let header_size: u32 = 24;
+    let payload_size = 4 + 4 + 40 + (count as u32) * 4;
+    let total_size = header_size + payload_size;
+
+    let mut buf = Vec::with_capacity(total_size as usize);
+    buf.write_all(b"mhod").unwrap();
+    buf.write_u32::<LittleEndian>(header_size).unwrap();
+    buf.write_u32::<LittleEndian>(total_size).unwrap();
+    buf.write_u32::<LittleEndian>(52).unwrap(); // mhod type = sort index
+    buf.write_u32::<LittleEndian>(0).unwrap(); // padding
+    buf.write_u32::<LittleEndian>(0).unwrap(); // padding
+
+    // Sort index payload.
+    buf.write_u32::<LittleEndian>(sort_type).unwrap();
+    buf.write_u32::<LittleEndian>(count as u32).unwrap();
+    // 40 bytes padding BEFORE entries (firmware skips these).
+    for _ in 0..10 {
+        buf.write_u32::<LittleEndian>(0).unwrap();
+    }
+    for &idx in &indices {
+        buf.write_u32::<LittleEndian>(idx as u32).unwrap();
+    }
+
+    buf
+}
+
+/// Get the lowercase sort key for a track by sort type.
+/// Sort type mapping from libgpod: 3=title, 4=album, 5=artist, 7=genre, 18=composer.
+fn sort_key(track: &IpodTrack, sort_type: u32) -> String {
+    match sort_type {
+        3 => track.title.to_lowercase(),
+        4 => track.album.to_lowercase(),
+        5 => track.artist.to_lowercase(),
+        7 => track.genre.as_deref().unwrap_or("").to_lowercase(),
+        18 => String::new(), // composer — not tracked yet
+        _ => String::new(),
+    }
+}
+
 /// Write an mhyp (playlist) chunk with its children. Returns serialized bytes.
 fn write_mhyp(
     playlist: &crate::IpodPlaylist,
     dbid_to_track_id: &std::collections::HashMap<u64, u32>,
     playlist_id: u64,
+    tracks: &[IpodTrack],
 ) -> Vec<u8> {
-    let header_size: u32 = 108;
+    let header_size: u32 = 184; // match iPod Classic header size
 
     // Build child mhods (playlist name).
     let mut mhods = Vec::new();
@@ -191,6 +254,17 @@ fn write_mhyp(
     if !playlist.name.is_empty() {
         mhods.extend(write_mhod(1, &playlist.name));
         num_mhods += 1;
+    }
+
+    // Master playlist gets sort indexes for all browse categories.
+    // These tell the firmware how to order tracks in the browse UI.
+    // The iPod will show "no music" without them when our tracks dataset
+    // is also present (the firmware doesn't rebuild them on its own).
+    if playlist.is_master && !tracks.is_empty() {
+        for &sort_type in SORT_TYPES {
+            mhods.extend(write_sort_index(tracks, sort_type));
+            num_mhods += 1;
+        }
     }
 
     // Build mhips.
@@ -267,7 +341,12 @@ pub fn serialize(db: &IpodDatabase) -> Vec<u8> {
     // Build playlist dataset (mhsd type 2 = mhlp + mhyps).
     let mut playlist_data = Vec::new();
     for (i, pl) in db.playlists.iter().enumerate() {
-        playlist_data.extend(write_mhyp(pl, &dbid_to_track_id, (i + 1) as u64));
+        playlist_data.extend(write_mhyp(
+            pl,
+            &dbid_to_track_id,
+            (i + 1) as u64,
+            &db.tracks,
+        ));
     }
 
     let mhlp_header_size: u32 = 92;
@@ -282,41 +361,126 @@ pub fn serialize(db: &IpodDatabase) -> Vec<u8> {
     }
     mhlp.extend(playlist_data);
 
-    let mhsd2_header_size: u32 = 96;
-    let mhsd2_total_size = mhsd2_header_size + mhlp.len() as u32;
+    // Build mhsd wrappers for the playlist data.
+    // Type 2 = playlists, Type 3 = podcast playlists (identical copy, required by firmware).
+    let mhsd_pl_header_size: u32 = 96;
+
     let mut mhsd2 = Vec::new();
     mhsd2.write_all(b"mhsd").unwrap();
-    mhsd2.write_u32::<LittleEndian>(mhsd2_header_size).unwrap();
-    mhsd2.write_u32::<LittleEndian>(mhsd2_total_size).unwrap();
+    mhsd2
+        .write_u32::<LittleEndian>(mhsd_pl_header_size)
+        .unwrap();
+    mhsd2
+        .write_u32::<LittleEndian>(mhsd_pl_header_size + mhlp.len() as u32)
+        .unwrap();
     mhsd2.write_u32::<LittleEndian>(2).unwrap(); // type = playlists
     let written = mhsd2.len();
-    for _ in 0..(mhsd2_header_size as usize - written) {
+    for _ in 0..(mhsd_pl_header_size as usize - written) {
         mhsd2.write_u8(0).unwrap();
     }
-    mhsd2.extend(mhlp);
+    mhsd2.extend(&mhlp);
 
-    // mhbd header.
-    let mhbd_header_size: u32 = 104;
-    let num_datasets: u32 = 2;
-    let mhbd_total_size = mhbd_header_size + mhsd1.len() as u32 + mhsd2.len() as u32;
+    // Type 3 = podcast playlists (duplicate of type 2 with different type field).
+    let mut mhsd3 = Vec::new();
+    mhsd3.write_all(b"mhsd").unwrap();
+    mhsd3
+        .write_u32::<LittleEndian>(mhsd_pl_header_size)
+        .unwrap();
+    mhsd3
+        .write_u32::<LittleEndian>(mhsd_pl_header_size + mhlp.len() as u32)
+        .unwrap();
+    mhsd3.write_u32::<LittleEndian>(3).unwrap(); // type = podcasts (copy of playlists)
+    let written = mhsd3.len();
+    for _ in 0..(mhsd_pl_header_size as usize - written) {
+        mhsd3.write_u8(0).unwrap();
+    }
+    mhsd3.extend(&mhlp);
+
+    // Type 4 = album list (mhla with zero entries).
+    let mhla_header_size: u32 = 92;
+    let mut mhla = Vec::new();
+    mhla.write_all(b"mhla").unwrap();
+    mhla.write_u32::<LittleEndian>(mhla_header_size).unwrap();
+    mhla.write_u32::<LittleEndian>(0).unwrap(); // 0 album entries
+    let written = mhla.len();
+    for _ in 0..(mhla_header_size as usize - written) {
+        mhla.write_u8(0).unwrap();
+    }
+
+    let mhsd4_header_size: u32 = 96;
+    let mhsd4_total_size = mhsd4_header_size + mhla.len() as u32;
+    let mut mhsd4 = Vec::new();
+    mhsd4.write_all(b"mhsd").unwrap();
+    mhsd4.write_u32::<LittleEndian>(mhsd4_header_size).unwrap();
+    mhsd4.write_u32::<LittleEndian>(mhsd4_total_size).unwrap();
+    mhsd4.write_u32::<LittleEndian>(4).unwrap(); // type = album list
+    let written = mhsd4.len();
+    for _ in 0..(mhsd4_header_size as usize - written) {
+        mhsd4.write_u8(0).unwrap();
+    }
+    mhsd4.extend(mhla);
+
+    // Type 5 = smart playlists (empty mhlp).
+    let mut mhlp5 = Vec::new();
+    mhlp5.write_all(b"mhlp").unwrap();
+    mhlp5.write_u32::<LittleEndian>(mhla_header_size).unwrap();
+    mhlp5.write_u32::<LittleEndian>(0).unwrap(); // 0 smart playlists
+    let written = mhlp5.len();
+    for _ in 0..(mhla_header_size as usize - written) {
+        mhlp5.write_u8(0).unwrap();
+    }
+
+    let mhsd5_header_size: u32 = 96;
+    let mhsd5_total_size = mhsd5_header_size + mhlp5.len() as u32;
+    let mut mhsd5 = Vec::new();
+    mhsd5.write_all(b"mhsd").unwrap();
+    mhsd5.write_u32::<LittleEndian>(mhsd5_header_size).unwrap();
+    mhsd5.write_u32::<LittleEndian>(mhsd5_total_size).unwrap();
+    mhsd5.write_u32::<LittleEndian>(5).unwrap(); // type = smart playlists
+    let written = mhsd5.len();
+    for _ in 0..(mhsd5_header_size as usize - written) {
+        mhsd5.write_u8(0).unwrap();
+    }
+    mhsd5.extend(mhlp5);
+
+    // mhbd header (244 bytes for hash58 compatibility with iPod Classic).
+    // Dataset order matches original: 4 (albums), 1 (tracks), 3 (podcasts), 2 (playlists), 5 (smart).
+    let mhbd_header_size: u32 = crate::hash::MHBD_HEADER_SIZE;
+    let num_datasets: u32 = 5;
+    let mhbd_total_size = mhbd_header_size
+        + mhsd4.len() as u32
+        + mhsd1.len() as u32
+        + mhsd3.len() as u32
+        + mhsd2.len() as u32
+        + mhsd5.len() as u32;
 
     let mut result = Vec::with_capacity(mhbd_total_size as usize);
     result.write_all(b"mhbd").unwrap();
     result.write_u32::<LittleEndian>(mhbd_header_size).unwrap();
     result.write_u32::<LittleEndian>(mhbd_total_size).unwrap();
-    result.write_u32::<LittleEndian>(1).unwrap(); // db_type (1 = iTunesDB)
-    result.write_u32::<LittleEndian>(db.db_version).unwrap();
-    result.write_u32::<LittleEndian>(num_datasets).unwrap();
-    result.write_u64::<LittleEndian>(0).unwrap(); // db_id
+    result.write_u32::<LittleEndian>(1).unwrap(); // +12 db_type (1 = iTunesDB)
+    result.write_u32::<LittleEndian>(db.db_version).unwrap(); // +16
+    result.write_u32::<LittleEndian>(num_datasets).unwrap(); // +20
+    result.write_u64::<LittleEndian>(0).unwrap(); // +24 db_id
+    result.write_u16::<LittleEndian>(0).unwrap(); // +32 platform
+    result.write_u16::<LittleEndian>(0).unwrap(); // +34 unk_0x22
+    result.write_u64::<LittleEndian>(0).unwrap(); // +36 id_0x24
+    result.write_u32::<LittleEndian>(0).unwrap(); // +44 unk_0x2c
+                                                  // +48 hashing_scheme (set by sign_hash58, leave 0 for unsigned)
+                                                  // Remaining fields (+48 through +244) are zero-padded.
+                                                  // hash58 at +0x58 will be written by sign_hash58() after serialization.
 
-    // Pad to header_size.
     let written = result.len();
     for _ in 0..(mhbd_header_size as usize - written) {
         result.write_u8(0).unwrap();
     }
 
+    // Dataset order: 4 (albums), 1 (tracks), 3 (podcasts), 2 (playlists), 5 (smart).
+    result.extend(mhsd4);
     result.extend(mhsd1);
+    result.extend(mhsd3);
     result.extend(mhsd2);
+    result.extend(mhsd5);
     result
 }
 
