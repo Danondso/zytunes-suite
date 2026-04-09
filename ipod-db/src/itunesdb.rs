@@ -145,9 +145,10 @@ fn parse_string_mhod(
 ///   +72  stop_time             +256 gapless_track_flag
 ///   +76  sound_check           +288 album_id
 ///   +80  play_count            +300 file_size2 (>4GB support)
-///   +84  play_count2
-///   +88  disc_number
-///   +92  disc_total
+///   +84  last_played (Mac timestamp)
+///   +88  date_added_to_device (Mac timestamp)
+///   +92  disc_number
+///   +96  disc_total
 fn parse_mhit(cur: &mut Cursor<&[u8]>, start: u64) -> crate::Result<IpodTrack> {
     let header_size = cur.read_u32::<LittleEndian>()?; // +4
     let total_size = cur.read_u32::<LittleEndian>()?; // +8
@@ -173,10 +174,10 @@ fn parse_mhit(cur: &mut Cursor<&[u8]>, start: u64) -> crate::Result<IpodTrack> {
     let _stop_time = cur.read_u32::<LittleEndian>()?; // +72
     let _sound_check = cur.read_u32::<LittleEndian>()?; // +76
     let _play_count = cur.read_u32::<LittleEndian>()?; // +80
-    let _play_count2 = cur.read_u32::<LittleEndian>()?; // +84
-    let disc_number = cur.read_u32::<LittleEndian>()?; // +88
-    let _disc_total = cur.read_u32::<LittleEndian>()?; // +92
-    let _bookmark_time_ms = cur.read_u32::<LittleEndian>()?; // +96
+    let _last_played = cur.read_u32::<LittleEndian>()?; // +84  Mac timestamp
+    let _date_added_to_device = cur.read_u32::<LittleEndian>()?; // +88  Mac timestamp
+    let disc_number = cur.read_u32::<LittleEndian>()?; // +92
+    let _disc_total = cur.read_u32::<LittleEndian>()?; // +96
     let _sort_order = cur.read_u32::<LittleEndian>()?; // +100
     let _date_added = cur.read_u32::<LittleEndian>()?; // +104
     let _date_released = cur.read_u32::<LittleEndian>()?; // +108

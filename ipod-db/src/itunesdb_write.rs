@@ -111,11 +111,11 @@ fn write_mhit(track: &IpodTrack) -> Vec<u8> {
     buf.write_u32::<LittleEndian>(0).unwrap(); // +72  stop_time
     buf.write_u32::<LittleEndian>(0).unwrap(); // +76  sound_check
     buf.write_u32::<LittleEndian>(0).unwrap(); // +80  play_count
-    buf.write_u32::<LittleEndian>(0).unwrap(); // +84  play_count2
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +84  last_played
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +88  date_added_to_device
     buf.write_u32::<LittleEndian>(track.disc_number.unwrap_or(0) as u32)
-        .unwrap(); // +88
-    buf.write_u32::<LittleEndian>(0).unwrap(); // +92  disc_total
-    buf.write_u32::<LittleEndian>(0).unwrap(); // +96  bookmark_time_ms
+        .unwrap(); // +92
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +96  disc_total
     buf.write_u32::<LittleEndian>(0).unwrap(); // +100 sort_order
     buf.write_u32::<LittleEndian>(0).unwrap(); // +104 date_added
     buf.write_u32::<LittleEndian>(0).unwrap(); // +108 date_released
