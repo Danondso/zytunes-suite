@@ -60,6 +60,7 @@
 //! itunesdb_write::write_to_disk(&db, Some(&fwid)).unwrap();
 //! ```
 
+pub mod artwork;
 pub mod detect;
 pub mod fs;
 pub mod hash;
@@ -82,6 +83,9 @@ pub enum IpodDbError {
 
     #[error("iPod filesystem error: {0}")]
     Filesystem(String),
+
+    #[error("artwork error: {0}")]
+    Artwork(String),
 }
 
 pub type Result<T> = std::result::Result<T, IpodDbError>;
@@ -135,7 +139,7 @@ pub struct IpodPlaylist {
 }
 
 /// The full in-memory representation of an iPod's iTunesDB.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct IpodDatabase {
     /// Database version (from mhbd header).
     pub db_version: u32,
@@ -145,6 +149,8 @@ pub struct IpodDatabase {
     pub playlists: Vec<IpodPlaylist>,
     /// Path to the iPod mount point.
     pub mount_point: PathBuf,
+    /// Artwork store (initialized when artwork is being managed).
+    pub artwork_store: Option<artwork::ArtworkStore>,
     /// Next available track ID for new entries.
     next_track_id: u32,
     /// Next available dbid for new entries.
@@ -163,6 +169,7 @@ impl IpodDatabase {
                 track_ids: Vec::new(),
             }],
             mount_point,
+            artwork_store: None,
             next_track_id: 1,
             next_dbid: 1,
         }
@@ -223,8 +230,28 @@ impl IpodDatabase {
             tracks,
             playlists,
             mount_point,
+            artwork_store: None,
             next_track_id,
             next_dbid,
         }
+    }
+
+    /// Initialize the artwork store with thumbnail specs for the target iPod model.
+    pub fn init_artwork(&mut self, specs: Vec<artwork::ThumbnailSpec>) {
+        self.artwork_store = Some(artwork::ArtworkStore::new(specs));
+    }
+
+    /// Set artwork for a track by dbid. The artwork store must be initialized first.
+    pub fn set_track_artwork(&mut self, dbid: u64, image_bytes: &[u8]) -> Result<()> {
+        let store = self
+            .artwork_store
+            .as_mut()
+            .ok_or_else(|| IpodDbError::Artwork("artwork store not initialized".into()))?;
+        store.add_artwork(dbid, image_bytes)
+    }
+
+    /// Path to the ArtworkDB file on disk.
+    pub fn artwork_db_path(&self) -> PathBuf {
+        artwork::ArtworkStore::db_path(&self.mount_point)
     }
 }

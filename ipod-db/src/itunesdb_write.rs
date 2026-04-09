@@ -39,7 +39,9 @@ fn write_mhod(mhod_type: u32, value: &str) -> Vec<u8> {
 }
 
 /// Write an mhit chunk with its child mhods. Returns the serialized bytes.
-fn write_mhit(track: &IpodTrack) -> Vec<u8> {
+///
+/// `artwork_count` is the number of thumbnail entries (0 if no artwork).
+fn write_mhit(track: &IpodTrack, artwork_count: u32) -> Vec<u8> {
     // Header size 0x270 (624) matches iPod Classic/Video/Mini (db versions 0x73-0x75).
     let header_size: u32 = 0x270;
 
@@ -123,13 +125,14 @@ fn write_mhit(track: &IpodTrack) -> Vec<u8> {
     buf.write_u32::<LittleEndian>(0).unwrap(); // +120 checked
     buf.write_u32::<LittleEndian>(0).unwrap(); // +124 app_rating
     buf.write_u32::<LittleEndian>(0).unwrap(); // +128 bpm
-    buf.write_u32::<LittleEndian>(0).unwrap(); // +132 artwork_count
+    buf.write_u32::<LittleEndian>(artwork_count).unwrap(); // +132 artwork_count
     buf.write_u32::<LittleEndian>(sr).unwrap(); // +136 sample_rate (dup)
     buf.write_u32::<LittleEndian>(0).unwrap(); // +140 date_released2
     buf.write_u32::<LittleEndian>(0).unwrap(); // +144 explicit_flag
     buf.write_u32::<LittleEndian>(0).unwrap(); // +148 skip_count
     buf.write_u32::<LittleEndian>(0).unwrap(); // +152 last_skipped
-    buf.write_u32::<LittleEndian>(0).unwrap(); // +156 has_artwork
+    buf.write_u32::<LittleEndian>(if artwork_count > 0 { 1 } else { 0 })
+        .unwrap(); // +156 has_artwork
     buf.write_u32::<LittleEndian>(0).unwrap(); // +160 skip_shuffling
     buf.write_u32::<LittleEndian>(0).unwrap(); // +164 remember_playback_pos
     buf.write_u64::<LittleEndian>(track.dbid).unwrap(); // +168 dbid2 (duplicate)
@@ -309,7 +312,12 @@ pub fn serialize(db: &IpodDatabase) -> Vec<u8> {
     // Build track dataset (mhsd type 1 = mhlt + mhits).
     let mut track_data = Vec::new();
     for track in &db.tracks {
-        track_data.extend(write_mhit(track));
+        let art_count = db
+            .artwork_store
+            .as_ref()
+            .map(|s| s.artwork_count(track.dbid))
+            .unwrap_or(0);
+        track_data.extend(write_mhit(track, art_count));
     }
 
     let mhlt_header_size: u32 = 92;
@@ -520,6 +528,12 @@ pub fn write_to_disk(db: &IpodDatabase, firewire_id: Option<&[u8; 20]>) -> crate
     rename_result.map_err(|e| {
         IpodDbError::Filesystem(format!("failed to atomically replace iTunesDB: {e}"))
     })?;
+
+    // Write ArtworkDB and .ithmb files if artwork is present.
+    if let Some(ref store) = db.artwork_store {
+        crate::artwork::ithmb::write_ithmb_files(&db.mount_point, &store.ithmb_files)?;
+        crate::artwork::artworkdb::write_to_disk(&db.mount_point, store)?;
+    }
 
     Ok(())
 }
