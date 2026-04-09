@@ -36,7 +36,7 @@
 //! # Example
 //!
 //! ```no_run
-//! use ipod_db::{itunesdb, itunesdb_write, IpodDatabase, IpodTrack};
+//! use ipod_db::{hash, itunesdb, itunesdb_write, IpodDatabase, IpodTrack};
 //! use std::path::PathBuf;
 //!
 //! // Parse an existing database
@@ -55,8 +55,9 @@
 //!     filetype: 0x4d503320,
 //! });
 //!
-//! // Write back to disk (atomic, with .bak backup)
-//! itunesdb_write::write_to_disk(&db).unwrap();
+//! // Write back to disk (atomic, with .bak backup and hash58 signing)
+//! let fwid = hash::parse_firewire_id("000A2700215CDB22").unwrap();
+//! itunesdb_write::write_to_disk(&db, Some(&fwid)).unwrap();
 //! ```
 
 pub mod detect;

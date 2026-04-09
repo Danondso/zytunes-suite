@@ -485,7 +485,10 @@ pub fn serialize(db: &IpodDatabase) -> Vec<u8> {
 }
 
 /// Write the database to disk with atomic temp+rename and .bak backup.
-pub fn write_to_disk(db: &IpodDatabase) -> crate::Result<()> {
+///
+/// If `firewire_id` is provided, signs the database with hash58 (required for
+/// iPod Classic). Pass `None` for older iPods that don't check the hash.
+pub fn write_to_disk(db: &IpodDatabase, firewire_id: Option<&[u8; 20]>) -> crate::Result<()> {
     let db_path = db.db_path();
 
     // Ensure parent directory exists.
@@ -500,12 +503,21 @@ pub fn write_to_disk(db: &IpodDatabase) -> crate::Result<()> {
             .map_err(|e| IpodDbError::Filesystem(format!("failed to create backup: {e}")))?;
     }
 
-    let data = serialize(db);
+    let mut data = serialize(db);
+
+    if let Some(fwid) = firewire_id {
+        crate::hash::sign_hash58(&mut data, fwid)?;
+    }
 
     // Write to temp file, then rename for atomicity.
     let tmp_path = db_path.with_extension("tmp");
     std::fs::write(&tmp_path, &data)?;
-    std::fs::rename(&tmp_path, &db_path).map_err(|e| {
+    let rename_result = std::fs::rename(&tmp_path, &db_path);
+    if rename_result.is_err() {
+        // Clean up orphaned temp file.
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    rename_result.map_err(|e| {
         IpodDbError::Filesystem(format!("failed to atomically replace iTunesDB: {e}"))
     })?;
 
