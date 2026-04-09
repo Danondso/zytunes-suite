@@ -122,34 +122,46 @@ fn parse_string_mhod(
 
 /// Parse an mhit (track item) and its child mhods.
 ///
-/// mhit field layout (offsets from chunk start):
-///   +0   magic "mhit"          +96  bookmark_time_ms
-///   +4   header_size           +100 sort_order
-///   +8   total_size            +104 date_added (Mac timestamp)
-///   +12  num_mhods             +108 date_released (Mac timestamp)
-///   +16  track_id              +112 dbid (persistent ID, u64)
-///   +20  visible               +120 checked (0xffff0001 = yes)
-///   +24  filetype              +124 app_rating
-///   +28  type|compilation|     +128 bpm
-///        rating|padding        +136 sample_rate (fixed-point, dup)
-///   +32  date_modified         +144 explicit_flag
-///   +36  file_size             +164 remember_playback_pos
-///   +40  total_time_ms         +168 dbid2 (duplicate of +112)
-///   +44  track_number          +176 lyrics_flag
-///   +48  total_tracks          +184 mark_unplayed
-///   +52  year                  +188 size_on_disk
-///   +56  bitrate               +200 media_type
-///   +60  sample_rate           +204 season_number|episode_number
-///   +64  volume_adjust         +208 has_gapless_data
-///   +68  start_time            +248 gapless_encoding_delay
-///   +72  stop_time             +256 gapless_track_flag
-///   +76  sound_check           +288 album_id
-///   +80  play_count            +300 file_size2 (>4GB support)
-///   +84  last_played (Mac timestamp)
-///   +88  date_added_to_device (Mac timestamp)
-///   +92  disc_number
-///   +96  disc_total
+/// mhit field layout (offsets from chunk start, all little-endian):
+///
+/// Core fields (+4 to +108, always present):
+///   +4   header_size     u32    +56  bitrate           u32
+///   +8   total_size      u32    +60  sample_rate       u32  fixed-point (Hz<<16)
+///   +12  num_mhods       u32    +64  volume_adjust     u32
+///   +16  track_id        u32    +68  start_time        u32  ms
+///   +20  visible         u32    +72  stop_time         u32  ms
+///   +24  filetype        u32    +76  sound_check       u32
+///   +28  type            u8     +80  play_count        u32
+///   +29  compilation     u8     +84  last_played       u32  Mac timestamp
+///   +30  rating          u8     +88  date_added_to_device u32 Mac timestamp
+///   +31  padding         u8     +92  disc_number       u32
+///   +32  date_modified   u32    +96  disc_total        u32
+///   +36  file_size       u32    +100 sort_order        u32
+///   +40  total_time_ms   u32    +104 date_added        u32  Mac timestamp
+///   +44  track_number    u32    +108 date_released     u32  Mac timestamp
+///   +48  total_tracks    u32
+///   +52  year            u32
+///
+/// Extended fields (+112 to +208, require header_size >= 212):
+///   +112 dbid            u64    +168 dbid2             u64  duplicate
+///   +120 checked         u32    +176 lyrics_flag       u32
+///   +124 app_rating      u32    +180 movie_flag        u32
+///   +128 bpm             u32    +184 mark_unplayed     u32
+///   +132 artwork_count   u32    +188 size_on_disk      u32
+///   +136 sample_rate_dup u32    +192 date_modified2    u32
+///   +140 date_released2  u32    +196 hash              u32
+///   +144 explicit_flag   u32    +200 media_type        u32
+///   +148 skip_count      u32    +204 season|episode    u32
+///   +152 last_skipped    u32    +208 has_gapless_data  u32
+///   +156 has_artwork     u32
+///   +160 skip_shuffling  u32
+///   +164 remember_pos    u32
+///
+/// Fields beyond +212 (gapless data, album IDs, etc.) vary by generation
+/// and are skipped via header_size.
 fn parse_mhit(cur: &mut Cursor<&[u8]>, start: u64) -> crate::Result<IpodTrack> {
+    // Read the minimum header fields (offsets +4 through +108, 108 bytes).
+    // Every field is read sequentially with no seek gaps.
     let header_size = cur.read_u32::<LittleEndian>()?; // +4
     let total_size = cur.read_u32::<LittleEndian>()?; // +8
     let num_mhods = cur.read_u32::<LittleEndian>()?; // +12
@@ -174,21 +186,50 @@ fn parse_mhit(cur: &mut Cursor<&[u8]>, start: u64) -> crate::Result<IpodTrack> {
     let _stop_time = cur.read_u32::<LittleEndian>()?; // +72
     let _sound_check = cur.read_u32::<LittleEndian>()?; // +76
     let _play_count = cur.read_u32::<LittleEndian>()?; // +80
-    let _last_played = cur.read_u32::<LittleEndian>()?; // +84  Mac timestamp
-    let _date_added_to_device = cur.read_u32::<LittleEndian>()?; // +88  Mac timestamp
+    let _last_played = cur.read_u32::<LittleEndian>()?; // +84   Mac timestamp
+    let _date_added_to_device = cur.read_u32::<LittleEndian>()?; // +88   Mac timestamp
     let disc_number = cur.read_u32::<LittleEndian>()?; // +92
     let _disc_total = cur.read_u32::<LittleEndian>()?; // +96
     let _sort_order = cur.read_u32::<LittleEndian>()?; // +100
-    let _date_added = cur.read_u32::<LittleEndian>()?; // +104
-    let _date_released = cur.read_u32::<LittleEndian>()?; // +108
+    let _date_added = cur.read_u32::<LittleEndian>()?; // +104  Mac timestamp
+    let _date_released = cur.read_u32::<LittleEndian>()?; // +108  Mac timestamp
+                                                          // Sequential read ends at +112. Remaining fields need header_size guards.
 
-    // dbid (persistent ID) at offset 112.
-    // Guard: only read if header is large enough to contain the field.
+    // Extended fields (offsets +112 through +320). Only present in larger headers.
+    // Each block is guarded by header_size to handle older iPod generations.
     let dbid = if header_size >= 120 {
-        cur.read_u64::<LittleEndian>()? // +112
+        cur.read_u64::<LittleEndian>()? // +112  persistent ID
     } else {
         0
     };
+
+    if header_size >= 212 {
+        let _checked = cur.read_u32::<LittleEndian>()?; // +120
+        let _app_rating = cur.read_u32::<LittleEndian>()?; // +124
+        let _bpm = cur.read_u32::<LittleEndian>()?; // +128
+        let _artwork_count = cur.read_u32::<LittleEndian>()?; // +132
+        let _sample_rate_dup = cur.read_u32::<LittleEndian>()?; // +136  fixed-point dup
+        let _date_released2 = cur.read_u32::<LittleEndian>()?; // +140
+        let _explicit_flag = cur.read_u32::<LittleEndian>()?; // +144
+        let _skip_count = cur.read_u32::<LittleEndian>()?; // +148
+        let _last_skipped = cur.read_u32::<LittleEndian>()?; // +152  Mac timestamp
+        let _has_artwork = cur.read_u32::<LittleEndian>()?; // +156
+        let _skip_shuffling = cur.read_u32::<LittleEndian>()?; // +160
+        let _remember_pos = cur.read_u32::<LittleEndian>()?; // +164
+        let _dbid2 = cur.read_u64::<LittleEndian>()?; // +168  persistent ID dup
+        let _lyrics_flag = cur.read_u32::<LittleEndian>()?; // +176
+        let _movie_flag = cur.read_u32::<LittleEndian>()?; // +180
+        let _mark_unplayed = cur.read_u32::<LittleEndian>()?; // +184
+        let _size_on_disk = cur.read_u32::<LittleEndian>()?; // +188
+        let _date_modified2 = cur.read_u32::<LittleEndian>()?; // +192
+        let _hash = cur.read_u32::<LittleEndian>()?; // +196
+        let _media_type = cur.read_u32::<LittleEndian>()?; // +200
+        let _season_episode = cur.read_u32::<LittleEndian>()?; // +204
+        let _has_gapless = cur.read_u32::<LittleEndian>()?; // +208
+    }
+    // Sequential read ends at +212. Remaining header bytes (212..header_size)
+    // contain gapless data, album IDs, and other fields that vary by generation.
+    // We skip them via the seek below — header_size handles forward compat.
 
     // Jump to end of mhit header to read child mhods.
     cur.seek(SeekFrom::Start(start + header_size as u64))?;
@@ -391,15 +432,7 @@ pub fn parse(data: &[u8], mount_point: std::path::PathBuf) -> crate::Result<Ipod
             .collect();
     }
 
-    let mut db = IpodDatabase {
-        db_version,
-        tracks,
-        playlists,
-        mount_point,
-        next_track_id: 0,
-        next_dbid: 0,
-    };
-    db.recalculate_ids();
+    let db = IpodDatabase::from_parsed(db_version, tracks, playlists, mount_point);
 
     Ok(db)
 }
@@ -538,5 +571,182 @@ mod tests {
         assert_eq!(parsed.playlists[1].track_ids.len(), 2);
         assert_eq!(parsed.playlists[1].track_ids[0], dbid2);
         assert_eq!(parsed.playlists[1].track_ids[1], dbid1);
+    }
+
+    #[test]
+    fn test_round_trip_all_fields() {
+        let mut db = IpodDatabase::new(PathBuf::from("/mnt/IPOD"));
+        db.add_track(IpodTrack {
+            dbid: 0,
+            track_id: 0,
+            title: "Song".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            album_artist: Some("AA".into()),
+            genre: Some("Rock".into()),
+            track_number: Some(7),
+            disc_number: Some(2),
+            total_time_ms: Some(300000),
+            year: Some(1999),
+            file_size: 8_000_000,
+            bitrate: Some(256),
+            sample_rate: Some(48000),
+            ipod_path: ":iPod_Control:Music:F05:XYZW.mp3".into(),
+            filetype: 0x4d503320,
+        });
+
+        let bytes = itunesdb_write::serialize(&db);
+        let parsed = parse(&bytes, PathBuf::from("/mnt/IPOD")).unwrap();
+
+        let t = &parsed.tracks[0];
+        assert_eq!(t.title, "Song");
+        assert_eq!(t.artist, "Artist");
+        assert_eq!(t.album, "Album");
+        assert_eq!(t.album_artist.as_deref(), Some("AA"));
+        assert_eq!(t.genre.as_deref(), Some("Rock"));
+        assert_eq!(t.track_number, Some(7));
+        assert_eq!(t.disc_number, Some(2));
+        assert_eq!(t.total_time_ms, Some(300000));
+        assert_eq!(t.year, Some(1999));
+        assert_eq!(t.file_size, 8_000_000);
+        assert_eq!(t.bitrate, Some(256));
+        assert_eq!(t.sample_rate, Some(48000));
+        assert_eq!(t.ipod_path, ":iPod_Control:Music:F05:XYZW.mp3");
+        assert_eq!(t.filetype, 0x4d503320);
+        assert_eq!(t.dbid, db.tracks[0].dbid);
+        assert_eq!(t.track_id, db.tracks[0].track_id);
+    }
+
+    #[test]
+    fn test_corrupt_mhod_string_length() {
+        // Build a minimal DB, then corrupt the string length in the first mhod.
+        let mut db = IpodDatabase::new(PathBuf::from("/mnt/IPOD"));
+        db.add_track(IpodTrack {
+            dbid: 0,
+            track_id: 0,
+            title: "X".into(),
+            artist: "Y".into(),
+            album: "Z".into(),
+            album_artist: None,
+            genre: None,
+            track_number: None,
+            disc_number: None,
+            total_time_ms: None,
+            year: None,
+            file_size: 100,
+            bitrate: None,
+            sample_rate: None,
+            ipod_path: ":iPod_Control:Music:F00:a.mp3".into(),
+            filetype: 0x4d503320,
+        });
+
+        let mut bytes = itunesdb_write::serialize(&db);
+
+        // Find the first mhod and corrupt its string_byte_len field (offset +28 from mhod start).
+        let mhod_pos = bytes.windows(4).position(|w| w == b"mhod").unwrap();
+        // String byte length is at mhod_pos + 28.
+        let len_pos = mhod_pos + 28;
+        // Write a huge length (0x01000000 = 16MB, exceeds 10MB limit).
+        bytes[len_pos..len_pos + 4].copy_from_slice(&0x01000000u32.to_le_bytes());
+
+        let result = parse(&bytes, PathBuf::from("/mnt/IPOD"));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("sanity limit"),
+            "expected sanity limit error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_small_mhit_header_no_dbid() {
+        // Build a DB, then shrink the mhit header_size to < 120 so dbid can't be read.
+        let mut db = IpodDatabase::new(PathBuf::from("/mnt/IPOD"));
+        db.add_track(IpodTrack {
+            dbid: 0,
+            track_id: 0,
+            title: "T".into(),
+            artist: "A".into(),
+            album: "B".into(),
+            album_artist: None,
+            genre: None,
+            track_number: None,
+            disc_number: None,
+            total_time_ms: None,
+            year: None,
+            file_size: 50,
+            bitrate: None,
+            sample_rate: None,
+            ipod_path: ":iPod_Control:Music:F00:b.mp3".into(),
+            filetype: 0x4d503320,
+        });
+
+        let mut bytes = itunesdb_write::serialize(&db);
+
+        // Find the mhit and restructure it with header_size=112.
+        // Must move mhod data to start at offset 112 and fix all sizes.
+        let mhit_pos = bytes.windows(4).position(|w| w == b"mhit").unwrap();
+        let old_hdr =
+            u32::from_le_bytes(bytes[mhit_pos + 4..mhit_pos + 8].try_into().unwrap()) as usize;
+        let old_total =
+            u32::from_le_bytes(bytes[mhit_pos + 8..mhit_pos + 12].try_into().unwrap()) as usize;
+        let new_hdr: usize = 112;
+
+        // Extract mhod data, rebuild mhit with smaller header.
+        let mhod_data = bytes[mhit_pos + old_hdr..mhit_pos + old_total].to_vec();
+        let new_total = new_hdr + mhod_data.len();
+        let mut new_mhit = bytes[mhit_pos..mhit_pos + new_hdr].to_vec();
+        new_mhit[4..8].copy_from_slice(&(new_hdr as u32).to_le_bytes());
+        new_mhit[8..12].copy_from_slice(&(new_total as u32).to_le_bytes());
+        new_mhit.extend_from_slice(&mhod_data);
+
+        // Replace old mhit and fix parent container sizes.
+        let size_diff = old_total as i64 - new_total as i64;
+        bytes.splice(mhit_pos..mhit_pos + old_total, new_mhit);
+        let mhbd_total = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as i64 - size_diff;
+        bytes[8..12].copy_from_slice(&(mhbd_total as u32).to_le_bytes());
+        let mhbd_hdr = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        let mhsd_total = u32::from_le_bytes(bytes[mhbd_hdr + 8..mhbd_hdr + 12].try_into().unwrap())
+            as i64
+            - size_diff;
+        bytes[mhbd_hdr + 8..mhbd_hdr + 12].copy_from_slice(&(mhsd_total as u32).to_le_bytes());
+
+        let parsed = parse(&bytes, PathBuf::from("/mnt/IPOD")).unwrap();
+        assert_eq!(parsed.tracks.len(), 1);
+        assert_eq!(
+            parsed.tracks[0].dbid, 0,
+            "dbid should default to 0 for small headers"
+        );
+        assert_eq!(parsed.tracks[0].title, "T");
+    }
+
+    #[test]
+    fn test_unknown_mhsd_types_skipped() {
+        // Build a normal DB, then insert a fake mhsd type=99 between the two real datasets.
+        let db = IpodDatabase::new(PathBuf::from("/mnt/IPOD"));
+        let mut bytes = itunesdb_write::serialize(&db);
+
+        // The mhbd says num_datasets=2. We'll change it to 3 and insert a dummy mhsd.
+        // mhbd num_datasets is at offset 20.
+        bytes[20..24].copy_from_slice(&3u32.to_le_bytes());
+
+        // Build a minimal fake mhsd (type=99, header=96, total=96).
+        let mut fake_mhsd = vec![0u8; 96];
+        fake_mhsd[0..4].copy_from_slice(b"mhsd");
+        fake_mhsd[4..8].copy_from_slice(&96u32.to_le_bytes()); // header_size
+        fake_mhsd[8..12].copy_from_slice(&96u32.to_le_bytes()); // total_size
+        fake_mhsd[12..16].copy_from_slice(&99u32.to_le_bytes()); // type = unknown
+
+        // Insert after the mhbd header (offset 104).
+        let mhbd_hdr_size = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        bytes.splice(mhbd_hdr_size..mhbd_hdr_size, fake_mhsd);
+
+        // Update mhbd total_size.
+        let new_total = bytes.len() as u32;
+        bytes[8..12].copy_from_slice(&new_total.to_le_bytes());
+
+        let parsed = parse(&bytes, PathBuf::from("/mnt/IPOD")).unwrap();
+        assert_eq!(parsed.tracks.len(), 0);
+        assert_eq!(parsed.playlists.len(), 1); // master playlist
     }
 }

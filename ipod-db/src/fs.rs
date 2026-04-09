@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 /// Number of F-directories on iPod (F00..F49).
@@ -24,20 +25,19 @@ pub fn ensure_f_dirs(mount: &Path) -> crate::Result<()> {
 /// Generate a hashed filename for a track file.
 ///
 /// iPod stores files with obfuscated names like `ABCD.mp3` in F-directories.
-/// We hash the original path to generate a deterministic but opaque name.
+/// We hash the original name + dbid to generate a deterministic but opaque name.
 pub fn hash_filename(original_name: &str, dbid: u64) -> String {
-    // Simple hash: combine dbid with name bytes for uniqueness.
-    let mut hash: u64 = dbid.wrapping_mul(2654435761);
-    for b in original_name.bytes() {
-        hash = hash.wrapping_mul(31).wrapping_add(b as u64);
-    }
+    let mut hasher = std::hash::DefaultHasher::new();
+    dbid.hash(&mut hasher);
+    original_name.hash(&mut hasher);
+    let hash = hasher.finish();
 
     let ext = Path::new(original_name)
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("mp3");
 
-    format!("{hash:016X}.{ext}").to_lowercase()
+    format!("{hash:016x}.{ext}")
 }
 
 /// Pick the F-directory with the fewest files for load balancing.

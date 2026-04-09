@@ -207,9 +207,22 @@ impl IpodDatabase {
             .join("iTunesDB")
     }
 
-    /// Recalculate next IDs from existing tracks (used after parsing).
-    pub(crate) fn recalculate_ids(&mut self) {
-        self.next_track_id = self.tracks.iter().map(|t| t.track_id).max().unwrap_or(0) + 1;
-        self.next_dbid = self.tracks.iter().map(|t| t.dbid).max().unwrap_or(0) + 1;
+    /// Construct from parsed data, auto-calculating next available IDs.
+    pub(crate) fn from_parsed(
+        db_version: u32,
+        tracks: Vec<IpodTrack>,
+        playlists: Vec<IpodPlaylist>,
+        mount_point: PathBuf,
+    ) -> Self {
+        let next_track_id = tracks.iter().map(|t| t.track_id).max().unwrap_or(0) + 1;
+        let next_dbid = tracks.iter().map(|t| t.dbid).max().unwrap_or(0) + 1;
+        Self {
+            db_version,
+            tracks,
+            playlists,
+            mount_point,
+            next_track_id,
+            next_dbid,
+        }
     }
 }
