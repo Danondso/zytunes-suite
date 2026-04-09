@@ -286,4 +286,60 @@ mod tests {
         let scheme = u16::from_le_bytes(buf[0x30..0x32].try_into().unwrap());
         assert_eq!(scheme, 1);
     }
+
+    #[test]
+    fn test_sign_hash58_deterministic() {
+        let mut buf1 = vec![0u8; 300];
+        buf1[0..4].copy_from_slice(b"mhbd");
+        buf1[4..8].copy_from_slice(&244u32.to_le_bytes());
+        buf1[8..12].copy_from_slice(&300u32.to_le_bytes());
+        buf1[244] = 0x42; // some payload data
+
+        let mut buf2 = buf1.clone();
+        let id = parse_firewire_id("000A2700215CDB22").unwrap();
+
+        sign_hash58(&mut buf1, &id).unwrap();
+        sign_hash58(&mut buf2, &id).unwrap();
+
+        assert_eq!(
+            &buf1[HASH58_OFFSET..HASH58_OFFSET + HASH58_SIZE],
+            &buf2[HASH58_OFFSET..HASH58_OFFSET + HASH58_SIZE],
+            "same input should produce same hash"
+        );
+    }
+
+    #[test]
+    fn test_sign_hash58_different_keys() {
+        let mut buf1 = vec![0u8; 300];
+        buf1[0..4].copy_from_slice(b"mhbd");
+        buf1[4..8].copy_from_slice(&244u32.to_le_bytes());
+        buf1[8..12].copy_from_slice(&300u32.to_le_bytes());
+
+        let mut buf2 = buf1.clone();
+
+        let id1 = parse_firewire_id("000A2700215CDB22").unwrap();
+        let id2 = parse_firewire_id("FFFFFFFFFFFFFFFF").unwrap();
+
+        sign_hash58(&mut buf1, &id1).unwrap();
+        sign_hash58(&mut buf2, &id2).unwrap();
+
+        assert_ne!(
+            &buf1[HASH58_OFFSET..HASH58_OFFSET + HASH58_SIZE],
+            &buf2[HASH58_OFFSET..HASH58_OFFSET + HASH58_SIZE],
+            "different keys should produce different hashes"
+        );
+    }
+
+    #[test]
+    fn test_sign_hash58_too_small() {
+        let mut buf = vec![0u8; 100]; // too small for 244-byte header
+        let id = parse_firewire_id("000A2700215CDB22").unwrap();
+        assert!(sign_hash58(&mut buf, &id).is_err());
+    }
+
+    #[test]
+    fn test_parse_firewire_id_empty() {
+        assert!(parse_firewire_id("").is_err());
+        assert!(parse_firewire_id("   ").is_err());
+    }
 }

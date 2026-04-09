@@ -9,7 +9,6 @@
 //! Usage:
 //!   sudo ./target/debug/examples/isolate_test /mnt/ipod-classic tracks
 
-use byteorder::{LittleEndian, WriteBytesExt};
 use ipod_db::{hash, itunesdb, itunesdb_write};
 use std::io::Write;
 

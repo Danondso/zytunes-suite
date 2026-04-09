@@ -760,4 +760,214 @@ mod tests {
         assert_eq!(parsed.tracks.len(), 0);
         assert_eq!(parsed.playlists.len(), 1); // master playlist
     }
+
+    #[test]
+    fn test_serialized_structure() {
+        use byteorder::{LittleEndian, ReadBytesExt};
+        use std::io::Cursor;
+
+        let mut db = IpodDatabase::new(PathBuf::from("/mnt/IPOD"));
+        db.add_track(IpodTrack {
+            dbid: 0,
+            track_id: 0,
+            title: "B Song".into(),
+            artist: "A Artist".into(),
+            album: "Album".into(),
+            album_artist: None,
+            genre: Some("Rock".into()),
+            track_number: None,
+            disc_number: None,
+            total_time_ms: None,
+            year: None,
+            file_size: 100,
+            bitrate: None,
+            sample_rate: None,
+            ipod_path: ":iPod_Control:Music:F00:a.mp3".into(),
+            filetype: 0x4d503320,
+        });
+        db.add_track(IpodTrack {
+            dbid: 0,
+            track_id: 0,
+            title: "A Song".into(),
+            artist: "B Artist".into(),
+            album: "Album".into(),
+            album_artist: None,
+            genre: Some("Pop".into()),
+            track_number: None,
+            disc_number: None,
+            total_time_ms: None,
+            year: None,
+            file_size: 200,
+            bitrate: None,
+            sample_rate: None,
+            ipod_path: ":iPod_Control:Music:F01:b.mp3".into(),
+            filetype: 0x4d503320,
+        });
+
+        let bytes = itunesdb_write::serialize(&db);
+        let mut cur = Cursor::new(bytes.as_slice());
+
+        // mhbd header is 244 bytes.
+        let mut magic = [0u8; 4];
+        cur.read_exact(&mut magic).unwrap();
+        assert_eq!(&magic, b"mhbd");
+        let mhbd_hdr = cur.read_u32::<LittleEndian>().unwrap();
+        assert_eq!(mhbd_hdr, 244, "mhbd header should be 244 bytes");
+        let mhbd_total = cur.read_u32::<LittleEndian>().unwrap();
+        assert_eq!(
+            mhbd_total as usize,
+            bytes.len(),
+            "mhbd total_size should match file"
+        );
+        cur.read_u32::<LittleEndian>().unwrap(); // db_type
+        cur.read_u32::<LittleEndian>().unwrap(); // db_version
+        let num_datasets = cur.read_u32::<LittleEndian>().unwrap();
+        assert_eq!(num_datasets, 5, "should have 5 datasets");
+
+        // Walk datasets and check order: 4, 1, 3, 2, 5.
+        cur.set_position(mhbd_hdr as u64);
+        let expected_types = [4, 1, 3, 2, 5];
+        for &expected in &expected_types {
+            cur.read_exact(&mut magic).unwrap();
+            assert_eq!(&magic, b"mhsd");
+            let _ds_hdr = cur.read_u32::<LittleEndian>().unwrap();
+            let ds_total = cur.read_u32::<LittleEndian>().unwrap();
+            let ds_type = cur.read_u32::<LittleEndian>().unwrap();
+            assert_eq!(ds_type, expected, "dataset type mismatch");
+            cur.set_position(cur.position() - 16 + ds_total as u64);
+        }
+
+        // Find first mhit and check header size is 624.
+        let mhit_pos = bytes.windows(4).position(|w| w == b"mhit").unwrap();
+        let mhit_hdr = u32::from_le_bytes(bytes[mhit_pos + 4..mhit_pos + 8].try_into().unwrap());
+        assert_eq!(mhit_hdr, 624, "mhit header should be 624 bytes");
+    }
+
+    #[test]
+    fn test_sort_index_padding_before_entries() {
+        let mut db = IpodDatabase::new(PathBuf::from("/mnt/IPOD"));
+        db.add_track(IpodTrack {
+            dbid: 0,
+            track_id: 0,
+            title: "Zebra".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            album_artist: None,
+            genre: None,
+            track_number: None,
+            disc_number: None,
+            total_time_ms: None,
+            year: None,
+            file_size: 100,
+            bitrate: None,
+            sample_rate: None,
+            ipod_path: ":iPod_Control:Music:F00:a.mp3".into(),
+            filetype: 0x4d503320,
+        });
+        db.add_track(IpodTrack {
+            dbid: 0,
+            track_id: 0,
+            title: "Apple".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            album_artist: None,
+            genre: None,
+            track_number: None,
+            disc_number: None,
+            total_time_ms: None,
+            year: None,
+            file_size: 200,
+            bitrate: None,
+            sample_rate: None,
+            ipod_path: ":iPod_Control:Music:F01:b.mp3".into(),
+            filetype: 0x4d503320,
+        });
+
+        let bytes = itunesdb_write::serialize(&db);
+
+        // Find the first mhod type=52 (sort index).
+        let mut pos = 0;
+        while pos + 16 < bytes.len() {
+            if &bytes[pos..pos + 4] == b"mhod" {
+                let mtype = u32::from_le_bytes(bytes[pos + 12..pos + 16].try_into().unwrap());
+                if mtype == 52 {
+                    // sort_type at +24, count at +28, then 40 bytes padding, then entries.
+                    let sort_type =
+                        u32::from_le_bytes(bytes[pos + 24..pos + 28].try_into().unwrap());
+                    let count = u32::from_le_bytes(bytes[pos + 28..pos + 32].try_into().unwrap());
+                    assert_eq!(count, 2);
+
+                    // 40 bytes of padding (offsets +32 to +72 from mhod start).
+                    let padding = &bytes[pos + 32..pos + 72];
+                    assert_eq!(
+                        padding, &[0u8; 40],
+                        "40-byte padding should be before entries"
+                    );
+
+                    // Entries start at +72.
+                    let entry0 = u32::from_le_bytes(bytes[pos + 72..pos + 76].try_into().unwrap());
+                    let entry1 = u32::from_le_bytes(bytes[pos + 76..pos + 80].try_into().unwrap());
+
+                    // sort_type=3 is title sort. "Apple" (index 1) < "Zebra" (index 0).
+                    if sort_type == 3 {
+                        assert_eq!(entry0, 1, "Apple (index 1) should sort first");
+                        assert_eq!(entry1, 0, "Zebra (index 0) should sort second");
+                    }
+                    break;
+                }
+            }
+            pos += 1;
+        }
+    }
+
+    #[test]
+    fn test_sort_index_correct_order() {
+        let mut db = IpodDatabase::new(PathBuf::from("/mnt/IPOD"));
+        let titles = ["Cherry", "Apple", "Banana"];
+        for (i, title) in titles.iter().enumerate() {
+            db.add_track(IpodTrack {
+                dbid: 0,
+                track_id: 0,
+                title: title.to_string(),
+                artist: "Artist".into(),
+                album: "Album".into(),
+                album_artist: None,
+                genre: None,
+                track_number: None,
+                disc_number: None,
+                total_time_ms: None,
+                year: None,
+                file_size: 100,
+                bitrate: None,
+                sample_rate: None,
+                ipod_path: format!(":iPod_Control:Music:F0{i}:x.mp3"),
+                filetype: 0x4d503320,
+            });
+        }
+
+        let bytes = itunesdb_write::serialize(&db);
+
+        // Find title sort index (sort_type=3).
+        let mut pos = 0;
+        while pos + 80 < bytes.len() {
+            if &bytes[pos..pos + 4] == b"mhod" {
+                let mtype = u32::from_le_bytes(bytes[pos + 12..pos + 16].try_into().unwrap());
+                let sort_type = u32::from_le_bytes(bytes[pos + 24..pos + 28].try_into().unwrap());
+                if mtype == 52 && sort_type == 3 {
+                    // Entries at +72 (after 40-byte padding).
+                    let e0 = u32::from_le_bytes(bytes[pos + 72..pos + 76].try_into().unwrap());
+                    let e1 = u32::from_le_bytes(bytes[pos + 76..pos + 80].try_into().unwrap());
+                    let e2 = u32::from_le_bytes(bytes[pos + 80..pos + 84].try_into().unwrap());
+
+                    // Alphabetical: Apple(1), Banana(2), Cherry(0).
+                    assert_eq!(e0, 1, "Apple should be first");
+                    assert_eq!(e1, 2, "Banana should be second");
+                    assert_eq!(e2, 0, "Cherry should be third");
+                    return;
+                }
+            }
+            pos += 1;
+        }
+        panic!("sort_type=3 mhod not found");
+    }
 }
