@@ -26,9 +26,18 @@ fn rgb_to_565(r: u8, g: u8, b: u8) -> [u8; 2] {
 /// The image is resized using Lanczos3 filtering for quality. Output length
 /// is always `width * height * 2` bytes.
 pub fn encode_rgb565(image_bytes: &[u8], width: u16, height: u16) -> crate::Result<Vec<u8>> {
-    let img = image::load_from_memory(image_bytes)
-        .map_err(|e| IpodDbError::Artwork(format!("failed to decode image: {e}")))?;
+    let img = decode_image(image_bytes)?;
+    Ok(resize_to_rgb565(&img, width, height))
+}
 
+/// Decode JPEG/PNG bytes into a DynamicImage.
+pub fn decode_image(image_bytes: &[u8]) -> crate::Result<image::DynamicImage> {
+    image::load_from_memory(image_bytes)
+        .map_err(|e| IpodDbError::Artwork(format!("failed to decode image: {e}")))
+}
+
+/// Resize a pre-decoded image to the target dimensions and convert to RGB565 LE.
+pub fn resize_to_rgb565(img: &image::DynamicImage, width: u16, height: u16) -> Vec<u8> {
     let resized = img.resize_exact(width as u32, height as u32, FilterType::Lanczos3);
 
     let mut buf = Vec::with_capacity(width as usize * height as usize * 2);
@@ -39,7 +48,7 @@ pub fn encode_rgb565(image_bytes: &[u8], width: u16, height: u16) -> crate::Resu
         }
     }
 
-    Ok(buf)
+    buf
 }
 
 /// Append RGB565 pixel data to an ItmbFileState.

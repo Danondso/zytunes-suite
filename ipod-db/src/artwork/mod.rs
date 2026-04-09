@@ -8,7 +8,7 @@
 pub mod artworkdb;
 pub mod ithmb;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 /// Pixel format for ITHMB thumbnail data.
@@ -89,8 +89,6 @@ pub struct ArtworkStore {
     pub ithmb_files: Vec<ItmbFileState>,
     /// Per-track artwork entries.
     pub track_artworks: Vec<TrackArtwork>,
-    /// Source image bytes keyed by dbid (kept for potential re-encoding).
-    source_images: HashMap<u64, Vec<u8>>,
 }
 
 impl ArtworkStore {
@@ -111,16 +109,16 @@ impl ArtworkStore {
             specs,
             ithmb_files,
             track_artworks: Vec::new(),
-            source_images: HashMap::new(),
         }
     }
 
-    /// Add artwork for a track. Encodes the image into all thumbnail sizes.
+    /// Add artwork for a track. Decodes the image once, then resizes for each thumbnail size.
     pub fn add_artwork(&mut self, dbid: u64, image_bytes: &[u8]) -> crate::Result<()> {
+        let img = ithmb::decode_image(image_bytes)?;
         let mut thumbnails = Vec::with_capacity(self.specs.len());
 
         for (i, spec) in self.specs.iter().enumerate() {
-            let rgb565 = ithmb::encode_rgb565(image_bytes, spec.width, spec.height)?;
+            let rgb565 = ithmb::resize_to_rgb565(&img, spec.width, spec.height);
             let offset = ithmb::append_to_ithmb(&mut self.ithmb_files[i], &rgb565);
 
             thumbnails.push(ThumbnailEntry {
@@ -133,7 +131,6 @@ impl ArtworkStore {
         }
 
         self.track_artworks.push(TrackArtwork { dbid, thumbnails });
-        self.source_images.insert(dbid, image_bytes.to_vec());
         Ok(())
     }
 
@@ -263,5 +260,95 @@ mod tests {
         assert!(!store.has_artwork(1));
         assert_eq!(store.artwork_count(1), 0);
         assert!(store.dbids_with_artwork().is_empty());
+    }
+
+    /// Helper: create a minimal 4x4 solid-red PNG in memory.
+    fn make_test_png() -> Vec<u8> {
+        let mut img = image::RgbImage::new(4, 4);
+        for pixel in img.pixels_mut() {
+            *pixel = image::Rgb([0xFF, 0x00, 0x00]);
+        }
+        let mut png_bytes = Vec::new();
+        let encoder = image::codecs::png::PngEncoder::new(std::io::Cursor::new(&mut png_bytes));
+        image::ImageEncoder::write_image(
+            encoder,
+            img.as_raw(),
+            4,
+            4,
+            image::ExtendedColorType::Rgb8,
+        )
+        .unwrap();
+        png_bytes
+    }
+
+    #[test]
+    fn test_add_artwork_full_pipeline() {
+        let png = make_test_png();
+        let mut store = ArtworkStore::new(model_specs_video());
+
+        store.add_artwork(42, &png).unwrap();
+        store.add_artwork(99, &png).unwrap();
+
+        // Verify store state.
+        assert!(store.has_artwork(42));
+        assert!(store.has_artwork(99));
+        assert!(!store.has_artwork(1));
+        assert_eq!(store.artwork_count(42), 2); // 2 specs
+        assert_eq!(store.dbids_with_artwork().len(), 2);
+
+        // Verify ithmb data accumulated correctly.
+        let expected_small = 100 * 100 * 2;
+        let expected_large = 200 * 200 * 2;
+        assert_eq!(store.ithmb_files[0].data.len(), expected_small * 2); // 2 images
+        assert_eq!(store.ithmb_files[1].data.len(), expected_large * 2);
+
+        // Verify offsets: first image at 0, second at image_size.
+        let ta0 = &store.track_artworks[0];
+        assert_eq!(ta0.thumbnails[0].image_offset, 0);
+        let ta1 = &store.track_artworks[1];
+        assert_eq!(ta1.thumbnails[0].image_offset, expected_small as u32);
+    }
+
+    #[test]
+    fn test_full_db_artwork_integration() {
+        use crate::{itunesdb, itunesdb_write, IpodDatabase, IpodTrack};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mount = dir.path().to_path_buf();
+
+        let mut db = IpodDatabase::new(mount);
+        db.add_track(IpodTrack {
+            dbid: 0,
+            track_id: 0,
+            title: "Test".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            album_artist: None,
+            genre: None,
+            track_number: Some(1),
+            disc_number: None,
+            total_time_ms: Some(180000),
+            year: Some(2024),
+            file_size: 5_000_000,
+            bitrate: Some(320),
+            sample_rate: Some(44100),
+            ipod_path: ":iPod_Control:Music:F00:ABCD.mp3".into(),
+            filetype: 0x4d503320,
+        });
+
+        // Add artwork.
+        let png = make_test_png();
+        db.init_artwork(model_specs_video());
+        let dbid = db.tracks[0].dbid;
+        db.set_track_artwork(dbid, &png).unwrap();
+
+        // Serialize iTunesDB and verify mhit has artwork flags.
+        let data = itunesdb_write::serialize(&db);
+        let db2 = itunesdb::parse(&data, dir.path().to_path_buf()).unwrap();
+        assert_eq!(db2.tracks.len(), 1);
+
+        // Serialize ArtworkDB and verify structure.
+        let art_data = super::artworkdb::serialize(db.artwork_store.as_ref().unwrap());
+        assert_eq!(&art_data[0..4], b"mhfd");
     }
 }

@@ -309,14 +309,22 @@ pub fn serialize(db: &IpodDatabase) -> Vec<u8> {
     let dbid_to_track_id: std::collections::HashMap<u64, u32> =
         db.tracks.iter().map(|t| (t.dbid, t.track_id)).collect();
 
+    // Pre-build artwork count map for O(1) lookup per track.
+    let art_counts: std::collections::HashMap<u64, u32> = db
+        .artwork_store
+        .as_ref()
+        .map(|s| {
+            s.track_artworks
+                .iter()
+                .map(|ta| (ta.dbid, ta.thumbnails.len() as u32))
+                .collect()
+        })
+        .unwrap_or_default();
+
     // Build track dataset (mhsd type 1 = mhlt + mhits).
     let mut track_data = Vec::new();
     for track in &db.tracks {
-        let art_count = db
-            .artwork_store
-            .as_ref()
-            .map(|s| s.artwork_count(track.dbid))
-            .unwrap_or(0);
+        let art_count = art_counts.get(&track.dbid).copied().unwrap_or(0);
         track_data.extend(write_mhit(track, art_count));
     }
 
