@@ -21,6 +21,7 @@ use std::io::Write;
 use std::path::Path;
 
 use super::{ArtworkStore, ItmbFileState, ThumbnailEntry, TrackArtwork};
+use crate::encoding::encode_utf16le;
 use crate::IpodDbError;
 
 // Header sizes from libgpod db-artwork-writer.c get_padded_header_size().
@@ -32,15 +33,6 @@ const MHNI_HEADER_SIZE: u32 = 76;
 const MHLF_HEADER_SIZE: u32 = 92;
 const MHIF_HEADER_SIZE: u32 = 124;
 const MHOD_HEADER_SIZE: u32 = 24;
-
-/// Encode a Rust string as UTF-16LE bytes.
-fn encode_utf16le(s: &str) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(s.len() * 2);
-    for unit in s.encode_utf16() {
-        buf.write_u16::<LittleEndian>(unit).unwrap();
-    }
-    buf
-}
 
 /// Write an mhod type 3 (filename string) for artwork.
 fn write_mhod_filename(filename: &str) -> Vec<u8> {

@@ -1,16 +1,8 @@
 use byteorder::{LittleEndian, WriteBytesExt};
 use std::io::Write;
 
+use crate::encoding::encode_utf16le;
 use crate::{IpodDatabase, IpodDbError, IpodTrack};
-
-/// Encode a Rust string as UTF-16LE bytes.
-fn encode_utf16le(s: &str) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(s.len() * 2);
-    for unit in s.encode_utf16() {
-        buf.write_u16::<LittleEndian>(unit).unwrap();
-    }
-    buf
-}
 
 /// Write a string mhod chunk. Returns the serialized bytes.
 fn write_mhod(mhod_type: u32, value: &str) -> Vec<u8> {

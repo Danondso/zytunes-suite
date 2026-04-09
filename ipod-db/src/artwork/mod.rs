@@ -42,7 +42,7 @@ impl ThumbnailSpec {
 }
 
 /// Tracks the accumulated state of one `.ithmb` file during a write session.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ItmbFileState {
     /// Correlation ID (matches ThumbnailSpec and mhif entries).
     pub correlation_id: u32,
@@ -81,7 +81,7 @@ pub struct TrackArtwork {
 }
 
 /// In-memory artwork state for the entire database.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ArtworkStore {
     /// Thumbnail size specifications for the target iPod model.
     pub specs: Vec<ThumbnailSpec>,
@@ -350,5 +350,164 @@ mod tests {
         // Serialize ArtworkDB and verify structure.
         let art_data = super::artworkdb::serialize(db.artwork_store.as_ref().unwrap());
         assert_eq!(&art_data[0..4], b"mhfd");
+    }
+
+    #[test]
+    fn test_add_artwork_invalid_image() {
+        let mut store = ArtworkStore::new(model_specs_video());
+        let result = store.add_artwork(1, b"not a valid image");
+        assert!(result.is_err());
+        assert!(!store.has_artwork(1));
+        // No ithmb data should have been written.
+        assert_eq!(store.ithmb_files[0].data.len(), 0);
+    }
+
+    #[test]
+    fn test_set_track_artwork_without_init() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::IpodDatabase::new(dir.path().to_path_buf());
+        // artwork_store is None — set_track_artwork should fail.
+        let mut db = db;
+        let result = db.set_track_artwork(1, &make_test_png());
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("not initialized"));
+    }
+
+    #[test]
+    fn test_write_to_disk_with_artwork() {
+        use crate::{itunesdb_write, IpodDatabase, IpodTrack};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mount = dir.path().to_path_buf();
+
+        let mut db = IpodDatabase::new(mount.clone());
+        db.add_track(IpodTrack {
+            dbid: 0,
+            track_id: 0,
+            title: "Song".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            album_artist: None,
+            genre: None,
+            track_number: None,
+            disc_number: None,
+            total_time_ms: None,
+            year: None,
+            file_size: 1000,
+            bitrate: None,
+            sample_rate: None,
+            ipod_path: ":iPod_Control:Music:F00:AAAA.mp3".into(),
+            filetype: 0x4d503320,
+        });
+
+        let png = make_test_png();
+        db.init_artwork(model_specs_video());
+        let dbid = db.tracks[0].dbid;
+        db.set_track_artwork(dbid, &png).unwrap();
+
+        // write_to_disk writes iTunesDB + ArtworkDB + .ithmb files.
+        itunesdb_write::write_to_disk(&db, None).unwrap();
+
+        // Verify all files exist.
+        assert!(mount.join("iPod_Control/iTunes/iTunesDB").exists());
+        assert!(mount.join("iPod_Control/Artwork/ArtworkDB").exists());
+        assert!(mount.join("iPod_Control/Artwork/F1028_1.ithmb").exists());
+        assert!(mount.join("iPod_Control/Artwork/F1029_1.ithmb").exists());
+
+        // Verify ithmb file sizes match expected pixel data.
+        let small = std::fs::read(mount.join("iPod_Control/Artwork/F1028_1.ithmb")).unwrap();
+        assert_eq!(small.len(), 100 * 100 * 2);
+        let large = std::fs::read(mount.join("iPod_Control/Artwork/F1029_1.ithmb")).unwrap();
+        assert_eq!(large.len(), 200 * 200 * 2);
+    }
+
+    #[test]
+    fn test_mhit_artwork_fields_in_serialized_output() {
+        use crate::{itunesdb_write, IpodDatabase, IpodTrack};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = IpodDatabase::new(dir.path().to_path_buf());
+        db.add_track(IpodTrack {
+            dbid: 0,
+            track_id: 0,
+            title: "T".into(),
+            artist: "A".into(),
+            album: "A".into(),
+            album_artist: None,
+            genre: None,
+            track_number: None,
+            disc_number: None,
+            total_time_ms: None,
+            year: None,
+            file_size: 1000,
+            bitrate: None,
+            sample_rate: None,
+            ipod_path: ":iPod_Control:Music:F00:AAAA.mp3".into(),
+            filetype: 0x4d503320,
+        });
+
+        let png = make_test_png();
+        db.init_artwork(model_specs_video());
+        let dbid = db.tracks[0].dbid;
+        db.set_track_artwork(dbid, &png).unwrap();
+
+        let data = itunesdb_write::serialize(&db);
+
+        // Find the mhit chunk (after mhbd header + mhsd4 + mhsd1 header + mhlt header).
+        // Search for "mhit" magic in the output.
+        let mhit_pos = data
+            .windows(4)
+            .position(|w| w == b"mhit")
+            .expect("mhit not found");
+
+        // artwork_count at offset +132
+        let art_count =
+            u32::from_le_bytes(data[mhit_pos + 132..mhit_pos + 136].try_into().unwrap());
+        assert_eq!(art_count, 2); // 2 thumbnail specs
+
+        // has_artwork at offset +156
+        let has_art = u32::from_le_bytes(data[mhit_pos + 156..mhit_pos + 160].try_into().unwrap());
+        assert_eq!(has_art, 1);
+    }
+
+    #[test]
+    fn test_mhit_no_artwork_fields_zero() {
+        use crate::{itunesdb_write, IpodDatabase, IpodTrack};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = IpodDatabase::new(dir.path().to_path_buf());
+        db.add_track(IpodTrack {
+            dbid: 0,
+            track_id: 0,
+            title: "T".into(),
+            artist: "A".into(),
+            album: "A".into(),
+            album_artist: None,
+            genre: None,
+            track_number: None,
+            disc_number: None,
+            total_time_ms: None,
+            year: None,
+            file_size: 1000,
+            bitrate: None,
+            sample_rate: None,
+            ipod_path: ":iPod_Control:Music:F00:AAAA.mp3".into(),
+            filetype: 0x4d503320,
+        });
+        // No artwork initialized.
+
+        let data = itunesdb_write::serialize(&db);
+        let mhit_pos = data
+            .windows(4)
+            .position(|w| w == b"mhit")
+            .expect("mhit not found");
+
+        let art_count =
+            u32::from_le_bytes(data[mhit_pos + 132..mhit_pos + 136].try_into().unwrap());
+        assert_eq!(art_count, 0);
+
+        let has_art = u32::from_le_bytes(data[mhit_pos + 156..mhit_pos + 160].try_into().unwrap());
+        assert_eq!(has_art, 0);
     }
 }

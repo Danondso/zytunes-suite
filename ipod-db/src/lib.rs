@@ -62,6 +62,7 @@
 
 pub mod artwork;
 pub mod detect;
+pub(crate) mod encoding;
 pub mod fs;
 pub mod hash;
 pub mod itunesdb;
@@ -139,7 +140,7 @@ pub struct IpodPlaylist {
 }
 
 /// The full in-memory representation of an iPod's iTunesDB.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct IpodDatabase {
     /// Database version (from mhbd header).
     pub db_version: u32,
