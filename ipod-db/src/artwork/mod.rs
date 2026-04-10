@@ -185,9 +185,15 @@ pub fn model_specs_video() -> Vec<ThumbnailSpec> {
     ]
 }
 
-/// Thumbnail specs for iPod Classic (6G/7G): 128x128 + 320x320.
+/// Thumbnail specs for iPod Classic (6G/7G): 56x56 + 128x128 + 320x320.
 pub fn model_specs_classic() -> Vec<ThumbnailSpec> {
     vec![
+        ThumbnailSpec {
+            correlation_id: 1061,
+            width: 56,
+            height: 56,
+            pixel_format: PixelFormat::Rgb565,
+        },
         ThumbnailSpec {
             correlation_id: 1055,
             width: 128,
@@ -237,11 +243,13 @@ mod tests {
     #[test]
     fn test_model_presets_classic() {
         let specs = model_specs_classic();
-        assert_eq!(specs.len(), 2);
-        assert_eq!(specs[0].correlation_id, 1055);
-        assert_eq!(specs[0].width, 128);
-        assert_eq!(specs[1].correlation_id, 1060);
-        assert_eq!(specs[1].width, 320);
+        assert_eq!(specs.len(), 3);
+        assert_eq!(specs[0].correlation_id, 1061);
+        assert_eq!(specs[0].width, 56);
+        assert_eq!(specs[1].correlation_id, 1055);
+        assert_eq!(specs[1].width, 128);
+        assert_eq!(specs[2].correlation_id, 1060);
+        assert_eq!(specs[2].width, 320);
     }
 
     #[test]
