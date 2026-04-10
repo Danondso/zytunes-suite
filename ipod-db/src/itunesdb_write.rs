@@ -511,13 +511,31 @@ pub fn write_to_disk(db: &IpodDatabase, firewire_id: Option<&[u8; 20]>) -> crate
             .map_err(|e| IpodDbError::Filesystem(format!("failed to create backup: {e}")))?;
     }
 
+    // Write ArtworkDB and .ithmb files before iTunesDB so that artwork flags
+    // in mhit entries never reference files that don't exist on disk yet.
+    if let Some(ref store) = db.artwork_store {
+        crate::artwork::ithmb::write_ithmb_files(&db.mount_point, &store.ithmb_files)?;
+        if let Err(e) = crate::artwork::artworkdb::write_to_disk(&db.mount_point, store) {
+            // Clean up orphaned .ithmb files so we don't leave partial artwork state.
+            for f in &store.ithmb_files {
+                let path = db
+                    .mount_point
+                    .join("iPod_Control")
+                    .join("Artwork")
+                    .join(&f.filename);
+                let _ = std::fs::remove_file(path);
+            }
+            return Err(e);
+        }
+    }
+
     let mut data = serialize(db);
 
     if let Some(fwid) = firewire_id {
         crate::hash::sign_hash58(&mut data, fwid)?;
     }
 
-    // Write to temp file, then rename for atomicity.
+    // Write iTunesDB to temp file, then rename for atomicity.
     let tmp_path = db_path.with_extension("tmp");
     std::fs::write(&tmp_path, &data)?;
     let rename_result = std::fs::rename(&tmp_path, &db_path);
@@ -528,12 +546,6 @@ pub fn write_to_disk(db: &IpodDatabase, firewire_id: Option<&[u8; 20]>) -> crate
     rename_result.map_err(|e| {
         IpodDbError::Filesystem(format!("failed to atomically replace iTunesDB: {e}"))
     })?;
-
-    // Write ArtworkDB and .ithmb files if artwork is present.
-    if let Some(ref store) = db.artwork_store {
-        crate::artwork::ithmb::write_ithmb_files(&db.mount_point, &store.ithmb_files)?;
-        crate::artwork::artworkdb::write_to_disk(&db.mount_point, store)?;
-    }
 
     Ok(())
 }

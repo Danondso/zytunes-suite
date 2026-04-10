@@ -65,9 +65,13 @@ fn main() {
             println!("Using iPod Classic specs (128x128 + 320x320)");
             artwork::model_specs_classic()
         }
-        "video" | _ => {
+        "video" => {
             println!("Using iPod Video specs (100x100 + 200x200)");
             artwork::model_specs_video()
+        }
+        other => {
+            eprintln!("Unknown model '{other}', expected 'classic' or 'video'");
+            std::process::exit(1);
         }
     };
     db.init_artwork(specs);

@@ -112,7 +112,8 @@ impl ArtworkStore {
         }
     }
 
-    /// Add artwork for a track. Decodes the image once, then resizes for each thumbnail size.
+    /// Add or replace artwork for a track. Decodes the image once, then resizes for each
+    /// thumbnail size. If artwork already exists for this dbid, the old entry is replaced.
     pub fn add_artwork(&mut self, dbid: u64, image_bytes: &[u8]) -> crate::Result<()> {
         let img = ithmb::decode_image(image_bytes)?;
         let mut thumbnails = Vec::with_capacity(self.specs.len());
@@ -130,7 +131,12 @@ impl ArtworkStore {
             });
         }
 
-        self.track_artworks.push(TrackArtwork { dbid, thumbnails });
+        // Replace existing entry for this dbid if present (avoids duplicate mhii entries).
+        if let Some(existing) = self.track_artworks.iter_mut().find(|ta| ta.dbid == dbid) {
+            existing.thumbnails = thumbnails;
+        } else {
+            self.track_artworks.push(TrackArtwork { dbid, thumbnails });
+        }
         Ok(())
     }
 
@@ -315,6 +321,20 @@ mod tests {
         assert_eq!(ta0.thumbnails[0].image_offset, 0);
         let ta1 = &store.track_artworks[1];
         assert_eq!(ta1.thumbnails[0].image_offset, expected_small as u32);
+    }
+
+    #[test]
+    fn test_add_artwork_duplicate_dbid_replaces() {
+        let png = make_test_png();
+        let mut store = ArtworkStore::new(model_specs_video());
+
+        store.add_artwork(42, &png).unwrap();
+        store.add_artwork(42, &png).unwrap();
+
+        // Should have exactly one entry, not two.
+        assert_eq!(store.track_artworks.len(), 1);
+        assert_eq!(store.track_artworks[0].dbid, 42);
+        assert_eq!(store.dbids_with_artwork().len(), 1);
     }
 
     #[test]
