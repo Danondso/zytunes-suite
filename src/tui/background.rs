@@ -30,6 +30,11 @@ pub enum BgCommand {
         dir: String,
     },
     CancelSync,
+    /// Load album art from ID3 tags in the background.
+    LoadAlbumArt {
+        key: String,
+        paths: Vec<String>,
+    },
 }
 
 /// A single item to sync (resolved to a file path).
@@ -106,6 +111,11 @@ pub enum BgEvent {
     AcquiredItemsCount(u32),
     /// Parsed sync progress status from MTP vendor op 0x922f.
     DeviceSyncStatus(Option<String>),
+    /// Album art loaded from ID3 tags in the background.
+    AlbumArtLoaded {
+        key: String,
+        image: Option<image::DynamicImage>,
+    },
 }
 
 /// Spawn the background worker thread. Returns a sender for commands.
@@ -763,6 +773,20 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                     } else {
                         let _ = event_tx.send(BgEvent::Error("No active session".into()));
                     }
+                }
+                BgCommand::LoadAlbumArt { key, paths } => {
+                    let mut result = None;
+                    for path in &paths {
+                        if let Ok(tag) = id3::Tag::read_from_path(path) {
+                            if let Some(pic) = tag.pictures().next() {
+                                if let Ok(img) = image::load_from_memory(&pic.data) {
+                                    result = Some(img);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    let _ = event_tx.send(BgEvent::AlbumArtLoaded { key, image: result });
                 }
             }
         }
