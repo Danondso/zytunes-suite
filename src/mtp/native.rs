@@ -564,22 +564,15 @@ impl NativeSession {
 
         self.log_msg("Initializing device library...");
 
-        // Detect device capabilities.
-        // On macOS, we can probe via GetObjectPropsSupported. On Linux, the
-        // Zune rejects these queries (timeout or GeneralError 0x2002) even
-        // though it supports the features. Since we only target the Zune 30,
-        // use known defaults on Linux and probe on macOS.
-        //
-        // artist_supported defaults to false — the safe path uses Music/
-        // subfolders directly. Album date and cover default to true since
-        // the Zune 30 supports them but the probe fails on Linux.
-        let (artist_supported, album_date_supported, album_cover_supported) =
-            if cfg!(target_os = "macos") {
-                self.probe_capabilities().unwrap_or((false, true, true))
-            } else {
-                self.log_msg("Using Zune defaults (artist=false, date=true, cover=true)");
-                (false, true, true)
-            };
+        // Use known Zune 30 capabilities instead of probing.
+        // GetObjectPropsSupported (0x9806) leaves the Zune's MTP session in a
+        // broken state on both macOS and Linux — subsequent GetObjectHandles
+        // calls fail with 0x2006 (Parameter Not Supported). Since we only
+        // target the Zune 30, hard-code the known values:
+        //   artist_supported = false (safe path using Music/ subfolders)
+        //   album_date_supported = true
+        //   album_cover_supported = true
+        let (artist_supported, album_date_supported, album_cover_supported) = (false, true, true);
 
         self.log_msg(&format!(
             "Caps: artist={} date={} cover={}",
@@ -1299,33 +1292,6 @@ impl NativeSession {
         if self.session.set_sync_progress(&cached[..530]).is_ok() {
             self.log_msg("Restored sync progress from cache");
         }
-    }
-
-    /// Probe device capabilities via GetObjectPropsSupported.
-    /// Returns None if any query fails (e.g., on Linux where the Zune may reject these).
-    fn probe_capabilities(&mut self) -> Option<(bool, bool, bool)> {
-        let artist_props = self
-            .session
-            .get_object_props_supported(FORMAT_ARTIST)
-            .ok()?;
-        let artist_supported = !artist_props.is_empty();
-
-        let album_props = self
-            .session
-            .get_object_props_supported(FORMAT_ABSTRACT_AUDIO_ALBUM)
-            .ok()?;
-        let album_date_supported = album_props.contains(&PROP_DATE_AUTHORED);
-        let album_cover_supported = album_props.contains(&PROP_REPRESENTATIVE_SAMPLE_DATA);
-
-        self.log_msg(&format!(
-            "Probed caps: artist={} date={} cover={}",
-            artist_supported, album_date_supported, album_cover_supported
-        ));
-        Some((
-            artist_supported,
-            album_date_supported,
-            album_cover_supported,
-        ))
     }
 
     /// Clear the track cache entirely.
