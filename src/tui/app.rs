@@ -981,7 +981,7 @@ impl App {
         !self.album_list.is_empty()
     }
 
-    /// Extract embedded album art from the first track that has it.
+    /// Request album art extraction in the background thread.
     pub fn refresh_album_art(&mut self) {
         // Build a cache key from the current track list context.
         let key = if let Some(t) = self.track_list.first() {
@@ -997,23 +997,19 @@ impl App {
         if key == self.album_art_key {
             return; // already cached
         }
-        self.album_art_key = key;
+        self.album_art_key = key.clone();
         self.album_art = None;
         self.album_art_lines.clear();
         self.album_art_size = (0, 0);
 
-        for track in &self.track_list {
-            if let Some(ref loc) = track.location {
-                if let Ok(tag) = id3::Tag::read_from_path(loc) {
-                    if let Some(pic) = tag.pictures().next() {
-                        if let Ok(img) = image::load_from_memory(&pic.data) {
-                            self.album_art = Some(img);
-                            return;
-                        }
-                    }
-                }
-            }
-        }
+        // Collect file paths and dispatch to the background thread.
+        let paths: Vec<String> = self
+            .track_list
+            .iter()
+            .filter_map(|t| t.location.clone())
+            .collect();
+        self.pending_bg_commands
+            .push(BgCommand::LoadAlbumArt { key, paths });
     }
 
     /// Render album art as halfblock characters sized to a square that fits
@@ -1322,6 +1318,14 @@ impl App {
             }
             BgEvent::DeviceSyncStatus(status) => {
                 self.device.sync_status = status;
+            }
+            BgEvent::AlbumArtLoaded { key, image } => {
+                // Only apply if the key still matches (user hasn't navigated away).
+                if key == self.album_art_key {
+                    self.album_art = image;
+                    self.album_art_lines.clear();
+                    self.album_art_size = (0, 0);
+                }
             }
             BgEvent::LoadingDeviceTracks => {
                 self.device.loading_tracks = true;
