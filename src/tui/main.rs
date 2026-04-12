@@ -123,9 +123,13 @@ fn run_loop(
             let overhead = 2 + 3 + if show_player { 9 } else { 0 }; // borders + footer + player
             let browser_h = size.height.saturating_sub(overhead as u16);
             let track_min = 4u16.min(app.track_list.len() as u16);
-            let art_h = browser_h.saturating_sub(track_min).min(26);
-            if right_w >= 6 && art_h >= 3 {
-                app.render_album_art(right_w, art_h);
+            // Art panel total rows (including its own top/bottom border).
+            let art_panel_h = browser_h.saturating_sub(track_min).min(26);
+            // Art cache fills the panel's inner area, so subtract 2 for borders and 2 cols for sides.
+            let art_inner_w = right_w.saturating_sub(2);
+            let art_inner_h = art_panel_h.saturating_sub(2);
+            if art_inner_w >= 6 && art_inner_h >= 3 {
+                app.render_album_art(art_inner_w, art_inner_h);
             }
         }
 

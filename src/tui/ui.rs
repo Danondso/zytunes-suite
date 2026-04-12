@@ -540,22 +540,44 @@ fn draw_album_detail(f: &mut Frame, app: &App, area: Rect, show_zip_art: bool) {
         let art = Paragraph::new(art_lines);
         f.render_widget(art, cols[0]);
 
-        // Split right column: tracks on top, album art below.
+        // Split right column: tracks on top, album art (boxed) below.
         let art_rows = match app.album_art_style {
             AlbumArtStyle::Halfblock => app.album_art_lines.len() as u16,
             AlbumArtStyle::Ascii => app.album_art_ascii_lines.len() as u16,
         };
+        // +2 to reserve space for the top/bottom border of the art panel.
+        let art_panel_rows = if art_rows > 0 { art_rows + 2 } else { 0 };
         let right_split = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(4), Constraint::Length(art_rows)])
+            .constraints([Constraint::Min(4), Constraint::Length(art_panel_rows)])
             .split(cols[1]);
 
         draw_album_track_list(f, app, right_split[0]);
-        draw_album_art_inline(f, app, right_split[1]);
+        draw_album_art_panel(f, app, right_split[1]);
     } else {
         // Not enough width or compact tier: full-width track list, no zip art.
         draw_album_track_list(f, app, inner);
     }
+}
+
+fn draw_album_art_panel(f: &mut Frame, app: &App, area: Rect) {
+    if area.height < 3 {
+        return;
+    }
+
+    let t = app.theme();
+    let title = match app.album_art_style {
+        AlbumArtStyle::Halfblock => " Art ",
+        AlbumArtStyle::Ascii => " Art (ASCII) ",
+    };
+    let block = t
+        .block()
+        .border_style(t.border())
+        .title(title)
+        .style(Style::default().bg(t.main_bg));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    draw_album_art_inline(f, app, inner);
 }
 
 fn draw_album_art_inline(f: &mut Frame, app: &App, area: Rect) {
