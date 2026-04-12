@@ -250,24 +250,18 @@ pub fn transcode_and_import_video(
     local_path: &str,
     temp_dir: &Path,
 ) -> Result<u64, String> {
-    if needs_video_transcoding(local_path) {
-        let wmv_path = transcode_to_wmv(local_path, temp_dir)?;
-        let filename = Path::new(&wmv_path)
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        let data = std::fs::read(&wmv_path).map_err(|e| format!("Read transcoded: {e}"))?;
-        session.import_video(&filename, &data)
+    let upload_path = if needs_video_transcoding(local_path) {
+        transcode_to_wmv(local_path, temp_dir)?
     } else {
-        let filename = Path::new(local_path)
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        let data = std::fs::read(local_path).map_err(|e| format!("Read video: {e}"))?;
-        session.import_video(&filename, &data)
-    }
+        local_path.to_string()
+    };
+    let filename = Path::new(&upload_path)
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let data = std::fs::read(&upload_path).map_err(|e| format!("Read video: {e}"))?;
+    session.import_video(&filename, &data)
 }
 
 /// Transcode if needed, then import via the device session.

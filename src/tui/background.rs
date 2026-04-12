@@ -538,8 +538,23 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                         let mut success = 0usize;
                         let mut failed = 0usize;
 
+                        // Check if ffmpeg is needed and available.
+                        let needs_ffmpeg = files.iter().any(|f| needs_video_transcoding(f));
+                        if needs_ffmpeg && !zytunes::check_ffmpeg_available() {
+                            let _ = event_tx.send(BgEvent::Error(
+                                "ffmpeg required for video transcoding but not found".into(),
+                            ));
+                            let _ = event_tx.send(BgEvent::VideoSyncComplete {
+                                success: 0,
+                                failed: 0,
+                            });
+                            continue;
+                        }
+
                         let _ = event_tx
                             .send(BgEvent::SyncMessage(format!("Syncing {} videos...", total)));
+
+                        let temp_dir = make_transcode_temp_dir();
 
                         for (i, file) in files.iter().enumerate() {
                             if let Ok(BgCommand::CancelSync) = cmd_rx.try_recv() {
@@ -591,7 +606,6 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                 )));
                             }
 
-                            let temp_dir = make_transcode_temp_dir();
                             match transcode_and_import_video(s.as_mut(), file, &temp_dir) {
                                 Ok(_) => success += 1,
                                 Err(e) => {
@@ -600,8 +614,9 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                         .send(BgEvent::SyncMessage(format!("  FAILED: {}", e)));
                                 }
                             }
-                            let _ = std::fs::remove_dir_all(&temp_dir);
                         }
+
+                        let _ = std::fs::remove_dir_all(&temp_dir);
 
                         if let Ok((tot, free)) = s.get_storage_info() {
                             let used = tot.saturating_sub(free);

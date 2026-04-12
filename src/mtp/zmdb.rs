@@ -302,11 +302,6 @@ impl Zmdb {
             .collect()
     }
 
-    /// Number of parsed video records.
-    pub fn video_count(&self) -> usize {
-        self.videos.len()
-    }
-
     /// Summary stats for logging.
     pub fn summary(&self) -> String {
         if self.videos.is_empty() {
