@@ -565,18 +565,45 @@ fn draw_album_art_panel(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    // The art is typically narrower than the full column (image aspect ratio).
+    // Shrink the panel horizontally to hug the art, centered within the slot.
+    let art_w = match app.album_art_style {
+        AlbumArtStyle::Halfblock => {
+            app.album_art_lines.first().map(|r| r.len()).unwrap_or(0) as u16
+        }
+        AlbumArtStyle::Ascii => app
+            .album_art_ascii_lines
+            .first()
+            .map(|r| r.len())
+            .unwrap_or(0) as u16,
+    };
+    if art_w == 0 {
+        return;
+    }
+
     let t = app.theme();
     let title = match app.album_art_style {
         AlbumArtStyle::Halfblock => " Art ",
         AlbumArtStyle::Ascii => " Art (ASCII) ",
     };
+    // Title must fit; otherwise fall through and use the slot width.
+    let min_w = (title.chars().count() as u16 + 2).max(art_w + 2);
+    let panel_w = min_w.min(area.width);
+    let x_offset = area.width.saturating_sub(panel_w) / 2;
+    let panel_area = Rect {
+        x: area.x + x_offset,
+        y: area.y,
+        width: panel_w,
+        height: area.height,
+    };
+
     let block = t
         .block()
         .border_style(t.border())
         .title(title)
         .style(Style::default().bg(t.main_bg));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = block.inner(panel_area);
+    f.render_widget(block, panel_area);
     draw_album_art_inline(f, app, inner);
 }
 
