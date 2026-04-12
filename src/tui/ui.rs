@@ -553,7 +553,15 @@ fn draw_album_detail(f: &mut Frame, app: &App, area: Rect, show_zip_art: bool) {
             .split(cols[1]);
 
         draw_album_track_list(f, app, right_split[0]);
-        draw_album_art_panel(f, app, right_split[1]);
+        // Extend the art slot one column right so the art panel's right border
+        // overlaps (shares) the outer detail block's right border column.
+        let art_slot = Rect {
+            x: right_split[1].x,
+            y: right_split[1].y,
+            width: right_split[1].width + 1,
+            height: right_split[1].height,
+        };
+        draw_album_art_panel(f, app, art_slot);
     } else {
         // Not enough width or compact tier: full-width track list, no zip art.
         draw_album_track_list(f, app, inner);
@@ -566,7 +574,9 @@ fn draw_album_art_panel(f: &mut Frame, app: &App, area: Rect) {
     }
 
     // The art is typically narrower than the full column (image aspect ratio).
-    // Shrink the panel horizontally to hug the art, centered within the slot.
+    // Shrink the panel horizontally to hug the art, anchored to the right edge
+    // of the slot so its right border coincides with the outer detail block's
+    // right border.
     let art_w = match app.album_art_style {
         AlbumArtStyle::Halfblock => {
             app.album_art_lines.first().map(|r| r.len()).unwrap_or(0) as u16
@@ -589,9 +599,9 @@ fn draw_album_art_panel(f: &mut Frame, app: &App, area: Rect) {
     // Title must fit; otherwise fall through and use the slot width.
     let min_w = (title.chars().count() as u16 + 2).max(art_w + 2);
     let panel_w = min_w.min(area.width);
-    let x_offset = area.width.saturating_sub(panel_w) / 2;
+    // Right-anchor: panel's right edge = slot's right edge.
     let panel_area = Rect {
-        x: area.x + x_offset,
+        x: area.x + area.width.saturating_sub(panel_w),
         y: area.y,
         width: panel_w,
         height: area.height,
