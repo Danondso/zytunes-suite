@@ -31,16 +31,33 @@ pub fn load() -> Config {
     toml::from_str(&contents).unwrap_or_default()
 }
 
-pub fn save(config: &Config) {
+/// Safely read-modify-write the on-disk config.
+///
+/// If the file exists but fails to parse, `update` returns without writing —
+/// this prevents a stray keypress from clobbering other fields the user had set.
+/// If the file is merely absent, a new file is written from defaults.
+pub fn update(f: impl FnOnce(&mut Config)) {
     let dir = match config_dir() {
         Some(d) => d,
         None => return,
     };
     let path = dir.join("config.toml");
-    let _ = std::fs::create_dir_all(&dir);
-    if let Ok(contents) = toml::to_string_pretty(config) {
-        let _ = std::fs::write(path, contents);
+    if let Some(new_contents) = update_contents(std::fs::read_to_string(&path).ok().as_deref(), f) {
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(&path, new_contents);
     }
+}
+
+/// Pure core of [`update`]: takes the existing file contents (if any) and a mutator,
+/// and returns the serialized new contents to write — or `None` if the existing
+/// contents are present but unparseable (in which case the caller should not write).
+fn update_contents(existing: Option<&str>, f: impl FnOnce(&mut Config)) -> Option<String> {
+    let mut config = match existing {
+        Some(contents) => toml::from_str::<Config>(contents).ok()?,
+        None => Config::default(),
+    };
+    f(&mut config);
+    toml::to_string_pretty(&config).ok()
 }
 
 #[cfg(test)]
@@ -98,5 +115,34 @@ music_dir = "/home/user/Music"
             let deserialized: Config = toml::from_str(&serialized).unwrap();
             assert_eq!(deserialized.album_art_style.as_deref(), Some(style));
         }
+    }
+
+    #[test]
+    fn update_contents_writes_new_file_when_missing() {
+        let out = update_contents(None, |c| c.theme = Some("BIOS".into()))
+            .expect("should produce output");
+        assert!(out.contains("theme = \"BIOS\""));
+    }
+
+    #[test]
+    fn update_contents_preserves_other_fields() {
+        let existing = r#"theme = "Gruvbox Dark"
+music_dir = "/home/user/Music"
+"#;
+        let out = update_contents(Some(existing), |c| c.album_art_style = Some("ascii".into()))
+            .expect("should produce output");
+        assert!(out.contains("theme = \"Gruvbox Dark\""));
+        assert!(out.contains("music_dir = \"/home/user/Music\""));
+        assert!(out.contains("album_art_style = \"ascii\""));
+    }
+
+    #[test]
+    fn update_contents_refuses_to_clobber_unparseable_file() {
+        let existing = "this is not valid toml ===";
+        let out = update_contents(Some(existing), |c| c.album_art_style = Some("ascii".into()));
+        assert!(
+            out.is_none(),
+            "update must not produce output when the existing file is corrupt"
+        );
     }
 }

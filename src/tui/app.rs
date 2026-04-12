@@ -84,14 +84,6 @@ pub enum AlbumArtStyle {
 }
 
 impl AlbumArtStyle {
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "halfblock" => Some(AlbumArtStyle::Halfblock),
-            "ascii" => Some(AlbumArtStyle::Ascii),
-            _ => None,
-        }
-    }
-
     pub fn as_str(&self) -> &'static str {
         match self {
             AlbumArtStyle::Halfblock => "halfblock",
@@ -100,7 +92,20 @@ impl AlbumArtStyle {
     }
 }
 
-/// Luminance ramp for ASCII art, ordered light to dark (10 chars).
+impl std::str::FromStr for AlbumArtStyle {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "halfblock" => Ok(AlbumArtStyle::Halfblock),
+            "ascii" => Ok(AlbumArtStyle::Ascii),
+            _ => Err(()),
+        }
+    }
+}
+
+/// Character ramp for ASCII art, ordered sparse → dense (10 chars).
+/// High-luminance pixels map to denser glyphs (more ink coverage).
 pub(crate) const ASCII_ART_RAMP: &[u8; 10] = b" .:-=+*%#@";
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -265,7 +270,7 @@ pub struct App {
     /// Cached ASCII art lines: (char, fg_rgb) per cell.
     pub album_art_ascii_lines: Vec<Vec<(char, [u8; 3])>>,
     /// Dimensions (w, h) the cached album art was rendered for.
-    pub(crate) album_art_size: (u16, u16),
+    album_art_size: (u16, u16),
     /// Renderer style for album art: halfblock (Unicode half-block) or ascii (character ramp).
     pub album_art_style: AlbumArtStyle,
     /// Background commands to send after event handling (main loop flushes these).
@@ -344,8 +349,8 @@ impl App {
                 let cfg = crate::config::load();
                 cfg.album_art_style
                     .as_deref()
-                    .and_then(AlbumArtStyle::from_str)
-                    .unwrap_or(AlbumArtStyle::Ascii)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(AlbumArtStyle::Halfblock)
             },
             pending_bg_commands: Vec::new(),
         }
@@ -362,9 +367,8 @@ impl App {
         self.album_art_ascii_lines.clear();
         self.album_art_size = (0, 0);
 
-        let mut config = crate::config::load();
-        config.album_art_style = Some(self.album_art_style.as_str().to_string());
-        crate::config::save(&config);
+        let style = self.album_art_style.as_str().to_string();
+        crate::config::update(|c| c.album_art_style = Some(style));
     }
 
     pub fn theme(&self) -> &'static Theme {
@@ -386,10 +390,8 @@ impl App {
 
     pub fn theme_picker_confirm(&mut self) {
         self.show_theme_picker = false;
-        // Save to config.
-        let mut config = crate::config::load();
-        config.theme = Some(self.theme().name.to_string());
-        crate::config::save(&config);
+        let theme_name = self.theme().name.to_string();
+        crate::config::update(|c| c.theme = Some(theme_name));
     }
 
     pub fn theme_picker_cancel(&mut self) {
@@ -1072,9 +1074,15 @@ impl App {
             .push(BgCommand::LoadAlbumArt { key, paths });
     }
 
-    /// Render album art as halfblock characters sized to a square that fits
-    /// within the given terminal area. Each cell packs two vertical pixels
-    /// using ▀ with fg=top color, bg=bottom color — doubling vertical resolution.
+    /// Rebuild the album-art cache sized to fit within the given terminal area,
+    /// using the renderer selected by `album_art_style`:
+    ///
+    /// - `Halfblock`: each cell packs two vertical pixels as ▀ with fg=top,
+    ///   bg=bottom — doubling vertical resolution.
+    /// - `Ascii`: one pixel per cell, mapped to a character ramp by luminance
+    ///   with fg=pixel color, bg=theme background.
+    ///
+    /// Only the cache for the active style is populated.
     pub fn render_album_art(&mut self, width: u16, height: u16) {
         let cache_populated = match self.album_art_style {
             AlbumArtStyle::Halfblock => !self.album_art_lines.is_empty(),
@@ -2610,10 +2618,10 @@ mod tests {
     #[test]
     fn album_art_style_from_str_round_trip() {
         for s in ["ascii", "halfblock"] {
-            let style = AlbumArtStyle::from_str(s).expect("valid style");
+            let style: AlbumArtStyle = s.parse().expect("valid style");
             assert_eq!(style.as_str(), s);
         }
-        assert!(AlbumArtStyle::from_str("bogus").is_none());
+        assert!("bogus".parse::<AlbumArtStyle>().is_err());
     }
 
     #[test]
