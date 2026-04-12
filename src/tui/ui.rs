@@ -553,13 +553,14 @@ fn draw_album_detail(f: &mut Frame, app: &App, area: Rect, show_zip_art: bool) {
             .split(cols[1]);
 
         draw_album_track_list(f, app, right_split[0]);
-        // Extend the art slot one column right so the art panel's right border
-        // overlaps (shares) the outer detail block's right border column.
+        // Extend the art slot one column right and one row down so the art
+        // panel's right and bottom borders overlap (share) the outer detail
+        // block's right and bottom border columns/row.
         let art_slot = Rect {
             x: right_split[1].x,
             y: right_split[1].y,
             width: right_split[1].width + 1,
-            height: right_split[1].height,
+            height: right_split[1].height + 1,
         };
         draw_album_art_panel(f, app, art_slot);
     } else {
