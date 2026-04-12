@@ -545,8 +545,8 @@ fn draw_album_detail(f: &mut Frame, app: &App, area: Rect, show_zip_art: bool) {
             AlbumArtStyle::Halfblock => app.album_art_lines.len() as u16,
             AlbumArtStyle::Ascii => app.album_art_ascii_lines.len() as u16,
         };
-        // +2 to reserve space for the top/bottom border of the art panel.
-        let art_panel_rows = if art_rows > 0 { art_rows + 2 } else { 0 };
+        // +2 for top/bottom border, +4 for 2-row padding on top and bottom.
+        let art_panel_rows = if art_rows > 0 { art_rows + 6 } else { 0 };
         let right_split = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(4), Constraint::Length(art_panel_rows)])
@@ -594,8 +594,9 @@ fn draw_album_art_panel(f: &mut Frame, app: &App, area: Rect) {
 
     let t = app.theme();
     let title = " Album Art ";
-    // Title must fit; otherwise fall through and use the slot width.
-    let min_w = (title.chars().count() as u16 + 2).max(art_w + 2);
+    // Panel sizing: art + 2 border + 4 padding on each axis.
+    // Title must also fit across the top.
+    let min_w = (title.chars().count() as u16 + 2).max(art_w + 6);
     let panel_w = min_w.min(area.width);
     // Right-anchor: panel's right edge = slot's right edge.
     let panel_area = Rect {
@@ -610,8 +611,16 @@ fn draw_album_art_panel(f: &mut Frame, app: &App, area: Rect) {
         .border_style(t.border())
         .title(title)
         .style(Style::default().bg(t.main_bg));
-    let inner = block.inner(panel_area);
+    let block_inner = block.inner(panel_area);
     f.render_widget(block, panel_area);
+
+    // Inset by 2 on each side for interior padding.
+    let inner = Rect {
+        x: block_inner.x + 2,
+        y: block_inner.y + 2,
+        width: block_inner.width.saturating_sub(4),
+        height: block_inner.height.saturating_sub(4),
+    };
 
     // Swap corner glyphs where the art panel's borders land on the outer
     // block's border lines: the corner should look like a T-junction so the
