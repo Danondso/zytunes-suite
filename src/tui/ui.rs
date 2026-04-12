@@ -1,7 +1,7 @@
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, Clear, List, ListItem, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{Cell, Clear, List, ListItem, Padding, Paragraph, Row, Table, Wrap};
 use ratatui::Frame;
 use throbber_widgets_tui::{Throbber, ThrobberState, WhichUse};
 
@@ -562,14 +562,14 @@ fn draw_album_detail(f: &mut Frame, app: &App, area: Rect, show_zip_art: bool) {
             width: right_split[1].width + 1,
             height: right_split[1].height + 1,
         };
-        draw_album_art_panel(f, app, art_slot);
+        draw_album_art_panel(f, app, art_slot, border_style);
     } else {
         // Not enough width or compact tier: full-width track list, no zip art.
         draw_album_track_list(f, app, inner);
     }
 }
 
-fn draw_album_art_panel(f: &mut Frame, app: &App, area: Rect) {
+fn draw_album_art_panel(f: &mut Frame, app: &App, area: Rect, outer_border_style: Style) {
     if area.height < 3 {
         return;
     }
@@ -606,40 +606,35 @@ fn draw_album_art_panel(f: &mut Frame, app: &App, area: Rect) {
         height: area.height,
     };
 
+    // Block with 2-cell interior padding; inner() accounts for both border
+    // and padding.
     let block = t
         .block()
         .border_style(t.border())
         .title(title)
-        .style(Style::default().bg(t.main_bg));
-    let block_inner = block.inner(panel_area);
+        .style(Style::default().bg(t.main_bg))
+        .padding(Padding::uniform(2));
+    let inner = block.inner(panel_area);
     f.render_widget(block, panel_area);
 
-    // Inset by 2 on each side for interior padding.
-    let inner = Rect {
-        x: block_inner.x + 2,
-        y: block_inner.y + 2,
-        width: block_inner.width.saturating_sub(4),
-        height: block_inner.height.saturating_sub(4),
-    };
-
-    // Swap corner glyphs where the art panel's borders land on the outer
-    // block's border lines: the corner should look like a T-junction so the
-    // outer line visually passes through. The top-right cell sits on the
-    // outer's vertical line (→ left-pointing T); the bottom-left cell sits on
-    // the outer's horizontal line (→ up-pointing T).
+    // The panel's top-right and bottom-left corners land on the outer block's
+    // border line. Replace them with T-junction glyphs so the outer line
+    // appears to pass through, and style them to match the outer block's
+    // active/inactive color — not the art panel's own border — since the
+    // outer line is what the junction visually extends.
     if let Some((right_t, up_t)) = junction_chars(t.border_type) {
-        let border_style = t.border().bg(t.main_bg);
+        let junction_style = outer_border_style.bg(t.main_bg);
         let buf = f.buffer_mut();
         if panel_area.width > 0 {
             let tr_x = panel_area.x + panel_area.width - 1;
             if let Some(cell) = buf.cell_mut((tr_x, panel_area.y)) {
-                cell.set_symbol(right_t).set_style(border_style);
+                cell.set_symbol(right_t).set_style(junction_style);
             }
         }
         if panel_area.height > 0 {
             let bl_y = panel_area.y + panel_area.height - 1;
             if let Some(cell) = buf.cell_mut((panel_area.x, bl_y)) {
-                cell.set_symbol(up_t).set_style(border_style);
+                cell.set_symbol(up_t).set_style(junction_style);
             }
         }
     }
@@ -670,75 +665,74 @@ fn draw_album_art_inline(f: &mut Frame, app: &App, area: Rect) {
     let t = app.theme();
     let pad_style = Style::default().bg(t.main_bg);
 
-    let lines: Vec<Line> = match app.album_art_style {
-        AlbumArtStyle::Halfblock => {
-            if app.album_art_lines.is_empty() {
-                return;
-            }
-            let art_w = app.album_art_lines.first().map(|r| r.len()).unwrap_or(0) as u16;
-            let x_offset = area.width.saturating_sub(art_w) / 2;
-            let pad: String = " ".repeat(x_offset as usize);
-
-            app.album_art_lines
-                .iter()
-                .take(area.height as usize)
-                .map(|row| {
-                    let mut spans: Vec<Span> = Vec::with_capacity(row.len() + 1);
-                    if x_offset > 0 {
-                        spans.push(Span::styled(pad.clone(), pad_style));
-                    }
-                    for &(_, fg, bg) in row
-                        .iter()
-                        .take(area.width.saturating_sub(x_offset) as usize)
-                    {
-                        spans.push(Span::styled(
-                            "▀",
-                            Style::default()
-                                .fg(Color::Rgb(fg[0], fg[1], fg[2]))
-                                .bg(Color::Rgb(bg[0], bg[1], bg[2])),
-                        ));
-                    }
-                    Line::from(spans)
-                })
-                .collect()
-        }
-        AlbumArtStyle::Ascii => {
-            if app.album_art_ascii_lines.is_empty() {
-                return;
-            }
-            let art_w = app
-                .album_art_ascii_lines
+    // Look up the active cache's row count + width via a single match.
+    let (row_count, art_w) = match app.album_art_style {
+        AlbumArtStyle::Halfblock => (
+            app.album_art_lines.len(),
+            app.album_art_lines.first().map(|r| r.len()).unwrap_or(0) as u16,
+        ),
+        AlbumArtStyle::Ascii => (
+            app.album_art_ascii_lines.len(),
+            app.album_art_ascii_lines
                 .first()
                 .map(|r| r.len())
-                .unwrap_or(0) as u16;
-            let x_offset = area.width.saturating_sub(art_w) / 2;
-            let pad: String = " ".repeat(x_offset as usize);
+                .unwrap_or(0) as u16,
+        ),
+    };
+    if row_count == 0 {
+        return;
+    }
 
-            app.album_art_ascii_lines
-                .iter()
-                .take(area.height as usize)
-                .map(|row| {
-                    let mut spans: Vec<Span> = Vec::with_capacity(row.len() + 1);
-                    if x_offset > 0 {
-                        spans.push(Span::styled(pad.clone(), pad_style));
-                    }
-                    for &(ch, fg) in row
-                        .iter()
-                        .take(area.width.saturating_sub(x_offset) as usize)
-                    {
-                        let mut buf = [0u8; 4];
-                        let s = ch.encode_utf8(&mut buf).to_string();
-                        spans.push(Span::styled(
-                            s,
-                            Style::default()
-                                .fg(Color::Rgb(fg[0], fg[1], fg[2]))
-                                .bg(t.main_bg),
-                        ));
-                    }
-                    Line::from(spans)
-                })
-                .collect()
+    let x_offset = area.width.saturating_sub(art_w) / 2;
+    let pad: String = " ".repeat(x_offset as usize);
+    let take_w = area.width.saturating_sub(x_offset) as usize;
+    let take_h = area.height as usize;
+
+    // Per-row prefix: the padding span (if any). Shared across both branches.
+    let prefix = |spans: &mut Vec<Span<'static>>| {
+        if x_offset > 0 {
+            spans.push(Span::styled(pad.clone(), pad_style));
         }
+    };
+
+    let lines: Vec<Line> = match app.album_art_style {
+        AlbumArtStyle::Halfblock => app
+            .album_art_lines
+            .iter()
+            .take(take_h)
+            .map(|row| {
+                let mut spans = Vec::with_capacity(row.len() + 1);
+                prefix(&mut spans);
+                for &(_, fg, bg) in row.iter().take(take_w) {
+                    spans.push(Span::styled(
+                        "▀",
+                        Style::default()
+                            .fg(Color::Rgb(fg[0], fg[1], fg[2]))
+                            .bg(Color::Rgb(bg[0], bg[1], bg[2])),
+                    ));
+                }
+                Line::from(spans)
+            })
+            .collect(),
+        AlbumArtStyle::Ascii => app
+            .album_art_ascii_lines
+            .iter()
+            .take(take_h)
+            .map(|row| {
+                let mut spans = Vec::with_capacity(row.len() + 1);
+                prefix(&mut spans);
+                for &(ch, fg) in row.iter().take(take_w) {
+                    let mut buf = [0u8; 4];
+                    spans.push(Span::styled(
+                        ch.encode_utf8(&mut buf).to_string(),
+                        Style::default()
+                            .fg(Color::Rgb(fg[0], fg[1], fg[2]))
+                            .bg(t.main_bg),
+                    ));
+                }
+                Line::from(spans)
+            })
+            .collect(),
     };
 
     f.render_widget(Paragraph::new(lines), area);
@@ -2078,6 +2072,31 @@ fn build_zune_art(screen_line1: &str, screen_line2: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn junction_chars_matches_expected_glyphs() {
+        use ratatui::widgets::BorderType;
+        assert_eq!(
+            junction_chars(BorderType::Plain),
+            Some(("\u{2524}", "\u{2534}"))
+        );
+        assert_eq!(
+            junction_chars(BorderType::Rounded),
+            Some(("\u{2524}", "\u{2534}"))
+        );
+        assert_eq!(
+            junction_chars(BorderType::Thick),
+            Some(("\u{252B}", "\u{253B}"))
+        );
+        assert_eq!(
+            junction_chars(BorderType::Double),
+            Some(("\u{2563}", "\u{2569}"))
+        );
+        // Block-style borders (QuadrantOutside/QuadrantInside) have no clean
+        // single-glyph T-junction; we intentionally fall through to None.
+        assert_eq!(junction_chars(BorderType::QuadrantOutside), None);
+        assert_eq!(junction_chars(BorderType::QuadrantInside), None);
+    }
 
     #[test]
     fn zune_art_connected_track_count() {

@@ -359,6 +359,15 @@ impl App {
     /// Toggle between halfblock and ASCII album art renderers, invalidating caches
     /// so the next render rebuilds at the current panel size. Persists choice to config.
     pub fn toggle_album_art_style(&mut self) {
+        self.flip_art_style_in_memory();
+        let style = self.album_art_style.as_str().to_string();
+        crate::config::update(|c| c.album_art_style = Some(style));
+    }
+
+    /// In-memory half of [`toggle_album_art_style`]: flips the style and
+    /// invalidates the cached art for the old style. Split out so unit tests
+    /// can exercise the state transition without touching the on-disk config.
+    fn flip_art_style_in_memory(&mut self) {
         self.album_art_style = match self.album_art_style {
             AlbumArtStyle::Halfblock => AlbumArtStyle::Ascii,
             AlbumArtStyle::Ascii => AlbumArtStyle::Halfblock,
@@ -366,9 +375,6 @@ impl App {
         self.album_art_lines.clear();
         self.album_art_ascii_lines.clear();
         self.album_art_size = (0, 0);
-
-        let style = self.album_art_style.as_str().to_string();
-        crate::config::update(|c| c.album_art_style = Some(style));
     }
 
     pub fn theme(&self) -> &'static Theme {
@@ -2622,6 +2628,27 @@ mod tests {
             assert_eq!(style.as_str(), s);
         }
         assert!("bogus".parse::<AlbumArtStyle>().is_err());
+    }
+
+    #[test]
+    fn flip_art_style_in_memory_flips_and_clears_caches() {
+        let mut app = App::new();
+        app.album_art_style = AlbumArtStyle::Halfblock;
+        app.album_art_lines.push(vec![('▀', [1, 2, 3], [4, 5, 6])]);
+        app.album_art_ascii_lines.push(vec![('#', [7, 8, 9])]);
+        app.album_art_size = (80, 24);
+
+        app.flip_art_style_in_memory();
+        assert_eq!(app.album_art_style, AlbumArtStyle::Ascii);
+        assert!(app.album_art_lines.is_empty());
+        assert!(app.album_art_ascii_lines.is_empty());
+        assert_eq!(app.album_art_size, (0, 0));
+
+        // Seed again and flip back; covers the other match arm.
+        app.album_art_ascii_lines.push(vec![('@', [0, 0, 0])]);
+        app.flip_art_style_in_memory();
+        assert_eq!(app.album_art_style, AlbumArtStyle::Halfblock);
+        assert!(app.album_art_ascii_lines.is_empty());
     }
 
     #[test]
