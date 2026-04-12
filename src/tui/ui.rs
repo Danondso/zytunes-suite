@@ -545,8 +545,8 @@ fn draw_album_detail(f: &mut Frame, app: &App, area: Rect, show_zip_art: bool) {
             AlbumArtStyle::Halfblock => app.album_art_lines.len() as u16,
             AlbumArtStyle::Ascii => app.album_art_ascii_lines.len() as u16,
         };
-        // +2 for top/bottom border, +4 for 2-row padding on top and bottom.
-        let art_panel_rows = if art_rows > 0 { art_rows + 6 } else { 0 };
+        // +2 for top/bottom border, +1 for 1-row padding on top (0 on bottom).
+        let art_panel_rows = if art_rows > 0 { art_rows + 3 } else { 0 };
         let right_split = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(4), Constraint::Length(art_panel_rows)])
@@ -594,7 +594,7 @@ fn draw_album_art_panel(f: &mut Frame, app: &App, area: Rect, outer_border_style
 
     let t = app.theme();
     let title = " Album Art ";
-    // Panel sizing: art + 2 border + 4 padding on each axis.
+    // Panel sizing horizontally: art + 2 border + 4 (2+2) padding.
     // Title must also fit across the top.
     let min_w = (title.chars().count() as u16 + 2).max(art_w + 6);
     let panel_w = min_w.min(area.width);
@@ -606,14 +606,14 @@ fn draw_album_art_panel(f: &mut Frame, app: &App, area: Rect, outer_border_style
         height: area.height,
     };
 
-    // Block with 2-cell interior padding; inner() accounts for both border
-    // and padding.
+    // Interior padding: 2 left/right, 1 top, 0 bottom. inner() accounts for
+    // both border and padding.
     let block = t
         .block()
         .border_style(t.border())
         .title(title)
         .style(Style::default().bg(t.main_bg))
-        .padding(Padding::uniform(2));
+        .padding(Padding::new(2, 2, 1, 0));
     let inner = block.inner(panel_area);
     f.render_widget(block, panel_area);
 
