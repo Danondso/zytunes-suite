@@ -210,6 +210,7 @@ impl TrackCache {
                 format: parts[2].to_string(),
                 size: parts[3].parse().unwrap_or(0),
                 name: parts[4].to_string(),
+                ..Default::default()
             });
         }
         if entries.is_empty() {
@@ -311,6 +312,8 @@ pub struct NativeSession {
     sync_cache_serial: Option<String>,
     sync_restored: bool,
     pub firmware_version: Option<String>,
+    /// Cached video entries from the last ZMDB parse.
+    zmdb_video_cache: Option<Vec<DeviceEntry>>,
 }
 
 impl NativeSession {
@@ -406,6 +409,7 @@ impl NativeSession {
             sync_cache_serial: None,
             sync_restored: false,
             firmware_version,
+            zmdb_video_cache: None,
         })
     }
 
@@ -456,6 +460,7 @@ impl NativeSession {
                         format: format_str,
                         size: info.compressed_size as u64,
                         name: full_name.clone(),
+                        ..Default::default()
                     });
                 }
             } else {
@@ -465,6 +470,7 @@ impl NativeSession {
                     format: format_str,
                     size: info.compressed_size as u64,
                     name: full_name.clone(),
+                    ..Default::default()
                 });
             }
         }
@@ -541,6 +547,7 @@ impl NativeSession {
         let raw = self.session.get_zmdb(1).mtp_err()?;
         let zmdb = crate::mtp::zmdb::Zmdb::parse(&raw)?;
         self.log_msg(&format!("ZMDB: {}", zmdb.summary()));
+        self.zmdb_video_cache = Some(zmdb.to_video_entries());
         Ok(zmdb.to_device_entries())
     }
 
@@ -940,6 +947,7 @@ impl DeviceSession for NativeSession {
             format: format_name(format),
             size: file_data.len() as u64,
             name: format!("{}/{}/{}", artist, album, filename),
+            ..Default::default()
         };
         self.cache.append(&new_entry);
 
@@ -1223,6 +1231,22 @@ impl DeviceSession for NativeSession {
         self.session.send_object(data).mtp_err()?;
         Ok(obj_id as u64)
     }
+
+    fn collect_all_videos(&mut self) -> Result<Vec<DeviceEntry>, String> {
+        // Return cached video entries from the last ZMDB parse if available.
+        if let Some(ref cached) = self.zmdb_video_cache {
+            self.log_msg(&format!("Returning {} cached video entries", cached.len()));
+            return Ok(cached.clone());
+        }
+        // Try ZMDB to populate the cache.
+        let _ = self.try_zmdb();
+        if let Some(ref cached) = self.zmdb_video_cache {
+            return Ok(cached.clone());
+        }
+        // Fallback: scan /Videos via MTP handle walk.
+        self.log_msg("No ZMDB video data, scanning /Videos...");
+        self.collect_all_tracks("/Videos")
+    }
 }
 
 impl NativeSession {
@@ -1344,6 +1368,7 @@ fn object_info_to_entry(handle: u32, info: &ObjectInfo) -> DeviceEntry {
         },
         size: info.compressed_size as u64,
         name: info.filename.clone(),
+        ..Default::default()
     }
 }
 
@@ -1661,6 +1686,7 @@ mod tests {
             format: "MP3".to_string(),
             size: 1024,
             name: name.to_string(),
+            ..Default::default()
         }
     }
 

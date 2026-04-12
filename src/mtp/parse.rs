@@ -1,5 +1,5 @@
 /// A file or directory entry from the device.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DeviceEntry {
     pub object_id: u64,
     #[allow(dead_code)]
@@ -7,6 +7,10 @@ pub struct DeviceEntry {
     pub format: String,
     pub size: u64,
     pub name: String,
+    /// Track number (1-based), if known from ZMDB.
+    pub track_number: Option<u32>,
+    /// Disc number (1-based), if known from ZMDB.
+    pub disc_number: Option<u32>,
 }
 
 impl DeviceEntry {
@@ -51,6 +55,7 @@ pub fn parse_lsext(lines: &[String]) -> Vec<DeviceEntry> {
             format,
             size,
             name,
+            ..Default::default()
         });
     }
     entries
@@ -138,6 +143,7 @@ mod tests {
                 format: fmt.to_string(),
                 size: 0,
                 name: "f".into(),
+                ..Default::default()
             };
             assert!(!entry.is_dir(), "format '{}' should not be dir", fmt);
         }

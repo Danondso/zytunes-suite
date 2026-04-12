@@ -42,6 +42,8 @@ pub struct DeviceTrackInfo {
     pub object_id: u64,
     pub artist: String,
     pub album: String,
+    pub track_number: Option<u32>,
+    pub disc_number: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -540,6 +542,8 @@ impl App {
                     object_id: entry.object_id,
                     artist,
                     album,
+                    track_number: entry.track_number,
+                    disc_number: entry.disc_number,
                 });
         }
 
@@ -1728,8 +1732,8 @@ fn device_tracks_to_info(tracks: &[DeviceTrackInfo]) -> Vec<TrackInfo> {
             duration_ms: None,
             kind: None,
             location: None,
-            track_number: None,
-            disc_number: None,
+            track_number: dt.track_number,
+            disc_number: dt.disc_number,
             on_device: false,
         })
         .collect()
@@ -1930,6 +1934,7 @@ mod tests {
             format: "MP3".to_string(),
             size,
             name: name.to_string(),
+            ..Default::default()
         }
     }
 
@@ -2024,6 +2029,7 @@ mod tests {
                 format: "Association".to_string(),
                 size: 0,
                 name: "Albums".to_string(),
+                ..Default::default()
             },
             make_device_entry("Artist/Album/song.mp3", 1000),
         ];
@@ -2465,6 +2471,8 @@ mod tests {
                 object_id: 1,
                 artist: "Queen".into(),
                 album: "A Night at the Opera".into(),
+                track_number: None,
+                disc_number: None,
             }],
         );
         build_match_sets(&mut device);
@@ -2501,6 +2509,8 @@ mod tests {
                 object_id: 10,
                 artist: "NSYNC".into(),
                 album: "No Strings Attached".into(),
+                track_number: None,
+                disc_number: None,
             }],
         );
         build_match_sets(&mut device);

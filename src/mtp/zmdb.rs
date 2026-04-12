@@ -11,6 +11,7 @@
 //!
 //! Record types (high byte of index entry):
 //!   0x01 — Tracks: album_ref + artist_ref + genre_ref + folder_ref + size + track_num + format + title
+//!   0x02 — Videos: folder_ref + metadata_ref + pad + size + duration_ms + pad*3 + format + pad + title
 //!   0x06 — Albums: artist_ref + name + file_path (UTF-16LE)
 //!   0x08 — Artists: name
 //!   0x09 — Genres: name
@@ -51,6 +52,8 @@ struct ZmdbTrack {
     artist_id: u32,
     album_id: u32,
     file_size: u32,
+    track_number: u16,
+    disc_number: u16,
 }
 
 struct ZmdbAlbum {
@@ -63,6 +66,14 @@ struct ZmdbArtist {
     name: String,
 }
 
+struct ZmdbVideo {
+    title: String,
+    file_size: u32,
+    #[allow(dead_code)]
+    duration_ms: u32,
+    format_code: u32,
+}
+
 struct ZmdbGenre {
     #[allow(dead_code)]
     name: String,
@@ -70,6 +81,7 @@ struct ZmdbGenre {
 
 pub struct Zmdb {
     tracks: Vec<ZmdbTrack>,
+    videos: Vec<ZmdbVideo>,
     albums: Vec<ZmdbAlbum>,
     artists: Vec<ZmdbArtist>,
     genres: Vec<ZmdbGenre>,
@@ -97,6 +109,7 @@ impl Zmdb {
         let idx_data_off = u32_at(data, 0x48).ok_or("ZMDB truncated at ZArr data offset")? as usize;
 
         let mut tracks = Vec::new();
+        let mut videos = Vec::new();
         let mut albums = Vec::new();
         let mut artists = Vec::new();
         let mut genres = Vec::new();
@@ -129,6 +142,13 @@ impl Zmdb {
                         Some(v) => v,
                         None => continue,
                     };
+                    // Track number field packs disc in high 16 bits, track in low 16.
+                    let track_num_raw = match u32_at(data, rec_off + 20) {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    let track_number = (track_num_raw & 0xFFFF) as u16;
+                    let disc_number = ((track_num_raw >> 16) & 0xFFFF) as u16;
                     if rec_off + 28 > data.len() {
                         continue;
                     }
@@ -140,6 +160,36 @@ impl Zmdb {
                             artist_id,
                             album_id,
                             file_size,
+                            track_number,
+                            disc_number,
+                        });
+                    }
+                }
+                0x02 => {
+                    // Video: [folder_ref 4][metadata_ref 4][pad 4][file_size 4]
+                    //        [duration_ms 4][pad 12][format_code 4][pad 4][title cstring]
+                    let file_size = match u32_at(data, rec_off + 12) {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    let duration_ms = match u32_at(data, rec_off + 16) {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    let format_code = match u32_at(data, rec_off + 32) {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    if rec_off + 40 > data.len() {
+                        continue;
+                    }
+                    let (title, _) = read_cstring(data, rec_off + 40);
+                    if !title.is_empty() {
+                        videos.push(ZmdbVideo {
+                            title,
+                            file_size,
+                            duration_ms,
+                            format_code,
                         });
                     }
                 }
@@ -179,6 +229,7 @@ impl Zmdb {
 
         Ok(Zmdb {
             tracks,
+            videos,
             albums,
             artists,
             genres,
@@ -214,6 +265,38 @@ impl Zmdb {
                     format: "MP3".to_string(),
                     size: t.file_size as u64,
                     name: format!("{}/{}/{}", artist, album, t.title),
+                    track_number: if t.track_number > 0 {
+                        Some(t.track_number as u32)
+                    } else {
+                        None
+                    },
+                    disc_number: if t.disc_number > 0 {
+                        Some(t.disc_number as u32)
+                    } else {
+                        None
+                    },
+                }
+            })
+            .collect()
+    }
+
+    /// Convert parsed ZMDB video data into DeviceEntry values.
+    pub fn to_video_entries(&self) -> Vec<DeviceEntry> {
+        self.videos
+            .iter()
+            .map(|v| {
+                let format = match v.format_code {
+                    0xB981 => "WMV",
+                    0x300A => "AVI",
+                    0x300B => "MPEG",
+                    0x300C => "ASF",
+                    _ => "Video",
+                };
+                DeviceEntry {
+                    format: format.to_string(),
+                    size: v.file_size as u64,
+                    name: v.title.clone(),
+                    ..Default::default()
                 }
             })
             .collect()
@@ -221,13 +304,24 @@ impl Zmdb {
 
     /// Summary stats for logging.
     pub fn summary(&self) -> String {
-        format!(
-            "{} tracks, {} albums, {} artists, {} genres",
-            self.tracks.len(),
-            self.albums.len(),
-            self.artists.len(),
-            self.genres.len()
-        )
+        if self.videos.is_empty() {
+            format!(
+                "{} tracks, {} albums, {} artists, {} genres",
+                self.tracks.len(),
+                self.albums.len(),
+                self.artists.len(),
+                self.genres.len()
+            )
+        } else {
+            format!(
+                "{} tracks, {} videos, {} albums, {} artists, {} genres",
+                self.tracks.len(),
+                self.videos.len(),
+                self.albums.len(),
+                self.artists.len(),
+                self.genres.len()
+            )
+        }
     }
 }
 
@@ -359,6 +453,8 @@ mod tests {
         assert_eq!(zmdb.tracks.len(), 1);
         assert_eq!(zmdb.tracks[0].title, "Say It Ain't So");
         assert_eq!(zmdb.tracks[0].file_size, 5_000_000);
+        assert_eq!(zmdb.tracks[0].track_number, 3);
+        assert_eq!(zmdb.tracks[0].disc_number, 0);
     }
 
     #[test]
@@ -394,6 +490,8 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "AFI/Sing the Sorrow/Miseria Cantare");
         assert_eq!(entries[0].size, 3_000_000);
+        assert_eq!(entries[0].track_number, Some(1));
+        assert_eq!(entries[0].disc_number, None); // disc 0 maps to None
         assert!(!entries[0].is_dir());
     }
 
@@ -422,5 +520,142 @@ mod tests {
         let entries = zmdb.to_device_entries();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "Unknown Artist/Unknown Album/Orphan Track");
+    }
+
+    #[test]
+    fn packed_disc_and_track_number() {
+        // The Zune packs disc number in the high 16 bits and track number in the low 16.
+        // e.g. disc 4, track 1 = 0x00040001 = 262145
+        let artist_rec = make_artist_record("Green Day");
+        let album_rec = make_album_record(1, "American Idiot");
+        let genre_rec = make_genre_record("Rock");
+        let track_rec = make_track_record(1, 1, 1, 174320, 0x00040001, "American Idiot");
+
+        let a_off = 0u32;
+        let al_off = a_off + artist_rec.len() as u32;
+        let g_off = al_off + album_rec.len() as u32;
+        let t_off = g_off + genre_rec.len() as u32;
+
+        let mut pool = Vec::new();
+        pool.extend_from_slice(&artist_rec);
+        pool.extend_from_slice(&album_rec);
+        pool.extend_from_slice(&genre_rec);
+        pool.extend_from_slice(&track_rec);
+
+        let data = make_zmdb(
+            &[
+                (0x08000001, a_off),
+                (0x06000001, al_off),
+                (0x09000001, g_off),
+                (0x01000001, t_off),
+            ],
+            &pool,
+        );
+
+        let zmdb = Zmdb::parse(&data).unwrap();
+        assert_eq!(zmdb.tracks[0].track_number, 1);
+        assert_eq!(zmdb.tracks[0].disc_number, 4);
+
+        let entries = zmdb.to_device_entries();
+        assert_eq!(entries[0].track_number, Some(1));
+        assert_eq!(entries[0].disc_number, Some(4));
+    }
+
+    fn make_video_record(
+        file_size: u32,
+        duration_ms: u32,
+        format_code: u32,
+        title: &str,
+    ) -> Vec<u8> {
+        let mut rec = Vec::new();
+        rec.extend_from_slice(&0x05000026u32.to_le_bytes()); // folder_ref (Video folder)
+        rec.extend_from_slice(&0x0a00004Bu32.to_le_bytes()); // metadata_ref
+        rec.extend_from_slice(&0u32.to_le_bytes()); // padding
+        rec.extend_from_slice(&file_size.to_le_bytes()); // file_size @ 12
+        rec.extend_from_slice(&duration_ms.to_le_bytes()); // duration_ms @ 16
+        rec.extend_from_slice(&0u32.to_le_bytes()); // padding @ 20
+        rec.extend_from_slice(&0u32.to_le_bytes()); // padding @ 24
+        rec.extend_from_slice(&0u32.to_le_bytes()); // padding @ 28
+        rec.extend_from_slice(&format_code.to_le_bytes()); // format_code @ 32
+        rec.extend_from_slice(&0x00010000u32.to_le_bytes()); // unknown @ 36
+        rec.extend_from_slice(title.as_bytes()); // title @ 40
+        rec.push(0); // null terminator
+        rec
+    }
+
+    #[test]
+    fn parse_video_record() {
+        let video_rec = make_video_record(10_106_067, 4_929_041, 0xB981, "Pirates of Caribbean");
+
+        let data = make_zmdb(&[(0x02000001, 0)], &video_rec);
+
+        let zmdb = Zmdb::parse(&data).unwrap();
+        assert_eq!(zmdb.videos.len(), 1);
+        assert_eq!(zmdb.videos[0].title, "Pirates of Caribbean");
+        assert_eq!(zmdb.videos[0].file_size, 10_106_067);
+        assert_eq!(zmdb.videos[0].duration_ms, 4_929_041);
+        assert_eq!(zmdb.videos[0].format_code, 0xB981);
+    }
+
+    #[test]
+    fn to_video_entries_format_mapping() {
+        let video_rec = make_video_record(5_000_000, 120_000, 0xB981, "Test Video");
+
+        let data = make_zmdb(&[(0x02000001, 0)], &video_rec);
+
+        let zmdb = Zmdb::parse(&data).unwrap();
+        let entries = zmdb.to_video_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "Test Video");
+        assert_eq!(entries[0].format, "WMV");
+        assert_eq!(entries[0].size, 5_000_000);
+    }
+
+    #[test]
+    fn mixed_tracks_and_videos() {
+        let artist_rec = make_artist_record("Weezer");
+        let album_rec = make_album_record(1, "Blue Album");
+        let genre_rec = make_genre_record("Rock");
+        let track_rec = make_track_record(1, 1, 1, 3_000_000, 1, "Buddy Holly");
+        let video_rec = make_video_record(10_000_000, 300_000, 0xB981, "Music Video");
+
+        let a_off = 0u32;
+        let al_off = a_off + artist_rec.len() as u32;
+        let g_off = al_off + album_rec.len() as u32;
+        let t_off = g_off + genre_rec.len() as u32;
+        let v_off = t_off + track_rec.len() as u32;
+
+        let mut pool = Vec::new();
+        pool.extend_from_slice(&artist_rec);
+        pool.extend_from_slice(&album_rec);
+        pool.extend_from_slice(&genre_rec);
+        pool.extend_from_slice(&track_rec);
+        pool.extend_from_slice(&video_rec);
+
+        let data = make_zmdb(
+            &[
+                (0x08000001, a_off),
+                (0x06000001, al_off),
+                (0x09000001, g_off),
+                (0x01000001, t_off),
+                (0x02000001, v_off),
+            ],
+            &pool,
+        );
+
+        let zmdb = Zmdb::parse(&data).unwrap();
+        assert_eq!(zmdb.tracks.len(), 1);
+        assert_eq!(zmdb.videos.len(), 1);
+        assert_eq!(zmdb.tracks[0].title, "Buddy Holly");
+        assert_eq!(zmdb.videos[0].title, "Music Video");
+        assert!(zmdb.summary().contains("1 videos"));
+    }
+
+    #[test]
+    fn summary_omits_videos_when_empty() {
+        let artist_rec = make_artist_record("AFI");
+        let data = make_zmdb(&[(0x08000001, 0)], &artist_rec);
+        let zmdb = Zmdb::parse(&data).unwrap();
+        assert!(!zmdb.summary().contains("video"));
     }
 }
