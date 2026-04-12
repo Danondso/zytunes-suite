@@ -781,9 +781,11 @@ fn draw_album_track_list(f: &mut Frame, app: &App, area: Rect) {
         }
 
         let is_selected = i == app.track_selected && is_active;
+        // Stripe by track position (the loop index), so disc headers don't
+        // desync alternation.
         let bg = if is_selected {
             t.selection_bg
-        } else if i % 2 == 0 {
+        } else if i.is_multiple_of(2) {
             t.main_bg
         } else {
             t.alt_row_bg
@@ -906,7 +908,7 @@ fn draw_track_table(f: &mut Frame, app: &App, area: Rect) {
         .map(|(i, track)| {
             let bg = if i == app.track_selected {
                 t.selection_bg
-            } else if i % 2 == 0 {
+            } else if i.is_multiple_of(2) {
                 t.main_bg
             } else {
                 t.alt_row_bg
@@ -1961,7 +1963,7 @@ fn build_zip_art<'a>(
     let dur_padded = pad(duration, label_w);
 
     vec![
-        Line::from(Span::styled(r#" .-|:"""":""""""'''"""":|-.  "#, dim)),
+        Line::from(Span::styled(r#"  .-|:"""":""""""'''"""":|-.  "#, dim)),
         Line::from(Span::styled(r#" :  |'----'-------------'|  : "#, dim)),
         // Artist name line 1
         Line::from(vec![
