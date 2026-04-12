@@ -178,6 +178,98 @@ pub fn strip_track_number(s: &str) -> &str {
     }
 }
 
+/// Check if a video file needs transcoding for the Zune 30 (only WMV is native).
+pub fn needs_video_transcoding(path: &str) -> bool {
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    ext != "wmv"
+}
+
+/// Check whether ffmpeg is available on the system.
+pub fn check_ffmpeg_available() -> bool {
+    std::process::Command::new("ffmpeg")
+        .arg("-version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Transcode a video file to WMV format for the Zune 30 via ffmpeg.
+///
+/// Uses wmv2 video codec at 320x240 and wmav2 audio — the Zune 30's native
+/// playback format. Returns the path to the output WMV file.
+pub fn transcode_to_wmv(input: &str, temp_dir: &Path) -> Result<String, String> {
+    std::fs::create_dir_all(temp_dir).map_err(|e| format!("Cannot create temp dir: {e}"))?;
+
+    let stem = Path::new(input)
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy();
+    let output = temp_dir.join(format!("{stem}.wmv"));
+
+    let result = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-i",
+            input,
+            "-c:v",
+            "wmv2",
+            "-b:v",
+            "768k",
+            "-vf",
+            "scale=320:240:force_original_aspect_ratio=decrease,pad=320:240:(ow-iw)/2:(oh-ih)/2",
+            "-c:a",
+            "wmav2",
+            "-b:a",
+            "128k",
+            "-ar",
+            "44100",
+        ])
+        .arg(output.to_str().unwrap())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| format!("Failed to run ffmpeg: {e}"))?;
+
+    if !result.status.success() {
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        return Err(format!("ffmpeg transcode failed: {}", stderr));
+    }
+
+    Ok(output.to_string_lossy().into_owned())
+}
+
+/// Transcode a video if needed, then import via the device session.
+pub fn transcode_and_import_video(
+    session: &mut dyn DeviceSession,
+    local_path: &str,
+    temp_dir: &Path,
+) -> Result<u64, String> {
+    if needs_video_transcoding(local_path) {
+        let wmv_path = transcode_to_wmv(local_path, temp_dir)?;
+        let filename = Path::new(&wmv_path)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let data = std::fs::read(&wmv_path).map_err(|e| format!("Read transcoded: {e}"))?;
+        session.import_video(&filename, &data)
+    } else {
+        let filename = Path::new(local_path)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let data = std::fs::read(local_path).map_err(|e| format!("Read video: {e}"))?;
+        session.import_video(&filename, &data)
+    }
+}
+
 /// Transcode if needed, then import via the device session.
 pub fn transcode_and_import(
     session: &mut dyn DeviceSession,
@@ -1115,6 +1207,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // -- needs_video_transcoding --
+
+    #[test]
+    fn wmv_does_not_need_transcoding() {
+        assert!(!needs_video_transcoding("movie.wmv"));
+        assert!(!needs_video_transcoding("MOVIE.WMV"));
+        assert!(!needs_video_transcoding("/path/to/file.Wmv"));
+    }
+
+    #[test]
+    fn non_wmv_needs_transcoding() {
+        assert!(needs_video_transcoding("movie.mp4"));
+        assert!(needs_video_transcoding("movie.avi"));
+        assert!(needs_video_transcoding("movie.mpeg"));
+        assert!(needs_video_transcoding("movie.mpg"));
+        assert!(needs_video_transcoding("movie.mkv"));
+    }
+
     // -- resize_photo_for_zune --
 
     #[test]
@@ -1214,6 +1324,7 @@ mod tests {
             format: "MP3".into(),
             size: 1000,
             name: name.into(),
+            ..Default::default()
         }
     }
 

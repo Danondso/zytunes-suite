@@ -39,4 +39,9 @@ pub trait DeviceSession {
     fn import_video(&mut self, _filename: &str, _data: &[u8]) -> Result<u64, String> {
         Err("Video import not supported".into())
     }
+    /// Collect all video entries from the device. Uses ZMDB if available,
+    /// otherwise falls back to scanning `/Videos` via MTP handle walk.
+    fn collect_all_videos(&mut self) -> Result<Vec<DeviceEntry>, String> {
+        Ok(Vec::new())
+    }
 }
