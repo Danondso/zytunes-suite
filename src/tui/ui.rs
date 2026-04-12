@@ -615,7 +615,45 @@ fn draw_album_art_panel(f: &mut Frame, app: &App, area: Rect) {
         .style(Style::default().bg(t.main_bg));
     let inner = block.inner(panel_area);
     f.render_widget(block, panel_area);
+
+    // Swap corner glyphs where the art panel's borders land on the outer
+    // block's border lines: the corner should look like a T-junction so the
+    // outer line visually passes through. The top-right cell sits on the
+    // outer's vertical line (→ left-pointing T); the bottom-left cell sits on
+    // the outer's horizontal line (→ up-pointing T).
+    if let Some((right_t, up_t)) = junction_chars(t.border_type) {
+        let border_style = t.border().bg(t.main_bg);
+        let buf = f.buffer_mut();
+        if panel_area.width > 0 {
+            let tr_x = panel_area.x + panel_area.width - 1;
+            if let Some(cell) = buf.cell_mut((tr_x, panel_area.y)) {
+                cell.set_symbol(right_t).set_style(border_style);
+            }
+        }
+        if panel_area.height > 0 {
+            let bl_y = panel_area.y + panel_area.height - 1;
+            if let Some(cell) = buf.cell_mut((panel_area.x, bl_y)) {
+                cell.set_symbol(up_t).set_style(border_style);
+            }
+        }
+    }
+
     draw_album_art_inline(f, app, inner);
+}
+
+/// T-junction glyphs matching a given border type: (right-side T, bottom-side T).
+/// Returns `None` for border types that lack clean single-glyph junctions
+/// (e.g. quadrant block borders), in which case we leave the corners as-is.
+fn junction_chars(bt: ratatui::widgets::BorderType) -> Option<(&'static str, &'static str)> {
+    use ratatui::widgets::BorderType;
+    match bt {
+        // Plain and Rounded share junction glyphs — rounded corners only differ
+        // at corners, not at T-intersections.
+        BorderType::Plain | BorderType::Rounded => Some(("\u{2524}", "\u{2534}")), // ┤ ┴
+        BorderType::Thick => Some(("\u{252B}", "\u{253B}")),                       // ┫ ┻
+        BorderType::Double => Some(("\u{2563}", "\u{2569}")),                      // ╣ ╩
+        _ => None,
+    }
 }
 
 fn draw_album_art_inline(f: &mut Frame, app: &App, area: Rect) {
