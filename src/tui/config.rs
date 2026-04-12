@@ -7,6 +7,7 @@ pub struct Config {
     pub music_dir: Option<String>,
     pub photo_dir: Option<String>,
     pub video_dir: Option<String>,
+    pub album_art_style: Option<String>,
 }
 
 fn config_dir() -> Option<PathBuf> {
@@ -57,6 +58,7 @@ music_dir = "/home/user/Music"
         assert_eq!(config.music_dir.as_deref(), Some("/home/user/Music"));
         assert!(config.photo_dir.is_none());
         assert!(config.video_dir.is_none());
+        assert!(config.album_art_style.is_none());
     }
 
     #[test]
@@ -66,11 +68,13 @@ music_dir = "/home/user/Music"
             music_dir: Some("/music".into()),
             photo_dir: Some("/photos".into()),
             video_dir: Some("/videos".into()),
+            album_art_style: Some("ascii".into()),
         };
         let serialized = toml::to_string_pretty(&config).unwrap();
         let deserialized: Config = toml::from_str(&serialized).unwrap();
         assert_eq!(deserialized.photo_dir.as_deref(), Some("/photos"));
         assert_eq!(deserialized.video_dir.as_deref(), Some("/videos"));
+        assert_eq!(deserialized.album_art_style.as_deref(), Some("ascii"));
     }
 
     #[test]
@@ -80,5 +84,19 @@ music_dir = "/home/user/Music"
         assert!(config.music_dir.is_none());
         assert!(config.photo_dir.is_none());
         assert!(config.video_dir.is_none());
+        assert!(config.album_art_style.is_none());
+    }
+
+    #[test]
+    fn config_round_trip_album_art_style() {
+        for style in ["ascii", "halfblock"] {
+            let config = Config {
+                album_art_style: Some(style.into()),
+                ..Config::default()
+            };
+            let serialized = toml::to_string_pretty(&config).unwrap();
+            let deserialized: Config = toml::from_str(&serialized).unwrap();
+            assert_eq!(deserialized.album_art_style.as_deref(), Some(style));
+        }
     }
 }

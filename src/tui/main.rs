@@ -295,6 +295,9 @@ fn run_loop(
                     KeyCode::Char('t') => {
                         app.open_theme_picker();
                     }
+                    KeyCode::Char('T') => {
+                        app.toggle_album_art_style();
+                    }
                     KeyCode::Char('v') => {
                         if app.browse_mode == BrowseMode::Device
                             || app.device.status == DeviceStatus::Connected

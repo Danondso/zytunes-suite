@@ -7,8 +7,8 @@ use throbber_widgets_tui::{Throbber, ThrobberState, WhichUse};
 
 use crate::anim;
 use crate::app::{
-    format_duration, format_with_commas, App, BrowseMode, DevicePresence, DeviceStatus, NowPlaying,
-    Panel, PlaybackState, SidebarMode, SortColumn, SyncStatus,
+    format_duration, format_with_commas, AlbumArtStyle, App, BrowseMode, DevicePresence,
+    DeviceStatus, NowPlaying, Panel, PlaybackState, SidebarMode, SortColumn, SyncStatus,
 };
 use crate::theme;
 
@@ -541,7 +541,10 @@ fn draw_album_detail(f: &mut Frame, app: &App, area: Rect, show_zip_art: bool) {
         f.render_widget(art, cols[0]);
 
         // Split right column: tracks on top, album art below.
-        let art_rows = app.album_art_lines.len() as u16;
+        let art_rows = match app.album_art_style {
+            AlbumArtStyle::Halfblock => app.album_art_lines.len() as u16,
+            AlbumArtStyle::Ascii => app.album_art_ascii_lines.len() as u16,
+        };
         let right_split = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(4), Constraint::Length(art_rows)])
@@ -556,39 +559,83 @@ fn draw_album_detail(f: &mut Frame, app: &App, area: Rect, show_zip_art: bool) {
 }
 
 fn draw_album_art_inline(f: &mut Frame, app: &App, area: Rect) {
-    if app.album_art_lines.is_empty() || area.height == 0 {
+    if area.height == 0 {
         return;
     }
 
-    let art_w = app.album_art_lines.first().map(|r| r.len()).unwrap_or(0) as u16;
-    let x_offset = area.width.saturating_sub(art_w) / 2;
+    let t = app.theme();
+    let pad_style = Style::default().bg(t.main_bg);
 
-    let pad: String = " ".repeat(x_offset as usize);
-    let pad_style = Style::default().bg(app.theme().main_bg);
-
-    let lines: Vec<Line> = app
-        .album_art_lines
-        .iter()
-        .take(area.height as usize)
-        .map(|row| {
-            let mut spans: Vec<Span> = Vec::with_capacity(row.len() + 1);
-            if x_offset > 0 {
-                spans.push(Span::styled(pad.as_str(), pad_style));
+    let lines: Vec<Line> = match app.album_art_style {
+        AlbumArtStyle::Halfblock => {
+            if app.album_art_lines.is_empty() {
+                return;
             }
-            for &(_, fg, bg) in row
+            let art_w = app.album_art_lines.first().map(|r| r.len()).unwrap_or(0) as u16;
+            let x_offset = area.width.saturating_sub(art_w) / 2;
+            let pad: String = " ".repeat(x_offset as usize);
+
+            app.album_art_lines
                 .iter()
-                .take(area.width.saturating_sub(x_offset) as usize)
-            {
-                spans.push(Span::styled(
-                    "▀",
-                    Style::default()
-                        .fg(Color::Rgb(fg[0], fg[1], fg[2]))
-                        .bg(Color::Rgb(bg[0], bg[1], bg[2])),
-                ));
+                .take(area.height as usize)
+                .map(|row| {
+                    let mut spans: Vec<Span> = Vec::with_capacity(row.len() + 1);
+                    if x_offset > 0 {
+                        spans.push(Span::styled(pad.clone(), pad_style));
+                    }
+                    for &(_, fg, bg) in row
+                        .iter()
+                        .take(area.width.saturating_sub(x_offset) as usize)
+                    {
+                        spans.push(Span::styled(
+                            "▀",
+                            Style::default()
+                                .fg(Color::Rgb(fg[0], fg[1], fg[2]))
+                                .bg(Color::Rgb(bg[0], bg[1], bg[2])),
+                        ));
+                    }
+                    Line::from(spans)
+                })
+                .collect()
+        }
+        AlbumArtStyle::Ascii => {
+            if app.album_art_ascii_lines.is_empty() {
+                return;
             }
-            Line::from(spans)
-        })
-        .collect();
+            let art_w = app
+                .album_art_ascii_lines
+                .first()
+                .map(|r| r.len())
+                .unwrap_or(0) as u16;
+            let x_offset = area.width.saturating_sub(art_w) / 2;
+            let pad: String = " ".repeat(x_offset as usize);
+
+            app.album_art_ascii_lines
+                .iter()
+                .take(area.height as usize)
+                .map(|row| {
+                    let mut spans: Vec<Span> = Vec::with_capacity(row.len() + 1);
+                    if x_offset > 0 {
+                        spans.push(Span::styled(pad.clone(), pad_style));
+                    }
+                    for &(ch, fg) in row
+                        .iter()
+                        .take(area.width.saturating_sub(x_offset) as usize)
+                    {
+                        let mut buf = [0u8; 4];
+                        let s = ch.encode_utf8(&mut buf).to_string();
+                        spans.push(Span::styled(
+                            s,
+                            Style::default()
+                                .fg(Color::Rgb(fg[0], fg[1], fg[2]))
+                                .bg(t.main_bg),
+                        ));
+                    }
+                    Line::from(spans)
+                })
+                .collect()
+        }
+    };
 
     f.render_widget(Paragraph::new(lines), area);
 }
@@ -1190,6 +1237,7 @@ fn draw_keys_panel(f: &mut Frame, app: &App, area: Rect) {
         ("4", "Sync queue"),
         ("v", "Lib/Device view"),
         ("t", "Theme picker"),
+        ("T", "Art style"),
         ("/", "Search"),
         ("c", "Connect"),
         ("X", "Clear cache"),
@@ -1603,6 +1651,7 @@ fn draw_help_overlay(f: &mut Frame, app: &App) {
         "  1/2/3       Artists / Albums / Playlists",
         "  v           Toggle Library / Device view",
         "  t           Theme picker",
+        "  T           Toggle album art style (halfblock/ASCII)",
         "",
         "  Library",
         "  /           Search sidebar",
