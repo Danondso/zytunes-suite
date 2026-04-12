@@ -77,6 +77,37 @@ pub enum SortColumn {
     Format,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlbumArtStyle {
+    Halfblock,
+    Ascii,
+}
+
+impl AlbumArtStyle {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AlbumArtStyle::Halfblock => "halfblock",
+            AlbumArtStyle::Ascii => "ascii",
+        }
+    }
+}
+
+impl std::str::FromStr for AlbumArtStyle {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "halfblock" => Ok(AlbumArtStyle::Halfblock),
+            "ascii" => Ok(AlbumArtStyle::Ascii),
+            _ => Err(()),
+        }
+    }
+}
+
+/// Character ramp for ASCII art, ordered sparse → dense (10 chars).
+/// High-luminance pixels map to denser glyphs (more ink coverage).
+pub(crate) const ASCII_ART_RAMP: &[u8; 10] = b" .:-=+*%#@";
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[allow(dead_code)]
 pub enum PlaybackState {
@@ -236,8 +267,12 @@ pub struct App {
     /// Cached halfblock art lines: (char, fg_rgb, bg_rgb) per cell.
     #[allow(clippy::type_complexity)]
     pub album_art_lines: Vec<Vec<(char, [u8; 3], [u8; 3])>>,
-    /// Dimensions (w, h) the cached ASCII art was rendered for.
+    /// Cached ASCII art lines: (char, fg_rgb) per cell.
+    pub album_art_ascii_lines: Vec<Vec<(char, [u8; 3])>>,
+    /// Dimensions (w, h) the cached album art was rendered for.
     album_art_size: (u16, u16),
+    /// Renderer style for album art: halfblock (Unicode half-block) or ascii (character ramp).
+    pub album_art_style: AlbumArtStyle,
     /// Background commands to send after event handling (main loop flushes these).
     pub pending_bg_commands: Vec<BgCommand>,
 }
@@ -308,9 +343,38 @@ impl App {
             album_art: None,
             album_art_key: String::new(),
             album_art_lines: Vec::new(),
+            album_art_ascii_lines: Vec::new(),
             album_art_size: (0, 0),
+            album_art_style: {
+                let cfg = crate::config::load();
+                cfg.album_art_style
+                    .as_deref()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(AlbumArtStyle::Halfblock)
+            },
             pending_bg_commands: Vec::new(),
         }
+    }
+
+    /// Toggle between halfblock and ASCII album art renderers, invalidating caches
+    /// so the next render rebuilds at the current panel size. Persists choice to config.
+    pub fn toggle_album_art_style(&mut self) {
+        self.flip_art_style_in_memory();
+        let style = self.album_art_style.as_str().to_string();
+        crate::config::update(|c| c.album_art_style = Some(style));
+    }
+
+    /// In-memory half of [`toggle_album_art_style`]: flips the style and
+    /// invalidates the cached art for the old style. Split out so unit tests
+    /// can exercise the state transition without touching the on-disk config.
+    fn flip_art_style_in_memory(&mut self) {
+        self.album_art_style = match self.album_art_style {
+            AlbumArtStyle::Halfblock => AlbumArtStyle::Ascii,
+            AlbumArtStyle::Ascii => AlbumArtStyle::Halfblock,
+        };
+        self.album_art_lines.clear();
+        self.album_art_ascii_lines.clear();
+        self.album_art_size = (0, 0);
     }
 
     pub fn theme(&self) -> &'static Theme {
@@ -332,10 +396,8 @@ impl App {
 
     pub fn theme_picker_confirm(&mut self) {
         self.show_theme_picker = false;
-        // Save to config.
-        let mut config = crate::config::load();
-        config.theme = Some(self.theme().name.to_string());
-        crate::config::save(&config);
+        let theme_name = self.theme().name.to_string();
+        crate::config::update(|c| c.theme = Some(theme_name));
     }
 
     pub fn theme_picker_cancel(&mut self) {
@@ -994,6 +1056,7 @@ impl App {
             self.album_art = None;
             self.album_art_key.clear();
             self.album_art_lines.clear();
+            self.album_art_ascii_lines.clear();
             self.album_art_size = (0, 0);
             return;
         };
@@ -1004,6 +1067,7 @@ impl App {
         self.album_art_key = key.clone();
         self.album_art = None;
         self.album_art_lines.clear();
+        self.album_art_ascii_lines.clear();
         self.album_art_size = (0, 0);
 
         // Collect file paths and dispatch to the background thread.
@@ -1016,22 +1080,33 @@ impl App {
             .push(BgCommand::LoadAlbumArt { key, paths });
     }
 
-    /// Render album art as halfblock characters sized to a square that fits
-    /// within the given terminal area. Each cell packs two vertical pixels
-    /// using ▀ with fg=top color, bg=bottom color — doubling vertical resolution.
+    /// Rebuild the album-art cache sized to fit within the given terminal area,
+    /// using the renderer selected by `album_art_style`:
+    ///
+    /// - `Halfblock`: each cell packs two vertical pixels as ▀ with fg=top,
+    ///   bg=bottom — doubling vertical resolution.
+    /// - `Ascii`: one pixel per cell, mapped to a character ramp by luminance
+    ///   with fg=pixel color, bg=theme background.
+    ///
+    /// Only the cache for the active style is populated.
     pub fn render_album_art(&mut self, width: u16, height: u16) {
-        if (width, height) == self.album_art_size && !self.album_art_lines.is_empty() {
+        let cache_populated = match self.album_art_style {
+            AlbumArtStyle::Halfblock => !self.album_art_lines.is_empty(),
+            AlbumArtStyle::Ascii => !self.album_art_ascii_lines.is_empty(),
+        };
+        if (width, height) == self.album_art_size && cache_populated {
             return;
         }
         self.album_art_size = (width, height);
         self.album_art_lines.clear();
+        self.album_art_ascii_lines.clear();
 
         let img = match &self.album_art {
             Some(img) => img,
             None => return,
         };
 
-        // Terminal chars are roughly 1:2 (w:h), so 1 cell = 1 pixel wide, 2 pixels tall.
+        // Terminal chars are roughly 1:2 (w:h), so 1 cell spans 1 pixel wide × 2 pixels tall.
         // Fit the image within the available area preserving aspect ratio.
         let (iw, ih) = (img.width(), img.height());
         let max_px_w = width as u32;
@@ -1041,17 +1116,41 @@ impl App {
         let px_h = ((ih as f64 * scale).round() as u32).max(2);
         let rows = px_h / 2;
 
-        let resized = img.resize_exact(cols, rows * 2, image::imageops::FilterType::Lanczos3);
-        let rgba = resized.to_rgba8();
-
-        for row in 0..rows {
-            let mut line = Vec::with_capacity(cols as usize);
-            for col in 0..cols {
-                let top = rgba.get_pixel(col, row * 2);
-                let bot = rgba.get_pixel(col, row * 2 + 1);
-                line.push(('▀', [top[0], top[1], top[2]], [bot[0], bot[1], bot[2]]));
+        match self.album_art_style {
+            AlbumArtStyle::Halfblock => {
+                let resized =
+                    img.resize_exact(cols, rows * 2, image::imageops::FilterType::Lanczos3);
+                let rgba = resized.to_rgba8();
+                for row in 0..rows {
+                    let mut line = Vec::with_capacity(cols as usize);
+                    for col in 0..cols {
+                        let top = rgba.get_pixel(col, row * 2);
+                        let bot = rgba.get_pixel(col, row * 2 + 1);
+                        line.push(('▀', [top[0], top[1], top[2]], [bot[0], bot[1], bot[2]]));
+                    }
+                    self.album_art_lines.push(line);
+                }
             }
-            self.album_art_lines.push(line);
+            AlbumArtStyle::Ascii => {
+                // One char per cell: sample one pixel per cell and map luminance to the ramp.
+                let resized = img.resize_exact(cols, rows, image::imageops::FilterType::Lanczos3);
+                let rgba = resized.to_rgba8();
+                let ramp_len = ASCII_ART_RAMP.len() as u32;
+                for row in 0..rows {
+                    let mut line = Vec::with_capacity(cols as usize);
+                    for col in 0..cols {
+                        let p = rgba.get_pixel(col, row);
+                        // Rec. 709 luma.
+                        let lum = (0.2126 * p[0] as f32
+                            + 0.7152 * p[1] as f32
+                            + 0.0722 * p[2] as f32) as u32;
+                        let idx = (lum * ramp_len / 256).min(ramp_len - 1) as usize;
+                        let ch = ASCII_ART_RAMP[idx] as char;
+                        line.push((ch, [p[0], p[1], p[2]]));
+                    }
+                    self.album_art_ascii_lines.push(line);
+                }
+            }
         }
     }
 
@@ -1328,6 +1427,7 @@ impl App {
                 if key == self.album_art_key {
                     self.album_art = image;
                     self.album_art_lines.clear();
+                    self.album_art_ascii_lines.clear();
                     self.album_art_size = (0, 0);
                 }
             }
@@ -2519,5 +2619,71 @@ mod tests {
             is_on_device("*NSYNC", "Bye Bye Bye", &device),
             "*NSYNC should match NSYNC on device"
         );
+    }
+
+    #[test]
+    fn album_art_style_from_str_round_trip() {
+        for s in ["ascii", "halfblock"] {
+            let style: AlbumArtStyle = s.parse().expect("valid style");
+            assert_eq!(style.as_str(), s);
+        }
+        assert!("bogus".parse::<AlbumArtStyle>().is_err());
+    }
+
+    #[test]
+    fn flip_art_style_in_memory_flips_and_clears_caches() {
+        let mut app = App::new();
+        app.album_art_style = AlbumArtStyle::Halfblock;
+        app.album_art_lines.push(vec![('▀', [1, 2, 3], [4, 5, 6])]);
+        app.album_art_ascii_lines.push(vec![('#', [7, 8, 9])]);
+        app.album_art_size = (80, 24);
+
+        app.flip_art_style_in_memory();
+        assert_eq!(app.album_art_style, AlbumArtStyle::Ascii);
+        assert!(app.album_art_lines.is_empty());
+        assert!(app.album_art_ascii_lines.is_empty());
+        assert_eq!(app.album_art_size, (0, 0));
+
+        // Seed again and flip back; covers the other match arm.
+        app.album_art_ascii_lines.push(vec![('@', [0, 0, 0])]);
+        app.flip_art_style_in_memory();
+        assert_eq!(app.album_art_style, AlbumArtStyle::Halfblock);
+        assert!(app.album_art_ascii_lines.is_empty());
+    }
+
+    #[test]
+    fn render_album_art_populates_only_active_cache() {
+        use image::{DynamicImage, RgbaImage};
+
+        let mut app = App::new();
+        // Tiny gradient test image so the renderer has pixels to sample.
+        let mut img = RgbaImage::new(8, 8);
+        for (x, y, px) in img.enumerate_pixels_mut() {
+            let v = ((x + y) * 16).min(255) as u8;
+            *px = image::Rgba([v, v, v, 255]);
+        }
+        app.album_art = Some(DynamicImage::ImageRgba8(img));
+
+        app.album_art_style = AlbumArtStyle::Halfblock;
+        app.render_album_art(16, 8);
+        assert!(!app.album_art_lines.is_empty());
+        assert!(app.album_art_ascii_lines.is_empty());
+
+        // Toggling should clear caches so the other renderer fills its buffer.
+        app.album_art_style = AlbumArtStyle::Ascii;
+        app.album_art_lines.clear();
+        app.album_art_ascii_lines.clear();
+        app.album_art_size = (0, 0);
+        app.render_album_art(16, 8);
+        assert!(app.album_art_lines.is_empty());
+        assert!(!app.album_art_ascii_lines.is_empty());
+
+        // Every glyph should belong to the ramp.
+        let ramp: &[u8] = ASCII_ART_RAMP;
+        for row in &app.album_art_ascii_lines {
+            for &(ch, _) in row {
+                assert!(ramp.contains(&(ch as u8)), "unexpected glyph {:?}", ch);
+            }
+        }
     }
 }
