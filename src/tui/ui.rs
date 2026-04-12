@@ -594,8 +594,8 @@ fn draw_album_art_panel(f: &mut Frame, app: &App, area: Rect) {
 
     let t = app.theme();
     let title = match app.album_art_style {
-        AlbumArtStyle::Halfblock => " Art ",
-        AlbumArtStyle::Ascii => " Art (ASCII) ",
+        AlbumArtStyle::Halfblock => " Album Art ",
+        AlbumArtStyle::Ascii => " Album Art (ASCII) ",
     };
     // Title must fit; otherwise fall through and use the slot width.
     let min_w = (title.chars().count() as u16 + 2).max(art_w + 2);
