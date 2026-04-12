@@ -1,7 +1,8 @@
 use zytunes::{
-    collect_music_files, collect_photo_files, collect_video_files, connect, find_matching_tracks,
-    library_xml_path, make_transcode_temp_dir, needs_transcoding, resize_photo_for_zune,
-    sync_to_device, transcode_and_import,
+    check_ffmpeg_available, collect_music_files, collect_photo_files, collect_video_files, connect,
+    find_matching_tracks, library_xml_path, make_transcode_temp_dir, needs_transcoding,
+    needs_video_transcoding, resize_photo_for_zune, sync_to_device, transcode_and_import,
+    transcode_and_import_video,
 };
 
 use std::collections::HashMap;
@@ -478,12 +479,34 @@ fn cmd_video_sync(dir: &str) -> Result<(), String> {
         return Err(format!("No video files found in {}", dir));
     }
 
+    // Check if any files need transcoding and verify ffmpeg is available.
+    let needs_transcode: Vec<_> = files
+        .iter()
+        .filter(|f| needs_video_transcoding(f))
+        .collect();
+    if !needs_transcode.is_empty() && !check_ffmpeg_available() {
+        return Err(format!(
+            "{} video(s) need transcoding to WMV but ffmpeg is not installed.\n\
+             Install ffmpeg or convert files to WMV manually.",
+            needs_transcode.len()
+        ));
+    }
+
     println!("Found {} video(s) to sync", files.len());
+    if !needs_transcode.is_empty() {
+        println!(
+            "  ({} will be transcoded to WMV via ffmpeg)",
+            needs_transcode.len()
+        );
+    }
 
     let (mut session, _caps, _detected) = connect()?;
     println!();
 
+    let temp_dir = make_transcode_temp_dir();
+
     // Get existing videos on device to skip duplicates.
+    // Check both original filename and .wmv variant for transcoded files.
     let existing: std::collections::HashSet<String> = session
         .ls("/Videos")
         .unwrap_or_default()
@@ -503,7 +526,18 @@ fn cmd_video_sync(dir: &str) -> Result<(), String> {
             .to_string_lossy()
             .to_string();
 
-        if existing.contains(&filename) {
+        // For non-WMV files, the device filename will be stem.wmv after transcoding.
+        let device_filename = if needs_video_transcoding(file) {
+            let stem = Path::new(file)
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy();
+            format!("{stem}.wmv")
+        } else {
+            filename.clone()
+        };
+
+        if existing.contains(&device_filename) {
             println!(
                 "[{}/{}] {} ... skipped (already on device)",
                 i + 1,
@@ -514,24 +548,26 @@ fn cmd_video_sync(dir: &str) -> Result<(), String> {
             continue;
         }
 
-        print!("[{}/{}] {} ... ", i + 1, total, filename);
-        match std::fs::read(file) {
-            Ok(data) => match session.import_video(&filename, &data) {
-                Ok(_id) => {
-                    println!("OK");
-                    success += 1;
-                }
-                Err(e) => {
-                    println!("FAILED: {}", e);
-                    failed += 1;
-                }
-            },
+        if needs_video_transcoding(file) {
+            print!("[{}/{}] {} (transcoding) ... ", i + 1, total, filename);
+        } else {
+            print!("[{}/{}] {} ... ", i + 1, total, filename);
+        }
+
+        match transcode_and_import_video(session.as_mut(), file, &temp_dir) {
+            Ok(_id) => {
+                println!("OK");
+                success += 1;
+            }
             Err(e) => {
-                println!("FAILED (read): {}", e);
+                println!("FAILED: {}", e);
                 failed += 1;
             }
         }
     }
+
+    // Clean up temp directory.
+    let _ = std::fs::remove_dir_all(&temp_dir);
 
     println!(
         "\nDone: {} synced, {} skipped, {} failed",

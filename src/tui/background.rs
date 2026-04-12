@@ -9,7 +9,7 @@ use zytunes::mtp::parse::DeviceEntry;
 use zytunes::mtp::DeviceSession;
 use zytunes::{
     collect_photo_files, collect_video_files, make_transcode_temp_dir, needs_transcoding,
-    resize_photo_for_zune, transcode_to_mp3,
+    needs_video_transcoding, resize_photo_for_zune, transcode_and_import_video, transcode_to_mp3,
 };
 
 /// Commands sent from the main TUI thread to the background worker.
@@ -548,8 +548,23 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                         let mut success = 0usize;
                         let mut failed = 0usize;
 
+                        // Check if ffmpeg is needed and available.
+                        let needs_ffmpeg = files.iter().any(|f| needs_video_transcoding(f));
+                        if needs_ffmpeg && !zytunes::check_ffmpeg_available() {
+                            let _ = event_tx.send(BgEvent::Error(
+                                "ffmpeg required for video transcoding but not found".into(),
+                            ));
+                            let _ = event_tx.send(BgEvent::VideoSyncComplete {
+                                success: 0,
+                                failed: 0,
+                            });
+                            continue;
+                        }
+
                         let _ = event_tx
                             .send(BgEvent::SyncMessage(format!("Syncing {} videos...", total)));
+
+                        let temp_dir = make_transcode_temp_dir();
 
                         for (i, file) in files.iter().enumerate() {
                             if let Ok(BgCommand::CancelSync) = cmd_rx.try_recv() {
@@ -564,7 +579,18 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                 .to_string_lossy()
                                 .to_string();
 
-                            if existing.contains(&filename) {
+                            // For non-WMV files, check the transcoded .wmv name.
+                            let device_filename = if needs_video_transcoding(file) {
+                                let stem = std::path::Path::new(file)
+                                    .file_stem()
+                                    .unwrap_or_default()
+                                    .to_string_lossy();
+                                format!("{stem}.wmv")
+                            } else {
+                                filename.clone()
+                            };
+
+                            if existing.contains(&device_filename) {
                                 let _ = event_tx.send(BgEvent::SyncMessage(format!(
                                     "[{}/{}] {} skipped (on device)",
                                     i + 1,
@@ -574,31 +600,33 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                 continue;
                             }
 
-                            let _ = event_tx.send(BgEvent::SyncMessage(format!(
-                                "[{}/{}] Syncing video: {}",
-                                i + 1,
-                                total,
-                                filename
-                            )));
+                            if needs_video_transcoding(file) {
+                                let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                                    "[{}/{}] Transcoding video: {}",
+                                    i + 1,
+                                    total,
+                                    filename
+                                )));
+                            } else {
+                                let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                                    "[{}/{}] Syncing video: {}",
+                                    i + 1,
+                                    total,
+                                    filename
+                                )));
+                            }
 
-                            match std::fs::read(file) {
-                                Ok(data) => match s.import_video(&filename, &data) {
-                                    Ok(_) => success += 1,
-                                    Err(e) => {
-                                        failed += 1;
-                                        let _ = event_tx
-                                            .send(BgEvent::SyncMessage(format!("  FAILED: {}", e)));
-                                    }
-                                },
+                            match transcode_and_import_video(s.as_mut(), file, &temp_dir) {
+                                Ok(_) => success += 1,
                                 Err(e) => {
                                     failed += 1;
-                                    let _ = event_tx.send(BgEvent::SyncMessage(format!(
-                                        "  FAILED (read): {}",
-                                        e
-                                    )));
+                                    let _ = event_tx
+                                        .send(BgEvent::SyncMessage(format!("  FAILED: {}", e)));
                                 }
                             }
                         }
+
+                        let _ = std::fs::remove_dir_all(&temp_dir);
 
                         if let Ok((tot, free)) = s.get_storage_info() {
                             let used = tot.saturating_sub(free);
@@ -725,6 +753,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                             "{}/{}/{}",
                                             item.artist, item.album, item.name
                                         ),
+                                        ..Default::default()
                                     };
                                     let _ = event_tx.send(BgEvent::DeviceTrackAdded(entry));
                                     // Update storage info every 5 tracks (avoid per-track USB overhead).

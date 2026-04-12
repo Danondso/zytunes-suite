@@ -210,6 +210,7 @@ impl TrackCache {
                 format: parts[2].to_string(),
                 size: parts[3].parse().unwrap_or(0),
                 name: parts[4].to_string(),
+                ..Default::default()
             });
         }
         if entries.is_empty() {
@@ -311,6 +312,8 @@ pub struct NativeSession {
     sync_cache_serial: Option<String>,
     sync_restored: bool,
     pub firmware_version: Option<String>,
+    /// Cached video entries from the last ZMDB parse.
+    zmdb_video_cache: Option<Vec<DeviceEntry>>,
 }
 
 impl NativeSession {
@@ -406,6 +409,7 @@ impl NativeSession {
             sync_cache_serial: None,
             sync_restored: false,
             firmware_version,
+            zmdb_video_cache: None,
         })
     }
 
@@ -456,6 +460,7 @@ impl NativeSession {
                         format: format_str,
                         size: info.compressed_size as u64,
                         name: full_name.clone(),
+                        ..Default::default()
                     });
                 }
             } else {
@@ -465,6 +470,7 @@ impl NativeSession {
                     format: format_str,
                     size: info.compressed_size as u64,
                     name: full_name.clone(),
+                    ..Default::default()
                 });
             }
         }
@@ -541,6 +547,7 @@ impl NativeSession {
         let raw = self.session.get_zmdb(1).mtp_err()?;
         let zmdb = crate::mtp::zmdb::Zmdb::parse(&raw)?;
         self.log_msg(&format!("ZMDB: {}", zmdb.summary()));
+        self.zmdb_video_cache = Some(zmdb.to_video_entries());
         Ok(zmdb.to_device_entries())
     }
 
@@ -564,22 +571,15 @@ impl NativeSession {
 
         self.log_msg("Initializing device library...");
 
-        // Detect device capabilities.
-        // On macOS, we can probe via GetObjectPropsSupported. On Linux, the
-        // Zune rejects these queries (timeout or GeneralError 0x2002) even
-        // though it supports the features. Since we only target the Zune 30,
-        // use known defaults on Linux and probe on macOS.
-        //
-        // artist_supported defaults to false — the safe path uses Music/
-        // subfolders directly. Album date and cover default to true since
-        // the Zune 30 supports them but the probe fails on Linux.
-        let (artist_supported, album_date_supported, album_cover_supported) =
-            if cfg!(target_os = "macos") {
-                self.probe_capabilities().unwrap_or((false, true, true))
-            } else {
-                self.log_msg("Using Zune defaults (artist=false, date=true, cover=true)");
-                (false, true, true)
-            };
+        // Use known Zune 30 capabilities instead of probing.
+        // GetObjectPropsSupported (0x9806) leaves the Zune's MTP session in a
+        // broken state on both macOS and Linux — subsequent GetObjectHandles
+        // calls fail with 0x2006 (Parameter Not Supported). Since we only
+        // target the Zune 30, hard-code the known values:
+        //   artist_supported = false (safe path using Music/ subfolders)
+        //   album_date_supported = true
+        //   album_cover_supported = true
+        let (artist_supported, album_date_supported, album_cover_supported) = (false, true, true);
 
         self.log_msg(&format!(
             "Caps: artist={} date={} cover={}",
@@ -947,6 +947,7 @@ impl DeviceSession for NativeSession {
             format: format_name(format),
             size: file_data.len() as u64,
             name: format!("{}/{}/{}", artist, album, filename),
+            ..Default::default()
         };
         self.cache.append(&new_entry);
 
@@ -1230,6 +1231,22 @@ impl DeviceSession for NativeSession {
         self.session.send_object(data).mtp_err()?;
         Ok(obj_id as u64)
     }
+
+    fn collect_all_videos(&mut self) -> Result<Vec<DeviceEntry>, String> {
+        // Return cached video entries from the last ZMDB parse if available.
+        if let Some(ref cached) = self.zmdb_video_cache {
+            self.log_msg(&format!("Returning {} cached video entries", cached.len()));
+            return Ok(cached.clone());
+        }
+        // Try ZMDB to populate the cache.
+        let _ = self.try_zmdb();
+        if let Some(ref cached) = self.zmdb_video_cache {
+            return Ok(cached.clone());
+        }
+        // Fallback: scan /Videos via MTP handle walk.
+        self.log_msg("No ZMDB video data, scanning /Videos...");
+        self.collect_all_tracks("/Videos")
+    }
 }
 
 impl NativeSession {
@@ -1301,33 +1318,6 @@ impl NativeSession {
         }
     }
 
-    /// Probe device capabilities via GetObjectPropsSupported.
-    /// Returns None if any query fails (e.g., on Linux where the Zune may reject these).
-    fn probe_capabilities(&mut self) -> Option<(bool, bool, bool)> {
-        let artist_props = self
-            .session
-            .get_object_props_supported(FORMAT_ARTIST)
-            .ok()?;
-        let artist_supported = !artist_props.is_empty();
-
-        let album_props = self
-            .session
-            .get_object_props_supported(FORMAT_ABSTRACT_AUDIO_ALBUM)
-            .ok()?;
-        let album_date_supported = album_props.contains(&PROP_DATE_AUTHORED);
-        let album_cover_supported = album_props.contains(&PROP_REPRESENTATIVE_SAMPLE_DATA);
-
-        self.log_msg(&format!(
-            "Probed caps: artist={} date={} cover={}",
-            artist_supported, album_date_supported, album_cover_supported
-        ));
-        Some((
-            artist_supported,
-            album_date_supported,
-            album_cover_supported,
-        ))
-    }
-
     /// Clear the track cache entirely.
     pub fn clear_cache(&self) {
         self.cache.clear();
@@ -1378,6 +1368,7 @@ fn object_info_to_entry(handle: u32, info: &ObjectInfo) -> DeviceEntry {
         },
         size: info.compressed_size as u64,
         name: info.filename.clone(),
+        ..Default::default()
     }
 }
 
@@ -1695,6 +1686,7 @@ mod tests {
             format: "MP3".to_string(),
             size: 1024,
             name: name.to_string(),
+            ..Default::default()
         }
     }
 
