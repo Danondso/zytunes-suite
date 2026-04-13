@@ -3354,5 +3354,6 @@ dependencies = [
  "symphonia",
  "throbber-widgets-tui",
  "toml",
+ "unicode-width",
  "zune-mtp",
 ]
