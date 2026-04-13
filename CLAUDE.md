@@ -103,6 +103,10 @@ This project uses **Conventional Commits** to drive automatic releases. The rele
 
 Scopes are optional: `feat(tui): add theme picker` is fine. Commits that don't match a release prefix (`docs:`, `chore:`, `refactor:`, `ci:`, `test:`, `style:`) will not trigger a release.
 
+## Known Limitations
+
+- **cosmic-term + CJK** — CJK text misaligns panel borders in Pop!_OS's cosmic-term because the terminal renders wide glyphs as 1 cell instead of 2 (upstream bugs [pop-os/cosmic-term#325](https://github.com/pop-os/cosmic-term/issues/325) and [#369](https://github.com/pop-os/cosmic-term/issues/369)). Our `unicode-width` measurement in `src/tui/ui.rs` is correct per Unicode EAW. Do **not** work around this by halving CJK widths or sniffing `$TERM_PROGRAM` — it would break every compliant terminal. Fix belongs upstream; recommend users switch terminals (Alacritty, kitty, wezterm, Zed) for CJK libraries.
+
 ## Zune 30 Constraints
 
 - Only accepts MP3, WMA, AAC formats

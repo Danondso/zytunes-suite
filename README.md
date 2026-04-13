@@ -126,6 +126,12 @@ iTunes 2004, Gruvbox Dark, Gruvbox Light, Everforest Dark, Everforest Light, Mia
 
 Selected theme is persisted to `~/.config/zytunes/config.toml`.
 
+### Terminal compatibility
+
+The TUI works in any EAW-compliant terminal (Alacritty, kitty, wezterm, Zed's embedded terminal, iTerm2, Ghostty, etc.). One known exception:
+
+- **cosmic-term** — CJK (Chinese / Japanese / Korean) text misaligns panel borders and zebra-row highlights. This is an upstream rendering bug in cosmic-term ([#325](https://github.com/pop-os/cosmic-term/issues/325), [#369](https://github.com/pop-os/cosmic-term/issues/369)): it advances the cursor by 1 cell for wide glyphs instead of the 2 cells required by Unicode East Asian Width. Our measurement code (via the `unicode-width` crate) is correct; use a different terminal for libraries with CJK metadata until cosmic-term is fixed upstream.
+
 ### Sync workflow
 
 1. Browse your iTunes library and press `a` to add artists, albums, playlists, or individual tracks to the sync queue
