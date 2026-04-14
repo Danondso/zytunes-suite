@@ -1295,6 +1295,7 @@ impl App {
                     tracks: vec![item],
                 });
                 self.set_toast(format!("Added \"{}\" to queue", track.name), false);
+                self.forward_last_queue_item_if_syncing();
             } else {
                 self.set_toast("Track has no file location".into(), true);
             }
@@ -1327,6 +1328,7 @@ impl App {
             tracks: items,
         });
         self.set_toast(format!("Added {} tracks to queue", count), false);
+        self.forward_last_queue_item_if_syncing();
     }
 
     pub fn add_sidebar_item_to_queue(&mut self) {
@@ -1363,10 +1365,28 @@ impl App {
                 tracks: items,
             });
             self.set_toast(format!("Added {} tracks to queue", count), false);
+            self.forward_last_queue_item_if_syncing();
         } else {
             // For albums, select to populate track list, then add all.
+            // (add_all_visible_to_queue handles the forward itself.)
             self.select_sidebar_item();
             self.add_all_visible_to_queue();
+        }
+    }
+
+    /// If a sync is currently in flight, forward the tracks of the most
+    /// recently pushed queue entry to the background worker so they get
+    /// picked up by the running sync instead of being orphaned when the
+    /// queue is cleared on completion.
+    fn forward_last_queue_item_if_syncing(&mut self) {
+        if !matches!(self.sync.status, SyncStatus::Running { .. }) {
+            return;
+        }
+        if let Some(item) = self.sync.queue.last() {
+            if !item.tracks.is_empty() {
+                self.pending_bg_commands
+                    .push(BgCommand::AppendSyncQueue(item.tracks.clone()));
+            }
         }
     }
 
@@ -2073,6 +2093,74 @@ mod tests {
         assert_eq!(app.sort_column, SortColumn::Artist);
         app.cycle_sort();
         assert_eq!(app.sort_column, SortColumn::Album);
+    }
+
+    #[test]
+    fn adding_track_while_syncing_forwards_to_worker() {
+        let mut app = App::new();
+        // Simulate an in-flight sync.
+        app.sync.status = SyncStatus::Running {
+            current: 1,
+            total: 5,
+        };
+        app.track_list.push(TrackInfo {
+            name: "Idioteque".into(),
+            artist: "Radiohead".into(),
+            album: "Kid A".into(),
+            duration_ms: None,
+            kind: None,
+            location: Some("/tmp/idioteque.mp3".into()),
+            track_number: None,
+            disc_number: None,
+            on_device: false,
+        });
+        app.track_selected = 0;
+
+        app.add_selected_track_to_queue();
+
+        // Queue retains a record of the addition (for display on completion).
+        assert_eq!(app.sync.queue.len(), 1);
+
+        // And the worker was told to append to the running sync.
+        let appended = app
+            .pending_bg_commands
+            .iter()
+            .filter_map(|cmd| match cmd {
+                BgCommand::AppendSyncQueue(items) => Some(items.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(appended.len(), 1, "expected exactly one AppendSyncQueue");
+        assert_eq!(appended[0].len(), 1);
+        assert_eq!(appended[0][0].name, "Idioteque");
+    }
+
+    #[test]
+    fn adding_track_when_idle_does_not_forward() {
+        let mut app = App::new();
+        assert!(matches!(app.sync.status, SyncStatus::Idle));
+        app.track_list.push(TrackInfo {
+            name: "Creep".into(),
+            artist: "Radiohead".into(),
+            album: "Pablo Honey".into(),
+            duration_ms: None,
+            kind: None,
+            location: Some("/tmp/creep.mp3".into()),
+            track_number: None,
+            disc_number: None,
+            on_device: false,
+        });
+        app.track_selected = 0;
+
+        app.add_selected_track_to_queue();
+
+        assert_eq!(app.sync.queue.len(), 1);
+        assert!(
+            !app.pending_bg_commands
+                .iter()
+                .any(|cmd| matches!(cmd, BgCommand::AppendSyncQueue(_))),
+            "should not forward while sync is Idle",
+        );
     }
 
     #[test]

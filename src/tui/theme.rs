@@ -3,7 +3,7 @@ use ratatui::widgets::BorderType;
 use ratatui::widgets::{Block, Borders};
 use throbber_widgets_tui::symbols::throbber::{
     Set, ASCII, BLACK_CIRCLE, BRAILLE_EIGHT, BRAILLE_ONE, BRAILLE_SIX, BRAILLE_SIX_DOUBLE, OGHAM_A,
-    OGHAM_B, QUADRANT_BLOCK, VERTICAL_BLOCK, WHITE_CIRCLE, WHITE_SQUARE,
+    OGHAM_B, QUADRANT_BLOCK, VERTICAL_BLOCK, WHITE_SQUARE,
 };
 
 use super::anim::{
@@ -512,7 +512,10 @@ pub const NEWPORT_LIGHTS: Theme = Theme {
     accent_anim: AccentAnim::Pulse,
     accent_secondary: Color::Rgb(255, 255, 255),
     player_skin: &SKIN_NEWPORT,
-    spinner_set: &WHITE_CIRCLE,
+    // 8 Braille frames spin smoothly in every terminal font we care about;
+    // the old WHITE_CIRCLE set (◷◶◵◴) had only 4 frames and its glyphs
+    // rendered inconsistently in some fonts, showing up as a skipped frame.
+    spinner_set: &BRAILLE_EIGHT,
 };
 
 pub const NEXTSTEP: Theme = Theme {
