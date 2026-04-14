@@ -108,6 +108,43 @@ impl std::str::FromStr for AlbumArtStyle {
 /// High-luminance pixels map to denser glyphs (more ink coverage).
 pub(crate) const ASCII_ART_RAMP: &[u8; 10] = b" .:-=+*%#@";
 
+/// Rendered album-art buffer. The variant tracks which renderer produced the
+/// buffer, so the cache can never drift out of sync with the active style.
+#[allow(clippy::type_complexity)]
+#[derive(Clone, Debug)]
+pub enum AlbumArtCache {
+    /// Halfblock cells: one terminal cell packs two vertical pixels as ▀ with
+    /// fg = top pixel, bg = bottom pixel.
+    Halfblock(Vec<Vec<(char, [u8; 3], [u8; 3])>>),
+    /// ASCII cells: one pixel per cell, character picked from the luminance
+    /// ramp, fg = pixel color.
+    Ascii(Vec<Vec<(char, [u8; 3])>>),
+}
+
+impl AlbumArtCache {
+    pub fn rows(&self) -> usize {
+        match self {
+            AlbumArtCache::Halfblock(v) => v.len(),
+            AlbumArtCache::Ascii(v) => v.len(),
+        }
+    }
+
+    pub fn width(&self) -> usize {
+        match self {
+            AlbumArtCache::Halfblock(v) => v.first().map(|r| r.len()).unwrap_or(0),
+            AlbumArtCache::Ascii(v) => v.first().map(|r| r.len()).unwrap_or(0),
+        }
+    }
+
+    pub fn matches_style(&self, style: AlbumArtStyle) -> bool {
+        matches!(
+            (self, style),
+            (AlbumArtCache::Halfblock(_), AlbumArtStyle::Halfblock)
+                | (AlbumArtCache::Ascii(_), AlbumArtStyle::Ascii)
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[allow(dead_code)]
 pub enum PlaybackState {
@@ -254,21 +291,19 @@ pub struct App {
     pub toast_message: Option<(String, Instant, bool)>, // (msg, time, is_error)
     pub library_path: Option<String>,
     pub loading_library: bool,
-    pub theme_index: usize,
+    pub theme: &'static Theme,
     pub show_theme_picker: bool,
     pub theme_picker_index: usize,
-    pub theme_before_picker: usize,
+    pub theme_before_picker: &'static Theme,
     /// Per-artist device presence for sidebar indicators (Library browse mode).
     pub artist_device_status: BTreeMap<String, DevicePresence>,
     /// Cached album art extracted from ID3 tags.
     pub album_art: Option<DynamicImage>,
     /// Key used to avoid re-extracting art (e.g. "artist/album").
     album_art_key: String,
-    /// Cached halfblock art lines: (char, fg_rgb, bg_rgb) per cell.
-    #[allow(clippy::type_complexity)]
-    pub album_art_lines: Vec<Vec<(char, [u8; 3], [u8; 3])>>,
-    /// Cached ASCII art lines: (char, fg_rgb) per cell.
-    pub album_art_ascii_lines: Vec<Vec<(char, [u8; 3])>>,
+    /// Rendered album-art buffer for the active style, or `None` if no art is
+    /// cached (either never built or invalidated by a style/size/key change).
+    pub album_art_cache: Option<AlbumArtCache>,
     /// Dimensions (w, h) the cached album art was rendered for.
     album_art_size: (u16, u16),
     /// Renderer style for album art: halfblock (Unicode half-block) or ascii (character ramp).
@@ -335,15 +370,14 @@ impl App {
             toast_message: None,
             library_path: None,
             loading_library: false,
-            theme_index: 0,
+            theme: &THEMES[0],
             show_theme_picker: false,
             theme_picker_index: 0,
-            theme_before_picker: 0,
+            theme_before_picker: &THEMES[0],
             artist_device_status: BTreeMap::new(),
             album_art: None,
             album_art_key: String::new(),
-            album_art_lines: Vec::new(),
-            album_art_ascii_lines: Vec::new(),
+            album_art_cache: None,
             album_art_size: (0, 0),
             album_art_style: {
                 let cfg = crate::config::load();
@@ -372,18 +406,17 @@ impl App {
             AlbumArtStyle::Halfblock => AlbumArtStyle::Ascii,
             AlbumArtStyle::Ascii => AlbumArtStyle::Halfblock,
         };
-        self.album_art_lines.clear();
-        self.album_art_ascii_lines.clear();
+        self.album_art_cache = None;
         self.album_art_size = (0, 0);
     }
 
     pub fn theme(&self) -> &'static Theme {
-        &THEMES[self.theme_index.min(THEMES.len() - 1)]
+        self.theme
     }
 
     pub fn open_theme_picker(&mut self) {
-        self.theme_before_picker = self.theme_index;
-        self.theme_picker_index = self.theme_index;
+        self.theme_before_picker = self.theme;
+        self.theme_picker_index = crate::theme::theme_position(self.theme);
         self.show_theme_picker = true;
     }
 
@@ -391,17 +424,17 @@ impl App {
         let len = THEMES.len();
         self.theme_picker_index =
             (self.theme_picker_index as isize + delta).rem_euclid(len as isize) as usize;
-        self.theme_index = self.theme_picker_index;
+        self.theme = &THEMES[self.theme_picker_index];
     }
 
     pub fn theme_picker_confirm(&mut self) {
         self.show_theme_picker = false;
-        let theme_name = self.theme().name.to_string();
+        let theme_name = self.theme.name.to_string();
         crate::config::update(|c| c.theme = Some(theme_name));
     }
 
     pub fn theme_picker_cancel(&mut self) {
-        self.theme_index = self.theme_before_picker;
+        self.theme = self.theme_before_picker;
         self.show_theme_picker = false;
     }
 
@@ -1055,8 +1088,7 @@ impl App {
         } else {
             self.album_art = None;
             self.album_art_key.clear();
-            self.album_art_lines.clear();
-            self.album_art_ascii_lines.clear();
+            self.album_art_cache = None;
             self.album_art_size = (0, 0);
             return;
         };
@@ -1066,8 +1098,7 @@ impl App {
         }
         self.album_art_key = key.clone();
         self.album_art = None;
-        self.album_art_lines.clear();
-        self.album_art_ascii_lines.clear();
+        self.album_art_cache = None;
         self.album_art_size = (0, 0);
 
         // Collect file paths and dispatch to the background thread.
@@ -1090,16 +1121,16 @@ impl App {
     ///
     /// Only the cache for the active style is populated.
     pub fn render_album_art(&mut self, width: u16, height: u16) {
-        let cache_populated = match self.album_art_style {
-            AlbumArtStyle::Halfblock => !self.album_art_lines.is_empty(),
-            AlbumArtStyle::Ascii => !self.album_art_ascii_lines.is_empty(),
-        };
-        if (width, height) == self.album_art_size && cache_populated {
+        let cache_valid = (width, height) == self.album_art_size
+            && self
+                .album_art_cache
+                .as_ref()
+                .is_some_and(|c| c.matches_style(self.album_art_style));
+        if cache_valid {
             return;
         }
         self.album_art_size = (width, height);
-        self.album_art_lines.clear();
-        self.album_art_ascii_lines.clear();
+        self.album_art_cache = None;
 
         let img = match &self.album_art {
             Some(img) => img,
@@ -1116,11 +1147,12 @@ impl App {
         let px_h = ((ih as f64 * scale).round() as u32).max(2);
         let rows = px_h / 2;
 
-        match self.album_art_style {
+        self.album_art_cache = Some(match self.album_art_style {
             AlbumArtStyle::Halfblock => {
                 let resized =
                     img.resize_exact(cols, rows * 2, image::imageops::FilterType::Lanczos3);
                 let rgba = resized.to_rgba8();
+                let mut lines = Vec::with_capacity(rows as usize);
                 for row in 0..rows {
                     let mut line = Vec::with_capacity(cols as usize);
                     for col in 0..cols {
@@ -1128,14 +1160,16 @@ impl App {
                         let bot = rgba.get_pixel(col, row * 2 + 1);
                         line.push(('▀', [top[0], top[1], top[2]], [bot[0], bot[1], bot[2]]));
                     }
-                    self.album_art_lines.push(line);
+                    lines.push(line);
                 }
+                AlbumArtCache::Halfblock(lines)
             }
             AlbumArtStyle::Ascii => {
                 // One char per cell: sample one pixel per cell and map luminance to the ramp.
                 let resized = img.resize_exact(cols, rows, image::imageops::FilterType::Lanczos3);
                 let rgba = resized.to_rgba8();
                 let ramp_len = ASCII_ART_RAMP.len() as u32;
+                let mut lines = Vec::with_capacity(rows as usize);
                 for row in 0..rows {
                     let mut line = Vec::with_capacity(cols as usize);
                     for col in 0..cols {
@@ -1148,10 +1182,11 @@ impl App {
                         let ch = ASCII_ART_RAMP[idx] as char;
                         line.push((ch, [p[0], p[1], p[2]]));
                     }
-                    self.album_art_ascii_lines.push(line);
+                    lines.push(line);
                 }
+                AlbumArtCache::Ascii(lines)
             }
-        }
+        });
     }
 
     fn sort_tracks(&mut self) {
@@ -1426,8 +1461,7 @@ impl App {
                 // Only apply if the key still matches (user hasn't navigated away).
                 if key == self.album_art_key {
                     self.album_art = image;
-                    self.album_art_lines.clear();
-                    self.album_art_ascii_lines.clear();
+                    self.album_art_cache = None;
                     self.album_art_size = (0, 0);
                 }
             }
@@ -2375,11 +2409,11 @@ mod tests {
     #[test]
     fn theme_picker_cancel_restores() {
         let mut app = App::new();
-        app.theme_index = 3;
+        app.theme = &crate::theme::THEMES[3];
         app.open_theme_picker();
         app.theme_picker_move(2); // changes preview
         app.theme_picker_cancel();
-        assert_eq!(app.theme_index, 3);
+        assert_eq!(app.theme.name, crate::theme::THEMES[3].name);
         assert!(!app.show_theme_picker);
     }
 
@@ -2634,21 +2668,23 @@ mod tests {
     fn flip_art_style_in_memory_flips_and_clears_caches() {
         let mut app = App::new();
         app.album_art_style = AlbumArtStyle::Halfblock;
-        app.album_art_lines.push(vec![('▀', [1, 2, 3], [4, 5, 6])]);
-        app.album_art_ascii_lines.push(vec![('#', [7, 8, 9])]);
+        app.album_art_cache = Some(AlbumArtCache::Halfblock(vec![vec![(
+            '▀',
+            [1, 2, 3],
+            [4, 5, 6],
+        )]]));
         app.album_art_size = (80, 24);
 
         app.flip_art_style_in_memory();
         assert_eq!(app.album_art_style, AlbumArtStyle::Ascii);
-        assert!(app.album_art_lines.is_empty());
-        assert!(app.album_art_ascii_lines.is_empty());
+        assert!(app.album_art_cache.is_none());
         assert_eq!(app.album_art_size, (0, 0));
 
-        // Seed again and flip back; covers the other match arm.
-        app.album_art_ascii_lines.push(vec![('@', [0, 0, 0])]);
+        // Seed the ascii variant and flip back; covers the other match arm.
+        app.album_art_cache = Some(AlbumArtCache::Ascii(vec![vec![('@', [0, 0, 0])]]));
         app.flip_art_style_in_memory();
         assert_eq!(app.album_art_style, AlbumArtStyle::Halfblock);
-        assert!(app.album_art_ascii_lines.is_empty());
+        assert!(app.album_art_cache.is_none());
     }
 
     #[test]
@@ -2666,21 +2702,23 @@ mod tests {
 
         app.album_art_style = AlbumArtStyle::Halfblock;
         app.render_album_art(16, 8);
-        assert!(!app.album_art_lines.is_empty());
-        assert!(app.album_art_ascii_lines.is_empty());
+        assert!(matches!(
+            app.album_art_cache,
+            Some(AlbumArtCache::Halfblock(_))
+        ));
 
-        // Toggling should clear caches so the other renderer fills its buffer.
+        // Toggling should invalidate the cache so the other renderer fills its buffer.
         app.album_art_style = AlbumArtStyle::Ascii;
-        app.album_art_lines.clear();
-        app.album_art_ascii_lines.clear();
+        app.album_art_cache = None;
         app.album_art_size = (0, 0);
         app.render_album_art(16, 8);
-        assert!(app.album_art_lines.is_empty());
-        assert!(!app.album_art_ascii_lines.is_empty());
+        let Some(AlbumArtCache::Ascii(rows)) = app.album_art_cache.as_ref() else {
+            panic!("expected Ascii cache");
+        };
 
         // Every glyph should belong to the ramp.
         let ramp: &[u8] = ASCII_ART_RAMP;
-        for row in &app.album_art_ascii_lines {
+        for row in rows {
             for &(ch, _) in row {
                 assert!(ramp.contains(&(ch as u8)), "unexpected glyph {:?}", ch);
             }

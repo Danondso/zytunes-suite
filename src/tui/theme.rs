@@ -599,12 +599,20 @@ pub const ZUNE_ORIGINAL: Theme = Theme {
     spinner_set: &BLACK_CIRCLE,
 };
 
-/// Find a theme index by name (case-insensitive). Returns 0 (default) if not found.
-pub fn find_theme_index(name: &str) -> usize {
+/// Look up a theme by name (case-insensitive). Falls back to the default theme
+/// (`THEMES[0]`) if no match is found.
+pub fn theme_by_name(name: &str) -> &'static Theme {
     THEMES
         .iter()
-        .position(|t| t.name.eq_ignore_ascii_case(name))
-        .unwrap_or(0)
+        .find(|t| t.name.eq_ignore_ascii_case(name))
+        .unwrap_or(&THEMES[0])
+}
+
+/// Position of `t` within `THEMES`, matched by name. Only called when opening
+/// the theme picker, so the linear scan cost is negligible. Pointer equality
+/// would be tempting but isn't reliable across uses of the `THEMES` const.
+pub fn theme_position(t: &Theme) -> usize {
+    THEMES.iter().position(|x| x.name == t.name).unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -613,9 +621,16 @@ mod tests {
 
     #[test]
     fn find_theme_by_name() {
-        assert_eq!(find_theme_index("Gruvbox Dark"), 1);
-        assert_eq!(find_theme_index("gruvbox dark"), 1);
-        assert_eq!(find_theme_index("nonexistent"), 0);
+        assert_eq!(theme_by_name("Gruvbox Dark").name, "Gruvbox Dark");
+        assert_eq!(theme_by_name("gruvbox dark").name, "Gruvbox Dark");
+        assert_eq!(theme_by_name("nonexistent").name, THEMES[0].name);
+    }
+
+    #[test]
+    fn theme_position_round_trips() {
+        for (i, t) in THEMES.iter().enumerate() {
+            assert_eq!(theme_position(t), i);
+        }
     }
 
     #[test]
@@ -646,7 +661,7 @@ mod tests {
         // Regression: THEMES grew and index-keyed skin lookup drifted, so Red Sands
         // rendered the Newport cigarette art. Skin now lives on the Theme struct —
         // this test guards the pairing.
-        let red_sands = &THEMES[find_theme_index("Red Sands")];
+        let red_sands = theme_by_name("Red Sands");
         let art: String = (red_sands.player_skin.art_fn)(true, 0).concat();
         assert!(
             !art.contains("NEWPORT"),
@@ -657,7 +672,7 @@ mod tests {
 
     #[test]
     fn newport_lights_uses_newport_skin() {
-        let newport = &THEMES[find_theme_index("Newport Lights")];
+        let newport = theme_by_name("Newport Lights");
         let art: String = (newport.player_skin.art_fn)(true, 0).concat();
         assert!(
             art.contains("NEWPORT"),

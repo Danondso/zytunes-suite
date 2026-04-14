@@ -59,7 +59,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load config and apply theme.
     let cfg = config::load();
     if let Some(ref theme_name) = cfg.theme {
-        app.theme_index = theme::find_theme_index(theme_name);
+        app.theme = theme::theme_by_name(theme_name);
     }
 
     // Set up background worker.

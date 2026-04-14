@@ -25,7 +25,7 @@ fn char_disp_width(c: char) -> usize {
 
 use crate::anim;
 use crate::app::{
-    format_duration, format_with_commas, AlbumArtStyle, App, BrowseMode, DevicePresence,
+    format_duration, format_with_commas, AlbumArtCache, App, BrowseMode, DevicePresence,
     DeviceStatus, NowPlaying, Panel, PlaybackState, SidebarMode, SortColumn, SyncStatus,
 };
 use crate::theme;
@@ -582,10 +582,11 @@ fn draw_album_detail(f: &mut Frame, app: &App, area: Rect, show_zip_art: bool) {
         f.render_widget(art, cols[0]);
 
         // Split right column: tracks on top, album art (boxed) below.
-        let art_rows = match app.album_art_style {
-            AlbumArtStyle::Halfblock => app.album_art_lines.len() as u16,
-            AlbumArtStyle::Ascii => app.album_art_ascii_lines.len() as u16,
-        };
+        let art_rows = app
+            .album_art_cache
+            .as_ref()
+            .map(|c| c.rows() as u16)
+            .unwrap_or(0);
         // +2 for top/bottom border, +1 for 1-row padding on top (0 on bottom).
         let art_panel_rows = if art_rows > 0 { art_rows + 3 } else { 0 };
         let right_split = Layout::default()
@@ -619,16 +620,11 @@ fn draw_album_art_panel(f: &mut Frame, app: &App, area: Rect, outer_border_style
     // Shrink the panel horizontally to hug the art, anchored to the right edge
     // of the slot so its right border coincides with the outer detail block's
     // right border.
-    let art_w = match app.album_art_style {
-        AlbumArtStyle::Halfblock => {
-            app.album_art_lines.first().map(|r| r.len()).unwrap_or(0) as u16
-        }
-        AlbumArtStyle::Ascii => app
-            .album_art_ascii_lines
-            .first()
-            .map(|r| r.len())
-            .unwrap_or(0) as u16,
-    };
+    let art_w = app
+        .album_art_cache
+        .as_ref()
+        .map(|c| c.width() as u16)
+        .unwrap_or(0);
     if art_w == 0 {
         return;
     }
@@ -721,23 +717,11 @@ fn draw_album_art_inline(f: &mut Frame, app: &App, area: Rect) {
     let t = app.theme();
     let pad_style = Style::default().bg(t.main_bg);
 
-    // Look up the active cache's row count + width via a single match.
-    let (row_count, art_w) = match app.album_art_style {
-        AlbumArtStyle::Halfblock => (
-            app.album_art_lines.len(),
-            app.album_art_lines.first().map(|r| r.len()).unwrap_or(0) as u16,
-        ),
-        AlbumArtStyle::Ascii => (
-            app.album_art_ascii_lines.len(),
-            app.album_art_ascii_lines
-                .first()
-                .map(|r| r.len())
-                .unwrap_or(0) as u16,
-        ),
+    let cache = match app.album_art_cache.as_ref() {
+        Some(c) if c.rows() > 0 => c,
+        _ => return,
     };
-    if row_count == 0 {
-        return;
-    }
+    let art_w = cache.width() as u16;
 
     let x_offset = area.width.saturating_sub(art_w) / 2;
     let pad: String = " ".repeat(x_offset as usize);
@@ -751,9 +735,8 @@ fn draw_album_art_inline(f: &mut Frame, app: &App, area: Rect) {
         }
     };
 
-    let lines: Vec<Line> = match app.album_art_style {
-        AlbumArtStyle::Halfblock => app
-            .album_art_lines
+    let lines: Vec<Line> = match cache {
+        AlbumArtCache::Halfblock(rows) => rows
             .iter()
             .take(take_h)
             .map(|row| {
@@ -770,8 +753,7 @@ fn draw_album_art_inline(f: &mut Frame, app: &App, area: Rect) {
                 Line::from(spans)
             })
             .collect(),
-        AlbumArtStyle::Ascii => app
-            .album_art_ascii_lines
+        AlbumArtCache::Ascii(rows) => rows
             .iter()
             .take(take_h)
             .map(|row| {
