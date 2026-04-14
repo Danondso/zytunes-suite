@@ -24,9 +24,9 @@ cargo clippy                  # Lint
 
 A Rust CLI tool for syncing music to a Microsoft Zune 30 from macOS and Linux. Detects the Zune over USB, authenticates via MTPZ (encrypted MTP), and manages music files on the device.
 
-CLI commands: `ls [path]`, `push <files...>`, `rm <paths...>`, `sync <type> <name>`, `library [xml] [query]`, `help`.
+CLI commands: `ls [path]`, `push <files...>`, `rm <paths...>`, `sync <type> <name>`, `library [query]`, `help`.
 
-**TUI** (`zytunes-tui`): Interactive terminal UI for browsing the music library (iTunes XML or directory scan) and device content, connecting to the device, managing a sync queue, removing tracks from the device, and monitoring sync progress. Library parsing runs asynchronously on a background thread at startup. The TUI supports two browse modes: Library (iTunes) and Device (Zune), toggled with `v`. Theme picker accessible with `t`.
+**TUI** (`zytunes-tui`): Interactive terminal UI for browsing the music library (directory scan) and device content, connecting to the device, managing a sync queue, removing tracks from the device, and monitoring sync progress. Library scanning runs asynchronously on a background thread at startup. The TUI supports two browse modes: Library and Device (Zune), toggled with `v`. Theme picker accessible with `t`.
 
 ## Architecture
 
@@ -46,16 +46,16 @@ CLI commands: `ls [path]`, `push <files...>`, `rm <paths...>`, `sync <type> <nam
 
 **Key modules:**
 - `device.rs` — USB scanning via rusb, identifies Zune by VID `0x045e`
-- `lib.rs` — Crate root, exports `SyncType` enum (`Artist`, `Album`, `Playlist`, `Track`) with `FromStr`/`Display` impls
-- `mtp/mod.rs` — `DeviceSession` trait abstracting device operations (ls, zune_import, rm, collect_all_tracks, create_playlist, save_sync_progress) for testability. All trait methods have doc comments
-- `mtp/native.rs` — `NativeSession` implements `DeviceSession` using `zune-mtp`: opens IOKit USB transport, performs MTPZ handshake, provides ls/import/rm/collect_all_tracks/create_playlist. Resolves device paths by walking object handles. `TrackCache` struct handles per-device track caching to `~/.zytunes-track-cache-{serial}`. `DeviceLibrary` struct caches artist/album MTP handles to `~/.zytunes-library-cache-{serial}` for fast reconnects. Sync progress cached to `~/.zytunes-sync-progress-{serial}`. `MtpResultExt` trait converts `MtpError` to `String` at the `DeviceSession` boundary
+- `lib.rs` — Crate root, exports `SyncType` enum (`Artist`, `Album`, `Track`) with `FromStr`/`Display` impls
+- `mtp/mod.rs` — `DeviceSession` trait abstracting device operations (ls, zune_import, rm, collect_all_tracks, save_sync_progress) for testability. All trait methods have doc comments
+- `mtp/native.rs` — `NativeSession` implements `DeviceSession` using `zune-mtp`: opens IOKit USB transport, performs MTPZ handshake, provides ls/import/rm/collect_all_tracks. Resolves device paths by walking object handles. `TrackCache` struct handles per-device track caching to `~/.zytunes-track-cache-{serial}`. `DeviceLibrary` struct caches artist/album MTP handles to `~/.zytunes-library-cache-{serial}` for fast reconnects. Sync progress cached to `~/.zytunes-sync-progress-{serial}`. `MtpResultExt` trait converts `MtpError` to `String` at the `DeviceSession` boundary
 - `mtp/parse.rs` — `DeviceEntry` struct and parsing utilities
 - `mtp/zmdb.rs` — ZMDB (Zune Metadata Database) parser. Parses the proprietary binary format returned by vendor op `0x9217` into tracks, albums, artists, genres. Used as the fast path in `collect_all_tracks` (single MTP call instead of hundreds)
-- `library.rs` — `MusicLibrary` trait abstracting library queries (artists, albums, playlists, track lookups). `ItunesLibrary` implements it via iTunes Library.xml plist parsing (streaming parser). `Track` and `Playlist` are shared data types used by all backends
-- `dirlib.rs` — `DirectoryLibrary` implements `MusicLibrary` by scanning a folder recursively for audio files. Reads metadata from all audio formats via lofty (FLAC, M4A, OGG, WAV, MP3, etc.), falls back to `Artist/Album/Track.ext` path structure for untagged files. Generates stable track IDs via path hashing. No playlist support
-- `main.rs` — CLI entry point, `run()` dispatcher, `cmd_sync`/`cmd_push`/`cmd_rm`/`cmd_ls`/`cmd_library` commands, `sync_to_device()` engine (takes `SyncType`), `find_matching_tracks()` (takes `SyncType`), transcoding via symphonia + LAME
+- `library.rs` — `MusicLibrary` trait abstracting library queries (artists, albums, track lookups) and the shared `Track` type
+- `dirlib.rs` — `DirectoryLibrary` implements `MusicLibrary` by scanning a folder recursively for audio files. Reads metadata from all audio formats via lofty (FLAC, M4A, OGG, WAV, MP3, etc.), falls back to `Artist/Album/Track.ext` path structure for untagged files. Generates stable track IDs via path hashing
+- `main.rs` — CLI entry point, `run()` dispatcher, `cmd_sync`/`cmd_push`/`cmd_rm`/`cmd_ls`/`cmd_library` commands, `sync_to_device()` engine, `find_matching_tracks()` (takes `SyncType`), transcoding via symphonia + LAME
 - `tui/main.rs` — TUI entry point (`zytunes-tui` binary), event loop (50ms poll), terminal setup/teardown
-- `tui/app.rs` — TUI application state (`App`), input handling, panel navigation. Panels: `Library` (sidebar), `Albums`, `TrackList`, `Device`, `SyncQueue` — cycled via Tab. Two browse modes: `BrowseMode::Library` and `BrowseMode::Device` (toggled with `v`). Three sidebar modes: `Artists`, `Albums`, `Playlists` (keys `1`/`2`/`3`). Sidebar selection positions saved per browse-mode × sidebar-mode pair. Device mode builds in-memory artist/album/track index from `Music/{Artist}/{Album}/{Track}` paths. `App` uses `DeviceState` sub-struct (holds device status, name, firmware, serial, storage, tracks, etc.) and `SyncState` sub-struct (holds sync queue, status, current track, and log). State machines: `DeviceStatus` (Disconnected → Detecting → Connecting → Connected), `SyncStatus` (Idle → Running)
+- `tui/app.rs` — TUI application state (`App`), input handling, panel navigation. Panels: `Library` (sidebar), `Albums`, `TrackList`, `Device`, `SyncQueue` — cycled via Tab. Two browse modes: `BrowseMode::Library` and `BrowseMode::Device` (toggled with `v`). Two sidebar modes: `Artists`, `Albums` (keys `1`/`2`). Sidebar selection positions saved per browse-mode × sidebar-mode pair. Device mode builds in-memory artist/album/track index from `Music/{Artist}/{Album}/{Track}` paths. `App` uses `DeviceState` sub-struct (holds device status, name, firmware, serial, storage, tracks, etc.) and `SyncState` sub-struct (holds sync queue, status, current track, and log). State machines: `DeviceStatus` (Disconnected → Detecting → Connecting → Connected), `SyncStatus` (Idle → Running)
 - `tui/background.rs` — background worker thread communicating via `mpsc` channels. Commands (`BgCommand`): `LoadLibrary`, `Connect`, `LoadDeviceTracks`, `Disconnect`, `ExecuteSyncQueue`, `RemoveFromDevice`, `CancelSync`. Events (`BgEvent`): `LibraryLoaded`, `DeviceDetected`, `SessionReady`, `SessionFailed`, `DeviceTracksLoaded`, `SyncProgress`, `SyncTrackDone`, `SyncComplete`, `RemoveProgress`, `RemoveComplete`, `StorageUpdated`, `Error`, `SyncMessage`. `DeviceInfo` struct does not include `mtp_version`. Uses NativeSession exclusively
 - `tui/anim.rs` — animation data for connection and sync progress
 - `tui/audio.rs` — local audio playback via rodio, play/pause/skip controls
@@ -63,7 +63,7 @@ CLI commands: `ls [path]`, `push <files...>`, `rm <paths...>`, `sync <type> <nam
 - `tui/theme.rs` — `Theme` struct with color/style fields (sidebar, selection, main/alt row, border, footer, header, dim, error, success, progress). 16 built-in presets: iTunes 2004, Gruvbox Dark/Light, Everforest Dark/Light, Tokyo Night, IBM Mainframe, Amber CRT, Windows 95, System 7, BIOS, Red Sands, Newport Lights, NeXTSTEP, WinAmp Classic, Zune Original. `find_theme_index()` for name-based lookup
 - `tui/config.rs` — TOML config file at `~/.config/zytunes/config.toml` (serde + toml). Stores selected theme name and optional `music_dir` for directory scanning backend
 
-**Configuration:** Music library is resolved by `load_library()` with auto-detection: (1) iTunes Library.xml at `ZYTUNES_LIBRARY` env var or `$HOME/Music/Music/Library.xml`, (2) `ZYTUNES_MUSIC_DIR` env var for directory scanning, (3) `music_dir` from config.toml. CLI also supports `--library <path>` per-command. TUI config (theme, music_dir) is stored in `~/.config/zytunes/config.toml`.
+**Configuration:** Music library is resolved by `load_library()`: (1) `ZYTUNES_MUSIC_DIR` env var, (2) `music_dir` from config.toml. Both point at a folder that is recursively scanned for audio files. TUI config (theme, `music_dir`) is stored in `~/.config/zytunes/config.toml`.
 
 **Licensing:** MIT license (`LICENSE`). Third-party attribution in `THIRD_PARTY.md` (MTPZ keys from libmtp-zune).
 

@@ -1,7 +1,7 @@
 //! Library metadata cache for fast startup.
 //!
-//! Caches parsed track/playlist data to `~/.cache/zytunes/` so repeat
-//! launches skip expensive XML parsing or directory scanning with lofty.
+//! Caches parsed track data to `~/.cache/zytunes/` so repeat launches skip
+//! expensive directory scanning with lofty.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -9,15 +9,16 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
-use crate::library::{Playlist, Track};
+use crate::library::Track;
 
 /// Fingerprint of the library source for cache invalidation.
 #[derive(Serialize, Deserialize, PartialEq)]
 struct Fingerprint {
-    /// For XML: the file path. For dir: the root path.
+    /// The root directory path.
     source: String,
-    /// For XML: single entry with mtime+size. For dir: count + newest mtime.
+    /// Newest audio-file mtime under the root.
     mtime_secs: u64,
+    /// Count of audio files under the root.
     size: u64,
 }
 
@@ -25,8 +26,6 @@ struct Fingerprint {
 struct CachedLibrary {
     fingerprint: Fingerprint,
     tracks: HashMap<u64, Track>,
-    playlists: Vec<Playlist>,
-    music_folder_path: Option<String>,
 }
 
 fn cache_dir() -> Option<std::path::PathBuf> {
@@ -36,21 +35,6 @@ fn cache_dir() -> Option<std::path::PathBuf> {
 
 fn cache_path(name: &str) -> Option<std::path::PathBuf> {
     cache_dir().map(|d| d.join(name))
-}
-
-fn file_fingerprint(path: &str) -> Option<Fingerprint> {
-    let meta = std::fs::metadata(path).ok()?;
-    let mtime = meta
-        .modified()
-        .ok()?
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .ok()?
-        .as_secs();
-    Some(Fingerprint {
-        source: path.to_string(),
-        mtime_secs: mtime,
-        size: meta.len(),
-    })
 }
 
 /// Build a fingerprint for a directory by counting audio files and tracking
@@ -117,48 +101,6 @@ fn save_cache(name: &str, cached: &CachedLibrary) {
     }
 }
 
-/// Cached iTunes library data.
-pub struct ItunesCacheData {
-    pub tracks: HashMap<u64, Track>,
-    pub playlists: Vec<Playlist>,
-    pub music_folder_path: Option<String>,
-}
-
-/// Try to load an iTunes library from cache. Returns None if cache is stale/missing.
-pub fn load_itunes_cached(xml_path: &str) -> Option<ItunesCacheData> {
-    let fp = file_fingerprint(xml_path)?;
-    let cached = load_cache("itunes-library.json")?;
-    if cached.fingerprint == fp {
-        Some(ItunesCacheData {
-            tracks: cached.tracks,
-            playlists: cached.playlists,
-            music_folder_path: cached.music_folder_path,
-        })
-    } else {
-        None
-    }
-}
-
-/// Save a parsed iTunes library to cache.
-pub fn save_itunes_cache(
-    xml_path: &str,
-    tracks: &HashMap<u64, Track>,
-    playlists: &[Playlist],
-    music_folder_path: Option<&str>,
-) {
-    if let Some(fp) = file_fingerprint(xml_path) {
-        save_cache(
-            "itunes-library.json",
-            &CachedLibrary {
-                fingerprint: fp,
-                tracks: tracks.clone(),
-                playlists: playlists.to_vec(),
-                music_folder_path: music_folder_path.map(|s| s.to_string()),
-            },
-        );
-    }
-}
-
 /// Try to load a directory library from cache. Returns None if cache is stale/missing.
 pub fn load_dirlib_cached(dir_path: &str) -> Option<HashMap<u64, Track>> {
     let fp = dir_fingerprint(dir_path)?;
@@ -178,8 +120,6 @@ pub fn save_dirlib_cache(dir_path: &str, tracks: &HashMap<u64, Track>) {
             &CachedLibrary {
                 fingerprint: fp,
                 tracks: tracks.clone(),
-                playlists: Vec::new(),
-                music_folder_path: Some(dir_path.to_string()),
             },
         );
     }

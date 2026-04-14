@@ -15,7 +15,6 @@ use zytunes::{
 /// Commands sent from the main TUI thread to the background worker.
 pub enum BgCommand {
     LoadLibrary {
-        xml_path: String,
         music_dir: Option<String>,
     },
     Connect,
@@ -128,11 +127,8 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
 
         while let Ok(cmd) = cmd_rx.recv() {
             match cmd {
-                BgCommand::LoadLibrary {
-                    xml_path,
-                    music_dir,
-                } => {
-                    let result = zytunes::load_library(&xml_path, music_dir.as_deref());
+                BgCommand::LoadLibrary { music_dir } => {
+                    let result = zytunes::load_library(music_dir.as_deref());
                     let _ = event_tx.send(BgEvent::LibraryLoaded(result));
                 }
                 BgCommand::Connect => {

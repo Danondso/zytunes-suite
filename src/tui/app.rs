@@ -24,7 +24,6 @@ pub enum Panel {
 pub enum SidebarMode {
     Artists,
     Albums,
-    Playlists,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -263,7 +262,7 @@ pub struct App {
     pub sidebar_items: Vec<String>,
     pub sidebar_selected: usize,
     pub sidebar_scroll: usize,
-    /// Per-mode saved selection positions: [Artists, Albums, Playlists] x [Library, Device]
+    /// Per-mode saved selection positions: [Artists, Albums] x [Library, Device]
     saved_sidebar_pos: HashMap<(BrowseMode, SidebarMode), usize>,
     pub album_list: Vec<AlbumInfo>,
     pub album_selected: usize,
@@ -289,7 +288,6 @@ pub struct App {
     pub search_active: bool,
     pub search_query: String,
     pub toast_message: Option<(String, Instant, bool)>, // (msg, time, is_error)
-    pub library_path: Option<String>,
     pub loading_library: bool,
     pub theme: &'static Theme,
     pub show_theme_picker: bool,
@@ -368,7 +366,6 @@ impl App {
             search_active: false,
             search_query: String::new(),
             toast_message: None,
-            library_path: None,
             loading_library: false,
             theme: &THEMES[0],
             show_theme_picker: false,
@@ -798,7 +795,6 @@ impl App {
                     })
                     .unwrap_or_default()
             }
-            SidebarMode::Playlists => Vec::new(),
         }
     }
 
@@ -819,7 +815,6 @@ impl App {
                     (item.to_string(), String::new())
                 }
             }
-            SidebarMode::Playlists => (String::new(), String::new()),
         }
     }
 
@@ -863,11 +858,6 @@ impl App {
                         .into_iter()
                         .map(|(artist, album)| format!("{} \u{2014} {}", artist, album))
                         .collect(),
-                    SidebarMode::Playlists => lib
-                        .user_playlists()
-                        .into_iter()
-                        .map(|p| format!("{} ({} tracks)", p.name, p.track_ids.len()))
-                        .collect(),
                 };
             }
             BrowseMode::Device => {
@@ -883,7 +873,6 @@ impl App {
                         items.sort();
                         items
                     }
-                    SidebarMode::Playlists => Vec::new(),
                 };
             }
         }
@@ -961,16 +950,6 @@ impl App {
                 self.track_scroll = 0;
                 self.refresh_album_art();
             }
-            SidebarMode::Playlists => {
-                self.album_list.clear();
-                let name = item.rfind(" (").map(|pos| &item[..pos]).unwrap_or(&item);
-                let tracks = lib.playlist_tracks(name);
-                self.track_list = tracks_to_info(tracks, &self.device);
-                self.sort_tracks();
-                self.track_selected = 0;
-                self.track_scroll = 0;
-                self.refresh_album_art();
-            }
         }
     }
 
@@ -1010,12 +989,6 @@ impl App {
                 } else {
                     self.track_list = Vec::new();
                 }
-                self.track_selected = 0;
-                self.track_scroll = 0;
-            }
-            SidebarMode::Playlists => {
-                self.album_list.clear();
-                self.track_list.clear();
                 self.track_selected = 0;
                 self.track_scroll = 0;
             }
@@ -1295,7 +1268,7 @@ impl App {
             });
             self.set_toast(format!("Added {} tracks to queue", count), false);
         } else {
-            // For albums/playlists, select to populate track list, then add all.
+            // For albums, select to populate track list, then add all.
             self.select_sidebar_item();
             self.add_all_visible_to_queue();
         }
@@ -2212,14 +2185,39 @@ mod tests {
 
     // -- handle_bg_event tests --
 
-    use std::collections::HashMap;
+    struct EmptyLibrary;
+    impl zytunes::library::MusicLibrary for EmptyLibrary {
+        fn artists(&self) -> Vec<&str> {
+            Vec::new()
+        }
+        fn albums(&self) -> Vec<(&str, &str)> {
+            Vec::new()
+        }
+        fn artist_tracks(&self, _: &str) -> Vec<&zytunes::library::Track> {
+            Vec::new()
+        }
+        fn album_tracks(&self, _: &str) -> Vec<&zytunes::library::Track> {
+            Vec::new()
+        }
+        fn album_tracks_by_artist(&self, _: &str, _: &str) -> Vec<&zytunes::library::Track> {
+            Vec::new()
+        }
+        fn tracks_by_name(&self, _: &str) -> Vec<&zytunes::library::Track> {
+            Vec::new()
+        }
+        fn track_count(&self) -> usize {
+            0
+        }
+        fn all_tracks(&self) -> Vec<&zytunes::library::Track> {
+            Vec::new()
+        }
+        fn music_folder(&self) -> Option<&str> {
+            None
+        }
+    }
 
     fn make_minimal_library() -> Box<dyn zytunes::library::MusicLibrary + Send> {
-        Box::new(zytunes::library::ItunesLibrary {
-            tracks: HashMap::new(),
-            playlists: Vec::new(),
-            music_folder_path: None,
-        })
+        Box::new(EmptyLibrary)
     }
 
     #[test]

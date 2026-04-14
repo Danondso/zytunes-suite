@@ -33,17 +33,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Silently ignore panics from unnamed threads (rodio, symphonia)
     }));
 
-    let args: Vec<String> = std::env::args().collect();
-
-    // Parse --library flag.
-    let default = zytunes::library_xml_path();
-    let library_path = args
-        .iter()
-        .position(|a| a == "--library")
-        .and_then(|i| args.get(i + 1))
-        .map(|s| s.as_str())
-        .unwrap_or(&default);
-
     // Set up terminal.
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -54,7 +43,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create app state.
     let mut app = App::new();
     app.loading_library = true;
-    app.library_path = Some(library_path.to_string());
 
     // Load config and apply theme.
     let cfg = config::load();
@@ -72,7 +60,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Kick off async library load.
     let _ = cmd_tx.send(BgCommand::LoadLibrary {
-        xml_path: library_path.to_string(),
         music_dir: cfg.music_dir.clone(),
     });
 
@@ -284,12 +271,6 @@ fn run_loop(
                     KeyCode::Char('2') => {
                         app.save_sidebar_pos();
                         app.sidebar_mode = SidebarMode::Albums;
-                        app.refresh_sidebar();
-                        app.active_panel = Panel::Library;
-                    }
-                    KeyCode::Char('3') => {
-                        app.save_sidebar_pos();
-                        app.sidebar_mode = SidebarMode::Playlists;
                         app.refresh_sidebar();
                         app.active_panel = Panel::Library;
                     }

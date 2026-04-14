@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
 
-use crate::library::{MusicLibrary, Playlist, Track};
+use crate::library::{MusicLibrary, Track};
 
 /// Audio file extensions recognized by the scanner.
 const AUDIO_EXTENSIONS: &[&str] = &[
@@ -230,19 +230,11 @@ impl MusicLibrary for DirectoryLibrary {
         albums
     }
 
-    fn user_playlists(&self) -> Vec<&Playlist> {
-        vec![]
-    }
-
     fn artist_tracks(&self, artist: &str) -> Vec<&Track> {
         self.tracks
             .values()
             .filter(|t| t.artist.eq_ignore_ascii_case(artist))
             .collect()
-    }
-
-    fn playlist_tracks(&self, _name: &str) -> Vec<&Track> {
-        vec![]
     }
 
     fn album_tracks(&self, album: &str) -> Vec<&Track> {
@@ -294,7 +286,6 @@ mod tests {
         let lib = DirectoryLibrary::scan(dir.to_str().unwrap()).unwrap();
         assert_eq!(lib.track_count(), 0);
         assert!(lib.artists().is_empty());
-        assert!(lib.user_playlists().is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 

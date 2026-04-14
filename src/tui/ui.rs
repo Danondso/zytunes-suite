@@ -251,8 +251,6 @@ fn draw_startup(f: &mut Frame, app: &App, area: Rect) {
         40,
     );
 
-    let path_display = app.library_path.as_deref().unwrap_or("Library.xml");
-
     let revealed = anim::typing_reveal("zytunes", app.anim_frame);
 
     let lines = vec![
@@ -264,10 +262,8 @@ fn draw_startup(f: &mut Frame, app: &App, area: Rect) {
         Line::from(""),
         Line::from(vec![
             Span::styled(format!(" {} ", symbol), Style::default().fg(pulse)),
-            Span::raw("Parsing library..."),
+            Span::raw("Scanning library..."),
         ]),
-        Line::from(""),
-        Line::from(Span::styled(path_display, t.dim())),
     ];
 
     let block = t
@@ -297,7 +293,6 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
     let mode_label = match app.sidebar_mode {
         SidebarMode::Artists => "Artists",
         SidebarMode::Albums => "Albums",
-        SidebarMode::Playlists => "Playlists",
     };
     let browse_prefix = match app.browse_mode {
         BrowseMode::Library => "",
@@ -331,8 +326,6 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
             BrowseMode::Device => {
                 if app.device.tracks.is_empty() {
                     "No tracks on device"
-                } else if app.sidebar_mode == SidebarMode::Playlists {
-                    "Playlists not available\nin device view"
                 } else {
                     "(empty)"
                 }
@@ -1836,7 +1829,7 @@ fn draw_help_overlay(f: &mut Frame, app: &App) {
         "  Tab         Cycle panels",
         "  Up/Down     Navigate items",
         "  Enter       Select / expand",
-        "  1/2/3       Artists / Albums / Playlists",
+        "  1/2         Artists / Albums",
         "  v           Toggle Library / Device view",
         "  t           Theme picker",
         "  T           Toggle album art style (halfblock/ASCII)",

@@ -34,7 +34,6 @@ const FORMAT_WMA: u16 = 0xB901;
 const FORMAT_AAC: u16 = 0xB903;
 const FORMAT_ARTIST: u16 = 0xB218;
 const FORMAT_ABSTRACT_AUDIO_ALBUM: u16 = 0xBA03;
-const FORMAT_ABSTRACT_AV_PLAYLIST: u16 = 0xBA05;
 const FORMAT_EXIF_JPEG: u16 = 0x3801;
 const FORMAT_WMV: u16 = 0xB981;
 
@@ -1118,49 +1117,6 @@ impl DeviceSession for NativeSession {
         self.log_msg(&format!("Cached {} tracks", tracks.len()));
 
         Ok(tracks)
-    }
-
-    fn create_playlist(&mut self, name: &str, track_ids: &[u64]) -> Result<(), String> {
-        self.ensure_library()?;
-        let music_folder = self.lib()?.music_folder;
-
-        // Step 1: Create playlist object via SendObjectPropList.
-        let props = PropListBuilder::new()
-            .add_string(PROP_OBJECT_FILENAME, &format!("{}.pla", name))
-            .build();
-        let (_, _, playlist_id) = self
-            .session
-            .send_object_prop_list(
-                self.storage_id,
-                music_folder,
-                FORMAT_ABSTRACT_AV_PLAYLIST,
-                0,
-                &props,
-            )
-            .mtp_err()?;
-
-        // Step 2: Send empty object data.
-        self.session.send_object(&[]).mtp_err()?;
-
-        // Step 3: Set display name via SetObjectPropValue.
-        let mut name_data = Vec::new();
-        let chars: Vec<u16> = name.encode_utf16().collect();
-        name_data.push((chars.len() + 1) as u8);
-        for ch in &chars {
-            name_data.extend_from_slice(&ch.to_le_bytes());
-        }
-        name_data.extend_from_slice(&0u16.to_le_bytes());
-        let _ = self
-            .session
-            .set_object_prop_value(playlist_id, PROP_NAME, &name_data);
-
-        // Step 4: Link tracks via SetObjectReferences.
-        let refs: Vec<u32> = track_ids.iter().map(|&id| id as u32).collect();
-        self.session
-            .set_object_references(playlist_id, &refs)
-            .mtp_err()?;
-
-        Ok(())
     }
 
     fn get_storage_info(&mut self) -> Result<(u64, u64), String> {

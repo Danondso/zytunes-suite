@@ -192,7 +192,6 @@ impl DeviceBackend for ZuneBackend {
             transcode_target: "mp3",
             music_root: "/Music",
             max_art_dimensions: Some((200, 200)),
-            playlist_support: true,
         }
     }
 
@@ -265,6 +264,5 @@ mod tests {
         assert_eq!(caps.transcode_target, "mp3");
         assert_eq!(caps.music_root, "/Music");
         assert_eq!(caps.max_art_dimensions, Some((200, 200)));
-        assert!(caps.playlist_support);
     }
 }
