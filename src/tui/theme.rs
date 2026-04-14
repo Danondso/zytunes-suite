@@ -1,6 +1,16 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::BorderType;
 use ratatui::widgets::{Block, Borders};
+use throbber_widgets_tui::symbols::throbber::{
+    Set, ASCII, BLACK_CIRCLE, BRAILLE_EIGHT, BRAILLE_ONE, BRAILLE_SIX, BRAILLE_SIX_DOUBLE, OGHAM_A,
+    OGHAM_B, QUADRANT_BLOCK, VERTICAL_BLOCK, WHITE_CIRCLE, WHITE_SQUARE,
+};
+
+use super::anim::{
+    PlayerSkin, SKIN_BIOS, SKIN_EVERFOREST_DARK, SKIN_EVERFOREST_LIGHT, SKIN_GRUVBOX_DARK,
+    SKIN_GRUVBOX_LIGHT, SKIN_IBM, SKIN_ITUNES, SKIN_NEWPORT, SKIN_RED_SANDS, SKIN_SYSTEM7,
+    SKIN_TOKYO_NIGHT, SKIN_WIN95,
+};
 
 // Modifier bit constants for const-compatible theme presets.
 const BOLD: u16 = Modifier::BOLD.bits();
@@ -48,6 +58,9 @@ pub struct Theme {
     // Animated accent
     pub accent_anim: AccentAnim,
     pub accent_secondary: Color,
+    // Now-playing animation skin and sidebar spinner set.
+    pub player_skin: &'static PlayerSkin,
+    pub spinner_set: &'static Set,
 }
 
 impl Theme {
@@ -162,6 +175,8 @@ pub const ITUNES_2004: Theme = Theme {
     footer_modifier: NONE,
     accent_anim: AccentAnim::Pulse,
     accent_secondary: Color::Rgb(56, 117, 215),
+    player_skin: &SKIN_ITUNES,
+    spinner_set: &BRAILLE_EIGHT,
 };
 
 pub const GRUVBOX_DARK: Theme = Theme {
@@ -188,6 +203,8 @@ pub const GRUVBOX_DARK: Theme = Theme {
     footer_modifier: NONE,
     accent_anim: AccentAnim::Pulse,
     accent_secondary: Color::Rgb(214, 93, 14),
+    player_skin: &SKIN_GRUVBOX_DARK,
+    spinner_set: &BRAILLE_SIX_DOUBLE,
 };
 
 pub const GRUVBOX_LIGHT: Theme = Theme {
@@ -214,6 +231,8 @@ pub const GRUVBOX_LIGHT: Theme = Theme {
     footer_modifier: NONE,
     accent_anim: AccentAnim::None,
     accent_secondary: Color::Rgb(175, 58, 3),
+    player_skin: &SKIN_GRUVBOX_LIGHT,
+    spinner_set: &BRAILLE_SIX,
 };
 
 pub const EVERFOREST_DARK: Theme = Theme {
@@ -240,6 +259,8 @@ pub const EVERFOREST_DARK: Theme = Theme {
     footer_modifier: NONE,
     accent_anim: AccentAnim::Pulse,
     accent_secondary: Color::Rgb(167, 192, 128),
+    player_skin: &SKIN_EVERFOREST_DARK,
+    spinner_set: &OGHAM_A,
 };
 
 pub const EVERFOREST_LIGHT: Theme = Theme {
@@ -266,6 +287,8 @@ pub const EVERFOREST_LIGHT: Theme = Theme {
     footer_modifier: NONE,
     accent_anim: AccentAnim::None,
     accent_secondary: Color::Rgb(141, 161, 1),
+    player_skin: &SKIN_EVERFOREST_LIGHT,
+    spinner_set: &OGHAM_B,
 };
 
 pub const TOKYO_NIGHT: Theme = Theme {
@@ -292,6 +315,8 @@ pub const TOKYO_NIGHT: Theme = Theme {
     footer_modifier: NONE,
     accent_anim: AccentAnim::HueCycle,
     accent_secondary: Color::Rgb(125, 207, 255),
+    player_skin: &SKIN_TOKYO_NIGHT,
+    spinner_set: &BLACK_CIRCLE,
 };
 
 pub const IBM_MAINFRAME: Theme = Theme {
@@ -318,6 +343,8 @@ pub const IBM_MAINFRAME: Theme = Theme {
     footer_modifier: BOLD,
     accent_anim: AccentAnim::Pulse,
     accent_secondary: Color::Rgb(40, 200, 80),
+    player_skin: &SKIN_IBM,
+    spinner_set: &VERTICAL_BLOCK,
 };
 
 pub const AMBER_CRT: Theme = Theme {
@@ -344,6 +371,8 @@ pub const AMBER_CRT: Theme = Theme {
     footer_modifier: BOLD,
     accent_anim: AccentAnim::Pulse,
     accent_secondary: Color::Rgb(255, 200, 60),
+    player_skin: &SKIN_IBM,
+    spinner_set: &VERTICAL_BLOCK,
 };
 
 pub const WINDOWS_95: Theme = Theme {
@@ -370,6 +399,8 @@ pub const WINDOWS_95: Theme = Theme {
     footer_modifier: NONE,
     accent_anim: AccentAnim::None,
     accent_secondary: Color::Rgb(0, 0, 128),
+    player_skin: &SKIN_WIN95,
+    spinner_set: &WHITE_SQUARE,
 };
 
 pub const SYSTEM_7: Theme = Theme {
@@ -396,6 +427,8 @@ pub const SYSTEM_7: Theme = Theme {
     footer_modifier: NONE,
     accent_anim: AccentAnim::None,
     accent_secondary: Color::Rgb(0, 0, 0),
+    player_skin: &SKIN_SYSTEM7,
+    spinner_set: &QUADRANT_BLOCK,
 };
 
 pub const BIOS: Theme = Theme {
@@ -422,6 +455,8 @@ pub const BIOS: Theme = Theme {
     footer_modifier: BOLD,
     accent_anim: AccentAnim::ColorShift,
     accent_secondary: Color::Rgb(85, 255, 85),
+    player_skin: &SKIN_BIOS,
+    spinner_set: &ASCII,
 };
 
 pub const RED_SANDS: Theme = Theme {
@@ -448,6 +483,8 @@ pub const RED_SANDS: Theme = Theme {
     footer_modifier: NONE,
     accent_anim: AccentAnim::ColorShift,
     accent_secondary: Color::Rgb(200, 80, 40),
+    player_skin: &SKIN_RED_SANDS,
+    spinner_set: &BRAILLE_ONE,
 };
 
 pub const NEWPORT_LIGHTS: Theme = Theme {
@@ -474,6 +511,8 @@ pub const NEWPORT_LIGHTS: Theme = Theme {
     footer_modifier: NONE,
     accent_anim: AccentAnim::Pulse,
     accent_secondary: Color::Rgb(255, 255, 255),
+    player_skin: &SKIN_NEWPORT,
+    spinner_set: &WHITE_CIRCLE,
 };
 
 pub const NEXTSTEP: Theme = Theme {
@@ -500,6 +539,8 @@ pub const NEXTSTEP: Theme = Theme {
     footer_modifier: NONE,
     accent_anim: AccentAnim::None,
     accent_secondary: Color::Rgb(96, 112, 140),
+    player_skin: &SKIN_SYSTEM7,
+    spinner_set: &BRAILLE_SIX,
 };
 
 pub const WINAMP_CLASSIC: Theme = Theme {
@@ -526,6 +567,8 @@ pub const WINAMP_CLASSIC: Theme = Theme {
     footer_modifier: BOLD,
     accent_anim: AccentAnim::ColorShift,
     accent_secondary: Color::Rgb(255, 220, 0),
+    player_skin: &SKIN_IBM,
+    spinner_set: &VERTICAL_BLOCK,
 };
 
 pub const ZUNE_ORIGINAL: Theme = Theme {
@@ -552,6 +595,8 @@ pub const ZUNE_ORIGINAL: Theme = Theme {
     footer_modifier: BOLD,
     accent_anim: AccentAnim::ColorShift,
     accent_secondary: Color::Rgb(235, 141, 0),
+    player_skin: &SKIN_TOKYO_NIGHT,
+    spinner_set: &BLACK_CIRCLE,
 };
 
 /// Find a theme index by name (case-insensitive). Returns 0 (default) if not found.
@@ -593,6 +638,52 @@ mod tests {
     fn block_helper_returns_block() {
         for t in THEMES {
             let _ = t.block();
+        }
+    }
+
+    #[test]
+    fn red_sands_is_not_newport_skin() {
+        // Regression: THEMES grew and index-keyed skin lookup drifted, so Red Sands
+        // rendered the Newport cigarette art. Skin now lives on the Theme struct —
+        // this test guards the pairing.
+        let red_sands = &THEMES[find_theme_index("Red Sands")];
+        let art: String = (red_sands.player_skin.art_fn)(true, 0).concat();
+        assert!(
+            !art.contains("NEWPORT"),
+            "Red Sands skin leaked Newport art: {}",
+            art
+        );
+    }
+
+    #[test]
+    fn newport_lights_uses_newport_skin() {
+        let newport = &THEMES[find_theme_index("Newport Lights")];
+        let art: String = (newport.player_skin.art_fn)(true, 0).concat();
+        assert!(
+            art.contains("NEWPORT"),
+            "Newport Lights skin missing expected art: {}",
+            art
+        );
+    }
+
+    #[test]
+    fn every_theme_has_nonempty_skin_and_spinner() {
+        for t in THEMES {
+            assert!(
+                !t.player_skin.play.is_empty(),
+                "{} has empty play glyph",
+                t.name
+            );
+            assert!(
+                !(t.player_skin.art_fn)(true, 0).is_empty(),
+                "{} has empty art",
+                t.name
+            );
+            assert!(
+                !t.spinner_set.symbols.is_empty(),
+                "{} has empty spinner set",
+                t.name
+            );
         }
     }
 

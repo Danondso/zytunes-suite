@@ -1,7 +1,9 @@
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, Clear, List, ListItem, Padding, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Cell, Clear, List, ListItem, Padding, Paragraph, Row, Table, Wrap,
+};
 use ratatui::Frame;
 use throbber_widgets_tui::{Throbber, ThrobberState, WhichUse};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -114,9 +116,9 @@ impl LayoutMetrics {
     }
 }
 
-fn throbber_symbol(state: &ThrobberState, theme_index: usize) -> String {
+fn throbber_symbol(state: &ThrobberState, theme: &theme::Theme) -> String {
     Throbber::default()
-        .throbber_set(anim::spinner_set_for_theme(theme_index))
+        .throbber_set(theme.spinner_set.clone())
         .use_type(WhichUse::Spin)
         .to_symbol_span(state)
         .content
@@ -240,7 +242,7 @@ pub fn draw(f: &mut Frame, app: &App) {
 
 fn draw_startup(f: &mut Frame, app: &App, area: Rect) {
     let t = app.theme();
-    let symbol = throbber_symbol(&app.throbber_state, app.theme_index);
+    let symbol = throbber_symbol(&app.throbber_state, app.theme());
     let pulse = anim::animated_accent(
         t.accent_color(),
         t.accent_secondary,
@@ -696,6 +698,21 @@ fn junction_chars(bt: ratatui::widgets::BorderType) -> Option<(&'static str, &'s
     }
 }
 
+/// T-junction glyphs where a vertical divider meets the outer horizontal border:
+/// (top = down-T, bottom = up-T). Returns `None` for border types without clean
+/// single-glyph junctions.
+fn vertical_divider_junctions(
+    bt: ratatui::widgets::BorderType,
+) -> Option<(&'static str, &'static str)> {
+    use ratatui::widgets::BorderType;
+    match bt {
+        BorderType::Plain | BorderType::Rounded => Some(("\u{252C}", "\u{2534}")), // ┬ ┴
+        BorderType::Thick => Some(("\u{2533}", "\u{253B}")),                       // ┳ ┻
+        BorderType::Double => Some(("\u{2566}", "\u{2569}")),                      // ╦ ╩
+        _ => None,
+    }
+}
+
 fn draw_album_art_inline(f: &mut Frame, app: &App, area: Rect) {
     if area.height == 0 {
         return;
@@ -1095,10 +1112,10 @@ fn draw_device_info_connected(f: &mut Frame, app: &App, area: Rect) {
 
     // Screen content: two lines inside the screen area.
     let (screen_line1, screen_line2) = if is_syncing {
-        let symbol = throbber_symbol(&app.throbber_state, app.theme_index);
+        let symbol = throbber_symbol(&app.throbber_state, app.theme());
         (symbol, "Syncing...".to_string())
     } else if is_busy {
-        let symbol = throbber_symbol(&app.throbber_state, app.theme_index);
+        let symbol = throbber_symbol(&app.throbber_state, app.theme());
         (symbol, "Loading...".to_string())
     } else {
         let count = app.device.tracks.len();
@@ -1235,7 +1252,7 @@ fn draw_sync_queue(f: &mut Frame, app: &App, area: Rect) {
 
     match app.sync.status {
         SyncStatus::Running { current, total } => {
-            let symbol = throbber_symbol(&app.throbber_state, app.theme_index);
+            let symbol = throbber_symbol(&app.throbber_state, app.theme());
             let title = format!(" {} {}/{} ", symbol, current, total);
             let block = t
                 .block()
@@ -1509,7 +1526,7 @@ fn key_line<'a>(app: &App, key: &'a str, desc: &'a str) -> Line<'a> {
 
 fn draw_now_playing(f: &mut Frame, app: &App, np: &NowPlaying, area: Rect, art_width: u16) {
     let t = app.theme();
-    let skin = anim::player_skin(app.theme_index);
+    let skin = app.theme().player_skin;
 
     let state_icon = match np.state {
         PlaybackState::Playing => skin.play,
@@ -1539,12 +1556,15 @@ fn draw_now_playing(f: &mut Frame, app: &App, np: &NowPlaying, area: Rect, art_w
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // Split inner area: info (left) | art (right), art hidden at Compact.
-    let show_art = art_width > 0 && inner.width > art_width + 20;
+    // Split inner area: info (left) | divider + art (right). The right column
+    // reserves 1 column for a vertical divider so the art sits inside its own
+    // bordered sub-panel that connects to the outer block via T-junctions.
+    let right_col_width = art_width + 1;
+    let show_art = art_width > 0 && inner.width > right_col_width + 20;
     let (info_area, art_area) = if show_art {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(20), Constraint::Length(art_width)])
+            .constraints([Constraint::Min(20), Constraint::Length(right_col_width)])
             .split(inner);
         (cols[0], Some(cols[1]))
     } else {
@@ -1553,6 +1573,29 @@ fn draw_now_playing(f: &mut Frame, app: &App, np: &NowPlaying, area: Rect, art_w
 
     // --- Art (right side, inside the shared block) ---
     if let Some(art_rect) = art_area {
+        // Draw a LEFT-only sub-border; its inner area holds the art.
+        let divider_style = Style::default().fg(border_color).bg(t.main_bg);
+        let divider_block = Block::default()
+            .borders(Borders::LEFT)
+            .border_type(t.border_type)
+            .border_style(divider_style)
+            .style(Style::default().bg(t.main_bg));
+        let art_inner = divider_block.inner(art_rect);
+        f.render_widget(divider_block, art_rect);
+
+        // Patch the cells where the divider meets the outer top/bottom borders
+        // with T-junction glyphs so the seams read as a single continuous frame.
+        if let Some((down_t, up_t)) = vertical_divider_junctions(t.border_type) {
+            let buf = f.buffer_mut();
+            if let Some(cell) = buf.cell_mut((art_rect.x, area.y)) {
+                cell.set_symbol(down_t).set_style(divider_style);
+            }
+            let bot_y = area.y + area.height.saturating_sub(1);
+            if let Some(cell) = buf.cell_mut((art_rect.x, bot_y)) {
+                cell.set_symbol(up_t).set_style(divider_style);
+            }
+        }
+
         let art_frame = np.paused_frame.unwrap_or(app.anim_frame);
         let art_lines = (skin.art_fn)(true, art_frame);
         let art_color = if np.state == PlaybackState::Playing {
@@ -1566,8 +1609,8 @@ fn draw_now_playing(f: &mut Frame, app: &App, np: &NowPlaying, area: Rect, art_w
         } else {
             t.accent_color()
         };
-        let aw = art_rect.width as usize;
-        let ah = art_rect.height as usize;
+        let aw = art_inner.width as usize;
+        let ah = art_inner.height as usize;
         // Vertically center the art within the available height.
         let v_pad = ah.saturating_sub(art_lines.len()) / 2;
         let mut art_text: Vec<Line> = Vec::with_capacity(ah);
@@ -1584,7 +1627,7 @@ fn draw_now_playing(f: &mut Frame, app: &App, np: &NowPlaying, area: Rect, art_w
                 Style::default().fg(art_color),
             )));
         }
-        f.render_widget(Paragraph::new(art_text), art_rect);
+        f.render_widget(Paragraph::new(art_text), art_inner);
     }
 
     // --- Info (left side) ---
@@ -2224,6 +2267,31 @@ mod tests {
         // single-glyph T-junction; we intentionally fall through to None.
         assert_eq!(junction_chars(BorderType::QuadrantOutside), None);
         assert_eq!(junction_chars(BorderType::QuadrantInside), None);
+    }
+
+    #[test]
+    fn vertical_divider_junctions_matches_expected_glyphs() {
+        use ratatui::widgets::BorderType;
+        assert_eq!(
+            vertical_divider_junctions(BorderType::Plain),
+            Some(("\u{252C}", "\u{2534}"))
+        );
+        assert_eq!(
+            vertical_divider_junctions(BorderType::Rounded),
+            Some(("\u{252C}", "\u{2534}"))
+        );
+        assert_eq!(
+            vertical_divider_junctions(BorderType::Thick),
+            Some(("\u{2533}", "\u{253B}"))
+        );
+        assert_eq!(
+            vertical_divider_junctions(BorderType::Double),
+            Some(("\u{2566}", "\u{2569}"))
+        );
+        assert_eq!(
+            vertical_divider_junctions(BorderType::QuadrantOutside),
+            None
+        );
     }
 
     #[test]

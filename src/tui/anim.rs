@@ -1,34 +1,6 @@
 use ratatui::style::Color;
-use throbber_widgets_tui::symbols::throbber::Set;
-use throbber_widgets_tui::{
-    ASCII, BLACK_CIRCLE, BRAILLE_EIGHT, BRAILLE_ONE, BRAILLE_SIX, BRAILLE_SIX_DOUBLE, OGHAM_A,
-    OGHAM_B, QUADRANT_BLOCK, VERTICAL_BLOCK, WHITE_CIRCLE, WHITE_SQUARE,
-};
 
 use super::theme::AccentAnim;
-
-/// Returns the theme-appropriate spinner set for the given theme index.
-pub fn spinner_set_for_theme(theme_index: usize) -> Set {
-    match theme_index {
-        0 => BRAILLE_EIGHT,      // iTunes 2004 — smooth Apple-era feel
-        1 => BRAILLE_SIX_DOUBLE, // Gruvbox Dark — warm, dense dots
-        2 => BRAILLE_SIX,        // Gruvbox Light — lighter variant
-        3 => OGHAM_A,            // Everforest Dark — organic strokes
-        4 => OGHAM_B,            // Everforest Light — same family, lighter
-        5 => BLACK_CIRCLE,       // Tokyo Night — ◑◒◐◓ moon phases
-        6 => VERTICAL_BLOCK,     // IBM Mainframe — ▁▂▃▄▅▆▇█ block chars
-        7 => VERTICAL_BLOCK,     // Amber CRT — block chars, phosphor feel
-        8 => WHITE_SQUARE,       // Windows 95 — ◳◲◱◰ chunky squares
-        9 => QUADRANT_BLOCK,     // System 7 — ▝▗▖▘ pixel-art era
-        10 => ASCII,             // BIOS — |/-\ classic
-        11 => BRAILLE_ONE,       // Red Sands — minimal desert
-        12 => WHITE_CIRCLE,      // Newport Lights — smooth circles
-        13 => BRAILLE_SIX,       // NeXTSTEP — sober grayscale dots
-        14 => VERTICAL_BLOCK,    // WinAmp Classic — VU-bar vibe
-        15 => BLACK_CIRCLE,      // Zune Original — bold circles
-        _ => BRAILLE_ONE,        // fallback
-    }
-}
 
 // Precomputed sine table for 40 steps over [0, 2*pi].
 // Values mapped to [0.0, 1.0] via (sin(x) + 1) / 2.
@@ -252,28 +224,6 @@ pub struct PlayerSkin {
     pub art_fn: fn(playing: bool, frame: usize) -> Vec<&'static str>,
 }
 
-pub fn player_skin(theme_index: usize) -> &'static PlayerSkin {
-    match theme_index {
-        0 => &SKIN_ITUNES,
-        1 => &SKIN_GRUVBOX_DARK,
-        2 => &SKIN_GRUVBOX_LIGHT,
-        3 => &SKIN_EVERFOREST_DARK,
-        4 => &SKIN_EVERFOREST_LIGHT,
-        5 => &SKIN_TOKYO_NIGHT,
-        6 => &SKIN_IBM,
-        7 => &SKIN_IBM,
-        8 => &SKIN_WIN95,
-        9 => &SKIN_SYSTEM7,
-        10 => &SKIN_BIOS,
-        11 => &SKIN_RED_SANDS,
-        12 => &SKIN_NEWPORT,
-        13 => &SKIN_SYSTEM7,
-        14 => &SKIN_IBM,
-        15 => &SKIN_TOKYO_NIGHT,
-        _ => &SKIN_ITUNES,
-    }
-}
-
 // All art: exactly 5 lines, each exactly 14 chars wide.
 // Consistent width prevents centering jitter.
 
@@ -311,7 +261,7 @@ fn art_itunes(_playing: bool, frame: usize) -> Vec<&'static str> {
         ],
     }
 }
-static SKIN_ITUNES: PlayerSkin = PlayerSkin {
+pub static SKIN_ITUNES: PlayerSkin = PlayerSkin {
     play: "▶",
     pause: "❚❚",
     next: "▷▷",
@@ -355,7 +305,7 @@ fn art_gruvbox_dark(_playing: bool, frame: usize) -> Vec<&'static str> {
         ],
     }
 }
-static SKIN_GRUVBOX_DARK: PlayerSkin = PlayerSkin {
+pub static SKIN_GRUVBOX_DARK: PlayerSkin = PlayerSkin {
     play: "►",
     pause: "▪",
     next: "▸▸",
@@ -369,7 +319,7 @@ static SKIN_GRUVBOX_DARK: PlayerSkin = PlayerSkin {
 fn art_gruvbox_light(_p: bool, f: usize) -> Vec<&'static str> {
     art_gruvbox_dark(_p, f)
 }
-static SKIN_GRUVBOX_LIGHT: PlayerSkin = PlayerSkin {
+pub static SKIN_GRUVBOX_LIGHT: PlayerSkin = PlayerSkin {
     play: "►",
     pause: "■",
     next: "▸▸",
@@ -413,7 +363,7 @@ fn art_everforest_dark(_playing: bool, frame: usize) -> Vec<&'static str> {
         ],
     }
 }
-static SKIN_EVERFOREST_DARK: PlayerSkin = PlayerSkin {
+pub static SKIN_EVERFOREST_DARK: PlayerSkin = PlayerSkin {
     play: "▶",
     pause: "||",
     next: "▷▷",
@@ -427,7 +377,7 @@ static SKIN_EVERFOREST_DARK: PlayerSkin = PlayerSkin {
 fn art_everforest_light(_p: bool, f: usize) -> Vec<&'static str> {
     art_everforest_dark(_p, f)
 }
-static SKIN_EVERFOREST_LIGHT: PlayerSkin = PlayerSkin {
+pub static SKIN_EVERFOREST_LIGHT: PlayerSkin = PlayerSkin {
     play: "▶",
     pause: "||",
     next: "▷▷",
@@ -471,7 +421,7 @@ fn art_tokyo_night(_playing: bool, frame: usize) -> Vec<&'static str> {
         ],
     }
 }
-static SKIN_TOKYO_NIGHT: PlayerSkin = PlayerSkin {
+pub static SKIN_TOKYO_NIGHT: PlayerSkin = PlayerSkin {
     play: "▶",
     pause: "||",
     next: "▷▷",
@@ -515,7 +465,7 @@ fn art_ibm(_playing: bool, frame: usize) -> Vec<&'static str> {
         ],
     }
 }
-static SKIN_IBM: PlayerSkin = PlayerSkin {
+pub static SKIN_IBM: PlayerSkin = PlayerSkin {
     play: "►",
     pause: "[]",
     next: ">>",
@@ -559,7 +509,7 @@ fn art_win95(_playing: bool, frame: usize) -> Vec<&'static str> {
         ],
     }
 }
-static SKIN_WIN95: PlayerSkin = PlayerSkin {
+pub static SKIN_WIN95: PlayerSkin = PlayerSkin {
     play: "|>",
     pause: "||",
     next: ">>|",
@@ -596,7 +546,7 @@ fn art_system7(_playing: bool, frame: usize) -> Vec<&'static str> {
         ],
     }
 }
-static SKIN_SYSTEM7: PlayerSkin = PlayerSkin {
+pub static SKIN_SYSTEM7: PlayerSkin = PlayerSkin {
     play: "▶",
     pause: "■",
     next: "▷▷",
@@ -640,7 +590,7 @@ fn art_bios(_playing: bool, frame: usize) -> Vec<&'static str> {
         ],
     }
 }
-static SKIN_BIOS: PlayerSkin = PlayerSkin {
+pub static SKIN_BIOS: PlayerSkin = PlayerSkin {
     play: "|>",
     pause: "||",
     next: ">>|",
@@ -712,7 +662,7 @@ fn art_red_sands(_playing: bool, frame: usize) -> Vec<&'static str> {
         ],
     }
 }
-static SKIN_RED_SANDS: PlayerSkin = PlayerSkin {
+pub static SKIN_RED_SANDS: PlayerSkin = PlayerSkin {
     play: "▸",
     pause: "◾",
     next: "▸▸",
@@ -784,7 +734,7 @@ fn art_newport(_playing: bool, frame: usize) -> Vec<&'static str> {
         ],
     }
 }
-static SKIN_NEWPORT: PlayerSkin = PlayerSkin {
+pub static SKIN_NEWPORT: PlayerSkin = PlayerSkin {
     play: "▶",
     pause: "||",
     next: "▷▷",
@@ -797,24 +747,6 @@ static SKIN_NEWPORT: PlayerSkin = PlayerSkin {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn spinner_set_for_all_themes() {
-        for i in 0..16 {
-            let set = spinner_set_for_theme(i);
-            assert!(
-                !set.symbols.is_empty(),
-                "Theme {} returned empty spinner set",
-                i
-            );
-        }
-    }
-
-    #[test]
-    fn spinner_set_fallback() {
-        let set = spinner_set_for_theme(999);
-        assert!(!set.symbols.is_empty());
-    }
 
     #[test]
     fn pulse_color_stays_in_range() {
@@ -921,29 +853,15 @@ mod tests {
     }
 
     #[test]
-    fn player_skin_for_all_themes() {
-        for i in 0..16 {
-            let skin = player_skin(i);
-            assert!(!skin.play.is_empty(), "Theme {} has empty play symbol", i);
-            assert!(!skin.pause.is_empty(), "Theme {} has empty pause symbol", i);
-            let art_playing = (skin.art_fn)(true, 0);
-            let art_paused = (skin.art_fn)(false, 0);
-            assert!(!art_playing.is_empty(), "Theme {} has empty playing art", i);
-            assert!(!art_paused.is_empty(), "Theme {} has empty paused art", i);
-        }
-    }
-
-    #[test]
-    fn player_skin_animation_frames() {
-        // Tokyo Night and IBM have animated art — verify they produce different frames
-        let tokyo = player_skin(5);
+    fn skin_animation_frames() {
+        // Verify at least a couple of skins actually animate (produce distinct frames).
+        let tokyo = &SKIN_TOKYO_NIGHT;
         let frames: Vec<_> = (0..20).map(|f| (tokyo.art_fn)(true, f)).collect();
-        // Should have at least 2 distinct frames
         let unique: std::collections::HashSet<String> =
             frames.iter().map(|f| format!("{:?}", f)).collect();
         assert!(unique.len() >= 2, "Tokyo Night should have animated frames");
 
-        let ibm = player_skin(6);
+        let ibm = &SKIN_IBM;
         let frames: Vec<_> = (0..20).map(|f| (ibm.art_fn)(true, f)).collect();
         let unique: std::collections::HashSet<String> =
             frames.iter().map(|f| format!("{:?}", f)).collect();
