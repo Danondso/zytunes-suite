@@ -66,6 +66,7 @@ pub struct StorageInfo {
 /// Events sent from the background worker back to the TUI.
 pub enum BgEvent {
     LibraryLoaded(Result<Box<dyn zytunes::library::MusicLibrary + Send>, String>),
+    LibraryScanProgress(zytunes::dirlib::ScanProgress),
     DeviceDetected(DeviceInfo),
     SessionReady(Option<StorageInfo>),
     SessionFailed(String),
@@ -128,7 +129,13 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
         while let Ok(cmd) = cmd_rx.recv() {
             match cmd {
                 BgCommand::LoadLibrary { music_dir } => {
-                    let result = zytunes::load_library(music_dir.as_deref());
+                    let result = zytunes::resolve_music_dir(music_dir.as_deref()).and_then(|dir| {
+                        let progress_tx = event_tx.clone();
+                        zytunes::dirlib::DirectoryLibrary::scan_with_progress(&dir, |p| {
+                            let _ = progress_tx.send(BgEvent::LibraryScanProgress(p));
+                        })
+                        .map(|l| Box::new(l) as Box<dyn zytunes::library::MusicLibrary + Send>)
+                    });
                     let _ = event_tx.send(BgEvent::LibraryLoaded(result));
                 }
                 BgCommand::Connect => {

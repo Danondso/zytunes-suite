@@ -7,6 +7,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rayon::prelude::*;
 
@@ -16,6 +17,22 @@ use crate::library::{MusicLibrary, Track};
 const AUDIO_EXTENSIONS: &[&str] = &[
     "mp3", "flac", "m4a", "aac", "ogg", "opus", "wma", "wav", "aiff", "alac",
 ];
+
+/// A single metadata sample emitted during a scan, for progress UI.
+#[derive(Clone, Debug)]
+pub struct TrackSample {
+    pub artist: String,
+    pub album: String,
+    pub name: String,
+}
+
+/// Progress update emitted from `scan_with_progress`.
+#[derive(Clone, Debug)]
+pub struct ScanProgress {
+    pub completed: u64,
+    pub total: u64,
+    pub sample: Option<TrackSample>,
+}
 
 /// A music library built by scanning a directory tree.
 pub struct DirectoryLibrary {
@@ -30,13 +47,32 @@ impl DirectoryLibrary {
     /// files have been added or modified since the last run. When the cache is
     /// stale, metadata reads are parallelized with rayon.
     pub fn scan(path: &str) -> Result<Self, String> {
+        Self::scan_with_progress(path, |_| {})
+    }
+
+    /// Same as `scan`, but invokes `on_progress` for each track built.
+    ///
+    /// The callback is called from rayon worker threads (so it must be `Sync`)
+    /// and is invoked once per track, plus once at the start with
+    /// `completed = 0` and `sample = None` to report the total.
+    pub fn scan_with_progress<F>(path: &str, on_progress: F) -> Result<Self, String>
+    where
+        F: Fn(ScanProgress) + Sync,
+    {
         let root = Path::new(path);
         if !root.is_dir() {
             return Err(format!("Not a directory: {path}"));
         }
 
-        // Try cache first.
+        // Try cache first. Cache hits skip the scan entirely; still report
+        // completion so the UI can transition out of the loading screen.
         if let Some(tracks) = crate::cache::load_dirlib_cached(path) {
+            let total = tracks.len() as u64;
+            on_progress(ScanProgress {
+                completed: total,
+                total,
+                sample: None,
+            });
             return Ok(DirectoryLibrary {
                 tracks,
                 root: path.to_string(),
@@ -46,12 +82,30 @@ impl DirectoryLibrary {
         // Collect all audio file paths first (fast directory walk).
         let mut paths = Vec::new();
         collect_audio_paths(root, &mut paths);
-        // Read metadata in parallel using rayon.
+        let total = paths.len() as u64;
+        on_progress(ScanProgress {
+            completed: 0,
+            total,
+            sample: None,
+        });
+
+        let completed = AtomicU64::new(0);
         let tracks: HashMap<u64, Track> = paths
             .par_iter()
             .map(|p| {
                 let id = hash_path(p);
-                (id, build_track(p, id))
+                let track = build_track(p, id);
+                let n = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                on_progress(ScanProgress {
+                    completed: n,
+                    total,
+                    sample: Some(TrackSample {
+                        artist: track.artist.clone(),
+                        album: track.album.clone(),
+                        name: track.name.clone(),
+                    }),
+                });
+                (id, track)
             })
             .collect();
 
@@ -328,6 +382,48 @@ mod tests {
         assert_eq!(lib.track_count(), 2);
         assert_eq!(lib.artists(), vec!["Artist"]);
         assert_eq!(lib.albums(), vec![("Artist", "Album")]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_with_progress_reports_total_and_per_track() {
+        use std::sync::Mutex;
+
+        let dir = std::env::temp_dir().join("zytunes-dirlib-progress");
+        let _ = fs::remove_dir_all(&dir);
+        let album = dir.join("ArtistP").join("AlbumP");
+        fs::create_dir_all(&album).unwrap();
+        fs::write(album.join("01 Alpha.mp3"), b"fake").unwrap();
+        fs::write(album.join("02 Beta.mp3"), b"fake").unwrap();
+        fs::write(album.join("03 Gamma.mp3"), b"fake").unwrap();
+
+        let updates: Mutex<Vec<ScanProgress>> = Mutex::new(Vec::new());
+        let lib = DirectoryLibrary::scan_with_progress(dir.to_str().unwrap(), |p| {
+            updates.lock().unwrap().push(p);
+        })
+        .unwrap();
+        assert_eq!(lib.track_count(), 3);
+
+        let updates = updates.into_inner().unwrap();
+        // First emission is the total announcement with no sample.
+        assert_eq!(updates.first().unwrap().total, 3);
+        assert_eq!(updates.first().unwrap().completed, 0);
+        assert!(updates.first().unwrap().sample.is_none());
+
+        // One per-track update plus the opener = 4.
+        assert_eq!(updates.len(), 4);
+        let with_samples: Vec<_> = updates.iter().filter(|u| u.sample.is_some()).collect();
+        assert_eq!(with_samples.len(), 3);
+        for u in &with_samples {
+            assert_eq!(u.total, 3);
+            let s = u.sample.as_ref().unwrap();
+            assert_eq!(s.artist, "ArtistP");
+            assert_eq!(s.album, "AlbumP");
+        }
+        // Max completed count equals the total.
+        let max_completed = updates.iter().map(|u| u.completed).max().unwrap();
+        assert_eq!(max_completed, 3);
+
         let _ = fs::remove_dir_all(&dir);
     }
 

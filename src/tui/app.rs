@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::mpsc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use image::DynamicImage;
 use throbber_widgets_tui::ThrobberState;
+use zytunes::dirlib::TrackSample;
 use zytunes::library::{MusicLibrary, Track};
 use zytunes::mtp::parse::DeviceEntry;
 
@@ -30,6 +31,78 @@ pub enum SidebarMode {
 pub enum BrowseMode {
     Library,
     Device,
+}
+
+/// Which field of a track sample a loading phrase refers to.
+#[derive(Copy, Clone)]
+enum ScanField {
+    Artist,
+    Album,
+    Track,
+}
+
+struct ScanPhrase {
+    prefix: &'static str,
+    field: ScanField,
+}
+
+/// Fun loading-phrase prefixes, cycled while the library is scanning.
+const SCAN_PHRASES: &[ScanPhrase] = &[
+    ScanPhrase {
+        prefix: "Scoping",
+        field: ScanField::Album,
+    },
+    ScanPhrase {
+        prefix: "Scanning",
+        field: ScanField::Artist,
+    },
+    ScanPhrase {
+        prefix: "Creepin' on",
+        field: ScanField::Artist,
+    },
+    ScanPhrase {
+        prefix: "Puttin' a spell on",
+        field: ScanField::Track,
+    },
+    ScanPhrase {
+        prefix: "Vibing with",
+        field: ScanField::Artist,
+    },
+    ScanPhrase {
+        prefix: "Peeking at",
+        field: ScanField::Album,
+    },
+    ScanPhrase {
+        prefix: "Digging through",
+        field: ScanField::Artist,
+    },
+    ScanPhrase {
+        prefix: "Unpacking",
+        field: ScanField::Album,
+    },
+    ScanPhrase {
+        prefix: "Snooping on",
+        field: ScanField::Track,
+    },
+    ScanPhrase {
+        prefix: "Cataloging",
+        field: ScanField::Artist,
+    },
+    ScanPhrase {
+        prefix: "Tipping hat to",
+        field: ScanField::Track,
+    },
+];
+
+/// Minimum time a scan phrase stays on screen before rotating (milliseconds).
+const SCAN_PHRASE_MS: u128 = 900;
+
+/// Cheap entropy source for picking phrases and samples; quality doesn't matter.
+fn quick_random() -> usize {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as usize)
+        .unwrap_or(0)
 }
 
 #[derive(Clone, Debug)]
@@ -289,6 +362,14 @@ pub struct App {
     pub search_query: String,
     pub toast_message: Option<(String, Instant, bool)>, // (msg, time, is_error)
     pub loading_library: bool,
+    /// (completed, total) track counts emitted by the library scanner.
+    pub scan_progress: Option<(u64, u64)>,
+    /// The current loading-screen message like "Scoping OK Computer".
+    pub scan_phrase: Option<String>,
+    /// When `scan_phrase` was last rotated.
+    scan_phrase_rotated_at: Option<Instant>,
+    /// Rolling buffer of recent track samples used to pick phrase targets.
+    scan_samples: Vec<TrackSample>,
     pub theme: &'static Theme,
     pub show_theme_picker: bool,
     pub theme_picker_index: usize,
@@ -367,6 +448,10 @@ impl App {
             search_query: String::new(),
             toast_message: None,
             loading_library: false,
+            scan_progress: None,
+            scan_phrase: None,
+            scan_phrase_rotated_at: None,
+            scan_samples: Vec::new(),
             theme: &THEMES[0],
             show_theme_picker: false,
             theme_picker_index: 0,
@@ -1334,6 +1419,10 @@ impl App {
         match event {
             BgEvent::LibraryLoaded(result) => {
                 self.loading_library = false;
+                self.scan_progress = None;
+                self.scan_phrase = None;
+                self.scan_phrase_rotated_at = None;
+                self.scan_samples.clear();
                 match result {
                     Ok(lib) => {
                         self.library = Some(lib);
@@ -1344,6 +1433,17 @@ impl App {
                         self.set_toast(format!("Library: {}", e), true);
                     }
                 }
+            }
+            BgEvent::LibraryScanProgress(p) => {
+                self.scan_progress = Some((p.completed, p.total));
+                if let Some(sample) = p.sample {
+                    // Keep a small rolling buffer (~128 most recent).
+                    if self.scan_samples.len() >= 128 {
+                        self.scan_samples.remove(0);
+                    }
+                    self.scan_samples.push(sample);
+                }
+                self.maybe_rotate_scan_phrase();
             }
             BgEvent::DeviceDetected(info) => {
                 self.device.name = Some(info.name);
@@ -1504,6 +1604,28 @@ impl App {
         self.toast_message = Some((msg, Instant::now(), is_error));
     }
 
+    /// Pick a new loading-screen phrase if enough time has passed (or none is set).
+    fn maybe_rotate_scan_phrase(&mut self) {
+        let should_rotate = self
+            .scan_phrase_rotated_at
+            .map(|t| t.elapsed().as_millis() >= SCAN_PHRASE_MS)
+            .unwrap_or(true);
+        if !should_rotate || self.scan_samples.is_empty() {
+            return;
+        }
+
+        let seed = quick_random();
+        let phrase = &SCAN_PHRASES[seed % SCAN_PHRASES.len()];
+        let sample = &self.scan_samples[(seed / 7) % self.scan_samples.len()];
+        let target: &str = match phrase.field {
+            ScanField::Artist => &sample.artist,
+            ScanField::Album => &sample.album,
+            ScanField::Track => &sample.name,
+        };
+        self.scan_phrase = Some(format!("{} {}", phrase.prefix, target));
+        self.scan_phrase_rotated_at = Some(Instant::now());
+    }
+
     pub fn tick(&mut self) {
         self.throbber_state.calc_next();
         self.anim_frame = self.anim_frame.wrapping_add(1);
@@ -1513,6 +1635,12 @@ impl App {
             if time.elapsed().as_secs() >= 5 {
                 self.toast_message = None;
             }
+        }
+
+        // Keep the scan phrase rotating even if no new samples arrive (e.g.
+        // the scan has stalled on a slow file).
+        if self.loading_library {
+            self.maybe_rotate_scan_phrase();
         }
     }
 
@@ -2239,6 +2367,57 @@ mod tests {
         let (msg, _, is_error) = app.toast_message.as_ref().unwrap();
         assert!(is_error);
         assert!(msg.contains("bad path"));
+    }
+
+    #[test]
+    fn scan_progress_event_sets_phrase_and_counts() {
+        use zytunes::dirlib::{ScanProgress, TrackSample};
+        let mut app = App::new();
+        app.loading_library = true;
+
+        app.handle_bg_event(BgEvent::LibraryScanProgress(ScanProgress {
+            completed: 7,
+            total: 42,
+            sample: Some(TrackSample {
+                artist: "Radiohead".into(),
+                album: "OK Computer".into(),
+                name: "Karma Police".into(),
+            }),
+        }));
+
+        assert_eq!(app.scan_progress, Some((7, 42)));
+        let phrase = app.scan_phrase.as_ref().expect("phrase should be set");
+        // The phrase must reference one of the sample fields.
+        assert!(
+            phrase.contains("Radiohead")
+                || phrase.contains("OK Computer")
+                || phrase.contains("Karma Police"),
+            "phrase {phrase:?} did not reference any sample field"
+        );
+    }
+
+    #[test]
+    fn library_loaded_clears_scan_state() {
+        use zytunes::dirlib::{ScanProgress, TrackSample};
+        let mut app = App::new();
+        app.loading_library = true;
+        app.handle_bg_event(BgEvent::LibraryScanProgress(ScanProgress {
+            completed: 1,
+            total: 1,
+            sample: Some(TrackSample {
+                artist: "A".into(),
+                album: "B".into(),
+                name: "C".into(),
+            }),
+        }));
+        assert!(app.scan_phrase.is_some());
+        assert!(app.scan_progress.is_some());
+
+        app.handle_bg_event(BgEvent::LibraryLoaded(Ok(make_minimal_library())));
+
+        assert!(app.scan_phrase.is_none());
+        assert!(app.scan_progress.is_none());
+        assert!(app.scan_samples.is_empty());
     }
 
     #[test]

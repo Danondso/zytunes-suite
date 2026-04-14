@@ -44,25 +44,21 @@ impl fmt::Display for SyncType {
     }
 }
 
-/// Load a music library by scanning a directory.
+/// Resolve the music directory from either `ZYTUNES_MUSIC_DIR` or `music_dir`.
 ///
-/// Tries sources in order:
-/// 1. `ZYTUNES_MUSIC_DIR` environment variable
-/// 2. `music_dir` argument (typically from config.toml)
-///
-/// Returns a boxed trait object so callers are backend-agnostic.
-pub fn load_library(music_dir: Option<&str>) -> Result<Box<dyn MusicLibrary + Send>, String> {
+/// Returns the first path that exists and is a directory. Used by both the CLI
+/// (via `load_library`) and the TUI (which calls `DirectoryLibrary::scan_with_progress`
+/// directly so it can stream progress events).
+pub fn resolve_music_dir(music_dir: Option<&str>) -> Result<String, String> {
     if let Ok(dir) = std::env::var("ZYTUNES_MUSIC_DIR") {
         if Path::new(&dir).is_dir() {
-            return dirlib::DirectoryLibrary::scan(&dir)
-                .map(|l| Box::new(l) as Box<dyn MusicLibrary + Send>);
+            return Ok(dir);
         }
     }
 
     if let Some(dir) = music_dir {
         if Path::new(dir).is_dir() {
-            return dirlib::DirectoryLibrary::scan(dir)
-                .map(|l| Box::new(l) as Box<dyn MusicLibrary + Send>);
+            return Ok(dir.to_string());
         }
     }
 
@@ -71,6 +67,15 @@ pub fn load_library(music_dir: Option<&str>) -> Result<Box<dyn MusicLibrary + Se
          or add music_dir to ~/.config/zytunes/config.toml"
             .into(),
     )
+}
+
+/// Load a music library by scanning a directory.
+///
+/// Tries `ZYTUNES_MUSIC_DIR`, then the `music_dir` argument (typically from
+/// config.toml). Returns a boxed trait object so callers are backend-agnostic.
+pub fn load_library(music_dir: Option<&str>) -> Result<Box<dyn MusicLibrary + Send>, String> {
+    let dir = resolve_music_dir(music_dir)?;
+    dirlib::DirectoryLibrary::scan(&dir).map(|l| Box::new(l) as Box<dyn MusicLibrary + Send>)
 }
 
 /// Formats the Zune 30 natively supports (no transcoding needed).

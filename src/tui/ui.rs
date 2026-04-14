@@ -253,7 +253,17 @@ fn draw_startup(f: &mut Frame, app: &App, area: Rect) {
 
     let revealed = anim::typing_reveal("zytunes", app.anim_frame);
 
-    let lines = vec![
+    // Pick the panel width first so we can truncate the phrase to fit inside.
+    let w = 48u16.min(area.width);
+    let h = 11u16.min(area.height);
+
+    // Status line: the rotating phrase if we have one, otherwise a default.
+    let phrase = app.scan_phrase.as_deref().unwrap_or("Scanning library...");
+    // 2 borders + leading " {symbol} " (3 cells) + trailing ellipsis (3) leaves a budget.
+    let phrase_budget = w.saturating_sub(10) as usize;
+    let phrase_trunc = truncate(phrase, phrase_budget);
+
+    let mut lines = vec![
         Line::from(""),
         Line::from(Span::styled(
             revealed,
@@ -262,9 +272,27 @@ fn draw_startup(f: &mut Frame, app: &App, area: Rect) {
         Line::from(""),
         Line::from(vec![
             Span::styled(format!(" {} ", symbol), Style::default().fg(pulse)),
-            Span::raw("Scanning library..."),
+            Span::raw(phrase_trunc),
         ]),
     ];
+
+    // Progress bar + counter.
+    if let Some((done, total)) = app.scan_progress {
+        if total > 0 {
+            let bar_width = w.saturating_sub(4) as usize; // 2 borders + 2 padding
+            let filled = ((done as f64 / total as f64) * bar_width as f64).round() as usize;
+            let filled = filled.min(bar_width);
+            let bar: String = std::iter::repeat_n('\u{2588}', filled)
+                .chain(std::iter::repeat_n('\u{2591}', bar_width - filled))
+                .collect();
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(bar, Style::default().fg(pulse))));
+            lines.push(Line::from(Span::styled(
+                format!("{} / {}", done, total),
+                t.dim(),
+            )));
+        }
+    }
 
     let block = t
         .block()
@@ -276,9 +304,8 @@ fn draw_startup(f: &mut Frame, app: &App, area: Rect) {
         .block(block)
         .alignment(Alignment::Center);
 
-    // Center the panel: 40 wide, 10 tall
-    let w = 40u16.min(area.width);
-    let h = 10u16.min(area.height);
+    // Center the panel.
+    let h = if app.scan_progress.is_some() { h } else { 10 };
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let centered = Rect::new(x, y, w, h);
