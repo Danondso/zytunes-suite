@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::mpsc;
 use std::time::Instant;
 
@@ -20,14 +20,14 @@ pub enum Panel {
     SyncQueue,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SidebarMode {
     Artists,
     Albums,
     Playlists,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BrowseMode {
     Library,
     Device,
@@ -264,7 +264,7 @@ pub struct App {
     pub sidebar_selected: usize,
     pub sidebar_scroll: usize,
     /// Per-mode saved selection positions: [Artists, Albums, Playlists] x [Library, Device]
-    saved_sidebar_pos: [[usize; 3]; 2],
+    saved_sidebar_pos: HashMap<(BrowseMode, SidebarMode), usize>,
     pub album_list: Vec<AlbumInfo>,
     pub album_selected: usize,
     pub track_list: Vec<TrackInfo>,
@@ -343,7 +343,7 @@ impl App {
             sidebar_items: Vec::new(),
             sidebar_selected: 0,
             sidebar_scroll: 0,
-            saved_sidebar_pos: [[0; 3]; 2],
+            saved_sidebar_pos: HashMap::new(),
             album_list: Vec::new(),
             album_selected: 0,
             track_list: Vec::new(),
@@ -823,33 +823,19 @@ impl App {
         }
     }
 
-    fn sidebar_mode_index(&self) -> usize {
-        match self.sidebar_mode {
-            SidebarMode::Artists => 0,
-            SidebarMode::Albums => 1,
-            SidebarMode::Playlists => 2,
-        }
-    }
-
-    fn browse_mode_index(&self) -> usize {
-        match self.browse_mode {
-            BrowseMode::Library => 0,
-            BrowseMode::Device => 1,
-        }
-    }
-
     /// Save the current sidebar selection for the active mode.
     pub fn save_sidebar_pos(&mut self) {
-        let b = self.browse_mode_index();
-        let m = self.sidebar_mode_index();
-        self.saved_sidebar_pos[b][m] = self.sidebar_selected;
+        self.saved_sidebar_pos
+            .insert((self.browse_mode, self.sidebar_mode), self.sidebar_selected);
     }
 
     /// Restore the saved sidebar selection for the active mode, clamped to list bounds.
     fn restore_sidebar_pos(&mut self) {
-        let b = self.browse_mode_index();
-        let m = self.sidebar_mode_index();
-        let saved = self.saved_sidebar_pos[b][m];
+        let saved = self
+            .saved_sidebar_pos
+            .get(&(self.browse_mode, self.sidebar_mode))
+            .copied()
+            .unwrap_or(0);
         if self.sidebar_items.is_empty() {
             self.sidebar_selected = 0;
         } else {
@@ -1190,56 +1176,25 @@ impl App {
     }
 
     fn sort_tracks(&mut self) {
-        let asc = self.sort_ascending;
+        // `sort_by_cached_key` computes each key once per element, not once per
+        // comparison — so the string columns allocate `n` lowercased Strings
+        // instead of `2·n·log n` worth of them.
         match self.sort_column {
-            SortColumn::Number => self.track_list.sort_by(|a, b| {
-                let cmp = a.track_number.cmp(&b.track_number);
-                if asc {
-                    cmp
-                } else {
-                    cmp.reverse()
-                }
-            }),
-            SortColumn::Name => self.track_list.sort_by(|a, b| {
-                let cmp = a.name.to_lowercase().cmp(&b.name.to_lowercase());
-                if asc {
-                    cmp
-                } else {
-                    cmp.reverse()
-                }
-            }),
-            SortColumn::Artist => self.track_list.sort_by(|a, b| {
-                let cmp = a.artist.to_lowercase().cmp(&b.artist.to_lowercase());
-                if asc {
-                    cmp
-                } else {
-                    cmp.reverse()
-                }
-            }),
-            SortColumn::Album => self.track_list.sort_by(|a, b| {
-                let cmp = a.album.to_lowercase().cmp(&b.album.to_lowercase());
-                if asc {
-                    cmp
-                } else {
-                    cmp.reverse()
-                }
-            }),
-            SortColumn::Duration => self.track_list.sort_by(|a, b| {
-                let cmp = a.duration_ms.cmp(&b.duration_ms);
-                if asc {
-                    cmp
-                } else {
-                    cmp.reverse()
-                }
-            }),
-            SortColumn::Format => self.track_list.sort_by(|a, b| {
-                let cmp = a.kind.cmp(&b.kind);
-                if asc {
-                    cmp
-                } else {
-                    cmp.reverse()
-                }
-            }),
+            SortColumn::Number => self.track_list.sort_by_cached_key(|t| t.track_number),
+            SortColumn::Name => self
+                .track_list
+                .sort_by_cached_key(|t| t.name.to_lowercase()),
+            SortColumn::Artist => self
+                .track_list
+                .sort_by_cached_key(|t| t.artist.to_lowercase()),
+            SortColumn::Album => self
+                .track_list
+                .sort_by_cached_key(|t| t.album.to_lowercase()),
+            SortColumn::Duration => self.track_list.sort_by_cached_key(|t| t.duration_ms),
+            SortColumn::Format => self.track_list.sort_by_cached_key(|t| t.kind.clone()),
+        }
+        if !self.sort_ascending {
+            self.track_list.reverse();
         }
     }
 
