@@ -577,8 +577,9 @@ pub const ZUNE_ORIGINAL: Theme = Theme {
     sidebar_text: Color::Rgb(235, 235, 235),
     selection_bg: Color::Rgb(232, 0, 164),
     selection_text: Color::Rgb(255, 255, 255),
-    main_bg: Color::Rgb(0, 0, 0),
-    alt_row_bg: Color::Rgb(21, 21, 21),
+    // Warm chocolate matching the original Zune 30 brown hardware finish.
+    main_bg: Color::Rgb(92, 51, 23),
+    alt_row_bg: Color::Rgb(77, 43, 19),
     border: Color::Rgb(42, 42, 42),
     footer_bg: Color::Rgb(20, 20, 20),
     footer_text: Color::Rgb(235, 141, 0),
