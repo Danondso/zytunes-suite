@@ -26,7 +26,7 @@ A Rust CLI tool for syncing music to a Microsoft Zune 30 from macOS and Linux.
 - **Interactive TUI** — `zytunes-tui` launches a terminal UI (ratatui) for browsing your music library, connecting to the device, managing a sync queue, and monitoring sync progress. Library parsing runs in the background on startup. TUI displays sync status on the Zune ASCII art screen including loading spinner, track count, syncing spinner, and queue count
 - **Device content browsing** — the TUI can browse tracks on the connected Zune organized by artist/album, toggled with `v`. The device library is indexed from the device's Music directory structure (`Artist/Album/Track`)
 - **Device track removal** — in device view mode, `a`/`A` removes selected tracks, albums, or artists from the device. Progress is shown during removal and the device track list auto-refreshes afterward
-- **Theming** — the TUI includes 11 built-in color themes (iTunes 2004, Gruvbox Dark/Light, Everforest Dark/Light, Miami Nights, IBM Mainframe, Windows 95, System 7, BIOS, Red Sands). Press `t` to open the theme picker. Selected theme is persisted to `~/.config/zytunes/config.toml`
+- **Theming** — the TUI includes 16 built-in color themes (iTunes 2004, Gruvbox Dark/Light, Everforest Dark/Light, Tokyo Night, IBM Mainframe, Amber CRT, Windows 95, System 7, BIOS, Red Sands, Newport Lights, NeXTSTEP, WinAmp Classic, Zune Original). Press `t` to open the theme picker. Selected theme is persisted to `~/.config/zytunes/config.toml`
 - **Native IOKit USB backend** — the `zune-mtp` crate provides direct MTP/MTPZ communication via Apple's IOKit framework, bypassing libusb. This is the sole backend for all device operations, supporting listing, import, removal, track collection, and playlist creation
 
 ## Interactive TUI
@@ -120,9 +120,9 @@ The album detail view shows a ZIP disk ASCII art with album metadata (artist, al
 
 ### Themes
 
-11 built-in themes, selectable with `t`:
+16 built-in themes, selectable with `t`:
 
-iTunes 2004, Gruvbox Dark, Gruvbox Light, Everforest Dark, Everforest Light, Miami Nights, IBM Mainframe, Windows 95, System 7, BIOS, Red Sands
+iTunes 2004, Gruvbox Dark, Gruvbox Light, Everforest Dark, Everforest Light, Tokyo Night, IBM Mainframe, Amber CRT, Windows 95, System 7, BIOS, Red Sands, Newport Lights, NeXTSTEP, WinAmp Classic, Zune Original
 
 Selected theme is persisted to `~/.config/zytunes/config.toml`.
 

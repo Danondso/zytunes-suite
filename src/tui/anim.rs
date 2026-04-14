@@ -15,13 +15,17 @@ pub fn spinner_set_for_theme(theme_index: usize) -> Set {
         2 => BRAILLE_SIX,        // Gruvbox Light — lighter variant
         3 => OGHAM_A,            // Everforest Dark — organic strokes
         4 => OGHAM_B,            // Everforest Light — same family, lighter
-        5 => BLACK_CIRCLE,       // Miami Nights — ◑◒◐◓ moon phases
+        5 => BLACK_CIRCLE,       // Tokyo Night — ◑◒◐◓ moon phases
         6 => VERTICAL_BLOCK,     // IBM Mainframe — ▁▂▃▄▅▆▇█ block chars
-        7 => WHITE_SQUARE,       // Windows 95 — ◳◲◱◰ chunky squares
-        8 => QUADRANT_BLOCK,     // System 7 — ▝▗▖▘ pixel-art era
-        9 => ASCII,              // BIOS — |/-\ classic
-        10 => BRAILLE_ONE,       // Red Sands — minimal desert
-        11 => WHITE_CIRCLE,      // Newport Lights — smooth circles
+        7 => VERTICAL_BLOCK,     // Amber CRT — block chars, phosphor feel
+        8 => WHITE_SQUARE,       // Windows 95 — ◳◲◱◰ chunky squares
+        9 => QUADRANT_BLOCK,     // System 7 — ▝▗▖▘ pixel-art era
+        10 => ASCII,             // BIOS — |/-\ classic
+        11 => BRAILLE_ONE,       // Red Sands — minimal desert
+        12 => WHITE_CIRCLE,      // Newport Lights — smooth circles
+        13 => BRAILLE_SIX,       // NeXTSTEP — sober grayscale dots
+        14 => VERTICAL_BLOCK,    // WinAmp Classic — VU-bar vibe
+        15 => BLACK_CIRCLE,      // Zune Original — bold circles
         _ => BRAILLE_ONE,        // fallback
     }
 }
@@ -255,13 +259,17 @@ pub fn player_skin(theme_index: usize) -> &'static PlayerSkin {
         2 => &SKIN_GRUVBOX_LIGHT,
         3 => &SKIN_EVERFOREST_DARK,
         4 => &SKIN_EVERFOREST_LIGHT,
-        5 => &SKIN_MIAMI,
+        5 => &SKIN_TOKYO_NIGHT,
         6 => &SKIN_IBM,
-        7 => &SKIN_WIN95,
-        8 => &SKIN_SYSTEM7,
-        9 => &SKIN_BIOS,
-        10 => &SKIN_RED_SANDS,
-        11 => &SKIN_NEWPORT,
+        7 => &SKIN_IBM,
+        8 => &SKIN_WIN95,
+        9 => &SKIN_SYSTEM7,
+        10 => &SKIN_BIOS,
+        11 => &SKIN_RED_SANDS,
+        12 => &SKIN_NEWPORT,
+        13 => &SKIN_SYSTEM7,
+        14 => &SKIN_IBM,
+        15 => &SKIN_TOKYO_NIGHT,
         _ => &SKIN_ITUNES,
     }
 }
@@ -429,8 +437,8 @@ static SKIN_EVERFOREST_LIGHT: PlayerSkin = PlayerSkin {
     art_fn: art_everforest_light,
 };
 
-// --- Miami Nights: turntable with tone arm ---
-fn art_miami(_playing: bool, frame: usize) -> Vec<&'static str> {
+// --- Tokyo Night: turntable with tone arm ---
+fn art_tokyo_night(_playing: bool, frame: usize) -> Vec<&'static str> {
     let p = (frame / 3) % 4;
     match p {
         0 => vec![
@@ -463,14 +471,14 @@ fn art_miami(_playing: bool, frame: usize) -> Vec<&'static str> {
         ],
     }
 }
-static SKIN_MIAMI: PlayerSkin = PlayerSkin {
+static SKIN_TOKYO_NIGHT: PlayerSkin = PlayerSkin {
     play: "▶",
     pause: "||",
     next: "▷▷",
     prev: "◁◁",
     bar_filled: '█',
     bar_empty: '░',
-    art_fn: art_miami,
+    art_fn: art_tokyo_night,
 };
 
 // --- IBM Mainframe: cassette reels ---
@@ -792,7 +800,7 @@ mod tests {
 
     #[test]
     fn spinner_set_for_all_themes() {
-        for i in 0..12 {
+        for i in 0..16 {
             let set = spinner_set_for_theme(i);
             assert!(
                 !set.symbols.is_empty(),
@@ -914,7 +922,7 @@ mod tests {
 
     #[test]
     fn player_skin_for_all_themes() {
-        for i in 0..12 {
+        for i in 0..16 {
             let skin = player_skin(i);
             assert!(!skin.play.is_empty(), "Theme {} has empty play symbol", i);
             assert!(!skin.pause.is_empty(), "Theme {} has empty pause symbol", i);
@@ -927,13 +935,13 @@ mod tests {
 
     #[test]
     fn player_skin_animation_frames() {
-        // Miami and IBM have animated art — verify they produce different frames
-        let miami = player_skin(5);
-        let frames: Vec<_> = (0..20).map(|f| (miami.art_fn)(true, f)).collect();
+        // Tokyo Night and IBM have animated art — verify they produce different frames
+        let tokyo = player_skin(5);
+        let frames: Vec<_> = (0..20).map(|f| (tokyo.art_fn)(true, f)).collect();
         // Should have at least 2 distinct frames
         let unique: std::collections::HashSet<String> =
             frames.iter().map(|f| format!("{:?}", f)).collect();
-        assert!(unique.len() >= 2, "Miami should have animated frames");
+        assert!(unique.len() >= 2, "Tokyo Night should have animated frames");
 
         let ibm = player_skin(6);
         let frames: Vec<_> = (0..20).map(|f| (ibm.art_fn)(true, f)).collect();

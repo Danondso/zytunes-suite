@@ -47,5 +47,5 @@
 - **Disable sync until device connected** — `execute_sync()` guards against syncing when no device is present.
 - **Batch import performance** — `TrackCache` in `NativeSession` caches the device library to `~/.zytunes-track-cache-{serial}`, avoiding full reload over USB 1.1.
 - **Proper rm for special characters** — path escaping handled natively in `zune-mtp` session operations.
-- **Theming** — 11 built-in theme presets (iTunes 2004, Gruvbox Dark/Light, Everforest Dark/Light, Miami Nights, IBM Mainframe, Windows 95, System 7, BIOS, Red Sands). Live preview picker (`t` key). Config persisted to `~/.config/zytunes/config.toml`.
+- **Theming** — 16 built-in theme presets (iTunes 2004, Gruvbox Dark/Light, Everforest Dark/Light, Tokyo Night, IBM Mainframe, Amber CRT, Windows 95, System 7, BIOS, Red Sands, Newport Lights, NeXTSTEP, WinAmp Classic, Zune Original). Live preview picker (`t` key). Config persisted to `~/.config/zytunes/config.toml`.
 - **Album art on import** — the Zune 30 rejects embedded art larger than ~200x200px (`InvalidObjectPropValue 0xa803`). Fixed by resizing art to 200x200 JPEG during transcoding.

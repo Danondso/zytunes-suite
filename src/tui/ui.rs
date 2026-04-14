@@ -421,7 +421,7 @@ fn draw_album_browser(f: &mut Frame, app: &App, area: Rect) {
     let border_style = if is_active {
         Style::default().fg(t.selection_bg)
     } else {
-        t.border()
+        Style::default().fg(t.accent_secondary)
     };
     let block = t
         .block()
@@ -1033,15 +1033,30 @@ fn draw_device_info(f: &mut Frame, app: &App, area: Rect) {
         .block()
         .border_style(border_style)
         .title(title)
-        .title_alignment(Alignment::Center);
+        .title_alignment(Alignment::Center)
+        .style(Style::default().bg(t.main_bg));
 
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     match app.device.status {
         DeviceStatus::Disconnected => {
-            let p = Paragraph::new("No device.\nPress 'c' to connect.").style(t.dim());
-            f.render_widget(p, inner);
+            let zune_art = build_zune_art("No Device", "Press [C]");
+            let pulse = anim::animated_accent(
+                t.dim_text,
+                t.accent_secondary,
+                theme::AccentAnim::Pulse,
+                app.anim_frame,
+                60,
+            );
+            let art_lines: Vec<Line> = zune_art
+                .iter()
+                .map(|l| {
+                    Line::from(Span::styled(l.as_str(), Style::default().fg(pulse)))
+                        .alignment(Alignment::Center)
+                })
+                .collect();
+            f.render_widget(Paragraph::new(art_lines), inner);
         }
         DeviceStatus::Detecting | DeviceStatus::Connecting => {
             let conn_frame = app
@@ -1222,7 +1237,11 @@ fn draw_sync_queue(f: &mut Frame, app: &App, area: Rect) {
         SyncStatus::Running { current, total } => {
             let symbol = throbber_symbol(&app.throbber_state, app.theme_index);
             let title = format!(" {} {}/{} ", symbol, current, total);
-            let block = t.block().border_style(border_style).title(title);
+            let block = t
+                .block()
+                .border_style(border_style)
+                .title(title)
+                .style(Style::default().bg(t.main_bg));
             let inner = block.inner(area);
             f.render_widget(block, area);
 
@@ -1321,6 +1340,7 @@ fn draw_sync_log(f: &mut Frame, app: &App, area: Rect) {
     let t = app.theme();
     let block = t
         .block()
+        .border_style(Style::default().fg(t.progress_bar))
         .title(" Log ")
         .style(Style::default().bg(t.main_bg));
     let inner = block.inner(area);
@@ -1593,7 +1613,8 @@ fn draw_now_playing(f: &mut Frame, app: &App, np: &NowPlaying, area: Rect, art_w
 
     // Artist — Album
     f.render_widget(
-        Paragraph::new(format!(" {} — {}", &np.artist, &np.album)).style(t.dim()),
+        Paragraph::new(format!(" {} — {}", &np.artist, &np.album))
+            .style(Style::default().fg(t.header_text)),
         rows[1],
     );
 
@@ -1651,7 +1672,10 @@ fn draw_now_playing(f: &mut Frame, app: &App, np: &NowPlaying, area: Rect, art_w
     let elapsed_str = format_duration(np.elapsed_ms);
     let total_str = format_duration(np.duration_ms);
     let time_line = format!("  {} / {}  </>:scrub  n/p:skip", elapsed_str, total_str);
-    f.render_widget(Paragraph::new(time_line).style(t.dim()), rows[4]);
+    f.render_widget(
+        Paragraph::new(time_line).style(Style::default().fg(t.header_text)),
+        rows[4],
+    );
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect, footer_left_width: u16) {
