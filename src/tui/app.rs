@@ -376,6 +376,8 @@ pub struct App {
     pub theme_before_picker: &'static Theme,
     /// Per-artist device presence for sidebar indicators (Library browse mode).
     pub artist_device_status: BTreeMap<String, DevicePresence>,
+    /// Per-(artist, album) device presence for album-list indicators.
+    pub album_device_status: BTreeMap<(String, String), DevicePresence>,
     /// Cached album art extracted from ID3 tags.
     pub album_art: Option<DynamicImage>,
     /// Key used to avoid re-extracting art (e.g. "artist/album").
@@ -457,6 +459,7 @@ impl App {
             theme_picker_index: 0,
             theme_before_picker: &THEMES[0],
             artist_device_status: BTreeMap::new(),
+            album_device_status: BTreeMap::new(),
             album_art: None,
             album_art_key: String::new(),
             album_art_cache: None,
@@ -751,10 +754,11 @@ impl App {
         }
     }
 
-    /// Compute per-artist device presence (None/Partial/Full) by checking
-    /// every artist track in the library against the device.
+    /// Compute per-artist and per-album device presence (None/Partial/Full)
+    /// by checking every track in the library against the device.
     pub fn rebuild_artist_device_status(&mut self) {
         self.artist_device_status.clear();
+        self.album_device_status.clear();
         let lib = match &self.library {
             Some(l) => l,
             None => return,
@@ -762,24 +766,30 @@ impl App {
         if self.device.status != DeviceStatus::Connected || self.device.track_set.is_empty() {
             return;
         }
-        let mut counts: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+        let mut artist_counts: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+        let mut album_counts: BTreeMap<(String, String), (usize, usize)> = BTreeMap::new();
         for t in lib.all_tracks() {
-            let entry = counts.entry(t.artist.clone()).or_default();
-            entry.1 += 1;
+            let artist_entry = artist_counts.entry(t.artist.clone()).or_default();
+            artist_entry.1 += 1;
+            let album_entry = album_counts
+                .entry((t.artist.clone(), t.album.clone()))
+                .or_default();
+            album_entry.1 += 1;
             if is_on_device(&t.artist, &t.name, &self.device) {
-                entry.0 += 1;
+                artist_entry.0 += 1;
+                album_entry.0 += 1;
             }
         }
-        for (artist, (on_device, total)) in counts {
-            let status = if on_device == 0 {
-                DevicePresence::None
-            } else if on_device >= total {
-                DevicePresence::Full
-            } else {
-                DevicePresence::Partial
-            };
+        for (artist, (on_device, total)) in artist_counts {
+            let status = presence_from_counts(on_device, total);
             if status != DevicePresence::None {
                 self.artist_device_status.insert(artist, status);
+            }
+        }
+        for (key, (on_device, total)) in album_counts {
+            let status = presence_from_counts(on_device, total);
+            if status != DevicePresence::None {
+                self.album_device_status.insert(key, status);
             }
         }
     }
@@ -792,6 +802,7 @@ impl App {
         self.device.artist_track_names.clear();
         self.device.acquired_items = 0;
         self.artist_device_status.clear();
+        self.album_device_status.clear();
         if self.browse_mode == BrowseMode::Device {
             self.browse_mode = BrowseMode::Library;
             self.refresh_sidebar();
@@ -1891,6 +1902,17 @@ fn tracks_to_info(tracks: Vec<&Track>, device: &DeviceState) -> Vec<TrackInfo> {
         .collect()
 }
 
+/// Map a `(matched, total)` track count to a tri-state presence marker.
+fn presence_from_counts(matched: usize, total: usize) -> DevicePresence {
+    if total == 0 || matched == 0 {
+        DevicePresence::None
+    } else if matched >= total {
+        DevicePresence::Full
+    } else {
+        DevicePresence::Partial
+    }
+}
+
 /// Check if a single track is on device using the precomputed sets.
 fn is_on_device(artist: &str, name: &str, device: &DeviceState) -> bool {
     if device.status != DeviceStatus::Connected || device.track_set.is_empty() {
@@ -2784,6 +2806,144 @@ mod tests {
         assert!(
             is_on_device("*NSYNC", "Bye Bye Bye", &device),
             "*NSYNC should match NSYNC on device"
+        );
+    }
+
+    #[test]
+    fn rebuild_device_status_tags_artists_and_albums() {
+        struct MockLib {
+            tracks: Vec<zytunes::library::Track>,
+        }
+        impl zytunes::library::MusicLibrary for MockLib {
+            fn artists(&self) -> Vec<&str> {
+                Vec::new()
+            }
+            fn albums(&self) -> Vec<(&str, &str)> {
+                Vec::new()
+            }
+            fn artist_tracks(&self, _: &str) -> Vec<&zytunes::library::Track> {
+                Vec::new()
+            }
+            fn album_tracks(&self, _: &str) -> Vec<&zytunes::library::Track> {
+                Vec::new()
+            }
+            fn album_tracks_by_artist(&self, _: &str, _: &str) -> Vec<&zytunes::library::Track> {
+                Vec::new()
+            }
+            fn tracks_by_name(&self, _: &str) -> Vec<&zytunes::library::Track> {
+                Vec::new()
+            }
+            fn track_count(&self) -> usize {
+                self.tracks.len()
+            }
+            fn all_tracks(&self) -> Vec<&zytunes::library::Track> {
+                self.tracks.iter().collect()
+            }
+            fn music_folder(&self) -> Option<&str> {
+                None
+            }
+        }
+
+        fn track(id: u64, artist: &str, album: &str, name: &str) -> zytunes::library::Track {
+            zytunes::library::Track {
+                id,
+                name: name.into(),
+                artist: artist.into(),
+                album: album.into(),
+                album_artist: None,
+                genre: None,
+                year: None,
+                track_number: None,
+                disc_number: None,
+                total_time_ms: None,
+                location: None,
+                kind: None,
+            }
+        }
+
+        // Library: Radiohead has two albums, Bjork one; only one Radiohead
+        // album is fully on device, the other is partial, Bjork's is absent.
+        let lib = MockLib {
+            tracks: vec![
+                track(1, "Radiohead", "OK Computer", "Airbag"),
+                track(2, "Radiohead", "OK Computer", "Karma Police"),
+                track(3, "Radiohead", "Kid A", "Idioteque"),
+                track(4, "Radiohead", "Kid A", "The National Anthem"),
+                track(5, "Bjork", "Post", "Army of Me"),
+            ],
+        };
+
+        let mut app = App::new();
+        app.library = Some(Box::new(lib));
+        app.device.status = DeviceStatus::Connected;
+        // Put both OK Computer tracks + one Kid A track on device.
+        app.device.album_tracks.insert(
+            ("Radiohead".into(), "OK Computer".into()),
+            vec![
+                DeviceTrackInfo {
+                    name: "Airbag".into(),
+                    device_path: "/Music/Radiohead/OK Computer/Airbag.mp3".into(),
+                    size: 1,
+                    object_id: 1,
+                    artist: "Radiohead".into(),
+                    album: "OK Computer".into(),
+                    track_number: None,
+                    disc_number: None,
+                },
+                DeviceTrackInfo {
+                    name: "Karma Police".into(),
+                    device_path: "/Music/Radiohead/OK Computer/Karma Police.mp3".into(),
+                    size: 1,
+                    object_id: 2,
+                    artist: "Radiohead".into(),
+                    album: "OK Computer".into(),
+                    track_number: None,
+                    disc_number: None,
+                },
+            ],
+        );
+        app.device.album_tracks.insert(
+            ("Radiohead".into(), "Kid A".into()),
+            vec![DeviceTrackInfo {
+                name: "Idioteque".into(),
+                device_path: "/Music/Radiohead/Kid A/Idioteque.mp3".into(),
+                size: 1,
+                object_id: 3,
+                artist: "Radiohead".into(),
+                album: "Kid A".into(),
+                track_number: None,
+                disc_number: None,
+            }],
+        );
+        build_match_sets(&mut app.device);
+
+        app.rebuild_artist_device_status();
+
+        assert_eq!(
+            app.artist_device_status.get("Radiohead"),
+            Some(&DevicePresence::Partial),
+            "Radiohead should be Partial (3 of 4 on device)",
+        );
+        assert!(
+            !app.artist_device_status.contains_key("Bjork"),
+            "Bjork should have no entry (nothing on device)",
+        );
+        assert_eq!(
+            app.album_device_status
+                .get(&("Radiohead".into(), "OK Computer".into())),
+            Some(&DevicePresence::Full),
+            "OK Computer should be Full",
+        );
+        assert_eq!(
+            app.album_device_status
+                .get(&("Radiohead".into(), "Kid A".into())),
+            Some(&DevicePresence::Partial),
+            "Kid A should be Partial",
+        );
+        assert!(
+            !app.album_device_status
+                .contains_key(&("Bjork".into(), "Post".into())),
+            "Post should not be tracked (nothing on device)",
         );
     }
 

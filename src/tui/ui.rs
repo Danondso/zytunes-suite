@@ -376,10 +376,11 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
         app.sidebar_items.len(),
     );
 
-    // Show device presence indicators in Library Artists mode.
+    // Show device presence indicators in Library browse mode for both
+    // Artists (keyed by artist name) and Albums (keyed by "artist — album").
     let show_device_status = app.browse_mode == BrowseMode::Library
-        && app.sidebar_mode == SidebarMode::Artists
-        && !app.artist_device_status.is_empty();
+        && (matches!(app.sidebar_mode, SidebarMode::Artists | SidebarMode::Albums))
+        && (!app.artist_device_status.is_empty() || !app.album_device_status.is_empty());
 
     let items: Vec<ListItem> = app
         .sidebar_items
@@ -399,7 +400,18 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
                 "  "
             };
             let (icon, icon_style) = if show_device_status {
-                match app.artist_device_status.get(name) {
+                let presence = match app.sidebar_mode {
+                    SidebarMode::Artists => app.artist_device_status.get(name).copied(),
+                    SidebarMode::Albums => {
+                        // Sidebar entries are "Artist — Album" (em dash).
+                        name.split_once(" \u{2014} ").and_then(|(artist, album)| {
+                            app.album_device_status
+                                .get(&(artist.to_string(), album.to_string()))
+                                .copied()
+                        })
+                    }
+                };
+                match presence {
                     Some(DevicePresence::Full) => ("✓ ", style.fg(t.selection_bg)),
                     Some(DevicePresence::Partial) => ("◐ ", style.fg(t.selection_bg)),
                     _ => ("  ", style),
@@ -482,8 +494,17 @@ fn draw_album_browser(f: &mut Frame, app: &App, area: Rect) {
         let is_selected = i == app.album_selected;
         let prefix = if is_selected { "> " } else { "  " };
         let prefix_w = disp_width(prefix);
+        let icon = match app
+            .album_device_status
+            .get(&(album.artist.clone(), album.name.clone()))
+        {
+            Some(DevicePresence::Full) => "✓ ",
+            Some(DevicePresence::Partial) => "◐ ",
+            _ => "",
+        };
+        let icon_w = disp_width(icon);
         let inner_w = inner.width as usize;
-        let max_name = inner_w.saturating_sub(prefix_w);
+        let max_name = inner_w.saturating_sub(prefix_w + icon_w);
         let display_name = if is_selected && disp_width(&album.name) > max_name && max_name > 0 {
             marquee(&album.name, max_name, app.anim_frame)
         } else {
@@ -493,7 +514,7 @@ fn draw_album_browser(f: &mut Frame, app: &App, area: Rect) {
         // cells than char count, and relying on ratatui to extend the row
         // background leaves gaps on some terminals — explicit trailing
         // spaces guarantee the selection highlight reaches the right border.
-        let mut label = format!("{}{}", prefix, display_name);
+        let mut label = format!("{}{}{}", prefix, icon, display_name);
         let rendered = disp_width(&label);
         if rendered < inner_w {
             label.push_str(&" ".repeat(inner_w - rendered));
