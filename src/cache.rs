@@ -3,7 +3,9 @@
 //! Caches parsed track data to `~/.cache/zytunes/` so repeat launches skip
 //! expensive directory scanning with lofty.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -101,10 +103,18 @@ fn save_cache(name: &str, cached: &CachedLibrary) {
     }
 }
 
+/// Cache filename keyed by a hash of the source path so multiple scan roots
+/// (and tests) don't clobber each other's caches.
+fn dirlib_cache_name(dir_path: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    dir_path.hash(&mut hasher);
+    format!("dirlib-library-{:016x}.json", hasher.finish())
+}
+
 /// Try to load a directory library from cache. Returns None if cache is stale/missing.
 pub fn load_dirlib_cached(dir_path: &str) -> Option<HashMap<u64, Track>> {
     let fp = dir_fingerprint(dir_path)?;
-    let cached = load_cache("dirlib-library.json")?;
+    let cached = load_cache(&dirlib_cache_name(dir_path))?;
     if cached.fingerprint == fp {
         Some(cached.tracks)
     } else {
@@ -116,11 +126,33 @@ pub fn load_dirlib_cached(dir_path: &str) -> Option<HashMap<u64, Track>> {
 pub fn save_dirlib_cache(dir_path: &str, tracks: &HashMap<u64, Track>) {
     if let Some(fp) = dir_fingerprint(dir_path) {
         save_cache(
-            "dirlib-library.json",
+            &dirlib_cache_name(dir_path),
             &CachedLibrary {
                 fingerprint: fp,
                 tracks: tracks.clone(),
             },
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dirlib_cache_name_is_per_path() {
+        let a = dirlib_cache_name("/Users/me/Music");
+        let b = dirlib_cache_name("/tmp/zytunes-test-scan");
+        assert_ne!(
+            a, b,
+            "distinct source paths should produce distinct cache filenames"
+        );
+        assert_eq!(
+            dirlib_cache_name("/Users/me/Music"),
+            a,
+            "same source path should produce the same cache filename"
+        );
+        assert!(a.starts_with("dirlib-library-"));
+        assert!(a.ends_with(".json"));
     }
 }
