@@ -253,52 +253,49 @@ fn draw_startup(f: &mut Frame, app: &App, area: Rect) {
 
     let revealed = anim::typing_reveal("zytunes", app.anim_frame);
 
-    // Pick the panel width first so we can truncate the phrase to fit inside.
+    // Pick the panel width first so we can size the phrase/bar/counter.
     let w = 48u16.min(area.width);
     let h = 11u16.min(area.height);
 
-    // Status line: the rotating phrase if we have one, otherwise a default.
+    // Inner content width (panel minus borders).
+    let inner_w = w.saturating_sub(2) as usize;
+    // Fixed-width display slot so shorter/longer phrases all take the same
+    // number of columns; otherwise a centered line jumps as phrases rotate.
+    // Reserve ` {symbol} ` (3 cells) before the phrase.
+    let phrase_slot = inner_w.saturating_sub(3);
     let phrase = app.scan_phrase.as_deref().unwrap_or("Scanning library...");
-    // 2 borders + leading " {symbol} " (3 cells) + trailing ellipsis (3) leaves a budget.
-    let phrase_budget = w.saturating_sub(10) as usize;
-    let phrase_trunc = truncate(phrase, phrase_budget);
+    let phrase_trunc = truncate(phrase, phrase_slot);
+    let phrase_padded = pad_right_to_width(&phrase_trunc, phrase_slot);
 
-    // The header stays centered; dynamic lines are left-aligned so their
-    // leading throbber/text don't shift around as the phrase length changes.
     let mut lines = vec![
         Line::from(""),
         Line::from(Span::styled(
             revealed,
             Style::default().add_modifier(Modifier::BOLD),
-        ))
-        .alignment(Alignment::Center),
+        )),
         Line::from(""),
         Line::from(vec![
             Span::styled(format!(" {} ", symbol), Style::default().fg(pulse)),
-            Span::raw(phrase_trunc),
-        ])
-        .alignment(Alignment::Left),
+            Span::raw(phrase_padded),
+        ]),
     ];
 
-    // Progress bar + counter.
+    // Progress bar + counter, both fixed-width so centering stays stable.
     if let Some((done, total)) = app.scan_progress {
         if total > 0 {
-            let bar_width = w.saturating_sub(4) as usize; // 2 borders + 2 padding
+            let bar_width = inner_w.saturating_sub(2); // 1 cell padding each side
             let filled = ((done as f64 / total as f64) * bar_width as f64).round() as usize;
             let filled = filled.min(bar_width);
             let bar: String = std::iter::repeat_n('\u{2588}', filled)
                 .chain(std::iter::repeat_n('\u{2591}', bar_width - filled))
                 .collect();
-            // Right-pad the counter to the same width as the largest number so
-            // it doesn't visibly grow digit-by-digit as scanning progresses.
+            // Zero-pad the completed count so digits don't grow the string
+            // while scanning (e.g. "     1 / 60000" → "  1234 / 60000").
             let total_digits = total.to_string().len();
-            let counter = format!(" {done:>total_digits$} / {total}");
+            let counter = format!("{done:>total_digits$} / {total}");
             lines.push(Line::from(""));
-            lines.push(
-                Line::from(Span::styled(bar, Style::default().fg(pulse)))
-                    .alignment(Alignment::Left),
-            );
-            lines.push(Line::from(Span::styled(counter, t.dim())).alignment(Alignment::Left));
+            lines.push(Line::from(Span::styled(bar, Style::default().fg(pulse))));
+            lines.push(Line::from(Span::styled(counter, t.dim())));
         }
     }
 
@@ -308,10 +305,10 @@ fn draw_startup(f: &mut Frame, app: &App, area: Rect) {
         .title(" Starting ")
         .title_alignment(Alignment::Center);
 
-    // Paragraph's default alignment is Left; per-line alignment above overrides.
+    // All dynamic content is now fixed-width per frame, so centering is stable.
     let paragraph = Paragraph::new(lines)
         .block(block)
-        .alignment(Alignment::Left);
+        .alignment(Alignment::Center);
 
     // Center the panel.
     let h = if app.scan_progress.is_some() { h } else { 10 };
@@ -2159,6 +2156,22 @@ fn truncate(s: &str, max: usize) -> String {
         used += w;
     }
     out.push_str(suffix);
+    out
+}
+
+/// Right-pad `s` with spaces so its rendered display width is exactly `width`.
+/// If `s` is already wider than `width`, returns it unchanged (the caller is
+/// expected to have truncated first).
+fn pad_right_to_width(s: &str, width: usize) -> String {
+    let cur = disp_width(s);
+    if cur >= width {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + (width - cur));
+    out.push_str(s);
+    for _ in 0..(width - cur) {
+        out.push(' ');
+    }
     out
 }
 
