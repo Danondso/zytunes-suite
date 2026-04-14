@@ -79,9 +79,8 @@ impl DirectoryLibrary {
             });
         }
 
-        // Collect all audio file paths first (fast directory walk).
-        let mut paths = Vec::new();
-        collect_audio_paths(root, &mut paths);
+        // Collect all audio file paths first (parallel directory walk).
+        let paths = collect_audio_paths(root);
         let total = paths.len() as u64;
         on_progress(ScanProgress {
             completed: 0,
@@ -119,19 +118,28 @@ impl DirectoryLibrary {
     }
 }
 
-fn collect_audio_paths(dir: &Path, out: &mut Vec<PathBuf>) {
+/// Recursively collect audio file paths, walking each subdirectory in parallel.
+///
+/// For large libraries the serial `read_dir` walk alone can take several seconds;
+/// rayon's recursive parallelism turns it into a few hundred milliseconds on SSD.
+fn collect_audio_paths(dir: &Path) -> Vec<PathBuf> {
     let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
+        Ok(e) => e.flatten().collect::<Vec<_>>(),
+        Err(_) => return Vec::new(),
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_audio_paths(&path, out);
-        } else if is_audio_file(&path) {
-            out.push(path);
-        }
-    }
+    entries
+        .par_iter()
+        .flat_map(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_audio_paths(&path)
+            } else if is_audio_file(&path) {
+                vec![path]
+            } else {
+                Vec::new()
+            }
+        })
+        .collect()
 }
 
 fn is_audio_file(path: &Path) -> bool {
@@ -157,11 +165,22 @@ fn build_track(path: &Path, id: u64) -> Track {
 }
 
 /// Read metadata from any audio file using lofty.
+///
+/// We disable `read_properties` — for MP3 VBR files lofty otherwise has to
+/// sample frames across the whole file to compute duration, which dominates
+/// scan time on large libraries. Duration is set to `None` and can be filled
+/// in later (the audio decoder reports the real duration for the currently
+/// playing track).
 fn track_from_lofty(path: &Path, id: u64) -> Option<Track> {
-    use lofty::file::{AudioFile, TaggedFileExt};
+    use lofty::config::ParseOptions;
+    use lofty::file::TaggedFileExt;
     use lofty::tag::Accessor;
 
-    let tagged = lofty::probe::read_from_path(path).ok()?;
+    let tagged = lofty::probe::Probe::open(path)
+        .ok()?
+        .options(ParseOptions::new().read_properties(false))
+        .read()
+        .ok()?;
     let tag = tagged.primary_tag().or_else(|| tagged.first_tag())?;
 
     // Require at least a title or artist to consider the tag useful
@@ -193,14 +212,8 @@ fn track_from_lofty(path: &Path, id: u64) -> Option<Track> {
         year: tag.year(),
         track_number: tag.track(),
         disc_number: tag.disk(),
-        total_time_ms: {
-            let dur = tagged.properties().duration();
-            if dur.is_zero() {
-                None
-            } else {
-                Some(dur.as_millis() as u64)
-            }
-        },
+        // Duration is skipped during the scan — see the doc comment above.
+        total_time_ms: None,
         location: Some(path.to_string_lossy().to_string()),
         kind: Some(format!(
             "{} audio file",

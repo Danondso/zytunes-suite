@@ -263,17 +263,21 @@ fn draw_startup(f: &mut Frame, app: &App, area: Rect) {
     let phrase_budget = w.saturating_sub(10) as usize;
     let phrase_trunc = truncate(phrase, phrase_budget);
 
+    // The header stays centered; dynamic lines are left-aligned so their
+    // leading throbber/text don't shift around as the phrase length changes.
     let mut lines = vec![
         Line::from(""),
         Line::from(Span::styled(
             revealed,
             Style::default().add_modifier(Modifier::BOLD),
-        )),
+        ))
+        .alignment(Alignment::Center),
         Line::from(""),
         Line::from(vec![
             Span::styled(format!(" {} ", symbol), Style::default().fg(pulse)),
             Span::raw(phrase_trunc),
-        ]),
+        ])
+        .alignment(Alignment::Left),
     ];
 
     // Progress bar + counter.
@@ -285,12 +289,16 @@ fn draw_startup(f: &mut Frame, app: &App, area: Rect) {
             let bar: String = std::iter::repeat_n('\u{2588}', filled)
                 .chain(std::iter::repeat_n('\u{2591}', bar_width - filled))
                 .collect();
+            // Right-pad the counter to the same width as the largest number so
+            // it doesn't visibly grow digit-by-digit as scanning progresses.
+            let total_digits = total.to_string().len();
+            let counter = format!(" {done:>total_digits$} / {total}");
             lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(bar, Style::default().fg(pulse))));
-            lines.push(Line::from(Span::styled(
-                format!("{} / {}", done, total),
-                t.dim(),
-            )));
+            lines.push(
+                Line::from(Span::styled(bar, Style::default().fg(pulse)))
+                    .alignment(Alignment::Left),
+            );
+            lines.push(Line::from(Span::styled(counter, t.dim())).alignment(Alignment::Left));
         }
     }
 
@@ -300,9 +308,10 @@ fn draw_startup(f: &mut Frame, app: &App, area: Rect) {
         .title(" Starting ")
         .title_alignment(Alignment::Center);
 
+    // Paragraph's default alignment is Left; per-line alignment above overrides.
     let paragraph = Paragraph::new(lines)
         .block(block)
-        .alignment(Alignment::Center);
+        .alignment(Alignment::Left);
 
     // Center the panel.
     let h = if app.scan_progress.is_some() { h } else { 10 };
