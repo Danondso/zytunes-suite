@@ -54,3 +54,30 @@ Delete or actually use. Each one is parsing + memory cost per track.
   and store alongside the display string.
 - Or a custom `contains_ignore_case` that walks without allocating (awkward
   for non-ASCII, so the pre-compute is likely cleaner).
+
+## UX follow-ups
+
+### Adding to a running sync queue clobbers it
+Currently, pressing `a` to add more tracks while a sync is already executing
+clears the visible queue panel even though the sync keeps running in the
+background. Expected behavior: append the new items to the existing queue so
+they get picked up after the current batch (or at least stay visible and
+queued). Verify against both `a` (single track) and `A` (add all visible).
+
+### TUI contrast audit
+- Zune Original theme: the brown `main_bg` makes the existing border color
+  nearly unreadable. Pick a lighter tint or switch to an accent-coloured
+  border for that theme.
+- Active-panel highlighting in general is hard to see — the current
+  `selection_bg` border tint doesn't stand out enough from the inactive
+  border color on several themes. Consider a thicker border, brighter
+  accent, or inverting the title bar for the active panel.
+- Sweep every theme for contrast issues once the scheme changes: sidebar
+  text on sidebar_bg, alt_row on main_bg, dim_text on main_bg, and the
+  active-vs-inactive border pair.
+
+### Newport Lights spinner skips a frame
+The throbber in the Newport Lights theme doesn't advance smoothly — it
+looks like the spinner set is missing a frame or the frames don't cycle
+cleanly. Check `src/tui/theme.rs` for the Newport spinner set and compare
+frame count / symbols against a theme that spins smoothly.
