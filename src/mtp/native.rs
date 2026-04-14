@@ -347,13 +347,26 @@ impl NativeSession {
 
     /// Query the number of items the device acquired on its own
     /// (podcast downloads, Zune-to-Zune sharing).
-    pub fn get_acquired_items_count(&mut self) -> Result<u32, String> {
-        self.session.get_acquired_items_count().mtp_err()
+    ///
+    /// Returns `Ok(None)` when the device reports the vendor op as unsupported
+    /// (older firmware). Callers should treat that as "feature unavailable"
+    /// rather than a hard error.
+    pub fn get_acquired_items_count(&mut self) -> Result<Option<u32>, String> {
+        match self.session.get_acquired_items_count() {
+            Ok(count) => Ok(Some(count)),
+            Err(e) if e.is_operation_not_supported() => Ok(None),
+            Err(e) => Err(e.to_string()),
+        }
     }
 
-    /// Query device sync progress (vendor op 0x922f). Returns raw payload bytes.
-    pub fn get_sync_progress(&mut self) -> Result<Vec<u8>, String> {
-        self.session.get_sync_progress().mtp_err()
+    /// Query device sync progress (vendor op 0x922f). Returns raw payload bytes,
+    /// or `Ok(None)` if the device doesn't support the query.
+    pub fn get_sync_progress(&mut self) -> Result<Option<Vec<u8>>, String> {
+        match self.session.get_sync_progress() {
+            Ok(raw) => Ok(Some(raw)),
+            Err(e) if e.is_operation_not_supported() => Ok(None),
+            Err(e) => Err(e.to_string()),
+        }
     }
 
     /// Open a native MTP session to the Zune.
@@ -542,8 +555,18 @@ impl NativeSession {
 
     /// Try to load the device library via the ZMDB vendor operation.
     /// Returns DeviceEntry values with synthesized paths matching the device filesystem.
+    ///
+    /// Treats `OperationNotSupported (0x2005)` from the device as a concise
+    /// "unsupported" error rather than a raw protocol message, so the caller
+    /// can log a clean fallback line instead of a scary stack trace.
     fn try_zmdb(&mut self) -> Result<Vec<DeviceEntry>, String> {
-        let raw = self.session.get_zmdb(1).mtp_err()?;
+        let raw = self.session.get_zmdb(1).map_err(|e| {
+            if e.is_operation_not_supported() {
+                "device does not support ZMDB bulk query".to_string()
+            } else {
+                e.to_string()
+            }
+        })?;
         let zmdb = crate::mtp::zmdb::Zmdb::parse(&raw)?;
         self.log_msg(&format!("ZMDB: {}", zmdb.summary()));
         self.zmdb_video_cache = Some(zmdb.to_video_entries());

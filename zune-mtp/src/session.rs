@@ -85,10 +85,10 @@ impl MtpSession {
         let hdr = ContainerHeader::parse(&data)
             .ok_or(MtpError::Protocol("Bad data response".to_string()))?;
         if !hdr.is_data() {
-            return Err(MtpError::Protocol(format!(
-                "Expected data container, got type={} code=0x{:04x}",
-                hdr.container_type, hdr.code
-            )));
+            // The device skipped the data phase and went straight to a
+            // response container — this is how it signals "operation not
+            // supported" (0x2005) and similar rejections for vendor ops.
+            return Err(MtpError::DeviceRejected(hdr.code));
         }
         let payload = data[CONTAINER_HEADER_SIZE..].to_vec();
 

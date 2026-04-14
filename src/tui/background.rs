@@ -221,9 +221,12 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                 if detected.family == DeviceFamily::Zune {
                                     // Query acquired items (podcasts, Zune-to-Zune shares).
                                     match s.get_acquired_items_count() {
-                                        Ok(count) => {
+                                        Ok(Some(count)) => {
                                             let _ =
                                                 event_tx.send(BgEvent::AcquiredItemsCount(count));
+                                        }
+                                        Ok(None) => {
+                                            // Firmware doesn't support the query; silently skip.
                                         }
                                         Err(e) => {
                                             let _ = event_tx.send(BgEvent::SyncMessage(format!(
@@ -235,7 +238,8 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
 
                                     // Query sync progress (vendor op 0x922f).
                                     let sync_status = match s.get_sync_progress() {
-                                        Ok(raw) => Some(parse_sync_progress(&raw)),
+                                        Ok(Some(raw)) => Some(parse_sync_progress(&raw)),
+                                        Ok(None) => None,
                                         Err(e) => {
                                             let _ = event_tx.send(BgEvent::SyncMessage(format!(
                                                 "Sync progress query failed: {}",
