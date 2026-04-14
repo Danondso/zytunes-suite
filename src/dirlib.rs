@@ -64,22 +64,11 @@ impl DirectoryLibrary {
             return Err(format!("Not a directory: {path}"));
         }
 
-        // Try cache first. Cache hits skip the scan entirely; still report
-        // completion so the UI can transition out of the loading screen.
-        if let Some(tracks) = crate::cache::load_dirlib_cached(path) {
-            let total = tracks.len() as u64;
-            on_progress(ScanProgress {
-                completed: total,
-                total,
-                sample: None,
-            });
-            return Ok(DirectoryLibrary {
-                tracks,
-                root: path.to_string(),
-            });
-        }
+        // Load the previous per-file cache. Missing / unreadable = empty map,
+        // so first launches just fall through to a full parse.
+        let cached = crate::cache::load_dirlib_cache(path);
 
-        // Collect all audio file paths first (parallel directory walk).
+        // Parallel directory walk.
         let paths = collect_audio_paths(root);
         let total = paths.len() as u64;
         on_progress(ScanProgress {
@@ -88,12 +77,22 @@ impl DirectoryLibrary {
             sample: None,
         });
 
+        // For each file: stat → fingerprint → reuse cached Track if the
+        // fingerprint matches, otherwise run lofty to parse tags + duration.
+        // Stats are cheap; lofty is the expensive step, so the cache makes
+        // repeat launches nearly instant even with `read_properties` on.
         let completed = AtomicU64::new(0);
-        let tracks: HashMap<u64, Track> = paths
+        let entries: Vec<(String, crate::cache::CachedFile)> = paths
             .par_iter()
-            .map(|p| {
-                let id = hash_path(p);
-                let track = build_track(p, id);
+            .filter_map(|p| {
+                let key = p.to_string_lossy().to_string();
+                let fingerprint = crate::cache::FileFingerprint::from_path(p)?;
+
+                let track = match cached.get(&key) {
+                    Some(entry) if entry.fingerprint == fingerprint => entry.track.clone(),
+                    _ => build_track(p, hash_path(p)),
+                };
+
                 let n = completed.fetch_add(1, Ordering::Relaxed) + 1;
                 on_progress(ScanProgress {
                     completed: n,
@@ -104,12 +103,20 @@ impl DirectoryLibrary {
                         name: track.name.clone(),
                     }),
                 });
-                (id, track)
+
+                Some((key, crate::cache::CachedFile { fingerprint, track }))
             })
             .collect();
 
-        // Save to cache for next startup.
-        crate::cache::save_dirlib_cache(path, &tracks);
+        let tracks: HashMap<u64, Track> = entries
+            .iter()
+            .map(|(_, cf)| (cf.track.id, cf.track.clone()))
+            .collect();
+
+        // Persist the fresh cache — implicitly drops entries for files that
+        // disappeared from the tree since the last scan.
+        let new_cache: HashMap<String, crate::cache::CachedFile> = entries.into_iter().collect();
+        crate::cache::save_dirlib_cache(path, new_cache);
 
         Ok(DirectoryLibrary {
             tracks,
@@ -164,23 +171,16 @@ fn build_track(path: &Path, id: u64) -> Track {
     track_from_path(path, id)
 }
 
-/// Read metadata from any audio file using lofty.
+/// Read metadata (tags + duration) from any audio file using lofty.
 ///
-/// We disable `read_properties` — for MP3 VBR files lofty otherwise has to
-/// sample frames across the whole file to compute duration, which dominates
-/// scan time on large libraries. Duration is set to `None` and can be filled
-/// in later (the audio decoder reports the real duration for the currently
-/// playing track).
+/// Reading properties is slow for MP3 VBR files because lofty has to sample
+/// frames across the whole file to compute duration, but the per-file cache
+/// makes sure we only pay that cost once per file per change.
 fn track_from_lofty(path: &Path, id: u64) -> Option<Track> {
-    use lofty::config::ParseOptions;
-    use lofty::file::TaggedFileExt;
+    use lofty::file::{AudioFile, TaggedFileExt};
     use lofty::tag::Accessor;
 
-    let tagged = lofty::probe::Probe::open(path)
-        .ok()?
-        .options(ParseOptions::new().read_properties(false))
-        .read()
-        .ok()?;
+    let tagged = lofty::probe::read_from_path(path).ok()?;
     let tag = tagged.primary_tag().or_else(|| tagged.first_tag())?;
 
     // Require at least a title or artist to consider the tag useful
@@ -212,8 +212,14 @@ fn track_from_lofty(path: &Path, id: u64) -> Option<Track> {
         year: tag.year(),
         track_number: tag.track(),
         disc_number: tag.disk(),
-        // Duration is skipped during the scan — see the doc comment above.
-        total_time_ms: None,
+        total_time_ms: {
+            let dur = tagged.properties().duration();
+            if dur.is_zero() {
+                None
+            } else {
+                Some(dur.as_millis() as u64)
+            }
+        },
         location: Some(path.to_string_lossy().to_string()),
         kind: Some(format!(
             "{} audio file",
@@ -436,6 +442,56 @@ mod tests {
         // Max completed count equals the total.
         let max_completed = updates.iter().map(|u| u.completed).max().unwrap();
         assert_eq!(max_completed, 3);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_reuses_cached_tracks_for_unchanged_files() {
+        // Use a distinct dir name so we don't race with other tests sharing
+        // the same cache slot.
+        let dir = std::env::temp_dir().join("zytunes-dirlib-incremental");
+        let _ = fs::remove_dir_all(&dir);
+        let album = dir.join("CacheArtist").join("CacheAlbum");
+        fs::create_dir_all(&album).unwrap();
+        fs::write(album.join("01 Original.mp3"), b"fake").unwrap();
+        fs::write(album.join("02 Second.mp3"), b"fake").unwrap();
+
+        // First scan: nothing cached, everything parsed fresh.
+        let lib1 = DirectoryLibrary::scan(dir.to_str().unwrap()).unwrap();
+        assert_eq!(lib1.track_count(), 2);
+
+        // Peek at the cache: both files should be recorded.
+        let cached = crate::cache::load_dirlib_cache(dir.to_str().unwrap());
+        assert_eq!(cached.len(), 2);
+        let original_fp = cached
+            .get(album.join("01 Original.mp3").to_str().unwrap())
+            .expect("first file should be cached")
+            .fingerprint;
+
+        // Add a third file. Second scan should reuse the first two from cache
+        // and parse only the new one.
+        fs::write(album.join("03 Added.mp3"), b"fake").unwrap();
+        let lib2 = DirectoryLibrary::scan(dir.to_str().unwrap()).unwrap();
+        assert_eq!(lib2.track_count(), 3);
+
+        let cached2 = crate::cache::load_dirlib_cache(dir.to_str().unwrap());
+        assert_eq!(cached2.len(), 3);
+        // Unchanged file's fingerprint must survive across scans.
+        assert_eq!(
+            cached2
+                .get(album.join("01 Original.mp3").to_str().unwrap())
+                .unwrap()
+                .fingerprint,
+            original_fp,
+        );
+        // Deleted file must be dropped from the cache.
+        fs::remove_file(album.join("01 Original.mp3")).unwrap();
+        let lib3 = DirectoryLibrary::scan(dir.to_str().unwrap()).unwrap();
+        assert_eq!(lib3.track_count(), 2);
+        let cached3 = crate::cache::load_dirlib_cache(dir.to_str().unwrap());
+        assert_eq!(cached3.len(), 2);
+        assert!(!cached3.contains_key(album.join("01 Original.mp3").to_str().unwrap()));
 
         let _ = fs::remove_dir_all(&dir);
     }
