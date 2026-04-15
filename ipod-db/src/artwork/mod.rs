@@ -192,6 +192,13 @@ pub fn model_specs_video() -> Vec<ThumbnailSpec> {
 }
 
 /// Thumbnail specs for iPod Classic (6G/7G): 56x56 + 128x128 + 320x320.
+///
+/// NOTE (2026-04-15): reference byte-diff shows iTunes actually uses 55×55 for
+/// the small thumbnail but stores each entry with a 56-pixel row stride
+/// (6160 bytes per entry = 56×55×2). Fixing this properly requires splitting
+/// display dimensions from storage stride on `ThumbnailSpec` and row-padding
+/// in `resize_to_rgb565` — leaving 56×56 for now so the ithmb byte-sizes
+/// remain internally consistent; see tier 2 follow-up.
 pub fn model_specs_classic() -> Vec<ThumbnailSpec> {
     vec![
         ThumbnailSpec {
