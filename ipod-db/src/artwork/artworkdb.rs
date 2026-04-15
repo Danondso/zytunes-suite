@@ -120,6 +120,8 @@ fn write_mhni(thumb: &ThumbnailEntry) -> Vec<u8> {
     buf.write_u16::<LittleEndian>(0).unwrap(); // +30 horizontal_padding
     buf.write_u16::<LittleEndian>(thumb.height).unwrap(); // +32
     buf.write_u16::<LittleEndian>(thumb.width).unwrap(); // +34
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +36 (unknown, always 0 in ref)
+    buf.write_u32::<LittleEndian>(thumb.image_size).unwrap(); // +40 image_size echo (+0x28)
 
     // Pad to header size.
     let written = buf.len();
@@ -153,13 +155,22 @@ fn write_mhii(artwork: &TrackArtwork, image_id: u32) -> Vec<u8> {
     buf.write_all(b"mhii").unwrap(); // +0
     buf.write_u32::<LittleEndian>(MHII_HEADER_SIZE).unwrap(); // +4
     buf.write_u32::<LittleEndian>(total_size).unwrap(); // +8
-    buf.write_u32::<LittleEndian>(num_children).unwrap(); // +12
-    buf.write_u32::<LittleEndian>(image_id).unwrap(); // +16 image_id (unique per record)
-    buf.write_u64::<LittleEndian>(artwork.dbid).unwrap(); // +20 song_id / dbid
+    buf.write_u32::<LittleEndian>(num_children).unwrap(); // +0x0C
+    buf.write_u32::<LittleEndian>(image_id).unwrap(); // +0x10 image_id (unique per record)
+    buf.write_u64::<LittleEndian>(artwork.dbid).unwrap(); // +0x14 song_id / dbid
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +0x1C unknown
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +0x20 rating (unused)
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +0x24 unknown
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +0x28 original_date
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +0x2C digitized_date
+    buf.write_u32::<LittleEndian>(artwork.source_image_bytes)
+        .unwrap(); // +0x30 source_image_size
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +0x34 unknown
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +0x38 per-record small int — purpose unknown, leaving 0
+    buf.write_u32::<LittleEndian>(1).unwrap(); // +0x3C invariant = 1 across all ref records
 
-    // Remaining 152-byte header fields (+0x1C rating, +0x28 dates,
-    // +0x30 source_image_size, etc.) are populated in a later pass — tier 1
-    // focuses on structural correctness.
+    // Pad rest of 152-byte header. Fields at +0x48..+0x58 have NaN-float
+    // patterns in the reference (defensive tier, not implemented yet).
     let written = buf.len();
     for _ in 0..(MHII_HEADER_SIZE as usize - written) {
         buf.write_u8(0).unwrap();
@@ -393,6 +404,7 @@ mod tests {
         let mut store = ArtworkStore::new(model_specs_video());
         store.track_artworks.push(TrackArtwork {
             dbid: 42,
+            source_image_bytes: 0,
             thumbnails: vec![
                 ThumbnailEntry {
                     correlation_id: 1028,

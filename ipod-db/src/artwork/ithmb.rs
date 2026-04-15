@@ -38,14 +38,39 @@ pub fn decode_image(image_bytes: &[u8]) -> crate::Result<image::DynamicImage> {
 
 /// Resize a pre-decoded image to the target dimensions and convert to RGB565 LE.
 pub fn resize_to_rgb565(img: &image::DynamicImage, width: u16, height: u16) -> Vec<u8> {
-    let resized = img.resize_exact(width as u32, height as u32, FilterType::Lanczos3);
+    resize_to_rgb565_with_stride(img, width, height, width)
+}
 
-    let mut buf = Vec::with_capacity(width as usize * height as usize * 2);
+/// Resize and convert to RGB565 LE with an explicit per-row storage stride.
+///
+/// When `row_stride_pixels > width`, each row is zero-padded from `width*2`
+/// bytes out to `row_stride_pixels*2` bytes. Used for the iPod Classic small
+/// thumbnail, which iTunes stores as 55 displayed pixels per row but 56
+/// pixels of storage per row (6160 bytes per 55×55 entry instead of 6050).
+pub fn resize_to_rgb565_with_stride(
+    img: &image::DynamicImage,
+    width: u16,
+    height: u16,
+    row_stride_pixels: u16,
+) -> Vec<u8> {
+    assert!(
+        row_stride_pixels >= width,
+        "row_stride_pixels ({row_stride_pixels}) must be >= width ({width})"
+    );
+    let resized = img.resize_exact(width as u32, height as u32, FilterType::Lanczos3);
+    let stride_bytes = row_stride_pixels as usize * 2;
+    let mut buf = vec![0u8; stride_bytes * height as usize];
+
     for y in 0..height as u32 {
+        let row_start = y as usize * stride_bytes;
         for x in 0..width as u32 {
             let pixel = resized.get_pixel(x, y);
-            buf.extend_from_slice(&rgb_to_565(pixel[0], pixel[1], pixel[2]));
+            let bytes = rgb_to_565(pixel[0], pixel[1], pixel[2]);
+            let p = row_start + x as usize * 2;
+            buf[p] = bytes[0];
+            buf[p + 1] = bytes[1];
         }
+        // Trailing bytes in the row (from `width*2` to `stride_bytes`) stay zero.
     }
 
     buf
@@ -80,6 +105,57 @@ pub fn write_ithmb_files(mount_point: &Path, ithmb_files: &[ItmbFileState]) -> c
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn solid_red_png(size: u32) -> Vec<u8> {
+        let mut img = image::RgbImage::new(size, size);
+        for pixel in img.pixels_mut() {
+            *pixel = image::Rgb([0xFF, 0x00, 0x00]);
+        }
+        let mut png_bytes = Vec::new();
+        let encoder = image::codecs::png::PngEncoder::new(std::io::Cursor::new(&mut png_bytes));
+        image::ImageEncoder::write_image(
+            encoder,
+            img.as_raw(),
+            size,
+            size,
+            image::ExtendedColorType::Rgb8,
+        )
+        .unwrap();
+        png_bytes
+    }
+
+    #[test]
+    fn test_resize_with_stride_matches_reference_shape() {
+        // Classic small thumbnail: 55×55 display, 56-pixel row stride.
+        // Produces 6160 bytes (56×55×2) with the last 2 bytes of each row padded to zero.
+        let png = solid_red_png(100);
+        let img = decode_image(&png).unwrap();
+        let out = resize_to_rgb565_with_stride(&img, 55, 55, 56);
+        assert_eq!(out.len(), 6160);
+
+        let red_le = 0xF800u16.to_le_bytes();
+        let stride_bytes = 56 * 2;
+        for row in 0..55usize {
+            let row_start = row * stride_bytes;
+            // First 55 pixels are the resized solid-red image.
+            for x in 0..55usize {
+                let p = row_start + x * 2;
+                assert_eq!(&out[p..p + 2], &red_le, "row {row} px {x}");
+            }
+            // Last pixel of each row is zero-padded.
+            let pad_start = row_start + 55 * 2;
+            assert_eq!(&out[pad_start..pad_start + 2], &[0, 0], "row {row} padding");
+        }
+    }
+
+    #[test]
+    fn test_resize_without_stride_padding_is_compact() {
+        // When stride == width, output is exactly width*height*2 with no padding.
+        let png = solid_red_png(10);
+        let img = decode_image(&png).unwrap();
+        let out = resize_to_rgb565_with_stride(&img, 10, 10, 10);
+        assert_eq!(out.len(), 200);
+    }
 
     #[test]
     fn test_rgb_to_565_known_colors() {

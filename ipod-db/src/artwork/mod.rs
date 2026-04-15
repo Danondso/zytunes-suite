@@ -23,21 +23,30 @@ pub enum PixelFormat {
 pub struct ThumbnailSpec {
     /// Correlation ID linking mhni entries to mhif entries and .ithmb filenames.
     pub correlation_id: u32,
-    /// Thumbnail width in pixels.
+    /// Displayed pixel width (goes in the mhni width field).
     pub width: u16,
-    /// Thumbnail height in pixels.
+    /// Displayed pixel height (goes in the mhni height field).
     pub height: u16,
+    /// Pixels per row in the ithmb storage. Equals `width` for square entries
+    /// without padding. iTunes pads the Classic small thumbnail from a
+    /// displayed 55×55 to a 56-pixel row stride, giving 6160-byte entries.
+    pub row_stride_pixels: u16,
     /// Pixel format (always RGB565 for now).
     pub pixel_format: PixelFormat,
 }
 
 impl ThumbnailSpec {
-    /// Bytes per image at this thumbnail size (width * height * bytes_per_pixel).
+    /// Bytes per image in the ithmb (row_stride_pixels * height * bpp).
+    ///
+    /// This is the per-entry allocation in the `.ithmb` file and the value
+    /// written to mhni +0x18. When `row_stride_pixels > width` the extra
+    /// pixels per row are zero padding; the firmware still treats the image
+    /// as `width × height` for display.
     pub fn image_byte_size(&self) -> u32 {
         let bpp = match self.pixel_format {
             PixelFormat::Rgb565 => 2,
         };
-        self.width as u32 * self.height as u32 * bpp
+        self.row_stride_pixels as u32 * self.height as u32 * bpp
     }
 }
 
@@ -76,6 +85,10 @@ pub struct ThumbnailEntry {
 pub struct TrackArtwork {
     /// Track dbid (matches mhit dbid in iTunesDB).
     pub dbid: u64,
+    /// Byte count of the original source image. Written to mhii +0x30 —
+    /// iTunes populates this field and firmware appears to use it to validate
+    /// that the artwork record corresponds to the on-disk source.
+    pub source_image_bytes: u32,
     /// One entry per thumbnail size.
     pub thumbnails: Vec<ThumbnailEntry>,
 }
@@ -116,10 +129,16 @@ impl ArtworkStore {
     /// thumbnail size. If artwork already exists for this dbid, the old entry is replaced.
     pub fn add_artwork(&mut self, dbid: u64, image_bytes: &[u8]) -> crate::Result<()> {
         let img = ithmb::decode_image(image_bytes)?;
+        let source_image_bytes = image_bytes.len() as u32;
         let mut thumbnails = Vec::with_capacity(self.specs.len());
 
         for (i, spec) in self.specs.iter().enumerate() {
-            let rgb565 = ithmb::resize_to_rgb565(&img, spec.width, spec.height);
+            let rgb565 = ithmb::resize_to_rgb565_with_stride(
+                &img,
+                spec.width,
+                spec.height,
+                spec.row_stride_pixels,
+            );
             let offset = ithmb::append_to_ithmb(&mut self.ithmb_files[i], &rgb565);
 
             thumbnails.push(ThumbnailEntry {
@@ -133,9 +152,14 @@ impl ArtworkStore {
 
         // Replace existing entry for this dbid if present (avoids duplicate mhii entries).
         if let Some(existing) = self.track_artworks.iter_mut().find(|ta| ta.dbid == dbid) {
+            existing.source_image_bytes = source_image_bytes;
             existing.thumbnails = thumbnails;
         } else {
-            self.track_artworks.push(TrackArtwork { dbid, thumbnails });
+            self.track_artworks.push(TrackArtwork {
+                dbid,
+                source_image_bytes,
+                thumbnails,
+            });
         }
         Ok(())
     }
@@ -180,43 +204,46 @@ pub fn model_specs_video() -> Vec<ThumbnailSpec> {
             correlation_id: 1028,
             width: 100,
             height: 100,
+            row_stride_pixels: 100,
             pixel_format: PixelFormat::Rgb565,
         },
         ThumbnailSpec {
             correlation_id: 1029,
             width: 200,
             height: 200,
+            row_stride_pixels: 200,
             pixel_format: PixelFormat::Rgb565,
         },
     ]
 }
 
-/// Thumbnail specs for iPod Classic (6G/7G): 56x56 + 128x128 + 320x320.
+/// Thumbnail specs for iPod Classic (6G/7G): 55x55 (stride 56) + 128x128 + 320x320.
 ///
-/// NOTE (2026-04-15): reference byte-diff shows iTunes actually uses 55×55 for
-/// the small thumbnail but stores each entry with a 56-pixel row stride
-/// (6160 bytes per entry = 56×55×2). Fixing this properly requires splitting
-/// display dimensions from storage stride on `ThumbnailSpec` and row-padding
-/// in `resize_to_rgb565` — leaving 56×56 for now so the ithmb byte-sizes
-/// remain internally consistent; see tier 2 follow-up.
+/// The small spec (F1061) is displayed at 55×55 but stored with a 56-pixel
+/// row stride — each entry is 6160 bytes (56×55×2), confirmed by byte-diff
+/// against an iTunes reference. Using a plain 55×55 or 56×56 spec produces
+/// the wrong per-entry byte size and the firmware reads misaligned data.
 pub fn model_specs_classic() -> Vec<ThumbnailSpec> {
     vec![
         ThumbnailSpec {
             correlation_id: 1061,
-            width: 56,
-            height: 56,
+            width: 55,
+            height: 55,
+            row_stride_pixels: 56,
             pixel_format: PixelFormat::Rgb565,
         },
         ThumbnailSpec {
             correlation_id: 1055,
             width: 128,
             height: 128,
+            row_stride_pixels: 128,
             pixel_format: PixelFormat::Rgb565,
         },
         ThumbnailSpec {
             correlation_id: 1060,
             width: 320,
             height: 320,
+            row_stride_pixels: 320,
             pixel_format: PixelFormat::Rgb565,
         },
     ]
@@ -238,9 +265,33 @@ mod tests {
             correlation_id: 1028,
             width: 100,
             height: 100,
+            row_stride_pixels: 100,
             pixel_format: PixelFormat::Rgb565,
         };
         assert_eq!(spec.image_byte_size(), 100 * 100 * 2);
+    }
+
+    #[test]
+    fn test_thumbnail_spec_byte_size_with_padded_stride() {
+        // Classic small thumbnail: 55×55 display, 56-pixel row stride.
+        let spec = ThumbnailSpec {
+            correlation_id: 1061,
+            width: 55,
+            height: 55,
+            row_stride_pixels: 56,
+            pixel_format: PixelFormat::Rgb565,
+        };
+        assert_eq!(spec.image_byte_size(), 6160, "56 × 55 × 2 = 6160");
+    }
+
+    #[test]
+    fn test_classic_small_spec_matches_reference() {
+        let specs = model_specs_classic();
+        let small = specs.iter().find(|s| s.correlation_id == 1061).unwrap();
+        assert_eq!(small.width, 55);
+        assert_eq!(small.height, 55);
+        assert_eq!(small.row_stride_pixels, 56);
+        assert_eq!(small.image_byte_size(), 6160);
     }
 
     #[test]
@@ -258,7 +309,7 @@ mod tests {
         let specs = model_specs_classic();
         assert_eq!(specs.len(), 3);
         assert_eq!(specs[0].correlation_id, 1061);
-        assert_eq!(specs[0].width, 56);
+        assert_eq!(specs[0].width, 55);
         assert_eq!(specs[1].correlation_id, 1055);
         assert_eq!(specs[1].width, 128);
         assert_eq!(specs[2].correlation_id, 1060);
