@@ -80,6 +80,10 @@ Custom skills in `.claude/skills/`:
 
 Both skills run `cargo fmt` and `cargo clippy -- -D warnings` as part of their fix workflow to catch formatting and lint issues before code is pushed. They also add meaningful test coverage for changes — regression tests for bugs, edge case tests for new logic — without test theatre or trivial assertions.
 
+## Boundaries
+
+Do not search, read, or list files outside the project directory (`~/GitHub/zytunes`) without asking first. If you need a file from the user's home directory, `~/Music`, or any other personal path, describe what you need and ask the user to provide it or confirm the path. This includes `find`/`glob`/`ls` sweeps of `$HOME`.
+
 ## Code Health
 
 Leave the codebase better than you found it. Prefer the maintainable solution over the quick fix — even if it takes longer. When you encounter something that needs attention while working on a task, handle it appropriately:

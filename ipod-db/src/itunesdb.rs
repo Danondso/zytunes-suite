@@ -260,6 +260,18 @@ fn parse_mhit(cur: &mut Cursor<&[u8]>, start: u64) -> crate::Result<IpodTrack> {
     // Ensure we're at end of mhit total size.
     cur.seek(SeekFrom::Start(start + total_size as u64))?;
 
+    // Capture raw mhit header for lossless replay on serialize.
+    let raw_mhit_header = {
+        let s = start as usize;
+        let end = s + header_size as usize;
+        let inner = cur.get_ref();
+        if end <= inner.len() {
+            Some(inner[s..end].to_vec())
+        } else {
+            None
+        }
+    };
+
     Ok(IpodTrack {
         dbid,
         track_id,
@@ -297,6 +309,7 @@ fn parse_mhit(cur: &mut Cursor<&[u8]>, start: u64) -> crate::Result<IpodTrack> {
         },
         ipod_path,
         filetype,
+        raw_mhit_header,
     })
 }
 
@@ -364,11 +377,20 @@ pub fn parse(data: &[u8], mount_point: std::path::PathBuf) -> crate::Result<Ipod
     let _db_type = cur.read_u32::<LittleEndian>()?; // 1 = iTunesDB, 2 = podcast DB
     let db_version = cur.read_u32::<LittleEndian>()?;
     let num_datasets = cur.read_u32::<LittleEndian>()?;
+    let db_id = cur.read_u64::<LittleEndian>()?; // +24 persistent database ID
+
+    // Preserve raw mhbd header for lossless replay of firmware-critical fields.
+    let raw_mhbd_header = if (mhbd_header_size as usize) <= data.len() {
+        Some(data[..mhbd_header_size as usize].to_vec())
+    } else {
+        None
+    };
 
     cur.seek(SeekFrom::Start(mhbd_header_size as u64))?;
 
     let mut tracks = Vec::new();
     let mut playlists = Vec::new();
+    let mut raw_smart_playlists: Option<Vec<u8>> = None;
 
     for _ in 0..num_datasets {
         let mhsd_start = cur.position();
@@ -410,6 +432,14 @@ pub fn parse(data: &[u8], mount_point: std::path::PathBuf) -> crate::Result<Ipod
                     playlists.push(parse_mhyp(&mut cur, mhyp_start)?);
                 }
             }
+            5 => {
+                // Smart playlists — preserve raw blob for lossless round-trip.
+                let start = mhsd_start as usize;
+                let end = start + mhsd_total_size as usize;
+                if end <= data.len() {
+                    raw_smart_playlists = Some(data[start..end].to_vec());
+                }
+            }
             _ => {
                 // Podcast or other dataset — skip.
             }
@@ -432,7 +462,15 @@ pub fn parse(data: &[u8], mount_point: std::path::PathBuf) -> crate::Result<Ipod
             .collect();
     }
 
-    let db = IpodDatabase::from_parsed(db_version, tracks, playlists, mount_point);
+    let db = IpodDatabase::from_parsed(
+        db_version,
+        db_id,
+        tracks,
+        playlists,
+        raw_mhbd_header,
+        raw_smart_playlists,
+        mount_point,
+    );
 
     Ok(db)
 }
@@ -486,6 +524,7 @@ mod tests {
             sample_rate: Some(44100),
             ipod_path: ":iPod_Control:Music:F00:abcdef.mp3".into(),
             filetype: 0x4d503320, // "MP3 "
+            raw_mhit_header: None,
         });
 
         let bytes = itunesdb_write::serialize(&db);
@@ -533,6 +572,7 @@ mod tests {
             sample_rate: None,
             ipod_path: ":iPod_Control:Music:F00:a.mp3".into(),
             filetype: 0x4d503320,
+            raw_mhit_header: None,
         });
         let dbid2 = db.add_track(IpodTrack {
             dbid: 0,
@@ -551,6 +591,7 @@ mod tests {
             sample_rate: None,
             ipod_path: ":iPod_Control:Music:F01:b.mp3".into(),
             filetype: 0x4d503320,
+            raw_mhit_header: None,
         });
 
         db.playlists.push(IpodPlaylist {
@@ -593,6 +634,7 @@ mod tests {
             sample_rate: Some(48000),
             ipod_path: ":iPod_Control:Music:F05:XYZW.mp3".into(),
             filetype: 0x4d503320,
+            raw_mhit_header: None,
         });
 
         let bytes = itunesdb_write::serialize(&db);
@@ -638,12 +680,18 @@ mod tests {
             sample_rate: None,
             ipod_path: ":iPod_Control:Music:F00:a.mp3".into(),
             filetype: 0x4d503320,
+            raw_mhit_header: None,
         });
 
         let mut bytes = itunesdb_write::serialize(&db);
 
-        // Find the first mhod and corrupt its string_byte_len field (offset +28 from mhod start).
-        let mhod_pos = bytes.windows(4).position(|w| w == b"mhod").unwrap();
+        // Find the first mhod inside the track dataset (after mhit), not in album/playlist headers.
+        let mhit_pos = bytes.windows(4).position(|w| w == b"mhit").unwrap();
+        let mhod_pos = mhit_pos
+            + bytes[mhit_pos..]
+                .windows(4)
+                .position(|w| w == b"mhod")
+                .unwrap();
         // String byte length is at mhod_pos + 28.
         let len_pos = mhod_pos + 28;
         // Write a huge length (0x01000000 = 16MB, exceeds 10MB limit).
@@ -679,6 +727,7 @@ mod tests {
             sample_rate: None,
             ipod_path: ":iPod_Control:Music:F00:b.mp3".into(),
             filetype: 0x4d503320,
+            raw_mhit_header: None,
         });
 
         let mut bytes = itunesdb_write::serialize(&db);
@@ -784,6 +833,7 @@ mod tests {
             sample_rate: None,
             ipod_path: ":iPod_Control:Music:F00:a.mp3".into(),
             filetype: 0x4d503320,
+            raw_mhit_header: None,
         });
         db.add_track(IpodTrack {
             dbid: 0,
@@ -802,6 +852,7 @@ mod tests {
             sample_rate: None,
             ipod_path: ":iPod_Control:Music:F01:b.mp3".into(),
             filetype: 0x4d503320,
+            raw_mhit_header: None,
         });
 
         let bytes = itunesdb_write::serialize(&db);
@@ -863,6 +914,7 @@ mod tests {
             sample_rate: None,
             ipod_path: ":iPod_Control:Music:F00:a.mp3".into(),
             filetype: 0x4d503320,
+            raw_mhit_header: None,
         });
         db.add_track(IpodTrack {
             dbid: 0,
@@ -881,6 +933,7 @@ mod tests {
             sample_rate: None,
             ipod_path: ":iPod_Control:Music:F01:b.mp3".into(),
             filetype: 0x4d503320,
+            raw_mhit_header: None,
         });
 
         let bytes = itunesdb_write::serialize(&db);
@@ -942,6 +995,7 @@ mod tests {
                 sample_rate: None,
                 ipod_path: format!(":iPod_Control:Music:F0{i}:x.mp3"),
                 filetype: 0x4d503320,
+                raw_mhit_header: None,
             });
         }
 
@@ -969,5 +1023,158 @@ mod tests {
             pos += 1;
         }
         panic!("sort_type=3 mhod not found");
+    }
+
+    /// Simulate the real-world scenario: parse an existing DB (with raw mhit
+    /// headers), add a new track (from-scratch mhit), serialize, and re-parse.
+    /// Both old and new tracks must survive.
+    #[test]
+    fn test_mixed_raw_and_scratch_tracks() {
+        // Step 1: Create initial DB with one track, serialize to get raw headers.
+        let mut db1 = IpodDatabase::new(PathBuf::from("/mnt/IPOD"));
+        db1.add_track(IpodTrack {
+            title: "Existing Song".into(),
+            artist: "Old Artist".into(),
+            album: "Old Album".into(),
+            album_artist: None,
+            genre: Some("Jazz".into()),
+            track_number: Some(1),
+            disc_number: None,
+            total_time_ms: Some(200000),
+            year: Some(2020),
+            file_size: 4_000_000,
+            bitrate: Some(256),
+            sample_rate: Some(44100),
+            ipod_path: ":iPod_Control:Music:F00:old.mp3".into(),
+            filetype: 0x4d503320,
+            ..Default::default()
+        });
+        let bytes1 = itunesdb_write::serialize(&db1);
+
+        // Step 2: Parse it back — this track now has raw_mhit_header.
+        let mut db2 = parse(&bytes1, PathBuf::from("/mnt/IPOD")).unwrap();
+        assert_eq!(db2.tracks.len(), 1);
+        assert!(
+            db2.tracks[0].raw_mhit_header.is_some(),
+            "parsed track should have raw header"
+        );
+
+        // Step 3: Add a NEW track (no raw header — will use from-scratch path).
+        db2.add_track(IpodTrack {
+            title: "New Song".into(),
+            artist: "New Artist".into(),
+            album: "New Album".into(),
+            album_artist: Some("New AA".into()),
+            genre: Some("Rock".into()),
+            track_number: Some(5),
+            disc_number: Some(2),
+            total_time_ms: Some(300000),
+            year: Some(2025),
+            file_size: 6_000_000,
+            bitrate: Some(320),
+            sample_rate: Some(48000),
+            ipod_path: ":iPod_Control:Music:F01:new.mp3".into(),
+            filetype: 0x4d503320,
+            ..Default::default()
+        });
+
+        // Step 4: Serialize the mixed DB and parse again.
+        let bytes2 = itunesdb_write::serialize(&db2);
+        let db3 = parse(&bytes2, PathBuf::from("/mnt/IPOD")).unwrap();
+
+        // Both tracks must be present and correct.
+        assert_eq!(db3.tracks.len(), 2);
+
+        let old = &db3.tracks[0];
+        assert_eq!(old.title, "Existing Song");
+        assert_eq!(old.artist, "Old Artist");
+        assert_eq!(old.album, "Old Album");
+        assert_eq!(old.genre.as_deref(), Some("Jazz"));
+        assert_eq!(old.track_number, Some(1));
+        assert_eq!(old.total_time_ms, Some(200000));
+        assert_eq!(old.year, Some(2020));
+        assert_eq!(old.file_size, 4_000_000);
+        assert_eq!(old.bitrate, Some(256));
+        assert_eq!(old.sample_rate, Some(44100));
+
+        let new = &db3.tracks[1];
+        assert_eq!(new.title, "New Song");
+        assert_eq!(new.artist, "New Artist");
+        assert_eq!(new.album, "New Album");
+        assert_eq!(new.album_artist.as_deref(), Some("New AA"));
+        assert_eq!(new.genre.as_deref(), Some("Rock"));
+        assert_eq!(new.track_number, Some(5));
+        assert_eq!(new.disc_number, Some(2));
+        assert_eq!(new.total_time_ms, Some(300000));
+        assert_eq!(new.year, Some(2025));
+        assert_eq!(new.file_size, 6_000_000);
+        assert_eq!(new.bitrate, Some(320));
+        assert_eq!(new.sample_rate, Some(48000));
+
+        // Master playlist should have both tracks.
+        assert_eq!(db3.playlists[0].track_ids.len(), 2);
+
+        // Verify mhit header size is 624 for both tracks.
+        let mhit_positions: Vec<usize> = bytes2
+            .windows(4)
+            .enumerate()
+            .filter(|(_, w)| w == b"mhit")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(mhit_positions.len(), 2, "should have 2 mhit records");
+        for pos in &mhit_positions {
+            let hs = u32::from_le_bytes(bytes2[pos + 4..pos + 8].try_into().unwrap());
+            assert_eq!(hs, 624, "mhit header should be 624 bytes");
+        }
+    }
+
+    /// Verify that timestamps in from-scratch mhit headers are non-zero Mac timestamps.
+    #[test]
+    fn test_from_scratch_timestamps_populated() {
+        let mut db = IpodDatabase::new(PathBuf::from("/mnt/IPOD"));
+        db.add_track(IpodTrack {
+            title: "T".into(),
+            artist: "A".into(),
+            album: "B".into(),
+            ipod_path: ":iPod_Control:Music:F00:t.mp3".into(),
+            filetype: 0x4d503320,
+            file_size: 100,
+            ..Default::default()
+        });
+
+        let bytes = itunesdb_write::serialize(&db);
+
+        // Find the mhit.
+        let mhit_pos = bytes.windows(4).position(|w| w == b"mhit").unwrap();
+
+        let date_modified =
+            u32::from_le_bytes(bytes[mhit_pos + 32..mhit_pos + 36].try_into().unwrap());
+        let date_added_to_device =
+            u32::from_le_bytes(bytes[mhit_pos + 88..mhit_pos + 92].try_into().unwrap());
+        let date_added =
+            u32::from_le_bytes(bytes[mhit_pos + 104..mhit_pos + 108].try_into().unwrap());
+        let date_modified2 =
+            u32::from_le_bytes(bytes[mhit_pos + 192..mhit_pos + 196].try_into().unwrap());
+        let size_on_disk =
+            u32::from_le_bytes(bytes[mhit_pos + 188..mhit_pos + 192].try_into().unwrap());
+
+        // Mac epoch: timestamps should be > 700_000_000 (roughly 2023+).
+        assert!(
+            date_modified > 700_000_000,
+            "date_modified should be a Mac timestamp, got {date_modified}"
+        );
+        assert!(
+            date_added_to_device > 700_000_000,
+            "date_added_to_device should be a Mac timestamp, got {date_added_to_device}"
+        );
+        assert!(
+            date_added > 700_000_000,
+            "date_added should be a Mac timestamp, got {date_added}"
+        );
+        assert_eq!(
+            date_modified, date_modified2,
+            "date_modified2 should mirror date_modified"
+        );
+        assert_eq!(size_on_disk, 100, "size_on_disk should equal file_size");
     }
 }

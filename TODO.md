@@ -18,6 +18,11 @@
   - Toggleable player panel with minimal controls
 - **Radio Support**
   - Is there a terminal thing for radio we can pipe into the player?
+- **Scrobbling** — hook into TUI player track-change events to submit listens
+  - Last.fm (auth handshake, now-playing + scrobble submit)
+  - ListenBrainz (token auth, listen submission + feedback)
+  - Config in `~/.config/zytunes/config.toml`, opt-in per service
+  - Respect scrobble rules (≥50% played or ≥4min, ≥30s track length)
 - **UX Audit**
   - Commands have been made organically
   - Audit mappings
@@ -35,6 +40,12 @@
 - ** iPod Support **
   - What's it take? I bet we can, pure rust like the zune is gonna be the route first
   - 
+- **Philips GoGear support** — user has a couple of units, worth attempting
+  - Identify which models (VID/PID, firmware generation — SA/HDD vs Vibe vs Ariaz etc.)
+  - Transport: most GoGears are UMS/MSC (plain mass storage) — no MTPZ/iTunesDB lift needed, just file copy + folder conventions
+  - Some later models use MTP (non-encrypted); `zune-mtp` transport is reusable, auth path is not
+  - Check if any model needs a proprietary DB (SA52xx songdb.dat) vs pure tag-based playback
+  - Slot into `DeviceSession` trait once scoped
 
 ## Done
 
