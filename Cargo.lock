@@ -3327,6 +3327,7 @@ dependencies = [
  "crossterm 0.28.1",
  "id3",
  "image",
+ "ipod-db",
  "lofty",
  "mp3lame-encoder",
  "ratatui",

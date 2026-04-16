@@ -1,7 +1,9 @@
+pub mod ipod_session;
 pub mod native;
 pub mod parse;
 pub mod zmdb;
 
+pub use ipod_session::IpodSession;
 pub use native::NativeSession;
 use parse::DeviceEntry;
 

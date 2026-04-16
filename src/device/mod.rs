@@ -1,5 +1,7 @@
+pub mod ipod;
 pub mod zune;
 
+pub use ipod::IpodBackend;
 pub use zune::{zune_model_from_storage, ZuneBackend, ZuneDetectError, ZuneDevice, ZuneDeviceData};
 
 use crate::mtp::DeviceSession;
@@ -8,6 +10,7 @@ use crate::mtp::DeviceSession;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceFamily {
     Zune,
+    Ipod,
 }
 
 /// Capabilities of a specific device family, used to drive format decisions,

@@ -4,7 +4,9 @@ pub mod dirlib;
 pub mod library;
 pub mod mtp;
 
-use device::{DetectedDevice, DeviceBackend, DeviceCapabilities, DeviceFamily, ZuneBackend};
+use device::{
+    DetectedDevice, DeviceBackend, DeviceCapabilities, DeviceFamily, IpodBackend, ZuneBackend,
+};
 use library::MusicLibrary;
 use mtp::DeviceSession;
 use std::fmt;
@@ -93,7 +95,7 @@ pub fn connect() -> Result<
     ),
     String,
 > {
-    let backends: Vec<Box<dyn DeviceBackend>> = vec![Box::new(ZuneBackend)];
+    let backends: Vec<Box<dyn DeviceBackend>> = vec![Box::new(ZuneBackend), Box::new(IpodBackend)];
 
     let mut last_err = String::from("No device backends available");
     for backend in &backends {
@@ -104,6 +106,7 @@ pub fn connect() -> Result<
                     detected.name,
                     match detected.family {
                         DeviceFamily::Zune => "Zune",
+                        DeviceFamily::Ipod => "iPod",
                     }
                 );
 
