@@ -26,6 +26,19 @@ use std::io::Write;
 use crate::encoding::encode_utf16le;
 use crate::{IpodDatabase, IpodDbError, IpodTrack};
 
+/// Mac epoch offset: seconds between Unix epoch (1970-01-01) and Mac epoch (2001-01-01).
+const MAC_EPOCH_OFFSET: u64 = 978_307_200;
+
+/// Current time as a Mac timestamp (seconds since 2001-01-01 00:00:00 UTC).
+fn mac_timestamp_now() -> u32 {
+    let unix_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    // Mac timestamps are u32, wrapping is fine (won't overflow until ~2137).
+    unix_secs.saturating_sub(MAC_EPOCH_OFFSET) as u32
+}
+
 /// Strip leading articles ("The ", "A ", "An ") for sort keys.
 fn strip_article(s: &str) -> String {
     let lower = s.to_lowercase();
@@ -175,79 +188,16 @@ fn write_mhit(track: &IpodTrack, artwork_count: u32, album_id: u32) -> Vec<u8> {
     // Header size 0x270 (624) matches iPod Classic/Video/Mini (db versions 0x73-0x75).
     let header_size: u32 = 0x270;
 
-    // Build child mhods.
-    let mut mhods = Vec::new();
-    let mut num_mhods: u32 = 0;
+    // Build child mhods (shared with the raw-header replay path).
+    let mhods = build_track_mhods(track, artwork_count);
+    let num_mhods = mhods.len() as u32;
+    let mhod_bytes: usize = mhods.iter().map(|m| m.len()).sum();
+    let total_size = header_size + mhod_bytes as u32;
 
-    // Title (type 1) — always present.
-    mhods.extend(write_mhod(1, &track.title));
-    num_mhods += 1;
+    let now = mac_timestamp_now();
+    let sr = (track.sample_rate.unwrap_or(0) as u32) << 16;
 
-    // Location (type 2) — always present.
-    mhods.extend(write_mhod(2, &track.ipod_path));
-    num_mhods += 1;
-
-    // Album (type 3).
-    if !track.album.is_empty() {
-        mhods.extend(write_mhod(3, &track.album));
-        num_mhods += 1;
-    }
-
-    // Artist (type 4).
-    if !track.artist.is_empty() {
-        mhods.extend(write_mhod(4, &track.artist));
-        num_mhods += 1;
-    }
-
-    // Genre (type 5).
-    if let Some(ref genre) = track.genre {
-        mhods.extend(write_mhod(5, genre));
-        num_mhods += 1;
-    }
-
-    // Filetype string (type 6) — always present in iTunes-written DBs.
-    let filetype_str = match track.filetype {
-        0x4d503320 => "MPEG audio file",          // "MP3 "
-        0x4d344120 => "AAC audio file",           // "M4A "
-        0x4d345020 => "Protected AAC audio file", // "M4P "
-        0x57415620 => "WAV audio file",           // "WAV "
-        0x574d4120 => "WMA audio file",           // "WMA "
-        _ => "Audio file",
-    };
-    mhods.extend(write_mhod(6, filetype_str));
-    num_mhods += 1;
-
-    // Album artist (type 14).
-    if let Some(ref aa) = track.album_artist {
-        mhods.extend(write_mhod(14, aa));
-        num_mhods += 1;
-    }
-
-    // Sort string mhods (types 22-29). iTunes writes these for browse sorting.
-    // We always emit them — if sort key equals display key, the firmware ignores
-    // the redundancy.
-    if !track.artist.is_empty() {
-        mhods.extend(write_mhod(22, &track.artist)); // sort artist
-        num_mhods += 1;
-    }
-    let sort_album_artist = track.album_artist.as_deref().unwrap_or(&track.artist);
-    if !sort_album_artist.is_empty() {
-        mhods.extend(write_mhod(23, sort_album_artist)); // sort album artist
-        num_mhods += 1;
-    }
-    if !track.title.is_empty() {
-        mhods.extend(write_mhod(27, &strip_article(&track.title))); // sort title
-        num_mhods += 1;
-    }
-    if !track.album.is_empty() {
-        mhods.extend(write_mhod(28, &strip_article(&track.album))); // sort album
-        num_mhods += 1;
-    }
-    // Sort composer (29) — empty string since we don't track composer.
-    // iTunes only writes this when composer is set, so skip for now.
-
-    let total_size = header_size + mhods.len() as u32;
-
+    // Core fields (+0 through +211), written sequentially.
     let mut buf = Vec::with_capacity(total_size as usize);
     buf.write_all(b"mhit").unwrap(); // +0
     buf.write_u32::<LittleEndian>(header_size).unwrap(); // +4
@@ -260,7 +210,7 @@ fn write_mhit(track: &IpodTrack, artwork_count: u32, album_id: u32) -> Vec<u8> {
     buf.write_u8(0).unwrap(); // +29  compilation
     buf.write_u8(0).unwrap(); // +30  rating
     buf.write_u8(0).unwrap(); // +31  padding
-    buf.write_u32::<LittleEndian>(0).unwrap(); // +32  date_modified
+    buf.write_u32::<LittleEndian>(now).unwrap(); // +32  date_modified (Mac timestamp)
     buf.write_u32::<LittleEndian>(track.file_size).unwrap(); // +36
     buf.write_u32::<LittleEndian>(track.total_time_ms.unwrap_or(0))
         .unwrap(); // +40
@@ -271,44 +221,45 @@ fn write_mhit(track: &IpodTrack, artwork_count: u32, album_id: u32) -> Vec<u8> {
         .unwrap(); // +52
     buf.write_u32::<LittleEndian>(track.bitrate.unwrap_or(0) as u32)
         .unwrap(); // +56
-    let sr = (track.sample_rate.unwrap_or(0) as u32) << 16;
-    buf.write_u32::<LittleEndian>(sr).unwrap(); // +60  sample_rate
+    buf.write_u32::<LittleEndian>(sr).unwrap(); // +60  sample_rate (fixed-point Hz<<16)
     buf.write_u32::<LittleEndian>(0).unwrap(); // +64  volume_adjust
     buf.write_u32::<LittleEndian>(0).unwrap(); // +68  start_time
     buf.write_u32::<LittleEndian>(0).unwrap(); // +72  stop_time
     buf.write_u32::<LittleEndian>(0).unwrap(); // +76  sound_check
     buf.write_u32::<LittleEndian>(0).unwrap(); // +80  play_count
     buf.write_u32::<LittleEndian>(0).unwrap(); // +84  last_played
-    buf.write_u32::<LittleEndian>(0).unwrap(); // +88  date_added_to_device
+    buf.write_u32::<LittleEndian>(now).unwrap(); // +88  date_added_to_device (Mac timestamp)
     buf.write_u32::<LittleEndian>(track.disc_number.unwrap_or(0) as u32)
         .unwrap(); // +92
     buf.write_u32::<LittleEndian>(0).unwrap(); // +96  disc_total
     buf.write_u32::<LittleEndian>(0).unwrap(); // +100 sort_order
-    buf.write_u32::<LittleEndian>(0).unwrap(); // +104 date_added
+    buf.write_u32::<LittleEndian>(now).unwrap(); // +104 date_added (Mac timestamp)
     buf.write_u32::<LittleEndian>(0).unwrap(); // +108 date_released
     buf.write_u64::<LittleEndian>(track.dbid).unwrap(); // +112 dbid
     buf.write_u32::<LittleEndian>(0).unwrap(); // +120 checked
-    buf.write_u32::<LittleEndian>(0).unwrap(); // +124 app_rating
+    buf.write_u32::<LittleEndian>(0xffff_0000).unwrap(); // +124 app_rating (ref: always 0xffff0000+)
     buf.write_u32::<LittleEndian>(0).unwrap(); // +128 bpm
     buf.write_u32::<LittleEndian>(artwork_count).unwrap(); // +132 artwork_count
-    buf.write_u32::<LittleEndian>(sr).unwrap(); // +136 sample_rate (dup)
+                                                           // +136: sample_rate as IEEE 754 float (NOT fixed-point like +60).
+    let sr_float = (track.sample_rate.unwrap_or(44100) as f32).to_bits();
+    buf.write_u32::<LittleEndian>(sr_float).unwrap(); // +136 sample_rate_float
     buf.write_u32::<LittleEndian>(0).unwrap(); // +140 date_released2
-    buf.write_u32::<LittleEndian>(0).unwrap(); // +144 explicit_flag
+    buf.write_u32::<LittleEndian>(0x0c).unwrap(); // +144 explicit_flag (ref: always >= 0x0c)
     buf.write_u32::<LittleEndian>(0).unwrap(); // +148 skip_count
     buf.write_u32::<LittleEndian>(0).unwrap(); // +152 last_skipped
     buf.write_u32::<LittleEndian>(if artwork_count > 0 { 1 } else { 0 })
         .unwrap(); // +156 has_artwork
     buf.write_u32::<LittleEndian>(0).unwrap(); // +160 skip_shuffling
-    buf.write_u32::<LittleEndian>(0).unwrap(); // +164 remember_playback_pos
+    buf.write_u32::<LittleEndian>(1).unwrap(); // +164 remember_playback_pos (ref: always 1 or 2)
     buf.write_u64::<LittleEndian>(track.dbid).unwrap(); // +168 dbid2 (duplicate)
-    buf.write_u32::<LittleEndian>(0).unwrap(); // +176 lyrics_flag
+    buf.write_u32::<LittleEndian>(0x0001_0000).unwrap(); // +176 lyrics_flag (ref: always 0x00010000+)
     buf.write_u32::<LittleEndian>(0).unwrap(); // +180 movie_flag
     buf.write_u32::<LittleEndian>(0).unwrap(); // +184 mark_unplayed
-    buf.write_u32::<LittleEndian>(0).unwrap(); // +188 size_on_disk (0 = let firmware calculate)
-    buf.write_u32::<LittleEndian>(0).unwrap(); // +192 date_modified2
-    buf.write_u32::<LittleEndian>(0).unwrap(); // +196 hash (per-track, set by firmware on sync)
-    buf.write_u32::<LittleEndian>(0).unwrap(); // +200 unknown
-    buf.write_u32::<LittleEndian>(1).unwrap(); // +204 unknown (constant 1 in reference)
+    buf.write_u32::<LittleEndian>(track.file_size).unwrap(); // +188 size_on_disk
+    buf.write_u32::<LittleEndian>(now).unwrap(); // +192 date_modified2 (mirrors +32)
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +196 per_track_hash (firmware may recompute)
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +200 media_type_legacy
+    buf.write_u32::<LittleEndian>(1).unwrap(); // +204 (ref: 99% nonzero, typically 1)
     buf.write_u32::<LittleEndian>(1).unwrap(); // +208 has_gapless_data
 
     // Extended fields (+212 through +623). The iPod Classic firmware (db_version
@@ -324,37 +275,31 @@ fn write_mhit(track: &IpodTrack, artwork_count: u32, album_id: u32) -> Vec<u8> {
     // +256: has_gapless_encoding — set to 1 (firmware expects this on all tracks)
     put_u32_at(&mut buf, 256, 1);
     // +288: album_id — cross-reference into mhsd type=4 album list.
-    //        Set by caller via album_id parameter.
     put_u32_at(&mut buf, 288, album_id);
     // +292, +296: unknown constants (identical across all iTunes-written tracks).
     put_u32_at(&mut buf, 292, 0xfc75_23d0);
     put_u32_at(&mut buf, 296, 0xa999_476a);
-    // +300: secondary unique ID (low 32 bits of dbid works fine).
-    put_u32_at(&mut buf, 300, track.dbid as u32);
+    // +300: secondary_id — reference shows this equals file_size, not dbid.
+    put_u32_at(&mut buf, 300, track.file_size);
     // +308: media_type_detailed — audio type flags.
-    //        0x0303_8081 is the most common value for MP3 audio.
-    let media_detail = match track.filetype {
-        0x4d503320 => 0x0303_8081u32, // MP3
-        0x4d344120 => 0x0303_8081,    // AAC/M4A
-        _ => 0x0303_8081,             // default audio
-    };
-    put_u32_at(&mut buf, 308, media_detail);
-    // +312: unknown — 0x8080 for most audio.
+    //        Reference shows 0x03038080 most common, 0x03038003 for some.
+    put_u32_at(&mut buf, 308, 0x0303_8080);
+    // +312: media subtype flags — 0x8080 for most audio, 0x8003 for some.
     put_u32_at(&mut buf, 312, 0x0000_8080);
-    // +352: unknown — observed values 0x64..0x7a (100-122). Set to 0x64 (100).
+    // +352: unknown — observed values 0x64..0x2a7. Set to 0x64 (100).
     put_u32_at(&mut buf, 352, 0x64);
     // +360: unknown — constant 1 on all tracks.
     put_u32_at(&mut buf, 360, 1);
-    // +404: unknown — constant 0x100 on all tracks.
-    put_u32_at(&mut buf, 404, 0x100);
-    // +480: artist_id — cross-reference. Use album_id as a proxy for now.
-    put_u32_at(&mut buf, 480, album_id);
-    // +500: per-track unique reference. Use track_id.
-    put_u32_at(&mut buf, 500, track.track_id);
-    // +524: media_type — 1=audio, 2=video.
+    // +480: artist_id — reference shows constant 0x218 across all tracks.
+    put_u32_at(&mut buf, 480, 0x218);
+    // +500: per-track unique reference. Reference shows track_id + 1.
+    put_u32_at(&mut buf, 500, track.track_id.wrapping_add(1));
+    // +524: media_type — 1=audio. Reference shows ~49% set (only newer tracks).
     put_u32_at(&mut buf, 524, 1);
 
-    buf.write_all(&mhods).unwrap();
+    for mhod in &mhods {
+        buf.extend_from_slice(mhod);
+    }
     buf
 }
 
