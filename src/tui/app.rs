@@ -1,9 +1,10 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::mpsc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use image::DynamicImage;
 use throbber_widgets_tui::ThrobberState;
+use zytunes::dirlib::TrackSample;
 use zytunes::library::{MusicLibrary, Track};
 use zytunes::mtp::parse::DeviceEntry;
 
@@ -20,17 +21,88 @@ pub enum Panel {
     SyncQueue,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SidebarMode {
     Artists,
     Albums,
-    Playlists,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BrowseMode {
     Library,
     Device,
+}
+
+/// Which field of a track sample a loading phrase refers to.
+#[derive(Copy, Clone)]
+enum ScanField {
+    Artist,
+    Album,
+    Track,
+}
+
+struct ScanPhrase {
+    prefix: &'static str,
+    field: ScanField,
+}
+
+/// Fun loading-phrase prefixes, cycled while the library is scanning.
+const SCAN_PHRASES: &[ScanPhrase] = &[
+    ScanPhrase {
+        prefix: "Scoping",
+        field: ScanField::Album,
+    },
+    ScanPhrase {
+        prefix: "Scanning",
+        field: ScanField::Artist,
+    },
+    ScanPhrase {
+        prefix: "Creepin' on",
+        field: ScanField::Artist,
+    },
+    ScanPhrase {
+        prefix: "Puttin' a spell on",
+        field: ScanField::Track,
+    },
+    ScanPhrase {
+        prefix: "Vibing with",
+        field: ScanField::Artist,
+    },
+    ScanPhrase {
+        prefix: "Peeking at",
+        field: ScanField::Album,
+    },
+    ScanPhrase {
+        prefix: "Digging through",
+        field: ScanField::Artist,
+    },
+    ScanPhrase {
+        prefix: "Unpacking",
+        field: ScanField::Album,
+    },
+    ScanPhrase {
+        prefix: "Snooping on",
+        field: ScanField::Track,
+    },
+    ScanPhrase {
+        prefix: "Cataloging",
+        field: ScanField::Artist,
+    },
+    ScanPhrase {
+        prefix: "Tipping hat to",
+        field: ScanField::Track,
+    },
+];
+
+/// Minimum time a scan phrase stays on screen before rotating (milliseconds).
+const SCAN_PHRASE_MS: u128 = 900;
+
+/// Cheap entropy source for picking phrases and samples; quality doesn't matter.
+fn quick_random() -> usize {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as usize)
+        .unwrap_or(0)
 }
 
 #[derive(Clone, Debug)]
@@ -75,6 +147,74 @@ pub enum SortColumn {
     Album,
     Duration,
     Format,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlbumArtStyle {
+    Halfblock,
+    Ascii,
+}
+
+impl AlbumArtStyle {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AlbumArtStyle::Halfblock => "halfblock",
+            AlbumArtStyle::Ascii => "ascii",
+        }
+    }
+}
+
+impl std::str::FromStr for AlbumArtStyle {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "halfblock" => Ok(AlbumArtStyle::Halfblock),
+            "ascii" => Ok(AlbumArtStyle::Ascii),
+            _ => Err(()),
+        }
+    }
+}
+
+/// Character ramp for ASCII art, ordered sparse → dense (10 chars).
+/// High-luminance pixels map to denser glyphs (more ink coverage).
+pub(crate) const ASCII_ART_RAMP: &[u8; 10] = b" .:-=+*%#@";
+
+/// Rendered album-art buffer. The variant tracks which renderer produced the
+/// buffer, so the cache can never drift out of sync with the active style.
+#[allow(clippy::type_complexity)]
+#[derive(Clone, Debug)]
+pub enum AlbumArtCache {
+    /// Halfblock cells: one terminal cell packs two vertical pixels as ▀ with
+    /// fg = top pixel, bg = bottom pixel.
+    Halfblock(Vec<Vec<(char, [u8; 3], [u8; 3])>>),
+    /// ASCII cells: one pixel per cell, character picked from the luminance
+    /// ramp, fg = pixel color.
+    Ascii(Vec<Vec<(char, [u8; 3])>>),
+}
+
+impl AlbumArtCache {
+    pub fn rows(&self) -> usize {
+        match self {
+            AlbumArtCache::Halfblock(v) => v.len(),
+            AlbumArtCache::Ascii(v) => v.len(),
+        }
+    }
+
+    pub fn width(&self) -> usize {
+        match self {
+            AlbumArtCache::Halfblock(v) => v.first().map(|r| r.len()).unwrap_or(0),
+            AlbumArtCache::Ascii(v) => v.first().map(|r| r.len()).unwrap_or(0),
+        }
+    }
+
+    pub fn matches_style(&self, style: AlbumArtStyle) -> bool {
+        matches!(
+            (self, style),
+            (AlbumArtCache::Halfblock(_), AlbumArtStyle::Halfblock)
+                | (AlbumArtCache::Ascii(_), AlbumArtStyle::Ascii)
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -195,8 +335,8 @@ pub struct App {
     pub sidebar_items: Vec<String>,
     pub sidebar_selected: usize,
     pub sidebar_scroll: usize,
-    /// Per-mode saved selection positions: [Artists, Albums, Playlists] x [Library, Device]
-    saved_sidebar_pos: [[usize; 3]; 2],
+    /// Per-mode saved selection positions: [Artists, Albums] x [Library, Device]
+    saved_sidebar_pos: HashMap<(BrowseMode, SidebarMode), usize>,
     pub album_list: Vec<AlbumInfo>,
     pub album_selected: usize,
     pub track_list: Vec<TrackInfo>,
@@ -221,23 +361,34 @@ pub struct App {
     pub search_active: bool,
     pub search_query: String,
     pub toast_message: Option<(String, Instant, bool)>, // (msg, time, is_error)
-    pub library_path: Option<String>,
     pub loading_library: bool,
-    pub theme_index: usize,
+    /// (completed, total) track counts emitted by the library scanner.
+    pub scan_progress: Option<(u64, u64)>,
+    /// The current loading-screen message like "Scoping OK Computer".
+    pub scan_phrase: Option<String>,
+    /// When `scan_phrase` was last rotated.
+    scan_phrase_rotated_at: Option<Instant>,
+    /// Rolling buffer of recent track samples used to pick phrase targets.
+    scan_samples: Vec<TrackSample>,
+    pub theme: &'static Theme,
     pub show_theme_picker: bool,
     pub theme_picker_index: usize,
-    pub theme_before_picker: usize,
+    pub theme_before_picker: &'static Theme,
     /// Per-artist device presence for sidebar indicators (Library browse mode).
     pub artist_device_status: BTreeMap<String, DevicePresence>,
+    /// Per-(artist, album) device presence for album-list indicators.
+    pub album_device_status: BTreeMap<(String, String), DevicePresence>,
     /// Cached album art extracted from ID3 tags.
     pub album_art: Option<DynamicImage>,
     /// Key used to avoid re-extracting art (e.g. "artist/album").
     album_art_key: String,
-    /// Cached halfblock art lines: (char, fg_rgb, bg_rgb) per cell.
-    #[allow(clippy::type_complexity)]
-    pub album_art_lines: Vec<Vec<(char, [u8; 3], [u8; 3])>>,
-    /// Dimensions (w, h) the cached ASCII art was rendered for.
+    /// Rendered album-art buffer for the active style, or `None` if no art is
+    /// cached (either never built or invalidated by a style/size/key change).
+    pub album_art_cache: Option<AlbumArtCache>,
+    /// Dimensions (w, h) the cached album art was rendered for.
     album_art_size: (u16, u16),
+    /// Renderer style for album art: halfblock (Unicode half-block) or ascii (character ramp).
+    pub album_art_style: AlbumArtStyle,
     /// Background commands to send after event handling (main loop flushes these).
     pub pending_bg_commands: Vec<BgCommand>,
 }
@@ -273,7 +424,7 @@ impl App {
             sidebar_items: Vec::new(),
             sidebar_selected: 0,
             sidebar_scroll: 0,
-            saved_sidebar_pos: [[0; 3]; 2],
+            saved_sidebar_pos: HashMap::new(),
             album_list: Vec::new(),
             album_selected: 0,
             track_list: Vec::new(),
@@ -298,28 +449,59 @@ impl App {
             search_active: false,
             search_query: String::new(),
             toast_message: None,
-            library_path: None,
             loading_library: false,
-            theme_index: 0,
+            scan_progress: None,
+            scan_phrase: None,
+            scan_phrase_rotated_at: None,
+            scan_samples: Vec::new(),
+            theme: &THEMES[0],
             show_theme_picker: false,
             theme_picker_index: 0,
-            theme_before_picker: 0,
+            theme_before_picker: &THEMES[0],
             artist_device_status: BTreeMap::new(),
+            album_device_status: BTreeMap::new(),
             album_art: None,
             album_art_key: String::new(),
-            album_art_lines: Vec::new(),
+            album_art_cache: None,
             album_art_size: (0, 0),
+            album_art_style: {
+                let cfg = crate::config::load();
+                cfg.album_art_style
+                    .as_deref()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(AlbumArtStyle::Halfblock)
+            },
             pending_bg_commands: Vec::new(),
         }
     }
 
+    /// Toggle between halfblock and ASCII album art renderers, invalidating caches
+    /// so the next render rebuilds at the current panel size. Persists choice to config.
+    pub fn toggle_album_art_style(&mut self) {
+        self.flip_art_style_in_memory();
+        let style = self.album_art_style.as_str().to_string();
+        crate::config::update(|c| c.album_art_style = Some(style));
+    }
+
+    /// In-memory half of [`toggle_album_art_style`]: flips the style and
+    /// invalidates the cached art for the old style. Split out so unit tests
+    /// can exercise the state transition without touching the on-disk config.
+    fn flip_art_style_in_memory(&mut self) {
+        self.album_art_style = match self.album_art_style {
+            AlbumArtStyle::Halfblock => AlbumArtStyle::Ascii,
+            AlbumArtStyle::Ascii => AlbumArtStyle::Halfblock,
+        };
+        self.album_art_cache = None;
+        self.album_art_size = (0, 0);
+    }
+
     pub fn theme(&self) -> &'static Theme {
-        &THEMES[self.theme_index.min(THEMES.len() - 1)]
+        self.theme
     }
 
     pub fn open_theme_picker(&mut self) {
-        self.theme_before_picker = self.theme_index;
-        self.theme_picker_index = self.theme_index;
+        self.theme_before_picker = self.theme;
+        self.theme_picker_index = crate::theme::theme_position(self.theme);
         self.show_theme_picker = true;
     }
 
@@ -327,19 +509,17 @@ impl App {
         let len = THEMES.len();
         self.theme_picker_index =
             (self.theme_picker_index as isize + delta).rem_euclid(len as isize) as usize;
-        self.theme_index = self.theme_picker_index;
+        self.theme = &THEMES[self.theme_picker_index];
     }
 
     pub fn theme_picker_confirm(&mut self) {
         self.show_theme_picker = false;
-        // Save to config.
-        let mut config = crate::config::load();
-        config.theme = Some(self.theme().name.to_string());
-        crate::config::save(&config);
+        let theme_name = self.theme.name.to_string();
+        crate::config::update(|c| c.theme = Some(theme_name));
     }
 
     pub fn theme_picker_cancel(&mut self) {
-        self.theme_index = self.theme_before_picker;
+        self.theme = self.theme_before_picker;
         self.show_theme_picker = false;
     }
 
@@ -574,10 +754,11 @@ impl App {
         }
     }
 
-    /// Compute per-artist device presence (None/Partial/Full) by checking
-    /// every artist track in the library against the device.
+    /// Compute per-artist and per-album device presence (None/Partial/Full)
+    /// by checking every track in the library against the device.
     pub fn rebuild_artist_device_status(&mut self) {
         self.artist_device_status.clear();
+        self.album_device_status.clear();
         let lib = match &self.library {
             Some(l) => l,
             None => return,
@@ -585,24 +766,30 @@ impl App {
         if self.device.status != DeviceStatus::Connected || self.device.track_set.is_empty() {
             return;
         }
-        let mut counts: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+        let mut artist_counts: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+        let mut album_counts: BTreeMap<(String, String), (usize, usize)> = BTreeMap::new();
         for t in lib.all_tracks() {
-            let entry = counts.entry(t.artist.clone()).or_default();
-            entry.1 += 1;
+            let artist_entry = artist_counts.entry(t.artist.clone()).or_default();
+            artist_entry.1 += 1;
+            let album_entry = album_counts
+                .entry((t.artist.clone(), t.album.clone()))
+                .or_default();
+            album_entry.1 += 1;
             if is_on_device(&t.artist, &t.name, &self.device) {
-                entry.0 += 1;
+                artist_entry.0 += 1;
+                album_entry.0 += 1;
             }
         }
-        for (artist, (on_device, total)) in counts {
-            let status = if on_device == 0 {
-                DevicePresence::None
-            } else if on_device >= total {
-                DevicePresence::Full
-            } else {
-                DevicePresence::Partial
-            };
+        for (artist, (on_device, total)) in artist_counts {
+            let status = presence_from_counts(on_device, total);
             if status != DevicePresence::None {
                 self.artist_device_status.insert(artist, status);
+            }
+        }
+        for (key, (on_device, total)) in album_counts {
+            let status = presence_from_counts(on_device, total);
+            if status != DevicePresence::None {
+                self.album_device_status.insert(key, status);
             }
         }
     }
@@ -615,6 +802,7 @@ impl App {
         self.device.artist_track_names.clear();
         self.device.acquired_items = 0;
         self.artist_device_status.clear();
+        self.album_device_status.clear();
         if self.browse_mode == BrowseMode::Device {
             self.browse_mode = BrowseMode::Library;
             self.refresh_sidebar();
@@ -703,7 +891,6 @@ impl App {
                     })
                     .unwrap_or_default()
             }
-            SidebarMode::Playlists => Vec::new(),
         }
     }
 
@@ -724,37 +911,22 @@ impl App {
                     (item.to_string(), String::new())
                 }
             }
-            SidebarMode::Playlists => (String::new(), String::new()),
-        }
-    }
-
-    fn sidebar_mode_index(&self) -> usize {
-        match self.sidebar_mode {
-            SidebarMode::Artists => 0,
-            SidebarMode::Albums => 1,
-            SidebarMode::Playlists => 2,
-        }
-    }
-
-    fn browse_mode_index(&self) -> usize {
-        match self.browse_mode {
-            BrowseMode::Library => 0,
-            BrowseMode::Device => 1,
         }
     }
 
     /// Save the current sidebar selection for the active mode.
     pub fn save_sidebar_pos(&mut self) {
-        let b = self.browse_mode_index();
-        let m = self.sidebar_mode_index();
-        self.saved_sidebar_pos[b][m] = self.sidebar_selected;
+        self.saved_sidebar_pos
+            .insert((self.browse_mode, self.sidebar_mode), self.sidebar_selected);
     }
 
     /// Restore the saved sidebar selection for the active mode, clamped to list bounds.
     fn restore_sidebar_pos(&mut self) {
-        let b = self.browse_mode_index();
-        let m = self.sidebar_mode_index();
-        let saved = self.saved_sidebar_pos[b][m];
+        let saved = self
+            .saved_sidebar_pos
+            .get(&(self.browse_mode, self.sidebar_mode))
+            .copied()
+            .unwrap_or(0);
         if self.sidebar_items.is_empty() {
             self.sidebar_selected = 0;
         } else {
@@ -782,11 +954,6 @@ impl App {
                         .into_iter()
                         .map(|(artist, album)| format!("{} \u{2014} {}", artist, album))
                         .collect(),
-                    SidebarMode::Playlists => lib
-                        .user_playlists()
-                        .into_iter()
-                        .map(|p| format!("{} ({} tracks)", p.name, p.track_ids.len()))
-                        .collect(),
                 };
             }
             BrowseMode::Device => {
@@ -802,7 +969,6 @@ impl App {
                         items.sort();
                         items
                     }
-                    SidebarMode::Playlists => Vec::new(),
                 };
             }
         }
@@ -880,16 +1046,6 @@ impl App {
                 self.track_scroll = 0;
                 self.refresh_album_art();
             }
-            SidebarMode::Playlists => {
-                self.album_list.clear();
-                let name = item.rfind(" (").map(|pos| &item[..pos]).unwrap_or(&item);
-                let tracks = lib.playlist_tracks(name);
-                self.track_list = tracks_to_info(tracks, &self.device);
-                self.sort_tracks();
-                self.track_selected = 0;
-                self.track_scroll = 0;
-                self.refresh_album_art();
-            }
         }
     }
 
@@ -929,12 +1085,6 @@ impl App {
                 } else {
                     self.track_list = Vec::new();
                 }
-                self.track_selected = 0;
-                self.track_scroll = 0;
-            }
-            SidebarMode::Playlists => {
-                self.album_list.clear();
-                self.track_list.clear();
                 self.track_selected = 0;
                 self.track_scroll = 0;
             }
@@ -993,7 +1143,7 @@ impl App {
         } else {
             self.album_art = None;
             self.album_art_key.clear();
-            self.album_art_lines.clear();
+            self.album_art_cache = None;
             self.album_art_size = (0, 0);
             return;
         };
@@ -1003,7 +1153,7 @@ impl App {
         }
         self.album_art_key = key.clone();
         self.album_art = None;
-        self.album_art_lines.clear();
+        self.album_art_cache = None;
         self.album_art_size = (0, 0);
 
         // Collect file paths and dispatch to the background thread.
@@ -1016,22 +1166,33 @@ impl App {
             .push(BgCommand::LoadAlbumArt { key, paths });
     }
 
-    /// Render album art as halfblock characters sized to a square that fits
-    /// within the given terminal area. Each cell packs two vertical pixels
-    /// using ▀ with fg=top color, bg=bottom color — doubling vertical resolution.
+    /// Rebuild the album-art cache sized to fit within the given terminal area,
+    /// using the renderer selected by `album_art_style`:
+    ///
+    /// - `Halfblock`: each cell packs two vertical pixels as ▀ with fg=top,
+    ///   bg=bottom — doubling vertical resolution.
+    /// - `Ascii`: one pixel per cell, mapped to a character ramp by luminance
+    ///   with fg=pixel color, bg=theme background.
+    ///
+    /// Only the cache for the active style is populated.
     pub fn render_album_art(&mut self, width: u16, height: u16) {
-        if (width, height) == self.album_art_size && !self.album_art_lines.is_empty() {
+        let cache_valid = (width, height) == self.album_art_size
+            && self
+                .album_art_cache
+                .as_ref()
+                .is_some_and(|c| c.matches_style(self.album_art_style));
+        if cache_valid {
             return;
         }
         self.album_art_size = (width, height);
-        self.album_art_lines.clear();
+        self.album_art_cache = None;
 
         let img = match &self.album_art {
             Some(img) => img,
             None => return,
         };
 
-        // Terminal chars are roughly 1:2 (w:h), so 1 cell = 1 pixel wide, 2 pixels tall.
+        // Terminal chars are roughly 1:2 (w:h), so 1 cell spans 1 pixel wide × 2 pixels tall.
         // Fit the image within the available area preserving aspect ratio.
         let (iw, ih) = (img.width(), img.height());
         let max_px_w = width as u32;
@@ -1041,71 +1202,68 @@ impl App {
         let px_h = ((ih as f64 * scale).round() as u32).max(2);
         let rows = px_h / 2;
 
-        let resized = img.resize_exact(cols, rows * 2, image::imageops::FilterType::Lanczos3);
-        let rgba = resized.to_rgba8();
-
-        for row in 0..rows {
-            let mut line = Vec::with_capacity(cols as usize);
-            for col in 0..cols {
-                let top = rgba.get_pixel(col, row * 2);
-                let bot = rgba.get_pixel(col, row * 2 + 1);
-                line.push(('▀', [top[0], top[1], top[2]], [bot[0], bot[1], bot[2]]));
+        self.album_art_cache = Some(match self.album_art_style {
+            AlbumArtStyle::Halfblock => {
+                let resized =
+                    img.resize_exact(cols, rows * 2, image::imageops::FilterType::Lanczos3);
+                let rgba = resized.to_rgba8();
+                let mut lines = Vec::with_capacity(rows as usize);
+                for row in 0..rows {
+                    let mut line = Vec::with_capacity(cols as usize);
+                    for col in 0..cols {
+                        let top = rgba.get_pixel(col, row * 2);
+                        let bot = rgba.get_pixel(col, row * 2 + 1);
+                        line.push(('▀', [top[0], top[1], top[2]], [bot[0], bot[1], bot[2]]));
+                    }
+                    lines.push(line);
+                }
+                AlbumArtCache::Halfblock(lines)
             }
-            self.album_art_lines.push(line);
-        }
+            AlbumArtStyle::Ascii => {
+                // One char per cell: sample one pixel per cell and map luminance to the ramp.
+                let resized = img.resize_exact(cols, rows, image::imageops::FilterType::Lanczos3);
+                let rgba = resized.to_rgba8();
+                let ramp_len = ASCII_ART_RAMP.len() as u32;
+                let mut lines = Vec::with_capacity(rows as usize);
+                for row in 0..rows {
+                    let mut line = Vec::with_capacity(cols as usize);
+                    for col in 0..cols {
+                        let p = rgba.get_pixel(col, row);
+                        // Rec. 709 luma.
+                        let lum = (0.2126 * p[0] as f32
+                            + 0.7152 * p[1] as f32
+                            + 0.0722 * p[2] as f32) as u32;
+                        let idx = (lum * ramp_len / 256).min(ramp_len - 1) as usize;
+                        let ch = ASCII_ART_RAMP[idx] as char;
+                        line.push((ch, [p[0], p[1], p[2]]));
+                    }
+                    lines.push(line);
+                }
+                AlbumArtCache::Ascii(lines)
+            }
+        });
     }
 
     fn sort_tracks(&mut self) {
-        let asc = self.sort_ascending;
+        // `sort_by_cached_key` computes each key once per element, not once per
+        // comparison — so the string columns allocate `n` lowercased Strings
+        // instead of `2·n·log n` worth of them.
         match self.sort_column {
-            SortColumn::Number => self.track_list.sort_by(|a, b| {
-                let cmp = a.track_number.cmp(&b.track_number);
-                if asc {
-                    cmp
-                } else {
-                    cmp.reverse()
-                }
-            }),
-            SortColumn::Name => self.track_list.sort_by(|a, b| {
-                let cmp = a.name.to_lowercase().cmp(&b.name.to_lowercase());
-                if asc {
-                    cmp
-                } else {
-                    cmp.reverse()
-                }
-            }),
-            SortColumn::Artist => self.track_list.sort_by(|a, b| {
-                let cmp = a.artist.to_lowercase().cmp(&b.artist.to_lowercase());
-                if asc {
-                    cmp
-                } else {
-                    cmp.reverse()
-                }
-            }),
-            SortColumn::Album => self.track_list.sort_by(|a, b| {
-                let cmp = a.album.to_lowercase().cmp(&b.album.to_lowercase());
-                if asc {
-                    cmp
-                } else {
-                    cmp.reverse()
-                }
-            }),
-            SortColumn::Duration => self.track_list.sort_by(|a, b| {
-                let cmp = a.duration_ms.cmp(&b.duration_ms);
-                if asc {
-                    cmp
-                } else {
-                    cmp.reverse()
-                }
-            }),
-            SortColumn::Format => self.track_list.sort_by(|a, b| {
-                let cmp = a.kind.cmp(&b.kind);
-                if asc {
-                    cmp
-                } else {
-                    cmp.reverse()
-                }
-            }),
+            SortColumn::Number => self.track_list.sort_by_cached_key(|t| t.track_number),
+            SortColumn::Name => self
+                .track_list
+                .sort_by_cached_key(|t| t.name.to_lowercase()),
+            SortColumn::Artist => self
+                .track_list
+                .sort_by_cached_key(|t| t.artist.to_lowercase()),
+            SortColumn::Album => self
+                .track_list
+                .sort_by_cached_key(|t| t.album.to_lowercase()),
+            SortColumn::Duration => self.track_list.sort_by_cached_key(|t| t.duration_ms),
+            SortColumn::Format => self.track_list.sort_by_cached_key(|t| t.kind.clone()),
+        }
+        if !self.sort_ascending {
+            self.track_list.reverse();
         }
     }
 
@@ -1137,6 +1295,7 @@ impl App {
                     tracks: vec![item],
                 });
                 self.set_toast(format!("Added \"{}\" to queue", track.name), false);
+                self.forward_last_queue_item_if_syncing();
             } else {
                 self.set_toast("Track has no file location".into(), true);
             }
@@ -1169,6 +1328,7 @@ impl App {
             tracks: items,
         });
         self.set_toast(format!("Added {} tracks to queue", count), false);
+        self.forward_last_queue_item_if_syncing();
     }
 
     pub fn add_sidebar_item_to_queue(&mut self) {
@@ -1205,10 +1365,28 @@ impl App {
                 tracks: items,
             });
             self.set_toast(format!("Added {} tracks to queue", count), false);
+            self.forward_last_queue_item_if_syncing();
         } else {
-            // For albums/playlists, select to populate track list, then add all.
+            // For albums, select to populate track list, then add all.
+            // (add_all_visible_to_queue handles the forward itself.)
             self.select_sidebar_item();
             self.add_all_visible_to_queue();
+        }
+    }
+
+    /// If a sync is currently in flight, forward the tracks of the most
+    /// recently pushed queue entry to the background worker so they get
+    /// picked up by the running sync instead of being orphaned when the
+    /// queue is cleared on completion.
+    fn forward_last_queue_item_if_syncing(&mut self) {
+        if !matches!(self.sync.status, SyncStatus::Running { .. }) {
+            return;
+        }
+        if let Some(item) = self.sync.queue.last() {
+            if !item.tracks.is_empty() {
+                self.pending_bg_commands
+                    .push(BgCommand::AppendSyncQueue(item.tracks.clone()));
+            }
         }
     }
 
@@ -1272,6 +1450,10 @@ impl App {
         match event {
             BgEvent::LibraryLoaded(result) => {
                 self.loading_library = false;
+                self.scan_progress = None;
+                self.scan_phrase = None;
+                self.scan_phrase_rotated_at = None;
+                self.scan_samples.clear();
                 match result {
                     Ok(lib) => {
                         self.library = Some(lib);
@@ -1282,6 +1464,17 @@ impl App {
                         self.set_toast(format!("Library: {}", e), true);
                     }
                 }
+            }
+            BgEvent::LibraryScanProgress(p) => {
+                self.scan_progress = Some((p.completed, p.total));
+                if let Some(sample) = p.sample {
+                    // Keep a small rolling buffer (~128 most recent).
+                    if self.scan_samples.len() >= 128 {
+                        self.scan_samples.remove(0);
+                    }
+                    self.scan_samples.push(sample);
+                }
+                self.maybe_rotate_scan_phrase();
             }
             BgEvent::DeviceDetected(info) => {
                 self.device.name = Some(info.name);
@@ -1327,7 +1520,7 @@ impl App {
                 // Only apply if the key still matches (user hasn't navigated away).
                 if key == self.album_art_key {
                     self.album_art = image;
-                    self.album_art_lines.clear();
+                    self.album_art_cache = None;
                     self.album_art_size = (0, 0);
                 }
             }
@@ -1442,6 +1635,28 @@ impl App {
         self.toast_message = Some((msg, Instant::now(), is_error));
     }
 
+    /// Pick a new loading-screen phrase if enough time has passed (or none is set).
+    fn maybe_rotate_scan_phrase(&mut self) {
+        let should_rotate = self
+            .scan_phrase_rotated_at
+            .map(|t| t.elapsed().as_millis() >= SCAN_PHRASE_MS)
+            .unwrap_or(true);
+        if !should_rotate || self.scan_samples.is_empty() {
+            return;
+        }
+
+        let seed = quick_random();
+        let phrase = &SCAN_PHRASES[seed % SCAN_PHRASES.len()];
+        let sample = &self.scan_samples[(seed / 7) % self.scan_samples.len()];
+        let target: &str = match phrase.field {
+            ScanField::Artist => &sample.artist,
+            ScanField::Album => &sample.album,
+            ScanField::Track => &sample.name,
+        };
+        self.scan_phrase = Some(format!("{} {}", phrase.prefix, target));
+        self.scan_phrase_rotated_at = Some(Instant::now());
+    }
+
     pub fn tick(&mut self) {
         self.throbber_state.calc_next();
         self.anim_frame = self.anim_frame.wrapping_add(1);
@@ -1451,6 +1666,12 @@ impl App {
             if time.elapsed().as_secs() >= 5 {
                 self.toast_message = None;
             }
+        }
+
+        // Keep the scan phrase rotating even if no new samples arrive (e.g.
+        // the scan has stalled on a slow file).
+        if self.loading_library {
+            self.maybe_rotate_scan_phrase();
         }
     }
 
@@ -1701,6 +1922,17 @@ fn tracks_to_info(tracks: Vec<&Track>, device: &DeviceState) -> Vec<TrackInfo> {
         .collect()
 }
 
+/// Map a `(matched, total)` track count to a tri-state presence marker.
+fn presence_from_counts(matched: usize, total: usize) -> DevicePresence {
+    if total == 0 || matched == 0 {
+        DevicePresence::None
+    } else if matched >= total {
+        DevicePresence::Full
+    } else {
+        DevicePresence::Partial
+    }
+}
+
 /// Check if a single track is on device using the precomputed sets.
 fn is_on_device(artist: &str, name: &str, device: &DeviceState) -> bool {
     if device.status != DeviceStatus::Connected || device.track_set.is_empty() {
@@ -1861,6 +2093,74 @@ mod tests {
         assert_eq!(app.sort_column, SortColumn::Artist);
         app.cycle_sort();
         assert_eq!(app.sort_column, SortColumn::Album);
+    }
+
+    #[test]
+    fn adding_track_while_syncing_forwards_to_worker() {
+        let mut app = App::new();
+        // Simulate an in-flight sync.
+        app.sync.status = SyncStatus::Running {
+            current: 1,
+            total: 5,
+        };
+        app.track_list.push(TrackInfo {
+            name: "Idioteque".into(),
+            artist: "Radiohead".into(),
+            album: "Kid A".into(),
+            duration_ms: None,
+            kind: None,
+            location: Some("/tmp/idioteque.mp3".into()),
+            track_number: None,
+            disc_number: None,
+            on_device: false,
+        });
+        app.track_selected = 0;
+
+        app.add_selected_track_to_queue();
+
+        // Queue retains a record of the addition (for display on completion).
+        assert_eq!(app.sync.queue.len(), 1);
+
+        // And the worker was told to append to the running sync.
+        let appended = app
+            .pending_bg_commands
+            .iter()
+            .filter_map(|cmd| match cmd {
+                BgCommand::AppendSyncQueue(items) => Some(items.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(appended.len(), 1, "expected exactly one AppendSyncQueue");
+        assert_eq!(appended[0].len(), 1);
+        assert_eq!(appended[0][0].name, "Idioteque");
+    }
+
+    #[test]
+    fn adding_track_when_idle_does_not_forward() {
+        let mut app = App::new();
+        assert!(matches!(app.sync.status, SyncStatus::Idle));
+        app.track_list.push(TrackInfo {
+            name: "Creep".into(),
+            artist: "Radiohead".into(),
+            album: "Pablo Honey".into(),
+            duration_ms: None,
+            kind: None,
+            location: Some("/tmp/creep.mp3".into()),
+            track_number: None,
+            disc_number: None,
+            on_device: false,
+        });
+        app.track_selected = 0;
+
+        app.add_selected_track_to_queue();
+
+        assert_eq!(app.sync.queue.len(), 1);
+        assert!(
+            !app.pending_bg_commands
+                .iter()
+                .any(|cmd| matches!(cmd, BgCommand::AppendSyncQueue(_))),
+            "should not forward while sync is Idle",
+        );
     }
 
     #[test]
@@ -2123,14 +2423,39 @@ mod tests {
 
     // -- handle_bg_event tests --
 
-    use std::collections::HashMap;
+    struct EmptyLibrary;
+    impl zytunes::library::MusicLibrary for EmptyLibrary {
+        fn artists(&self) -> Vec<&str> {
+            Vec::new()
+        }
+        fn albums(&self) -> Vec<(&str, &str)> {
+            Vec::new()
+        }
+        fn artist_tracks(&self, _: &str) -> Vec<&zytunes::library::Track> {
+            Vec::new()
+        }
+        fn album_tracks(&self, _: &str) -> Vec<&zytunes::library::Track> {
+            Vec::new()
+        }
+        fn album_tracks_by_artist(&self, _: &str, _: &str) -> Vec<&zytunes::library::Track> {
+            Vec::new()
+        }
+        fn tracks_by_name(&self, _: &str) -> Vec<&zytunes::library::Track> {
+            Vec::new()
+        }
+        fn track_count(&self) -> usize {
+            0
+        }
+        fn all_tracks(&self) -> Vec<&zytunes::library::Track> {
+            Vec::new()
+        }
+        fn music_folder(&self) -> Option<&str> {
+            None
+        }
+    }
 
     fn make_minimal_library() -> Box<dyn zytunes::library::MusicLibrary + Send> {
-        Box::new(zytunes::library::ItunesLibrary {
-            tracks: HashMap::new(),
-            playlists: Vec::new(),
-            music_folder_path: None,
-        })
+        Box::new(EmptyLibrary)
     }
 
     #[test]
@@ -2152,6 +2477,57 @@ mod tests {
         let (msg, _, is_error) = app.toast_message.as_ref().unwrap();
         assert!(is_error);
         assert!(msg.contains("bad path"));
+    }
+
+    #[test]
+    fn scan_progress_event_sets_phrase_and_counts() {
+        use zytunes::dirlib::{ScanProgress, TrackSample};
+        let mut app = App::new();
+        app.loading_library = true;
+
+        app.handle_bg_event(BgEvent::LibraryScanProgress(ScanProgress {
+            completed: 7,
+            total: 42,
+            sample: Some(TrackSample {
+                artist: "Radiohead".into(),
+                album: "OK Computer".into(),
+                name: "Karma Police".into(),
+            }),
+        }));
+
+        assert_eq!(app.scan_progress, Some((7, 42)));
+        let phrase = app.scan_phrase.as_ref().expect("phrase should be set");
+        // The phrase must reference one of the sample fields.
+        assert!(
+            phrase.contains("Radiohead")
+                || phrase.contains("OK Computer")
+                || phrase.contains("Karma Police"),
+            "phrase {phrase:?} did not reference any sample field"
+        );
+    }
+
+    #[test]
+    fn library_loaded_clears_scan_state() {
+        use zytunes::dirlib::{ScanProgress, TrackSample};
+        let mut app = App::new();
+        app.loading_library = true;
+        app.handle_bg_event(BgEvent::LibraryScanProgress(ScanProgress {
+            completed: 1,
+            total: 1,
+            sample: Some(TrackSample {
+                artist: "A".into(),
+                album: "B".into(),
+                name: "C".into(),
+            }),
+        }));
+        assert!(app.scan_phrase.is_some());
+        assert!(app.scan_progress.is_some());
+
+        app.handle_bg_event(BgEvent::LibraryLoaded(Ok(make_minimal_library())));
+
+        assert!(app.scan_phrase.is_none());
+        assert!(app.scan_progress.is_none());
+        assert!(app.scan_samples.is_empty());
     }
 
     #[test]
@@ -2275,11 +2651,11 @@ mod tests {
     #[test]
     fn theme_picker_cancel_restores() {
         let mut app = App::new();
-        app.theme_index = 3;
+        app.theme = &crate::theme::THEMES[3];
         app.open_theme_picker();
         app.theme_picker_move(2); // changes preview
         app.theme_picker_cancel();
-        assert_eq!(app.theme_index, 3);
+        assert_eq!(app.theme.name, crate::theme::THEMES[3].name);
         assert!(!app.show_theme_picker);
     }
 
@@ -2519,5 +2895,213 @@ mod tests {
             is_on_device("*NSYNC", "Bye Bye Bye", &device),
             "*NSYNC should match NSYNC on device"
         );
+    }
+
+    #[test]
+    fn rebuild_device_status_tags_artists_and_albums() {
+        struct MockLib {
+            tracks: Vec<zytunes::library::Track>,
+        }
+        impl zytunes::library::MusicLibrary for MockLib {
+            fn artists(&self) -> Vec<&str> {
+                Vec::new()
+            }
+            fn albums(&self) -> Vec<(&str, &str)> {
+                Vec::new()
+            }
+            fn artist_tracks(&self, _: &str) -> Vec<&zytunes::library::Track> {
+                Vec::new()
+            }
+            fn album_tracks(&self, _: &str) -> Vec<&zytunes::library::Track> {
+                Vec::new()
+            }
+            fn album_tracks_by_artist(&self, _: &str, _: &str) -> Vec<&zytunes::library::Track> {
+                Vec::new()
+            }
+            fn tracks_by_name(&self, _: &str) -> Vec<&zytunes::library::Track> {
+                Vec::new()
+            }
+            fn track_count(&self) -> usize {
+                self.tracks.len()
+            }
+            fn all_tracks(&self) -> Vec<&zytunes::library::Track> {
+                self.tracks.iter().collect()
+            }
+            fn music_folder(&self) -> Option<&str> {
+                None
+            }
+        }
+
+        fn track(id: u64, artist: &str, album: &str, name: &str) -> zytunes::library::Track {
+            zytunes::library::Track {
+                id,
+                name: name.into(),
+                artist: artist.into(),
+                album: album.into(),
+                album_artist: None,
+                genre: None,
+                year: None,
+                track_number: None,
+                disc_number: None,
+                total_time_ms: None,
+                location: None,
+                kind: None,
+            }
+        }
+
+        // Library: Radiohead has two albums, Bjork one; only one Radiohead
+        // album is fully on device, the other is partial, Bjork's is absent.
+        let lib = MockLib {
+            tracks: vec![
+                track(1, "Radiohead", "OK Computer", "Airbag"),
+                track(2, "Radiohead", "OK Computer", "Karma Police"),
+                track(3, "Radiohead", "Kid A", "Idioteque"),
+                track(4, "Radiohead", "Kid A", "The National Anthem"),
+                track(5, "Bjork", "Post", "Army of Me"),
+            ],
+        };
+
+        let mut app = App::new();
+        app.library = Some(Box::new(lib));
+        app.device.status = DeviceStatus::Connected;
+        // Put both OK Computer tracks + one Kid A track on device.
+        app.device.album_tracks.insert(
+            ("Radiohead".into(), "OK Computer".into()),
+            vec![
+                DeviceTrackInfo {
+                    name: "Airbag".into(),
+                    device_path: "/Music/Radiohead/OK Computer/Airbag.mp3".into(),
+                    size: 1,
+                    object_id: 1,
+                    artist: "Radiohead".into(),
+                    album: "OK Computer".into(),
+                    track_number: None,
+                    disc_number: None,
+                },
+                DeviceTrackInfo {
+                    name: "Karma Police".into(),
+                    device_path: "/Music/Radiohead/OK Computer/Karma Police.mp3".into(),
+                    size: 1,
+                    object_id: 2,
+                    artist: "Radiohead".into(),
+                    album: "OK Computer".into(),
+                    track_number: None,
+                    disc_number: None,
+                },
+            ],
+        );
+        app.device.album_tracks.insert(
+            ("Radiohead".into(), "Kid A".into()),
+            vec![DeviceTrackInfo {
+                name: "Idioteque".into(),
+                device_path: "/Music/Radiohead/Kid A/Idioteque.mp3".into(),
+                size: 1,
+                object_id: 3,
+                artist: "Radiohead".into(),
+                album: "Kid A".into(),
+                track_number: None,
+                disc_number: None,
+            }],
+        );
+        build_match_sets(&mut app.device);
+
+        app.rebuild_artist_device_status();
+
+        assert_eq!(
+            app.artist_device_status.get("Radiohead"),
+            Some(&DevicePresence::Partial),
+            "Radiohead should be Partial (3 of 4 on device)",
+        );
+        assert!(
+            !app.artist_device_status.contains_key("Bjork"),
+            "Bjork should have no entry (nothing on device)",
+        );
+        assert_eq!(
+            app.album_device_status
+                .get(&("Radiohead".into(), "OK Computer".into())),
+            Some(&DevicePresence::Full),
+            "OK Computer should be Full",
+        );
+        assert_eq!(
+            app.album_device_status
+                .get(&("Radiohead".into(), "Kid A".into())),
+            Some(&DevicePresence::Partial),
+            "Kid A should be Partial",
+        );
+        assert!(
+            !app.album_device_status
+                .contains_key(&("Bjork".into(), "Post".into())),
+            "Post should not be tracked (nothing on device)",
+        );
+    }
+
+    #[test]
+    fn album_art_style_from_str_round_trip() {
+        for s in ["ascii", "halfblock"] {
+            let style: AlbumArtStyle = s.parse().expect("valid style");
+            assert_eq!(style.as_str(), s);
+        }
+        assert!("bogus".parse::<AlbumArtStyle>().is_err());
+    }
+
+    #[test]
+    fn flip_art_style_in_memory_flips_and_clears_caches() {
+        let mut app = App::new();
+        app.album_art_style = AlbumArtStyle::Halfblock;
+        app.album_art_cache = Some(AlbumArtCache::Halfblock(vec![vec![(
+            '▀',
+            [1, 2, 3],
+            [4, 5, 6],
+        )]]));
+        app.album_art_size = (80, 24);
+
+        app.flip_art_style_in_memory();
+        assert_eq!(app.album_art_style, AlbumArtStyle::Ascii);
+        assert!(app.album_art_cache.is_none());
+        assert_eq!(app.album_art_size, (0, 0));
+
+        // Seed the ascii variant and flip back; covers the other match arm.
+        app.album_art_cache = Some(AlbumArtCache::Ascii(vec![vec![('@', [0, 0, 0])]]));
+        app.flip_art_style_in_memory();
+        assert_eq!(app.album_art_style, AlbumArtStyle::Halfblock);
+        assert!(app.album_art_cache.is_none());
+    }
+
+    #[test]
+    fn render_album_art_populates_only_active_cache() {
+        use image::{DynamicImage, RgbaImage};
+
+        let mut app = App::new();
+        // Tiny gradient test image so the renderer has pixels to sample.
+        let mut img = RgbaImage::new(8, 8);
+        for (x, y, px) in img.enumerate_pixels_mut() {
+            let v = ((x + y) * 16).min(255) as u8;
+            *px = image::Rgba([v, v, v, 255]);
+        }
+        app.album_art = Some(DynamicImage::ImageRgba8(img));
+
+        app.album_art_style = AlbumArtStyle::Halfblock;
+        app.render_album_art(16, 8);
+        assert!(matches!(
+            app.album_art_cache,
+            Some(AlbumArtCache::Halfblock(_))
+        ));
+
+        // Toggling should invalidate the cache so the other renderer fills its buffer.
+        app.album_art_style = AlbumArtStyle::Ascii;
+        app.album_art_cache = None;
+        app.album_art_size = (0, 0);
+        app.render_album_art(16, 8);
+        let Some(AlbumArtCache::Ascii(rows)) = app.album_art_cache.as_ref() else {
+            panic!("expected Ascii cache");
+        };
+
+        // Every glyph should belong to the ramp.
+        let ramp: &[u8] = ASCII_ART_RAMP;
+        for row in rows {
+            for &(ch, _) in row {
+                assert!(ramp.contains(&(ch as u8)), "unexpected glyph {:?}", ch);
+            }
+        }
     }
 }

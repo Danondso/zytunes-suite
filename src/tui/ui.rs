@@ -1,14 +1,32 @@
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, Clear, List, ListItem, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Cell, Clear, List, ListItem, Padding, Paragraph, Row, Table, Wrap,
+};
 use ratatui::Frame;
 use throbber_widgets_tui::{Throbber, ThrobberState, WhichUse};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+/// Display width of a string in terminal cells. Uses standard Unicode EAW
+/// measurement (ambiguous-width chars counted as 1 cell) to match what
+/// common terminals actually render, and more importantly what ratatui uses
+/// internally when laying out spans and widgets. CJK Wide chars are 2 cells
+/// under either measurement, so this still fixes the Japanese-overflow case.
+#[inline]
+fn disp_width(s: &str) -> usize {
+    UnicodeWidthStr::width(s)
+}
+
+#[inline]
+fn char_disp_width(c: char) -> usize {
+    UnicodeWidthChar::width(c).unwrap_or(0)
+}
 
 use crate::anim;
 use crate::app::{
-    format_duration, format_with_commas, App, BrowseMode, DevicePresence, DeviceStatus, NowPlaying,
-    Panel, PlaybackState, SidebarMode, SortColumn, SyncStatus,
+    format_duration, format_with_commas, AlbumArtCache, App, BrowseMode, DevicePresence,
+    DeviceStatus, NowPlaying, Panel, PlaybackState, SidebarMode, SortColumn, SyncStatus,
 };
 use crate::theme;
 
@@ -98,9 +116,9 @@ impl LayoutMetrics {
     }
 }
 
-fn throbber_symbol(state: &ThrobberState, theme_index: usize) -> String {
+fn throbber_symbol(state: &ThrobberState, theme: &theme::Theme) -> String {
     Throbber::default()
-        .throbber_set(anim::spinner_set_for_theme(theme_index))
+        .throbber_set(theme.spinner_set.clone())
         .use_type(WhichUse::Spin)
         .to_symbol_span(state)
         .content
@@ -224,7 +242,7 @@ pub fn draw(f: &mut Frame, app: &App) {
 
 fn draw_startup(f: &mut Frame, app: &App, area: Rect) {
     let t = app.theme();
-    let symbol = throbber_symbol(&app.throbber_state, app.theme_index);
+    let symbol = throbber_symbol(&app.throbber_state, app.theme());
     let pulse = anim::animated_accent(
         t.accent_color(),
         t.accent_secondary,
@@ -233,11 +251,23 @@ fn draw_startup(f: &mut Frame, app: &App, area: Rect) {
         40,
     );
 
-    let path_display = app.library_path.as_deref().unwrap_or("Library.xml");
-
     let revealed = anim::typing_reveal("zytunes", app.anim_frame);
 
-    let lines = vec![
+    // Pick the panel width first so we can size the phrase/bar/counter.
+    let w = 48u16.min(area.width);
+    let h = 11u16.min(area.height);
+
+    // Inner content width (panel minus borders).
+    let inner_w = w.saturating_sub(2) as usize;
+    // Fixed-width display slot so shorter/longer phrases all take the same
+    // number of columns; otherwise a centered line jumps as phrases rotate.
+    // Reserve ` {symbol} ` (3 cells) before the phrase.
+    let phrase_slot = inner_w.saturating_sub(3);
+    let phrase = app.scan_phrase.as_deref().unwrap_or("Scanning library...");
+    let phrase_trunc = truncate(phrase, phrase_slot);
+    let phrase_padded = pad_right_to_width(&phrase_trunc, phrase_slot);
+
+    let mut lines = vec![
         Line::from(""),
         Line::from(Span::styled(
             revealed,
@@ -246,11 +276,28 @@ fn draw_startup(f: &mut Frame, app: &App, area: Rect) {
         Line::from(""),
         Line::from(vec![
             Span::styled(format!(" {} ", symbol), Style::default().fg(pulse)),
-            Span::raw("Parsing library..."),
+            Span::raw(phrase_padded),
         ]),
-        Line::from(""),
-        Line::from(Span::styled(path_display, t.dim())),
     ];
+
+    // Progress bar + counter, both fixed-width so centering stays stable.
+    if let Some((done, total)) = app.scan_progress {
+        if total > 0 {
+            let bar_width = inner_w.saturating_sub(2); // 1 cell padding each side
+            let filled = ((done as f64 / total as f64) * bar_width as f64).round() as usize;
+            let filled = filled.min(bar_width);
+            let bar: String = std::iter::repeat_n('\u{2588}', filled)
+                .chain(std::iter::repeat_n('\u{2591}', bar_width - filled))
+                .collect();
+            // Zero-pad the completed count so digits don't grow the string
+            // while scanning (e.g. "     1 / 60000" → "  1234 / 60000").
+            let total_digits = total.to_string().len();
+            let counter = format!("{done:>total_digits$} / {total}");
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(bar, Style::default().fg(pulse))));
+            lines.push(Line::from(Span::styled(counter, t.dim())));
+        }
+    }
 
     let block = t
         .block()
@@ -258,13 +305,13 @@ fn draw_startup(f: &mut Frame, app: &App, area: Rect) {
         .title(" Starting ")
         .title_alignment(Alignment::Center);
 
+    // All dynamic content is now fixed-width per frame, so centering is stable.
     let paragraph = Paragraph::new(lines)
         .block(block)
         .alignment(Alignment::Center);
 
-    // Center the panel: 40 wide, 10 tall
-    let w = 40u16.min(area.width);
-    let h = 10u16.min(area.height);
+    // Center the panel.
+    let h = if app.scan_progress.is_some() { h } else { 10 };
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let centered = Rect::new(x, y, w, h);
@@ -279,7 +326,6 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
     let mode_label = match app.sidebar_mode {
         SidebarMode::Artists => "Artists",
         SidebarMode::Albums => "Albums",
-        SidebarMode::Playlists => "Playlists",
     };
     let browse_prefix = match app.browse_mode {
         BrowseMode::Library => "",
@@ -313,8 +359,6 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
             BrowseMode::Device => {
                 if app.device.tracks.is_empty() {
                     "No tracks on device"
-                } else if app.sidebar_mode == SidebarMode::Playlists {
-                    "Playlists not available\nin device view"
                 } else {
                     "(empty)"
                 }
@@ -332,10 +376,11 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
         app.sidebar_items.len(),
     );
 
-    // Show device presence indicators in Library Artists mode.
+    // Show device presence indicators in Library browse mode for both
+    // Artists (keyed by artist name) and Albums (keyed by "artist — album").
     let show_device_status = app.browse_mode == BrowseMode::Library
-        && app.sidebar_mode == SidebarMode::Artists
-        && !app.artist_device_status.is_empty();
+        && (matches!(app.sidebar_mode, SidebarMode::Artists | SidebarMode::Albums))
+        && (!app.artist_device_status.is_empty() || !app.album_device_status.is_empty());
 
     let items: Vec<ListItem> = app
         .sidebar_items
@@ -355,7 +400,18 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
                 "  "
             };
             let (icon, icon_style) = if show_device_status {
-                match app.artist_device_status.get(name) {
+                let presence = match app.sidebar_mode {
+                    SidebarMode::Artists => app.artist_device_status.get(name).copied(),
+                    SidebarMode::Albums => {
+                        // Sidebar entries are "Artist — Album" (em dash).
+                        name.split_once(" \u{2014} ").and_then(|(artist, album)| {
+                            app.album_device_status
+                                .get(&(artist.to_string(), album.to_string()))
+                                .copied()
+                        })
+                    }
+                };
+                match presence {
                     Some(DevicePresence::Full) => ("✓ ", style.fg(t.selection_bg)),
                     Some(DevicePresence::Partial) => ("◐ ", style.fg(t.selection_bg)),
                     _ => ("  ", style),
@@ -363,11 +419,24 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
             } else {
                 ("", style)
             };
-            let max_name = inner.width as usize - cursor.len() - icon.chars().count() - 1;
+            let inner_w = inner.width as usize;
+            let cursor_w = disp_width(cursor);
+            let icon_w = disp_width(icon);
+            let max_name = inner_w.saturating_sub(cursor_w + icon_w);
+            let name_trunc = truncate(name, max_name).to_string();
+            // Pad to full row width so the selection background reaches the
+            // right border (see album browser for rationale).
+            let used = cursor_w + icon_w + disp_width(&name_trunc);
+            let trailing = if used < inner_w {
+                " ".repeat(inner_w - used)
+            } else {
+                String::new()
+            };
             let line = Line::from(vec![
                 Span::styled(cursor, style),
                 Span::styled(icon, icon_style),
-                Span::styled(truncate(name, max_name).to_string(), style),
+                Span::styled(name_trunc, style),
+                Span::styled(trailing, style),
             ]);
             ListItem::new(line)
         })
@@ -392,7 +461,7 @@ fn draw_album_browser(f: &mut Frame, app: &App, area: Rect) {
     let border_style = if is_active {
         Style::default().fg(t.selection_bg)
     } else {
-        t.border()
+        Style::default().fg(t.accent_secondary)
     };
     let block = t
         .block()
@@ -424,13 +493,32 @@ fn draw_album_browser(f: &mut Frame, app: &App, area: Rect) {
         }
         let is_selected = i == app.album_selected;
         let prefix = if is_selected { "> " } else { "  " };
-        let max_name = inner.width.saturating_sub(3) as usize;
-        let display_name = if is_selected && album.name.len() > max_name && max_name > 0 {
+        let prefix_w = disp_width(prefix);
+        let icon = match app
+            .album_device_status
+            .get(&(album.artist.clone(), album.name.clone()))
+        {
+            Some(DevicePresence::Full) => "✓ ",
+            Some(DevicePresence::Partial) => "◐ ",
+            _ => "",
+        };
+        let icon_w = disp_width(icon);
+        let inner_w = inner.width as usize;
+        let max_name = inner_w.saturating_sub(prefix_w + icon_w);
+        let display_name = if is_selected && disp_width(&album.name) > max_name && max_name > 0 {
             marquee(&album.name, max_name, app.anim_frame)
         } else {
             truncate(&album.name, max_name).to_string()
         };
-        let label = format!("{}{}", prefix, display_name);
+        // Pad the row to the full interior width. CJK text is narrower in
+        // cells than char count, and relying on ratatui to extend the row
+        // background leaves gaps on some terminals — explicit trailing
+        // spaces guarantee the selection highlight reaches the right border.
+        let mut label = format!("{}{}{}", prefix, icon, display_name);
+        let rendered = disp_width(&label);
+        if rendered < inner_w {
+            label.push_str(&" ".repeat(inner_w - rendered));
+        }
         rows.push((Some(i), label, false));
     }
 
@@ -540,55 +628,197 @@ fn draw_album_detail(f: &mut Frame, app: &App, area: Rect, show_zip_art: bool) {
         let art = Paragraph::new(art_lines);
         f.render_widget(art, cols[0]);
 
-        // Split right column: tracks on top, album art below.
-        let art_rows = app.album_art_lines.len() as u16;
+        // Split right column: tracks on top, album art (boxed) below.
+        let art_rows = app
+            .album_art_cache
+            .as_ref()
+            .map(|c| c.rows() as u16)
+            .unwrap_or(0);
+        // +2 for top/bottom border, +1 for 1-row padding on top (0 on bottom).
+        let art_panel_rows = if art_rows > 0 { art_rows + 3 } else { 0 };
         let right_split = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(4), Constraint::Length(art_rows)])
+            .constraints([Constraint::Min(4), Constraint::Length(art_panel_rows)])
             .split(cols[1]);
 
         draw_album_track_list(f, app, right_split[0]);
-        draw_album_art_inline(f, app, right_split[1]);
+        // Extend the art slot one column right and one row down so the art
+        // panel's right and bottom borders overlap (share) the outer detail
+        // block's right and bottom border columns/row.
+        let art_slot = Rect {
+            x: right_split[1].x,
+            y: right_split[1].y,
+            width: right_split[1].width + 1,
+            height: right_split[1].height + 1,
+        };
+        draw_album_art_panel(f, app, art_slot, border_style);
     } else {
         // Not enough width or compact tier: full-width track list, no zip art.
         draw_album_track_list(f, app, inner);
     }
 }
 
-fn draw_album_art_inline(f: &mut Frame, app: &App, area: Rect) {
-    if app.album_art_lines.is_empty() || area.height == 0 {
+fn draw_album_art_panel(f: &mut Frame, app: &App, area: Rect, outer_border_style: Style) {
+    if area.height < 3 {
         return;
     }
 
-    let art_w = app.album_art_lines.first().map(|r| r.len()).unwrap_or(0) as u16;
+    // The art is typically narrower than the full column (image aspect ratio).
+    // Shrink the panel horizontally to hug the art, anchored to the right edge
+    // of the slot so its right border coincides with the outer detail block's
+    // right border.
+    let art_w = app
+        .album_art_cache
+        .as_ref()
+        .map(|c| c.width() as u16)
+        .unwrap_or(0);
+    if art_w == 0 {
+        return;
+    }
+
+    let t = app.theme();
+    let title = " Album Art ";
+    // Panel sizing horizontally: art + 2 border + 4 (2+2) padding.
+    // Title must also fit across the top.
+    let min_w = (title.chars().count() as u16 + 2).max(art_w + 6);
+    let panel_w = min_w.min(area.width);
+    // Right-anchor: panel's right edge = slot's right edge.
+    let panel_area = Rect {
+        x: area.x + area.width.saturating_sub(panel_w),
+        y: area.y,
+        width: panel_w,
+        height: area.height,
+    };
+
+    // Interior padding: 2 left/right, 1 top, 0 bottom. inner() accounts for
+    // both border and padding.
+    let block = t
+        .block()
+        .border_style(t.border())
+        .title(title)
+        .style(Style::default().bg(t.main_bg))
+        .padding(Padding::new(2, 2, 1, 0));
+    let inner = block.inner(panel_area);
+    f.render_widget(block, panel_area);
+
+    // The panel's top-right and bottom-left corners land on the outer block's
+    // border line. Replace them with T-junction glyphs so the outer line
+    // appears to pass through, and style them to match the outer block's
+    // active/inactive color — not the art panel's own border — since the
+    // outer line is what the junction visually extends.
+    if let Some((right_t, up_t)) = junction_chars(t.border_type) {
+        let junction_style = outer_border_style.bg(t.main_bg);
+        let buf = f.buffer_mut();
+        if panel_area.width > 0 {
+            let tr_x = panel_area.x + panel_area.width - 1;
+            if let Some(cell) = buf.cell_mut((tr_x, panel_area.y)) {
+                cell.set_symbol(right_t).set_style(junction_style);
+            }
+        }
+        if panel_area.height > 0 {
+            let bl_y = panel_area.y + panel_area.height - 1;
+            if let Some(cell) = buf.cell_mut((panel_area.x, bl_y)) {
+                cell.set_symbol(up_t).set_style(junction_style);
+            }
+        }
+    }
+
+    draw_album_art_inline(f, app, inner);
+}
+
+/// T-junction glyphs matching a given border type: (right-side T, bottom-side T).
+/// Returns `None` for border types that lack clean single-glyph junctions
+/// (e.g. quadrant block borders), in which case we leave the corners as-is.
+fn junction_chars(bt: ratatui::widgets::BorderType) -> Option<(&'static str, &'static str)> {
+    use ratatui::widgets::BorderType;
+    match bt {
+        // Plain and Rounded share junction glyphs — rounded corners only differ
+        // at corners, not at T-intersections.
+        BorderType::Plain | BorderType::Rounded => Some(("\u{2524}", "\u{2534}")), // ┤ ┴
+        BorderType::Thick => Some(("\u{252B}", "\u{253B}")),                       // ┫ ┻
+        BorderType::Double => Some(("\u{2563}", "\u{2569}")),                      // ╣ ╩
+        _ => None,
+    }
+}
+
+/// T-junction glyphs where a vertical divider meets the outer horizontal border:
+/// (top = down-T, bottom = up-T). Returns `None` for border types without clean
+/// single-glyph junctions.
+fn vertical_divider_junctions(
+    bt: ratatui::widgets::BorderType,
+) -> Option<(&'static str, &'static str)> {
+    use ratatui::widgets::BorderType;
+    match bt {
+        BorderType::Plain | BorderType::Rounded => Some(("\u{252C}", "\u{2534}")), // ┬ ┴
+        BorderType::Thick => Some(("\u{2533}", "\u{253B}")),                       // ┳ ┻
+        BorderType::Double => Some(("\u{2566}", "\u{2569}")),                      // ╦ ╩
+        _ => None,
+    }
+}
+
+fn draw_album_art_inline(f: &mut Frame, app: &App, area: Rect) {
+    if area.height == 0 {
+        return;
+    }
+
+    let t = app.theme();
+    let pad_style = Style::default().bg(t.main_bg);
+
+    let cache = match app.album_art_cache.as_ref() {
+        Some(c) if c.rows() > 0 => c,
+        _ => return,
+    };
+    let art_w = cache.width() as u16;
+
     let x_offset = area.width.saturating_sub(art_w) / 2;
-
     let pad: String = " ".repeat(x_offset as usize);
-    let pad_style = Style::default().bg(app.theme().main_bg);
+    let take_w = area.width.saturating_sub(x_offset) as usize;
+    let take_h = area.height as usize;
 
-    let lines: Vec<Line> = app
-        .album_art_lines
-        .iter()
-        .take(area.height as usize)
-        .map(|row| {
-            let mut spans: Vec<Span> = Vec::with_capacity(row.len() + 1);
-            if x_offset > 0 {
-                spans.push(Span::styled(pad.as_str(), pad_style));
-            }
-            for &(_, fg, bg) in row
-                .iter()
-                .take(area.width.saturating_sub(x_offset) as usize)
-            {
-                spans.push(Span::styled(
-                    "▀",
-                    Style::default()
-                        .fg(Color::Rgb(fg[0], fg[1], fg[2]))
-                        .bg(Color::Rgb(bg[0], bg[1], bg[2])),
-                ));
-            }
-            Line::from(spans)
-        })
-        .collect();
+    // Per-row prefix: the padding span (if any). Shared across both branches.
+    let prefix = |spans: &mut Vec<Span<'static>>| {
+        if x_offset > 0 {
+            spans.push(Span::styled(pad.clone(), pad_style));
+        }
+    };
+
+    let lines: Vec<Line> = match cache {
+        AlbumArtCache::Halfblock(rows) => rows
+            .iter()
+            .take(take_h)
+            .map(|row| {
+                let mut spans = Vec::with_capacity(row.len() + 1);
+                prefix(&mut spans);
+                for &(_, fg, bg) in row.iter().take(take_w) {
+                    spans.push(Span::styled(
+                        "▀",
+                        Style::default()
+                            .fg(Color::Rgb(fg[0], fg[1], fg[2]))
+                            .bg(Color::Rgb(bg[0], bg[1], bg[2])),
+                    ));
+                }
+                Line::from(spans)
+            })
+            .collect(),
+        AlbumArtCache::Ascii(rows) => rows
+            .iter()
+            .take(take_h)
+            .map(|row| {
+                let mut spans = Vec::with_capacity(row.len() + 1);
+                prefix(&mut spans);
+                for &(ch, fg) in row.iter().take(take_w) {
+                    let mut buf = [0u8; 4];
+                    spans.push(Span::styled(
+                        ch.encode_utf8(&mut buf).to_string(),
+                        Style::default()
+                            .fg(Color::Rgb(fg[0], fg[1], fg[2]))
+                            .bg(t.main_bg),
+                    ));
+                }
+                Line::from(spans)
+            })
+            .collect(),
+    };
 
     f.render_widget(Paragraph::new(lines), area);
 }
@@ -630,9 +860,11 @@ fn draw_album_track_list(f: &mut Frame, app: &App, area: Rect) {
         }
 
         let is_selected = i == app.track_selected && is_active;
+        // Stripe by track position (the loop index), so disc headers don't
+        // desync alternation.
         let bg = if is_selected {
             t.selection_bg
-        } else if i % 2 == 0 {
+        } else if i.is_multiple_of(2) {
             t.main_bg
         } else {
             t.alt_row_bg
@@ -755,7 +987,7 @@ fn draw_track_table(f: &mut Frame, app: &App, area: Rect) {
         .map(|(i, track)| {
             let bg = if i == app.track_selected {
                 t.selection_bg
-            } else if i % 2 == 0 {
+            } else if i.is_multiple_of(2) {
                 t.main_bg
             } else {
                 t.alt_row_bg
@@ -847,15 +1079,30 @@ fn draw_device_info(f: &mut Frame, app: &App, area: Rect) {
         .block()
         .border_style(border_style)
         .title(title)
-        .title_alignment(Alignment::Center);
+        .title_alignment(Alignment::Center)
+        .style(Style::default().bg(t.main_bg));
 
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     match app.device.status {
         DeviceStatus::Disconnected => {
-            let p = Paragraph::new("No device.\nPress 'c' to connect.").style(t.dim());
-            f.render_widget(p, inner);
+            let zune_art = build_zune_art("No Device", "Press [C]");
+            let pulse = anim::animated_accent(
+                t.dim_text,
+                t.accent_secondary,
+                theme::AccentAnim::Pulse,
+                app.anim_frame,
+                60,
+            );
+            let art_lines: Vec<Line> = zune_art
+                .iter()
+                .map(|l| {
+                    Line::from(Span::styled(l.as_str(), Style::default().fg(pulse)))
+                        .alignment(Alignment::Center)
+                })
+                .collect();
+            f.render_widget(Paragraph::new(art_lines), inner);
         }
         DeviceStatus::Detecting | DeviceStatus::Connecting => {
             let conn_frame = app
@@ -894,10 +1141,10 @@ fn draw_device_info_connected(f: &mut Frame, app: &App, area: Rect) {
 
     // Screen content: two lines inside the screen area.
     let (screen_line1, screen_line2) = if is_syncing {
-        let symbol = throbber_symbol(&app.throbber_state, app.theme_index);
+        let symbol = throbber_symbol(&app.throbber_state, app.theme());
         (symbol, "Syncing...".to_string())
     } else if is_busy {
-        let symbol = throbber_symbol(&app.throbber_state, app.theme_index);
+        let symbol = throbber_symbol(&app.throbber_state, app.theme());
         (symbol, "Loading...".to_string())
     } else {
         let count = app.device.tracks.len();
@@ -1034,9 +1281,13 @@ fn draw_sync_queue(f: &mut Frame, app: &App, area: Rect) {
 
     match app.sync.status {
         SyncStatus::Running { current, total } => {
-            let symbol = throbber_symbol(&app.throbber_state, app.theme_index);
+            let symbol = throbber_symbol(&app.throbber_state, app.theme());
             let title = format!(" {} {}/{} ", symbol, current, total);
-            let block = t.block().border_style(border_style).title(title);
+            let block = t
+                .block()
+                .border_style(border_style)
+                .title(title)
+                .style(Style::default().bg(t.main_bg));
             let inner = block.inner(area);
             f.render_widget(block, area);
 
@@ -1135,6 +1386,7 @@ fn draw_sync_log(f: &mut Frame, app: &App, area: Rect) {
     let t = app.theme();
     let block = t
         .block()
+        .border_style(Style::default().fg(t.progress_bar))
         .title(" Log ")
         .style(Style::default().bg(t.main_bg));
     let inner = block.inner(area);
@@ -1190,6 +1442,7 @@ fn draw_keys_panel(f: &mut Frame, app: &App, area: Rect) {
         ("4", "Sync queue"),
         ("v", "Lib/Device view"),
         ("t", "Theme picker"),
+        ("T", "Art style"),
         ("/", "Search"),
         ("c", "Connect"),
         ("X", "Clear cache"),
@@ -1302,7 +1555,7 @@ fn key_line<'a>(app: &App, key: &'a str, desc: &'a str) -> Line<'a> {
 
 fn draw_now_playing(f: &mut Frame, app: &App, np: &NowPlaying, area: Rect, art_width: u16) {
     let t = app.theme();
-    let skin = anim::player_skin(app.theme_index);
+    let skin = app.theme().player_skin;
 
     let state_icon = match np.state {
         PlaybackState::Playing => skin.play,
@@ -1332,12 +1585,15 @@ fn draw_now_playing(f: &mut Frame, app: &App, np: &NowPlaying, area: Rect, art_w
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // Split inner area: info (left) | art (right), art hidden at Compact.
-    let show_art = art_width > 0 && inner.width > art_width + 20;
+    // Split inner area: info (left) | divider + art (right). The right column
+    // reserves 1 column for a vertical divider so the art sits inside its own
+    // bordered sub-panel that connects to the outer block via T-junctions.
+    let right_col_width = art_width + 1;
+    let show_art = art_width > 0 && inner.width > right_col_width + 20;
     let (info_area, art_area) = if show_art {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(20), Constraint::Length(art_width)])
+            .constraints([Constraint::Min(20), Constraint::Length(right_col_width)])
             .split(inner);
         (cols[0], Some(cols[1]))
     } else {
@@ -1346,6 +1602,29 @@ fn draw_now_playing(f: &mut Frame, app: &App, np: &NowPlaying, area: Rect, art_w
 
     // --- Art (right side, inside the shared block) ---
     if let Some(art_rect) = art_area {
+        // Draw a LEFT-only sub-border; its inner area holds the art.
+        let divider_style = Style::default().fg(border_color).bg(t.main_bg);
+        let divider_block = Block::default()
+            .borders(Borders::LEFT)
+            .border_type(t.border_type)
+            .border_style(divider_style)
+            .style(Style::default().bg(t.main_bg));
+        let art_inner = divider_block.inner(art_rect);
+        f.render_widget(divider_block, art_rect);
+
+        // Patch the cells where the divider meets the outer top/bottom borders
+        // with T-junction glyphs so the seams read as a single continuous frame.
+        if let Some((down_t, up_t)) = vertical_divider_junctions(t.border_type) {
+            let buf = f.buffer_mut();
+            if let Some(cell) = buf.cell_mut((art_rect.x, area.y)) {
+                cell.set_symbol(down_t).set_style(divider_style);
+            }
+            let bot_y = area.y + area.height.saturating_sub(1);
+            if let Some(cell) = buf.cell_mut((art_rect.x, bot_y)) {
+                cell.set_symbol(up_t).set_style(divider_style);
+            }
+        }
+
         let art_frame = np.paused_frame.unwrap_or(app.anim_frame);
         let art_lines = (skin.art_fn)(true, art_frame);
         let art_color = if np.state == PlaybackState::Playing {
@@ -1359,8 +1638,8 @@ fn draw_now_playing(f: &mut Frame, app: &App, np: &NowPlaying, area: Rect, art_w
         } else {
             t.accent_color()
         };
-        let aw = art_rect.width as usize;
-        let ah = art_rect.height as usize;
+        let aw = art_inner.width as usize;
+        let ah = art_inner.height as usize;
         // Vertically center the art within the available height.
         let v_pad = ah.saturating_sub(art_lines.len()) / 2;
         let mut art_text: Vec<Line> = Vec::with_capacity(ah);
@@ -1377,7 +1656,7 @@ fn draw_now_playing(f: &mut Frame, app: &App, np: &NowPlaying, area: Rect, art_w
                 Style::default().fg(art_color),
             )));
         }
-        f.render_widget(Paragraph::new(art_text), art_rect);
+        f.render_widget(Paragraph::new(art_text), art_inner);
     }
 
     // --- Info (left side) ---
@@ -1406,7 +1685,8 @@ fn draw_now_playing(f: &mut Frame, app: &App, np: &NowPlaying, area: Rect, art_w
 
     // Artist — Album
     f.render_widget(
-        Paragraph::new(format!(" {} — {}", &np.artist, &np.album)).style(t.dim()),
+        Paragraph::new(format!(" {} — {}", &np.artist, &np.album))
+            .style(Style::default().fg(t.header_text)),
         rows[1],
     );
 
@@ -1464,7 +1744,10 @@ fn draw_now_playing(f: &mut Frame, app: &App, np: &NowPlaying, area: Rect, art_w
     let elapsed_str = format_duration(np.elapsed_ms);
     let total_str = format_duration(np.duration_ms);
     let time_line = format!("  {} / {}  </>:scrub  n/p:skip", elapsed_str, total_str);
-    f.render_widget(Paragraph::new(time_line).style(t.dim()), rows[4]);
+    f.render_widget(
+        Paragraph::new(time_line).style(Style::default().fg(t.header_text)),
+        rows[4],
+    );
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect, footer_left_width: u16) {
@@ -1600,9 +1883,10 @@ fn draw_help_overlay(f: &mut Frame, app: &App) {
         "  Tab         Cycle panels",
         "  Up/Down     Navigate items",
         "  Enter       Select / expand",
-        "  1/2/3       Artists / Albums / Playlists",
+        "  1/2         Artists / Albums",
         "  v           Toggle Library / Device view",
         "  t           Theme picker",
+        "  T           Toggle album art style (halfblock/ASCII)",
         "",
         "  Library",
         "  /           Search sidebar",
@@ -1726,12 +2010,13 @@ fn build_zip_art<'a>(
         .add_modifier(Modifier::BOLD);
     let info = Style::default().fg(t.header_text);
 
-    // Pad or truncate a string to exactly `w` chars.
+    // Pad or truncate a string to exactly `w` display columns. Uses
+    // CJK-aware width so emoji / ambiguous-width chars don't overflow.
     let pad = |s: &str, w: usize| -> String {
         let t = truncate(s, w);
-        let chars: Vec<char> = t.chars().collect();
-        if chars.len() < w {
-            format!("{}{}", t, " ".repeat(w - chars.len()))
+        let used = disp_width(&t);
+        if used < w {
+            format!("{}{}", t, " ".repeat(w - used))
         } else {
             t
         }
@@ -1740,23 +2025,29 @@ fn build_zip_art<'a>(
     // Body lines (upper area) — artist and album name.
     let body_w = 18; // width inside `:  | ` and ` |  :`
 
-    // Word-wrap helper: split text at a word boundary near `width`.
+    // Word-wrap helper: split text at a word boundary near `width` display
+    // columns. Measures in cells, not chars, so wide glyphs don't push the
+    // break point past the panel edge.
     let word_wrap = |text: &str, width: usize| -> (String, Option<String>) {
-        let chars: Vec<char> = text.chars().collect();
-        if chars.len() <= width {
-            (pad(text, width), None)
-        } else {
-            let byte_end = text
-                .char_indices()
-                .take(width)
-                .last()
-                .map(|(i, c)| i + c.len_utf8())
-                .unwrap_or(width);
-            let break_at = text[..byte_end].rfind(' ').unwrap_or(byte_end);
-            let first = pad(&text[..break_at], width);
-            let rest = text[break_at..].trim_start().to_string();
-            (first, Some(rest))
+        if disp_width(text) <= width {
+            return (pad(text, width), None);
         }
+        // Walk chars accumulating display width, stopping at the first char
+        // whose inclusion would exceed `width`.
+        let mut used = 0usize;
+        let mut byte_end = text.len();
+        for (i, ch) in text.char_indices() {
+            let cw = char_disp_width(ch);
+            if used + cw > width {
+                byte_end = i;
+                break;
+            }
+            used += cw;
+        }
+        let break_at = text[..byte_end].rfind(' ').unwrap_or(byte_end);
+        let first = pad(&text[..break_at], width);
+        let rest = text[break_at..].trim_start().to_string();
+        (first, Some(rest))
     };
 
     // Wrap artist across lines 1-2.
@@ -1808,7 +2099,7 @@ fn build_zip_art<'a>(
     let dur_padded = pad(duration, label_w);
 
     vec![
-        Line::from(Span::styled(r#" .-|:"""":""""""'''"""":|-.  "#, dim)),
+        Line::from(Span::styled(r#"  .-|:"""":""""""'''"""":|-.  "#, dim)),
         Line::from(Span::styled(r#" :  |'----'-------------'|  : "#, dim)),
         // Artist name line 1
         Line::from(vec![
@@ -1855,25 +2146,65 @@ fn build_zip_art<'a>(
     ]
 }
 
+/// Truncate a string to at most `max` terminal display columns, appending
+/// an ellipsis if truncated. CJK characters occupy 2 columns, so char count
+/// alone misrepresents rendered width.
 fn truncate(s: &str, max: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= max {
-        s.to_string()
-    } else if max > 1 {
-        chars[..max - 1].iter().collect::<String>() + "\u{2026}"
-    } else {
-        chars[..max].iter().collect()
+    if disp_width(s) <= max {
+        return s.to_string();
     }
+    if max == 0 {
+        return String::new();
+    }
+    // Reserve columns for the ellipsis glyph when there's room. `…` is an
+    // ambiguous-width char — 2 cells under CJK-wide measurement — so reserve
+    // its actual display width, not a hard-coded 1.
+    let ellipsis = "\u{2026}";
+    let ellipsis_w = disp_width(ellipsis);
+    let (budget, suffix) = if max > ellipsis_w {
+        (max - ellipsis_w, ellipsis)
+    } else {
+        (max, "")
+    };
+    let mut used = 0usize;
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        let w = char_disp_width(ch);
+        if used + w > budget {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out.push_str(suffix);
+    out
 }
 
-/// Marquee-scroll a string that's longer than `width`. Scrolls through
-/// `text   text` seamlessly, advancing one character every 4 frames, with
-/// a pause at the start.
+/// Right-pad `s` with spaces so its rendered display width is exactly `width`.
+/// If `s` is already wider than `width`, returns it unchanged (the caller is
+/// expected to have truncated first).
+fn pad_right_to_width(s: &str, width: usize) -> String {
+    let cur = disp_width(s);
+    if cur >= width {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + (width - cur));
+    out.push_str(s);
+    for _ in 0..(width - cur) {
+        out.push(' ');
+    }
+    out
+}
+
+/// Marquee-scroll a string that's wider than `width` display columns.
+/// Scrolls through `text   text` seamlessly, advancing one character every
+/// 4 frames with an initial pause. Respects grapheme display widths so wide
+/// chars don't cause the visible window to drift.
 fn marquee(text: &str, width: usize, frame: usize) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= width || width == 0 {
+    if disp_width(text) <= width || width == 0 {
         return truncate(text, width);
     }
+    let chars: Vec<char> = text.chars().collect();
     let gap = 3;
     let cycle_len = chars.len() + gap;
     // Pause at the start for 12 frames before scrolling.
@@ -1885,19 +2216,53 @@ fn marquee(text: &str, width: usize, frame: usize) -> String {
         .chain(chars.iter())
         .copied()
         .collect();
-    padded[offset..offset + width].iter().collect()
+    // Take chars from `offset` onward until we fill `width` display columns.
+    let mut used = 0usize;
+    let mut out = String::new();
+    for &ch in &padded[offset..] {
+        let w = char_disp_width(ch);
+        if used + w > width {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    // Pad with spaces if the last char we couldn't fit left a half-column gap,
+    // so the rendered width is stable across frames.
+    while used < width {
+        out.push(' ');
+        used += 1;
+    }
+    out
 }
 
 /// Pad/center a string to exactly `w` chars.
 fn center_pad(s: &str, w: usize) -> String {
-    let len = s.chars().count();
+    let clipped = truncate_hard(s, w);
+    let len = disp_width(&clipped);
     if len >= w {
-        s.chars().take(w).collect()
+        clipped
     } else {
         let left = (w - len) / 2;
         let right = w - len - left;
-        format!("{}{}{}", " ".repeat(left), s, " ".repeat(right))
+        format!("{}{}{}", " ".repeat(left), clipped, " ".repeat(right))
     }
+}
+
+/// Truncate to at most `max` display columns with no ellipsis. Used when
+/// center/pad logic needs a hard cap on width.
+fn truncate_hard(s: &str, max: usize) -> String {
+    let mut used = 0usize;
+    let mut out = String::new();
+    for ch in s.chars() {
+        let cw = char_disp_width(ch);
+        if used + cw > max {
+            break;
+        }
+        out.push(ch);
+        used += cw;
+    }
+    out
 }
 
 /// Build the Zune ASCII art lines with the given screen content.
@@ -1923,6 +2288,56 @@ fn build_zune_art(screen_line1: &str, screen_line2: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn junction_chars_matches_expected_glyphs() {
+        use ratatui::widgets::BorderType;
+        assert_eq!(
+            junction_chars(BorderType::Plain),
+            Some(("\u{2524}", "\u{2534}"))
+        );
+        assert_eq!(
+            junction_chars(BorderType::Rounded),
+            Some(("\u{2524}", "\u{2534}"))
+        );
+        assert_eq!(
+            junction_chars(BorderType::Thick),
+            Some(("\u{252B}", "\u{253B}"))
+        );
+        assert_eq!(
+            junction_chars(BorderType::Double),
+            Some(("\u{2563}", "\u{2569}"))
+        );
+        // Block-style borders (QuadrantOutside/QuadrantInside) have no clean
+        // single-glyph T-junction; we intentionally fall through to None.
+        assert_eq!(junction_chars(BorderType::QuadrantOutside), None);
+        assert_eq!(junction_chars(BorderType::QuadrantInside), None);
+    }
+
+    #[test]
+    fn vertical_divider_junctions_matches_expected_glyphs() {
+        use ratatui::widgets::BorderType;
+        assert_eq!(
+            vertical_divider_junctions(BorderType::Plain),
+            Some(("\u{252C}", "\u{2534}"))
+        );
+        assert_eq!(
+            vertical_divider_junctions(BorderType::Rounded),
+            Some(("\u{252C}", "\u{2534}"))
+        );
+        assert_eq!(
+            vertical_divider_junctions(BorderType::Thick),
+            Some(("\u{2533}", "\u{253B}"))
+        );
+        assert_eq!(
+            vertical_divider_junctions(BorderType::Double),
+            Some(("\u{2566}", "\u{2569}"))
+        );
+        assert_eq!(
+            vertical_divider_junctions(BorderType::QuadrantOutside),
+            None
+        );
+    }
 
     #[test]
     fn zune_art_connected_track_count() {
@@ -2045,6 +2460,111 @@ mod tests {
     #[test]
     fn marquee_short_text_no_scroll() {
         assert_eq!(marquee("Hi", 10, 0), "Hi");
+    }
+
+    #[test]
+    fn truncate_respects_cjk_display_width() {
+        // Each CJK char is 2 display columns. 14 chars = 28 columns,
+        // so at max=28 the string fits untouched; at max=27 it must be
+        // truncated so rendered width is <= 27.
+        let s = "自分は此処にいるへきてない"; // 13 CJK chars = 26 cols
+        assert_eq!(s.width(), 26);
+        assert_eq!(truncate(s, 26).width(), 26);
+        assert!(truncate(s, 20).width() <= 20);
+        assert!(truncate(s, 10).width() <= 10);
+        // Ellipsis branch: result still fits budget.
+        let out = truncate(s, 10);
+        assert!(out.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn truncate_mixed_ascii_hiragana_budget() {
+        // Mixes ASCII with Hiragana (Wide). Output width must stay <= max for
+        // every budget so panel borders don't shift.
+        let s = "(っ◔◡◔)っ ♥ Computer Class";
+        for max in [10usize, 15, 19, 22] {
+            let out = truncate(s, max);
+            assert!(
+                disp_width(&out) <= max,
+                "max={max} produced width {} for {out:?}",
+                disp_width(&out)
+            );
+        }
+    }
+
+    #[test]
+    fn zip_art_lines_uniform_display_width() {
+        // Every line of the zip-disk art must render at the same display
+        // width so the `|` delimiters stay column-aligned. A long ASCII
+        // album name forces the mga-line truncation path; CJK artist forces
+        // the word-wrap path.
+        use crate::app::App;
+        let app = App::new();
+        let tests = [
+            (
+                "GORE",
+                "Mortality Salience (2022 Year End Mix) (single)",
+                "2022",
+                2usize,
+                "1 hr 0 min",
+            ),
+            (
+                "(っ◔◡◔)っ ♥ Computer Class",
+                "Powered By Flash",
+                "2021",
+                9,
+                "27 min",
+            ),
+            ("GORE", "耳をつんさくような沈黙 MIX", "2024", 12, "45 min"),
+        ];
+        for (artist, album, year, tracks, dur) in tests {
+            let lines = build_zip_art(&app, album, artist, year, tracks, dur);
+            let widths: Vec<usize> = lines
+                .iter()
+                .map(|l| l.iter().map(|s| disp_width(&s.content)).sum::<usize>())
+                .collect();
+            let first = widths[0];
+            for (i, w) in widths.iter().enumerate() {
+                assert_eq!(
+                    *w, first,
+                    "artist={artist:?} album={album:?}: line {i} width {w} != line 0 width {first}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn center_pad_cjk_exact_width() {
+        // "世界" is 4 display cells (2 Wide CJK chars).
+        let out = center_pad("世界", 8);
+        assert_eq!(disp_width(&out), 8);
+    }
+
+    #[test]
+    fn truncate_mixed_ascii_cjk() {
+        let s = "Hello 世界!"; // H=1,e=1,l=1,l=1,o=1,space=1,世=2,界=2,!=1 = 11
+        assert_eq!(s.width(), 11);
+        assert_eq!(truncate(s, 11), s);
+        // At width 8, must stop before or at 8 columns.
+        assert!(truncate(s, 8).width() <= 8);
+    }
+
+    #[test]
+    fn marquee_cjk_frame_width_is_stable() {
+        // A long CJK string that must scroll. The rendered width at every
+        // frame should be exactly `width` — wide chars can't straddle the
+        // visible window without the function compensating.
+        let text = "あいうえおかきくけこ"; // 10 chars × 2 cols = 20 cols
+        let width = 7;
+        for frame in 0..40 {
+            let out = marquee(text, width, frame);
+            assert_eq!(
+                out.width(),
+                width,
+                "frame {frame} produced width {} for {out:?}",
+                out.width()
+            );
+        }
     }
 
     #[test]

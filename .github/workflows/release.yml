@@ -30,8 +30,12 @@ jobs:
             RANGE="${LATEST_TAG}..HEAD"
           fi
 
-          # Read current version from Cargo.toml.
+          # Read current version from Cargo.toml. The project ships as an
+          # alpha (single-user, not battle-tested), so the stored version has
+          # a "-alpha" pre-release suffix. Strip it for arithmetic and re-
+          # apply it when writing the new version.
           OLD_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          OLD_CORE="${OLD_VERSION%-*}"
           echo "old_version=$OLD_VERSION" >> "$GITHUB_OUTPUT"
 
           # Analyze conventional commits to determine bump type.
@@ -54,14 +58,15 @@ jobs:
             exit 0
           fi
 
-          # Calculate new version.
-          IFS='.' read -r MAJOR MINOR PATCH <<< "$OLD_VERSION"
+          # Calculate new version. Split the core x.y.z (no suffix), bump,
+          # then re-attach the -alpha suffix.
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$OLD_CORE"
           case "$BUMP" in
             major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
             minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
             patch) PATCH=$((PATCH + 1)) ;;
           esac
-          NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}-alpha"
 
           # Skip if tag already exists.
           if git rev-parse "v${NEW_VERSION}" >/dev/null 2>&1; then

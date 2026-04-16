@@ -569,7 +569,7 @@ mod tests {
     ) -> Vec<u8> {
         let mut rec = Vec::new();
         rec.extend_from_slice(&0x05000026u32.to_le_bytes()); // folder_ref (Video folder)
-        rec.extend_from_slice(&0x0a00004Bu32.to_le_bytes()); // metadata_ref
+        rec.extend_from_slice(&0x0a00004b_u32.to_le_bytes()); // metadata_ref
         rec.extend_from_slice(&0u32.to_le_bytes()); // padding
         rec.extend_from_slice(&file_size.to_le_bytes()); // file_size @ 12
         rec.extend_from_slice(&duration_ms.to_le_bytes()); // duration_ms @ 16

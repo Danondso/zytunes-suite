@@ -15,13 +15,14 @@ use zytunes::{
 /// Commands sent from the main TUI thread to the background worker.
 pub enum BgCommand {
     LoadLibrary {
-        xml_path: String,
         music_dir: Option<String>,
     },
     Connect,
     LoadDeviceTracks,
     Disconnect,
     ExecuteSyncQueue(Vec<SyncItem>),
+    /// Append more items onto an already-running sync; dropped if no sync is active.
+    AppendSyncQueue(Vec<SyncItem>),
     RemoveFromDevice(Vec<(String, u64)>),
     SyncPhotos {
         dir: String,
@@ -67,6 +68,7 @@ pub struct StorageInfo {
 /// Events sent from the background worker back to the TUI.
 pub enum BgEvent {
     LibraryLoaded(Result<Box<dyn zytunes::library::MusicLibrary + Send>, String>),
+    LibraryScanProgress(zytunes::dirlib::ScanProgress),
     DeviceDetected(DeviceInfo),
     SessionReady(Option<StorageInfo>),
     SessionFailed(String),
@@ -128,11 +130,14 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
 
         while let Ok(cmd) = cmd_rx.recv() {
             match cmd {
-                BgCommand::LoadLibrary {
-                    xml_path,
-                    music_dir,
-                } => {
-                    let result = zytunes::load_library(&xml_path, music_dir.as_deref());
+                BgCommand::LoadLibrary { music_dir } => {
+                    let result = zytunes::resolve_music_dir(music_dir.as_deref()).and_then(|dir| {
+                        let progress_tx = event_tx.clone();
+                        zytunes::dirlib::DirectoryLibrary::scan_with_progress(&dir, |p| {
+                            let _ = progress_tx.send(BgEvent::LibraryScanProgress(p));
+                        })
+                        .map(|l| Box::new(l) as Box<dyn zytunes::library::MusicLibrary + Send>)
+                    });
                     let _ = event_tx.send(BgEvent::LibraryLoaded(result));
                 }
                 BgCommand::Connect => {
@@ -216,9 +221,12 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                 if detected.family == DeviceFamily::Zune {
                                     // Query acquired items (podcasts, Zune-to-Zune shares).
                                     match s.get_acquired_items_count() {
-                                        Ok(count) => {
+                                        Ok(Some(count)) => {
                                             let _ =
                                                 event_tx.send(BgEvent::AcquiredItemsCount(count));
+                                        }
+                                        Ok(None) => {
+                                            // Firmware doesn't support the query; silently skip.
                                         }
                                         Err(e) => {
                                             let _ = event_tx.send(BgEvent::SyncMessage(format!(
@@ -230,7 +238,8 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
 
                                     // Query sync progress (vendor op 0x922f).
                                     let sync_status = match s.get_sync_progress() {
-                                        Ok(raw) => Some(parse_sync_progress(&raw)),
+                                        Ok(Some(raw)) => Some(parse_sync_progress(&raw)),
+                                        Ok(None) => None,
                                         Err(e) => {
                                             let _ = event_tx.send(BgEvent::SyncMessage(format!(
                                                 "Sync progress query failed: {}",
@@ -323,6 +332,10 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                 }
                 BgCommand::CancelSync => {
                     // Handled inline during sync execution via try_recv.
+                }
+                BgCommand::AppendSyncQueue(_) => {
+                    // Appends are consumed by the in-flight sync loop; any that
+                    // arrive when no sync is active are silently dropped.
                 }
                 BgCommand::RemoveFromDevice(items) => {
                     if let Some(ref mut s) = session {
@@ -657,14 +670,19 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                             .unwrap_or(&["mp3", "wma", "aac"]);
                         let max_art_dims = cur_caps.as_ref().and_then(|c| c.max_art_dimensions);
 
-                        let total = items.len();
+                        // Mutable queue so `AppendSyncQueue` commands received
+                        // mid-sync can extend the work in flight.
+                        let mut sync_queue: std::collections::VecDeque<SyncItem> = items.into();
+                        let mut total = sync_queue.len();
+                        let mut processed = 0usize;
                         let mut success = 0usize;
                         let mut failed = 0usize;
+                        let mut cancelled = false;
 
                         let temp_dir = make_transcode_temp_dir();
                         let _ = std::fs::create_dir_all(&temp_dir);
 
-                        let to_transcode = items
+                        let to_transcode = sync_queue
                             .iter()
                             .filter(|it| needs_transcoding(&it.location, supported_formats))
                             .count();
@@ -673,15 +691,35 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                             total, to_transcode
                         )));
 
-                        for (i, item) in items.iter().enumerate() {
-                            // Check for cancel command.
-                            if let Ok(BgCommand::CancelSync) = cmd_rx.try_recv() {
+                        while let Some(item) = sync_queue.pop_front() {
+                            // Drain any pending commands between tracks:
+                            // honour cancel, splice appended items onto the end.
+                            while let Ok(cmd) = cmd_rx.try_recv() {
+                                match cmd {
+                                    BgCommand::CancelSync => cancelled = true,
+                                    BgCommand::AppendSyncQueue(more) => {
+                                        if !more.is_empty() {
+                                            let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                                                "Queued {} more track(s) during sync",
+                                                more.len()
+                                            )));
+                                            total += more.len();
+                                            sync_queue.extend(more);
+                                        }
+                                    }
+                                    // Other commands dropped during sync; the
+                                    // TUI doesn't send them while SyncStatus is Running.
+                                    _ => {}
+                                }
+                            }
+                            if cancelled {
                                 let _ =
                                     event_tx.send(BgEvent::SyncMessage("Sync cancelled".into()));
                                 break;
                             }
+                            processed += 1;
                             let _ = event_tx.send(BgEvent::SyncProgress {
-                                current: i + 1,
+                                current: processed,
                                 total,
                                 track_name: item.name.clone(),
                             });
@@ -690,9 +728,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                 if needs_transcoding(&item.location, supported_formats) {
                                     let _ = event_tx.send(BgEvent::SyncMessage(format!(
                                         "[{}/{}] Transcoding \"{}\" to MP3...",
-                                        i + 1,
-                                        total,
-                                        item.name
+                                        processed, total, item.name
                                     )));
                                     match transcode_to_mp3(&item.location, &temp_dir, max_art_dims)
                                     {
@@ -725,9 +761,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
 
                             let _ = event_tx.send(BgEvent::SyncMessage(format!(
                                 "[{}/{}] Uploading \"{}\"...",
-                                i + 1,
-                                total,
-                                item.name
+                                processed, total, item.name
                             )));
 
                             match s.import_track(&upload_path) {
@@ -757,7 +791,8 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                     };
                                     let _ = event_tx.send(BgEvent::DeviceTrackAdded(entry));
                                     // Update storage info every 5 tracks (avoid per-track USB overhead).
-                                    if (i + 1).is_multiple_of(5) || i + 1 == total {
+                                    // Also fire on the last pending item so the final usage is fresh.
+                                    if processed.is_multiple_of(5) || sync_queue.is_empty() {
                                         if let Ok((tot, free)) = s.get_storage_info() {
                                             let used = tot.saturating_sub(free);
                                             let pct =

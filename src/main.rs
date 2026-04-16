@@ -1,8 +1,7 @@
 use zytunes::{
     check_ffmpeg_available, collect_music_files, collect_photo_files, collect_video_files, connect,
-    find_matching_tracks, library_xml_path, make_transcode_temp_dir, needs_transcoding,
-    needs_video_transcoding, resize_photo_for_zune, sync_to_device, transcode_and_import,
-    transcode_and_import_video,
+    find_matching_tracks, make_transcode_temp_dir, needs_transcoding, needs_video_transcoding,
+    resize_photo_for_zune, sync_to_device, transcode_and_import, transcode_and_import_video,
 };
 
 use std::collections::HashMap;
@@ -45,17 +44,12 @@ fn run(args: &[String]) -> Result<(), String> {
             }
             cmd_rm(&args[2..])
         }
-        "library" => {
-            let default = library_xml_path();
-            let xml_path = args.get(2).map(|s| s.as_str()).unwrap_or(&default);
-            cmd_library(xml_path, args.get(3).map(|s| s.as_str()))
-        }
+        "library" => cmd_library(args.get(2).map(|s| s.as_str())),
         "sync" => {
             if args.len() < 3 {
-                return Err("Usage: zytunes sync <type> <name> [--library <path>]\n  \
-                     type: artist, album, playlist, track\n  \
-                     e.g.: zytunes sync artist \"Radiohead\"\n       \
-                     zytunes sync playlist \"Classic Rock\""
+                return Err("Usage: zytunes sync <type> <name>\n  \
+                     type: artist, album, track\n  \
+                     e.g.: zytunes sync artist \"Radiohead\""
                     .into());
             }
             cmd_sync(&args[2..])
@@ -89,22 +83,22 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("  ls [path]              List device contents (default: /)");
             println!("  push <files...>        Push music files to the Zune");
             println!("  rm <device-paths...>   Remove files/folders from the Zune");
-            println!("  sync <type> <name>     Sync from iTunes library to Zune");
+            println!("  sync <type> <name>     Sync music to the Zune");
             println!("  photo-sync [dir]       Sync photos to the Zune");
             println!("  video-sync [dir]       Sync videos to the Zune");
-            println!("  library [xml] [query]  Browse iTunes library");
+            println!("  library [query]        Browse the music library");
             println!("  help                   Show this help");
             println!("\nSync types:");
             println!("  sync artist <name>     Sync all tracks by an artist");
             println!("  sync album <name>      Sync all tracks in an album");
-            println!("  sync playlist <name>   Sync all tracks in a playlist");
             println!("  sync track <name>      Sync a single track by name");
             println!("\nUnsupported formats (FLAC, OGG, WAV, M4A, OPUS, etc.)");
             println!("are auto-transcoded to MP3 with album art.");
             println!("\nPhotos are resized to fit the Zune 30 screen (240x320).");
+            println!("\nSet ZYTUNES_MUSIC_DIR or music_dir in ~/.config/zytunes/config.toml");
+            println!("to point at your music folder.");
             println!("\nExamples:");
             println!("  zytunes sync artist \"Radiohead\"");
-            println!("  zytunes sync playlist \"Classic Rock\"");
             println!("  zytunes sync album \"OK Computer\"");
             println!("  zytunes push song.mp3");
             println!("  zytunes photo-sync ~/Pictures/zune-wallpapers");
@@ -120,10 +114,10 @@ fn run(args: &[String]) -> Result<(), String> {
 }
 
 /// Browse the music library.
-fn cmd_library(xml_path: &str, query: Option<&str>) -> Result<(), String> {
+fn cmd_library(query: Option<&str>) -> Result<(), String> {
     println!("Loading music library...");
     let start = std::time::Instant::now();
-    let lib = zytunes::load_library(xml_path, None)?;
+    let lib = zytunes::load_library(load_config_field("music_dir").as_deref())?;
     println!(
         "Loaded {} tracks in {:.1}s\n",
         lib.track_count(),
@@ -142,22 +136,13 @@ fn cmd_library(xml_path: &str, query: Option<&str>) -> Result<(), String> {
                 println!("  {a}");
             }
         }
-        Some("playlists") => {
-            let playlists = lib.user_playlists();
-            println!("\n{} playlists:", playlists.len());
-            for p in &playlists {
-                println!("  {} ({} tracks)", p.name, p.track_ids.len());
-            }
-        }
         Some("stats") | None => {
             let artists = lib.artists();
             let albums = lib.albums();
-            let playlists = lib.user_playlists();
             println!("\nStats:");
             println!("  {} tracks", lib.track_count());
             println!("  {} artists", artists.len());
             println!("  {} albums", albums.len());
-            println!("  {} playlists", playlists.len());
 
             // Format breakdown.
             let mut formats: HashMap<String, usize> = HashMap::new();
@@ -171,18 +156,12 @@ fn cmd_library(xml_path: &str, query: Option<&str>) -> Result<(), String> {
             for (kind, count) in fmts {
                 println!("  {count:>6}  {kind}");
             }
-
-            if !playlists.is_empty() {
-                println!("\nPlaylists:");
-                for p in &playlists {
-                    println!("  {} ({} tracks)", p.name, p.track_ids.len());
-                }
-            }
         }
         Some(q) => {
-            // Search by artist or playlist name.
             let tracks = lib.artist_tracks(q);
-            if !tracks.is_empty() {
+            if tracks.is_empty() {
+                println!("No artist matching \"{q}\"");
+            } else {
                 println!("Artist \"{q}\": {} tracks", tracks.len());
                 for t in &tracks {
                     println!(
@@ -192,44 +171,24 @@ fn cmd_library(xml_path: &str, query: Option<&str>) -> Result<(), String> {
                         t.kind.as_deref().unwrap_or("?")
                     );
                 }
-            } else {
-                let tracks = lib.playlist_tracks(q);
-                if !tracks.is_empty() {
-                    println!("Playlist \"{q}\": {} tracks", tracks.len());
-                    for t in &tracks {
-                        println!("  {} - {} - {}", t.artist, t.album, t.name);
-                    }
-                } else {
-                    println!("No artist or playlist matching \"{q}\"");
-                }
             }
         }
     }
     Ok(())
 }
 
-/// Sync tracks from iTunes library to Zune.
+/// Sync tracks from the music library to the Zune.
 fn cmd_sync(args: &[String]) -> Result<(), String> {
     if args.len() < 2 {
-        return Err("Usage: zytunes sync <type> <name> [--library <path>]".into());
+        return Err("Usage: zytunes sync <type> <name>".into());
     }
 
     let sync_type: zytunes::SyncType = args[0].parse()?;
     let name = &args[1];
 
-    // Check for --library flag.
-    let default = library_xml_path();
-    let xml_path = args
-        .iter()
-        .position(|a| a == "--library")
-        .and_then(|i| args.get(i + 1))
-        .map(|s| s.as_str())
-        .unwrap_or(&default);
-
-    // Load music library.
     println!("Loading music library...");
     let start = std::time::Instant::now();
-    let lib = zytunes::load_library(xml_path, None)?;
+    let lib = zytunes::load_library(load_config_field("music_dir").as_deref())?;
     println!(
         "Loaded {} tracks in {:.1}s\n",
         lib.track_count(),
@@ -284,14 +243,7 @@ fn cmd_sync(args: &[String]) -> Result<(), String> {
             .map_err(|e| format!("Failed to create temp directory: {e}"))?;
     }
 
-    let result = sync_to_device(
-        session.as_mut(),
-        &pushable,
-        sync_type,
-        name.as_str(),
-        &temp_dir,
-        &caps,
-    )?;
+    let result = sync_to_device(session.as_mut(), &pushable, &temp_dir, &caps)?;
 
     // Clean up temp files.
     let _ = std::fs::remove_dir_all(&temp_dir);

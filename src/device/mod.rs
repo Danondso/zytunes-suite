@@ -19,7 +19,6 @@ pub struct DeviceCapabilities {
     pub transcode_target: &'static str,
     pub music_root: &'static str,
     pub max_art_dimensions: Option<(u32, u32)>,
-    pub playlist_support: bool,
 }
 
 /// A detected (but not yet connected) device, with backend-specific data

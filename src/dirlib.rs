@@ -7,15 +7,32 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rayon::prelude::*;
 
-use crate::library::{MusicLibrary, Playlist, Track};
+use crate::library::{MusicLibrary, Track};
 
 /// Audio file extensions recognized by the scanner.
 const AUDIO_EXTENSIONS: &[&str] = &[
     "mp3", "flac", "m4a", "aac", "ogg", "opus", "wma", "wav", "aiff", "alac",
 ];
+
+/// A single metadata sample emitted during a scan, for progress UI.
+#[derive(Clone, Debug)]
+pub struct TrackSample {
+    pub artist: String,
+    pub album: String,
+    pub name: String,
+}
+
+/// Progress update emitted from `scan_with_progress`.
+#[derive(Clone, Debug)]
+pub struct ScanProgress {
+    pub completed: u64,
+    pub total: u64,
+    pub sample: Option<TrackSample>,
+}
 
 /// A music library built by scanning a directory tree.
 pub struct DirectoryLibrary {
@@ -30,33 +47,76 @@ impl DirectoryLibrary {
     /// files have been added or modified since the last run. When the cache is
     /// stale, metadata reads are parallelized with rayon.
     pub fn scan(path: &str) -> Result<Self, String> {
+        Self::scan_with_progress(path, |_| {})
+    }
+
+    /// Same as `scan`, but invokes `on_progress` for each track built.
+    ///
+    /// The callback is called from rayon worker threads (so it must be `Sync`)
+    /// and is invoked once per track, plus once at the start with
+    /// `completed = 0` and `sample = None` to report the total.
+    pub fn scan_with_progress<F>(path: &str, on_progress: F) -> Result<Self, String>
+    where
+        F: Fn(ScanProgress) + Sync,
+    {
         let root = Path::new(path);
         if !root.is_dir() {
             return Err(format!("Not a directory: {path}"));
         }
 
-        // Try cache first.
-        if let Some(tracks) = crate::cache::load_dirlib_cached(path) {
-            return Ok(DirectoryLibrary {
-                tracks,
-                root: path.to_string(),
-            });
-        }
+        // Load the previous per-file cache. Missing / unreadable = empty map,
+        // so first launches just fall through to a full parse.
+        let cached = crate::cache::load_dirlib_cache(path);
 
-        // Collect all audio file paths first (fast directory walk).
-        let mut paths = Vec::new();
-        collect_audio_paths(root, &mut paths);
-        // Read metadata in parallel using rayon.
-        let tracks: HashMap<u64, Track> = paths
+        // Parallel directory walk.
+        let paths = collect_audio_paths(root);
+        let total = paths.len() as u64;
+        on_progress(ScanProgress {
+            completed: 0,
+            total,
+            sample: None,
+        });
+
+        // For each file: stat → fingerprint → reuse cached Track if the
+        // fingerprint matches, otherwise run lofty to parse tags + duration.
+        // Stats are cheap; lofty is the expensive step, so the cache makes
+        // repeat launches nearly instant even with `read_properties` on.
+        let completed = AtomicU64::new(0);
+        let entries: Vec<(String, crate::cache::CachedFile)> = paths
             .par_iter()
-            .map(|p| {
-                let id = hash_path(p);
-                (id, build_track(p, id))
+            .filter_map(|p| {
+                let key = p.to_string_lossy().to_string();
+                let fingerprint = crate::cache::FileFingerprint::from_path(p)?;
+
+                let track = match cached.get(&key) {
+                    Some(entry) if entry.fingerprint == fingerprint => entry.track.clone(),
+                    _ => build_track(p, hash_path(p)),
+                };
+
+                let n = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                on_progress(ScanProgress {
+                    completed: n,
+                    total,
+                    sample: Some(TrackSample {
+                        artist: track.artist.clone(),
+                        album: track.album.clone(),
+                        name: track.name.clone(),
+                    }),
+                });
+
+                Some((key, crate::cache::CachedFile { fingerprint, track }))
             })
             .collect();
 
-        // Save to cache for next startup.
-        crate::cache::save_dirlib_cache(path, &tracks);
+        let tracks: HashMap<u64, Track> = entries
+            .iter()
+            .map(|(_, cf)| (cf.track.id, cf.track.clone()))
+            .collect();
+
+        // Persist the fresh cache — implicitly drops entries for files that
+        // disappeared from the tree since the last scan.
+        let new_cache: HashMap<String, crate::cache::CachedFile> = entries.into_iter().collect();
+        crate::cache::save_dirlib_cache(path, new_cache);
 
         Ok(DirectoryLibrary {
             tracks,
@@ -65,19 +125,28 @@ impl DirectoryLibrary {
     }
 }
 
-fn collect_audio_paths(dir: &Path, out: &mut Vec<PathBuf>) {
+/// Recursively collect audio file paths, walking each subdirectory in parallel.
+///
+/// For large libraries the serial `read_dir` walk alone can take several seconds;
+/// rayon's recursive parallelism turns it into a few hundred milliseconds on SSD.
+fn collect_audio_paths(dir: &Path) -> Vec<PathBuf> {
     let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
+        Ok(e) => e.flatten().collect::<Vec<_>>(),
+        Err(_) => return Vec::new(),
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_audio_paths(&path, out);
-        } else if is_audio_file(&path) {
-            out.push(path);
-        }
-    }
+    entries
+        .par_iter()
+        .flat_map(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_audio_paths(&path)
+            } else if is_audio_file(&path) {
+                vec![path]
+            } else {
+                Vec::new()
+            }
+        })
+        .collect()
 }
 
 fn is_audio_file(path: &Path) -> bool {
@@ -102,7 +171,11 @@ fn build_track(path: &Path, id: u64) -> Track {
     track_from_path(path, id)
 }
 
-/// Read metadata from any audio file using lofty.
+/// Read metadata (tags + duration) from any audio file using lofty.
+///
+/// Reading properties is slow for MP3 VBR files because lofty has to sample
+/// frames across the whole file to compute duration, but the per-file cache
+/// makes sure we only pay that cost once per file per change.
 fn track_from_lofty(path: &Path, id: u64) -> Option<Track> {
     use lofty::file::{AudioFile, TaggedFileExt};
     use lofty::tag::Accessor;
@@ -230,19 +303,11 @@ impl MusicLibrary for DirectoryLibrary {
         albums
     }
 
-    fn user_playlists(&self) -> Vec<&Playlist> {
-        vec![]
-    }
-
     fn artist_tracks(&self, artist: &str) -> Vec<&Track> {
         self.tracks
             .values()
             .filter(|t| t.artist.eq_ignore_ascii_case(artist))
             .collect()
-    }
-
-    fn playlist_tracks(&self, _name: &str) -> Vec<&Track> {
-        vec![]
     }
 
     fn album_tracks(&self, album: &str) -> Vec<&Track> {
@@ -294,7 +359,6 @@ mod tests {
         let lib = DirectoryLibrary::scan(dir.to_str().unwrap()).unwrap();
         assert_eq!(lib.track_count(), 0);
         assert!(lib.artists().is_empty());
-        assert!(lib.user_playlists().is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -337,6 +401,98 @@ mod tests {
         assert_eq!(lib.track_count(), 2);
         assert_eq!(lib.artists(), vec!["Artist"]);
         assert_eq!(lib.albums(), vec![("Artist", "Album")]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_with_progress_reports_total_and_per_track() {
+        use std::sync::Mutex;
+
+        let dir = std::env::temp_dir().join("zytunes-dirlib-progress");
+        let _ = fs::remove_dir_all(&dir);
+        let album = dir.join("ArtistP").join("AlbumP");
+        fs::create_dir_all(&album).unwrap();
+        fs::write(album.join("01 Alpha.mp3"), b"fake").unwrap();
+        fs::write(album.join("02 Beta.mp3"), b"fake").unwrap();
+        fs::write(album.join("03 Gamma.mp3"), b"fake").unwrap();
+
+        let updates: Mutex<Vec<ScanProgress>> = Mutex::new(Vec::new());
+        let lib = DirectoryLibrary::scan_with_progress(dir.to_str().unwrap(), |p| {
+            updates.lock().unwrap().push(p);
+        })
+        .unwrap();
+        assert_eq!(lib.track_count(), 3);
+
+        let updates = updates.into_inner().unwrap();
+        // First emission is the total announcement with no sample.
+        assert_eq!(updates.first().unwrap().total, 3);
+        assert_eq!(updates.first().unwrap().completed, 0);
+        assert!(updates.first().unwrap().sample.is_none());
+
+        // One per-track update plus the opener = 4.
+        assert_eq!(updates.len(), 4);
+        let with_samples: Vec<_> = updates.iter().filter(|u| u.sample.is_some()).collect();
+        assert_eq!(with_samples.len(), 3);
+        for u in &with_samples {
+            assert_eq!(u.total, 3);
+            let s = u.sample.as_ref().unwrap();
+            assert_eq!(s.artist, "ArtistP");
+            assert_eq!(s.album, "AlbumP");
+        }
+        // Max completed count equals the total.
+        let max_completed = updates.iter().map(|u| u.completed).max().unwrap();
+        assert_eq!(max_completed, 3);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_reuses_cached_tracks_for_unchanged_files() {
+        // Use a distinct dir name so we don't race with other tests sharing
+        // the same cache slot.
+        let dir = std::env::temp_dir().join("zytunes-dirlib-incremental");
+        let _ = fs::remove_dir_all(&dir);
+        let album = dir.join("CacheArtist").join("CacheAlbum");
+        fs::create_dir_all(&album).unwrap();
+        fs::write(album.join("01 Original.mp3"), b"fake").unwrap();
+        fs::write(album.join("02 Second.mp3"), b"fake").unwrap();
+
+        // First scan: nothing cached, everything parsed fresh.
+        let lib1 = DirectoryLibrary::scan(dir.to_str().unwrap()).unwrap();
+        assert_eq!(lib1.track_count(), 2);
+
+        // Peek at the cache: both files should be recorded.
+        let cached = crate::cache::load_dirlib_cache(dir.to_str().unwrap());
+        assert_eq!(cached.len(), 2);
+        let original_fp = cached
+            .get(album.join("01 Original.mp3").to_str().unwrap())
+            .expect("first file should be cached")
+            .fingerprint;
+
+        // Add a third file. Second scan should reuse the first two from cache
+        // and parse only the new one.
+        fs::write(album.join("03 Added.mp3"), b"fake").unwrap();
+        let lib2 = DirectoryLibrary::scan(dir.to_str().unwrap()).unwrap();
+        assert_eq!(lib2.track_count(), 3);
+
+        let cached2 = crate::cache::load_dirlib_cache(dir.to_str().unwrap());
+        assert_eq!(cached2.len(), 3);
+        // Unchanged file's fingerprint must survive across scans.
+        assert_eq!(
+            cached2
+                .get(album.join("01 Original.mp3").to_str().unwrap())
+                .unwrap()
+                .fingerprint,
+            original_fp,
+        );
+        // Deleted file must be dropped from the cache.
+        fs::remove_file(album.join("01 Original.mp3")).unwrap();
+        let lib3 = DirectoryLibrary::scan(dir.to_str().unwrap()).unwrap();
+        assert_eq!(lib3.track_count(), 2);
+        let cached3 = crate::cache::load_dirlib_cache(dir.to_str().unwrap());
+        assert_eq!(cached3.len(), 2);
+        assert!(!cached3.contains_key(album.join("01 Original.mp3").to_str().unwrap()));
+
         let _ = fs::remove_dir_all(&dir);
     }
 

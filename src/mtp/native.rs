@@ -34,7 +34,6 @@ const FORMAT_WMA: u16 = 0xB901;
 const FORMAT_AAC: u16 = 0xB903;
 const FORMAT_ARTIST: u16 = 0xB218;
 const FORMAT_ABSTRACT_AUDIO_ALBUM: u16 = 0xBA03;
-const FORMAT_ABSTRACT_AV_PLAYLIST: u16 = 0xBA05;
 const FORMAT_EXIF_JPEG: u16 = 0x3801;
 const FORMAT_WMV: u16 = 0xB981;
 
@@ -324,6 +323,26 @@ impl NativeSession {
             .ok_or_else(|| "Device library not initialized".to_string())
     }
 
+    /// `(major, minor)` version parsed from the firmware string, if readable.
+    /// The Zune reports firmware like `"01.04.00485.00-00425"`; we only care
+    /// about the first two segments.
+    fn firmware_version_tuple(&self) -> Option<(u16, u16)> {
+        parse_firmware_version(self.firmware_version.as_deref()?)
+    }
+
+    /// True if the device firmware is recent enough to implement the Zune
+    /// metadata DB, acquired-items count, and sync-progress vendor ops.
+    /// These were added in firmware 3.0 (Zune software 3.0, Sep 2008).
+    /// Returns `true` when the version can't be parsed so we still attempt
+    /// the ops — some code paths rely on the device's `DeviceRejected`
+    /// reply to tell us to fall back.
+    fn supports_modern_vendor_ops(&self) -> bool {
+        match self.firmware_version_tuple() {
+            Some((major, _)) => major >= 3,
+            None => true,
+        }
+    }
+
     /// Set a log channel for progress messages.
     pub fn set_log_sender(&mut self, tx: std::sync::mpsc::Sender<String>) {
         self.log = Some(tx);
@@ -348,13 +367,32 @@ impl NativeSession {
 
     /// Query the number of items the device acquired on its own
     /// (podcast downloads, Zune-to-Zune sharing).
-    pub fn get_acquired_items_count(&mut self) -> Result<u32, String> {
-        self.session.get_acquired_items_count().mtp_err()
+    ///
+    /// Returns `Ok(None)` when the device reports the vendor op as unsupported
+    /// (older firmware). Callers should treat that as "feature unavailable"
+    /// rather than a hard error.
+    pub fn get_acquired_items_count(&mut self) -> Result<Option<u32>, String> {
+        if !self.supports_modern_vendor_ops() {
+            return Ok(None);
+        }
+        match self.session.get_acquired_items_count() {
+            Ok(count) => Ok(Some(count)),
+            Err(e) if e.is_operation_not_supported() => Ok(None),
+            Err(e) => Err(e.to_string()),
+        }
     }
 
-    /// Query device sync progress (vendor op 0x922f). Returns raw payload bytes.
-    pub fn get_sync_progress(&mut self) -> Result<Vec<u8>, String> {
-        self.session.get_sync_progress().mtp_err()
+    /// Query device sync progress (vendor op 0x922f). Returns raw payload bytes,
+    /// or `Ok(None)` if the device doesn't support the query.
+    pub fn get_sync_progress(&mut self) -> Result<Option<Vec<u8>>, String> {
+        if !self.supports_modern_vendor_ops() {
+            return Ok(None);
+        }
+        match self.session.get_sync_progress() {
+            Ok(raw) => Ok(Some(raw)),
+            Err(e) if e.is_operation_not_supported() => Ok(None),
+            Err(e) => Err(e.to_string()),
+        }
     }
 
     /// Open a native MTP session to the Zune.
@@ -388,6 +426,15 @@ impl NativeSession {
             });
         if let Some(ref v) = firmware_version {
             log(&format!("MTP: Firmware version: {}", v));
+            if let Some((major, _)) = parse_firmware_version(v) {
+                if major < 3 {
+                    log(&format!(
+                        "MTP: Firmware {v} predates Zune software 3.0 (Sep 2008); \
+                         ZMDB bulk-query, acquired-items, and sync-progress ops \
+                         will be skipped. A firmware upgrade to 3.x restores them."
+                    ));
+                }
+            }
         }
 
         log("MTP: Querying storage...");
@@ -543,8 +590,25 @@ impl NativeSession {
 
     /// Try to load the device library via the ZMDB vendor operation.
     /// Returns DeviceEntry values with synthesized paths matching the device filesystem.
+    ///
+    /// Short-circuits on firmware older than 3.0, where ZMDB was not yet
+    /// implemented, and converts `OperationNotSupported (0x2005)` from newer
+    /// devices into a concise error string so the caller's fallback log reads
+    /// cleanly.
     fn try_zmdb(&mut self) -> Result<Vec<DeviceEntry>, String> {
-        let raw = self.session.get_zmdb(1).mtp_err()?;
+        if !self.supports_modern_vendor_ops() {
+            let v = self.firmware_version.as_deref().unwrap_or("unknown");
+            return Err(format!(
+                "firmware {v} predates ZMDB (added in firmware 3.0)"
+            ));
+        }
+        let raw = self.session.get_zmdb(1).map_err(|e| {
+            if e.is_operation_not_supported() {
+                "device does not support ZMDB bulk query".to_string()
+            } else {
+                e.to_string()
+            }
+        })?;
         let zmdb = crate::mtp::zmdb::Zmdb::parse(&raw)?;
         self.log_msg(&format!("ZMDB: {}", zmdb.summary()));
         self.zmdb_video_cache = Some(zmdb.to_video_entries());
@@ -1120,49 +1184,6 @@ impl DeviceSession for NativeSession {
         Ok(tracks)
     }
 
-    fn create_playlist(&mut self, name: &str, track_ids: &[u64]) -> Result<(), String> {
-        self.ensure_library()?;
-        let music_folder = self.lib()?.music_folder;
-
-        // Step 1: Create playlist object via SendObjectPropList.
-        let props = PropListBuilder::new()
-            .add_string(PROP_OBJECT_FILENAME, &format!("{}.pla", name))
-            .build();
-        let (_, _, playlist_id) = self
-            .session
-            .send_object_prop_list(
-                self.storage_id,
-                music_folder,
-                FORMAT_ABSTRACT_AV_PLAYLIST,
-                0,
-                &props,
-            )
-            .mtp_err()?;
-
-        // Step 2: Send empty object data.
-        self.session.send_object(&[]).mtp_err()?;
-
-        // Step 3: Set display name via SetObjectPropValue.
-        let mut name_data = Vec::new();
-        let chars: Vec<u16> = name.encode_utf16().collect();
-        name_data.push((chars.len() + 1) as u8);
-        for ch in &chars {
-            name_data.extend_from_slice(&ch.to_le_bytes());
-        }
-        name_data.extend_from_slice(&0u16.to_le_bytes());
-        let _ = self
-            .session
-            .set_object_prop_value(playlist_id, PROP_NAME, &name_data);
-
-        // Step 4: Link tracks via SetObjectReferences.
-        let refs: Vec<u32> = track_ids.iter().map(|&id| id as u32).collect();
-        self.session
-            .set_object_references(playlist_id, &refs)
-            .mtp_err()?;
-
-        Ok(())
-    }
-
     fn get_storage_info(&mut self) -> Result<(u64, u64), String> {
         self.session.get_storage_info(self.storage_id).mtp_err()
     }
@@ -1538,9 +1559,62 @@ fn write_mtp_string(buf: &mut Vec<u8>, s: &str) {
     buf.extend_from_slice(&0u16.to_le_bytes()); // null terminator
 }
 
+/// Parse the `major.minor` version from a Zune firmware string.
+///
+/// The Zune reports firmware in the form `"01.04.00485.00-00425"` — four
+/// dot-separated segments plus an optional trailing `-BUILD`. We only look
+/// at the first two segments; leading zeros are stripped. Returns `None`
+/// for anything we can't confidently parse (unknown devices).
+fn parse_firmware_version(raw: &str) -> Option<(u16, u16)> {
+    let head = raw.split('-').next().unwrap_or(raw);
+    let mut parts = head.split('.');
+    let major = parts.next()?.trim_start_matches('0');
+    let minor = parts.next()?.trim_start_matches('0');
+    // An all-zero segment like "00" becomes "" after trimming — treat as 0.
+    let major: u16 = if major.is_empty() {
+        0
+    } else {
+        major.parse().ok()?
+    };
+    let minor: u16 = if minor.is_empty() {
+        0
+    } else {
+        minor.parse().ok()?
+    };
+    Some((major, minor))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_firmware_version_handles_zune_format() {
+        // Real-world sample from a Zune 30 on early firmware.
+        assert_eq!(parse_firmware_version("01.04.00485.00-00425"), Some((1, 4)));
+        // Firmware 3.0 (Sep 2008) — first release with ZMDB/acquired-items.
+        assert_eq!(parse_firmware_version("03.00.00123.00-00001"), Some((3, 0)));
+        // No build suffix.
+        assert_eq!(parse_firmware_version("03.02.01000.00"), Some((3, 2)));
+        // Single leading segment.
+        assert_eq!(parse_firmware_version("5.0"), Some((5, 0)));
+    }
+
+    #[test]
+    fn parse_firmware_version_handles_all_zero_segments() {
+        // A segment that trims to an empty string should round-trip to 0,
+        // not propagate as a parse failure.
+        assert_eq!(parse_firmware_version("00.00"), Some((0, 0)));
+    }
+
+    #[test]
+    fn parse_firmware_version_rejects_garbage() {
+        assert!(parse_firmware_version("").is_none());
+        assert!(parse_firmware_version("no-dots").is_none());
+        assert!(parse_firmware_version("bogus.nope").is_none());
+        // Single segment — we need at least major.minor.
+        assert!(parse_firmware_version("3").is_none());
+    }
 
     #[test]
     fn write_mtp_string_ascii() {
