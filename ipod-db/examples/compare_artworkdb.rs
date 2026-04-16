@@ -284,7 +284,8 @@ fn parse_mhlf(data: &[u8], db: &mut ArtworkDb) -> Result<(), String> {
         }
         let mhif_header_size = u32_at(data, cursor + 4) as usize;
         let mhif_total = u32_at(data, cursor + 8) as usize;
-        let corr_id = u32_at(data, cursor + 12);
+        // Reference mhif layout: +0x0C is padding (always 0), +0x10 is corr_id.
+        let corr_id = u32_at(data, cursor + 16);
 
         let header = data[cursor..cursor + mhif_header_size].to_vec();
         db.mhif.insert(corr_id, Mhif { header });
@@ -543,19 +544,30 @@ fn diff_mhif(a: &ArtworkDb, b: &ArtworkDb) {
 
     for (corr, ma) in &a.mhif {
         let Some(mb) = b.mhif.get(corr) else { continue };
-        // +0x10 image_size. Tail is model-specific (nano vs classic).
         let mut lines: Vec<String> = Vec::new();
         push_diff_u32(
             &mut lines,
-            "    image_size        (+0x10)",
+            "    padding           (+0x0C)",
+            u32_at(&ma.header, 12),
+            u32_at(&mb.header, 12),
+        );
+        push_diff_u32(
+            &mut lines,
+            "    correlation_id    (+0x10)",
             u32_at(&ma.header, 16),
             u32_at(&mb.header, 16),
         );
+        push_diff_u32(
+            &mut lines,
+            "    image_size        (+0x14)",
+            u32_at(&ma.header, 20),
+            u32_at(&mb.header, 20),
+        );
         push_diff_bytes(
             &mut lines,
-            "    header_tail       (+0x14..)",
-            &ma.header[20..],
-            &mb.header[20..],
+            "    header_tail       (+0x18..)",
+            &ma.header[24..],
+            &mb.header[24..],
         );
         if !lines.is_empty() {
             println!("  mhif corr_id={}", corr);

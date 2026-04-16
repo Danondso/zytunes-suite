@@ -260,6 +260,18 @@ fn parse_mhit(cur: &mut Cursor<&[u8]>, start: u64) -> crate::Result<IpodTrack> {
     // Ensure we're at end of mhit total size.
     cur.seek(SeekFrom::Start(start + total_size as u64))?;
 
+    // Capture raw mhit header for lossless replay on serialize.
+    let raw_mhit_header = {
+        let s = start as usize;
+        let end = s + header_size as usize;
+        let inner = cur.get_ref();
+        if end <= inner.len() {
+            Some(inner[s..end].to_vec())
+        } else {
+            None
+        }
+    };
+
     Ok(IpodTrack {
         dbid,
         track_id,
@@ -297,6 +309,7 @@ fn parse_mhit(cur: &mut Cursor<&[u8]>, start: u64) -> crate::Result<IpodTrack> {
         },
         ipod_path,
         filetype,
+        raw_mhit_header,
     })
 }
 
@@ -364,11 +377,20 @@ pub fn parse(data: &[u8], mount_point: std::path::PathBuf) -> crate::Result<Ipod
     let _db_type = cur.read_u32::<LittleEndian>()?; // 1 = iTunesDB, 2 = podcast DB
     let db_version = cur.read_u32::<LittleEndian>()?;
     let num_datasets = cur.read_u32::<LittleEndian>()?;
+    let db_id = cur.read_u64::<LittleEndian>()?; // +24 persistent database ID
+
+    // Preserve raw mhbd header for lossless replay of firmware-critical fields.
+    let raw_mhbd_header = if (mhbd_header_size as usize) <= data.len() {
+        Some(data[..mhbd_header_size as usize].to_vec())
+    } else {
+        None
+    };
 
     cur.seek(SeekFrom::Start(mhbd_header_size as u64))?;
 
     let mut tracks = Vec::new();
     let mut playlists = Vec::new();
+    let mut raw_smart_playlists: Option<Vec<u8>> = None;
 
     for _ in 0..num_datasets {
         let mhsd_start = cur.position();
@@ -410,6 +432,14 @@ pub fn parse(data: &[u8], mount_point: std::path::PathBuf) -> crate::Result<Ipod
                     playlists.push(parse_mhyp(&mut cur, mhyp_start)?);
                 }
             }
+            5 => {
+                // Smart playlists — preserve raw blob for lossless round-trip.
+                let start = mhsd_start as usize;
+                let end = start + mhsd_total_size as usize;
+                if end <= data.len() {
+                    raw_smart_playlists = Some(data[start..end].to_vec());
+                }
+            }
             _ => {
                 // Podcast or other dataset — skip.
             }
@@ -432,7 +462,15 @@ pub fn parse(data: &[u8], mount_point: std::path::PathBuf) -> crate::Result<Ipod
             .collect();
     }
 
-    let db = IpodDatabase::from_parsed(db_version, tracks, playlists, mount_point);
+    let db = IpodDatabase::from_parsed(
+        db_version,
+        db_id,
+        tracks,
+        playlists,
+        raw_mhbd_header,
+        raw_smart_playlists,
+        mount_point,
+    );
 
     Ok(db)
 }
@@ -486,6 +524,7 @@ mod tests {
             sample_rate: Some(44100),
             ipod_path: ":iPod_Control:Music:F00:abcdef.mp3".into(),
             filetype: 0x4d503320, // "MP3 "
+            raw_mhit_header: None,
         });
 
         let bytes = itunesdb_write::serialize(&db);
@@ -533,6 +572,7 @@ mod tests {
             sample_rate: None,
             ipod_path: ":iPod_Control:Music:F00:a.mp3".into(),
             filetype: 0x4d503320,
+            raw_mhit_header: None,
         });
         let dbid2 = db.add_track(IpodTrack {
             dbid: 0,
@@ -551,6 +591,7 @@ mod tests {
             sample_rate: None,
             ipod_path: ":iPod_Control:Music:F01:b.mp3".into(),
             filetype: 0x4d503320,
+            raw_mhit_header: None,
         });
 
         db.playlists.push(IpodPlaylist {
@@ -593,6 +634,7 @@ mod tests {
             sample_rate: Some(48000),
             ipod_path: ":iPod_Control:Music:F05:XYZW.mp3".into(),
             filetype: 0x4d503320,
+            raw_mhit_header: None,
         });
 
         let bytes = itunesdb_write::serialize(&db);
@@ -638,12 +680,18 @@ mod tests {
             sample_rate: None,
             ipod_path: ":iPod_Control:Music:F00:a.mp3".into(),
             filetype: 0x4d503320,
+            raw_mhit_header: None,
         });
 
         let mut bytes = itunesdb_write::serialize(&db);
 
-        // Find the first mhod and corrupt its string_byte_len field (offset +28 from mhod start).
-        let mhod_pos = bytes.windows(4).position(|w| w == b"mhod").unwrap();
+        // Find the first mhod inside the track dataset (after mhit), not in album/playlist headers.
+        let mhit_pos = bytes.windows(4).position(|w| w == b"mhit").unwrap();
+        let mhod_pos = mhit_pos
+            + bytes[mhit_pos..]
+                .windows(4)
+                .position(|w| w == b"mhod")
+                .unwrap();
         // String byte length is at mhod_pos + 28.
         let len_pos = mhod_pos + 28;
         // Write a huge length (0x01000000 = 16MB, exceeds 10MB limit).
@@ -679,6 +727,7 @@ mod tests {
             sample_rate: None,
             ipod_path: ":iPod_Control:Music:F00:b.mp3".into(),
             filetype: 0x4d503320,
+            raw_mhit_header: None,
         });
 
         let mut bytes = itunesdb_write::serialize(&db);
@@ -784,6 +833,7 @@ mod tests {
             sample_rate: None,
             ipod_path: ":iPod_Control:Music:F00:a.mp3".into(),
             filetype: 0x4d503320,
+            raw_mhit_header: None,
         });
         db.add_track(IpodTrack {
             dbid: 0,
@@ -802,6 +852,7 @@ mod tests {
             sample_rate: None,
             ipod_path: ":iPod_Control:Music:F01:b.mp3".into(),
             filetype: 0x4d503320,
+            raw_mhit_header: None,
         });
 
         let bytes = itunesdb_write::serialize(&db);
@@ -863,6 +914,7 @@ mod tests {
             sample_rate: None,
             ipod_path: ":iPod_Control:Music:F00:a.mp3".into(),
             filetype: 0x4d503320,
+            raw_mhit_header: None,
         });
         db.add_track(IpodTrack {
             dbid: 0,
@@ -881,6 +933,7 @@ mod tests {
             sample_rate: None,
             ipod_path: ":iPod_Control:Music:F01:b.mp3".into(),
             filetype: 0x4d503320,
+            raw_mhit_header: None,
         });
 
         let bytes = itunesdb_write::serialize(&db);
@@ -942,6 +995,7 @@ mod tests {
                 sample_rate: None,
                 ipod_path: format!(":iPod_Control:Music:F0{i}:x.mp3"),
                 filetype: 0x4d503320,
+                raw_mhit_header: None,
             });
         }
 

@@ -420,6 +420,7 @@ mod tests {
             sample_rate: Some(44100),
             ipod_path: ":iPod_Control:Music:F00:ABCD.mp3".into(),
             filetype: 0x4d503320,
+            raw_mhit_header: None,
         });
 
         // Add artwork.
@@ -485,6 +486,7 @@ mod tests {
             sample_rate: None,
             ipod_path: ":iPod_Control:Music:F00:AAAA.mp3".into(),
             filetype: 0x4d503320,
+            raw_mhit_header: None,
         });
 
         let png = make_test_png();
@@ -531,6 +533,7 @@ mod tests {
             sample_rate: None,
             ipod_path: ":iPod_Control:Music:F00:AAAA.mp3".into(),
             filetype: 0x4d503320,
+            raw_mhit_header: None,
         });
 
         let png = make_test_png();
@@ -580,6 +583,7 @@ mod tests {
             sample_rate: None,
             ipod_path: ":iPod_Control:Music:F00:AAAA.mp3".into(),
             filetype: 0x4d503320,
+            raw_mhit_header: None,
         });
         // No artwork initialized.
 
