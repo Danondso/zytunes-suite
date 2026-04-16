@@ -195,7 +195,8 @@ fn write_mhit(track: &IpodTrack, artwork_count: u32, album_id: u32) -> Vec<u8> {
     let total_size = header_size + mhod_bytes as u32;
 
     let now = mac_timestamp_now();
-    let sr = (track.sample_rate.unwrap_or(0) as u32) << 16;
+    let sample_rate = track.sample_rate.unwrap_or(44100);
+    let sr = (sample_rate as u32) << 16;
 
     // Core fields (+0 through +211), written sequentially.
     let mut buf = Vec::with_capacity(total_size as usize);
@@ -241,7 +242,7 @@ fn write_mhit(track: &IpodTrack, artwork_count: u32, album_id: u32) -> Vec<u8> {
     buf.write_u32::<LittleEndian>(0).unwrap(); // +128 bpm
     buf.write_u32::<LittleEndian>(artwork_count).unwrap(); // +132 artwork_count
                                                            // +136: sample_rate as IEEE 754 float (NOT fixed-point like +60).
-    let sr_float = (track.sample_rate.unwrap_or(44100) as f32).to_bits();
+    let sr_float = (sample_rate as f32).to_bits();
     buf.write_u32::<LittleEndian>(sr_float).unwrap(); // +136 sample_rate_float
     buf.write_u32::<LittleEndian>(0).unwrap(); // +140 date_released2
     buf.write_u32::<LittleEndian>(0x0c).unwrap(); // +144 explicit_flag (ref: always >= 0x0c)
