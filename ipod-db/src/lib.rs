@@ -167,12 +167,31 @@ pub struct IpodTrack {
     pub sample_rate: Option<u16>,
     /// iPod-style path (colon-separated, e.g. ":iPod_Control:Music:F00:ABCD.mp3").
     pub ipod_path: String,
-    /// File type (1 = MP3, 2 = AAC/M4A, 4 = WAV).
+    /// File type code (0x4d503320 = MP3, 0x4d344120 = M4A/AAC/ALAC, etc).
     pub filetype: u32,
+    /// Filetype description string for mhod type 6 (e.g. "MPEG audio file",
+    /// "AAC audio file", "Apple Lossless audio file"). The iPod firmware uses
+    /// this to select the audio decoder. When `None`, derived from `filetype`.
+    pub filetype_string: Option<String>,
     /// Raw mhit header bytes (full 624-byte header from parsed database).
     /// When present, the serializer replays this and patches only the fields
     /// it actively manages (artwork_count, has_artwork, total_size, num_mhods).
     pub(crate) raw_mhit_header: Option<Vec<u8>>,
+}
+
+impl IpodTrack {
+    /// Clear the raw mhit header, forcing the serializer to rebuild it from
+    /// scratch using the track's metadata fields. Use this when the cached
+    /// header needs to be regenerated (e.g. after fixing field values).
+    pub fn clear_raw_header(&mut self) {
+        self.raw_mhit_header = None;
+    }
+
+    /// Mutable access to the raw mhit header bytes for field-level patching.
+    /// Returns `None` if the track was created from scratch (no parsed header).
+    pub fn raw_header_mut(&mut self) -> Option<&mut Vec<u8>> {
+        self.raw_mhit_header.as_mut()
+    }
 }
 
 /// A playlist in the iPod database.

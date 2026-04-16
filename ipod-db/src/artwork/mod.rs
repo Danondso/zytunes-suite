@@ -420,6 +420,7 @@ mod tests {
             sample_rate: Some(44100),
             ipod_path: ":iPod_Control:Music:F00:ABCD.mp3".into(),
             filetype: 0x4d503320,
+            filetype_string: None,
             raw_mhit_header: None,
         });
 
@@ -486,6 +487,7 @@ mod tests {
             sample_rate: None,
             ipod_path: ":iPod_Control:Music:F00:AAAA.mp3".into(),
             filetype: 0x4d503320,
+            filetype_string: None,
             raw_mhit_header: None,
         });
 
@@ -533,6 +535,7 @@ mod tests {
             sample_rate: None,
             ipod_path: ":iPod_Control:Music:F00:AAAA.mp3".into(),
             filetype: 0x4d503320,
+            filetype_string: None,
             raw_mhit_header: None,
         });
 
@@ -550,13 +553,13 @@ mod tests {
             .position(|w| w == b"mhit")
             .expect("mhit not found");
 
-        // artwork_count at offset +132
+        // artwork_count at +0x7C (u16 in libgpod layout)
         let art_count =
-            u32::from_le_bytes(data[mhit_pos + 132..mhit_pos + 136].try_into().unwrap());
+            u16::from_le_bytes(data[mhit_pos + 0x7C..mhit_pos + 0x7E].try_into().unwrap());
         assert_eq!(art_count, 2); // 2 thumbnail specs
 
-        // has_artwork at offset +156
-        let has_art = u32::from_le_bytes(data[mhit_pos + 156..mhit_pos + 160].try_into().unwrap());
+        // has_artwork at +0xA4 (u8 in libgpod layout: 1=yes, 2=no)
+        let has_art = data[mhit_pos + 0xA4];
         assert_eq!(has_art, 1);
     }
 
@@ -583,6 +586,7 @@ mod tests {
             sample_rate: None,
             ipod_path: ":iPod_Control:Music:F00:AAAA.mp3".into(),
             filetype: 0x4d503320,
+            filetype_string: None,
             raw_mhit_header: None,
         });
         // No artwork initialized.
