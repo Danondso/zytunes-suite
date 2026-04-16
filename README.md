@@ -339,3 +339,11 @@ src/
 ## License
 
 MIT — see [LICENSE](LICENSE). Third-party notices in [THIRD_PARTY.md](THIRD_PARTY.md).
+
+## Trademarks
+
+"Zune" is a trademark of Microsoft Corporation. "iPod" and "iTunes" are
+trademarks of Apple Inc. zytunes is an independent interoperability tool and
+is not affiliated with, endorsed by, or sponsored by Microsoft or Apple. All
+product names are used under nominative fair use for the sole purpose of
+describing compatibility with the named devices.
