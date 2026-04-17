@@ -1,4 +1,26 @@
-# iPod Sync Debug — libgpod Investigation
+# iPod Sync Debug — SOLVED 🎉
+
+## Root Cause: Filename Extension Case-Sensitivity
+
+The iPod Classic firmware matches filename extensions **case-sensitively**
+when picking the decoder. Uppercase `.M4A` is silently rejected — track
+appears in the library but skips on playback.
+
+The source file `/Volumes/Music/Artist/Album/03 Track.M4A`
+has an uppercase extension. Our `hash_filename()` preserved the original
+extension, producing paths like `:iPod_Control:Music:F23:ABCD.M4A`. Files
+existed at those paths (FAT32 is case-insensitive), but the firmware's
+extension match is case-sensitive.
+
+**Fix**: one line in `ipod-db/src/fs.rs::hash_filename` — `.to_lowercase()`
+on the extension before constructing the filename.
+
+MP3 imports always worked because the an existing MP3 source already had
+lowercase `.mp3`. Only `.M4A` in the Music collection tripped this.
+
+---
+
+
 
 ## Current Status
 

@@ -164,7 +164,13 @@ fn build_track_mhods(track: &IpodTrack, _artwork_count: u32) -> Vec<Vec<u8>> {
 /// Field layout follows `references/libgpod/src/itdb_itunesdb.c` line 3956.
 /// Header size is 0x248 (584 bytes) — libgpod's standard. The iPod Classic
 /// firmware accepts this even though iTunes writes 0x270 (624).
-fn write_mhit(track: &IpodTrack, artwork_count: u32, album_id: u32, id_0x24: u64) -> Vec<u8> {
+fn write_mhit(
+    track: &IpodTrack,
+    artwork_count: u32,
+    album_id: u32,
+    artist_id: u32,
+    id_0x24: u64,
+) -> Vec<u8> {
     // If we have the raw blob (header + mhods) from a parsed database, replay
     // it verbatim. This preserves the exact mhod set, order, and content that
     // iTunes wrote — the firmware depends on this for playback routing.
@@ -198,7 +204,17 @@ fn write_mhit(track: &IpodTrack, artwork_count: u32, album_id: u32, id_0x24: u64
     } else {
         0
     };
-    let unk204: u32 = if is_mp3 { 1 } else { 0 };
+    // unk204 at +0xCC: libgpod writes 1 for MP3, 0 for others. But iTunes
+    // actually writes 0x02000003 for AAC tracks (verified from golden DB).
+    // MP3s synced by iTunes play even with libgpod's value, so MP3=1 is fine.
+    // AAC tracks need the iTunes-compatible value or they skip on playback.
+    let unk204: u32 = if is_mp3 {
+        1
+    } else if is_aac {
+        0x0200_0003
+    } else {
+        0
+    };
 
     // Sequential write matching libgpod mk_mhit field order exactly.
     let mut buf = Vec::with_capacity(total_size as usize);
@@ -314,8 +330,11 @@ fn write_mhit(track: &IpodTrack, artwork_count: u32, album_id: u32, id_0x24: u64
     buf.write_u32::<LittleEndian>(track.file_size).unwrap(); // +0x12C size (duplicate)
                                                              // +0x130
     buf.write_u32::<LittleEndian>(0).unwrap();
-    buf.write_u64::<LittleEndian>(0x0000_8080_8080_8080)
-        .unwrap(); // +0x134 mystery constant
+    // +0x134 mystery constant. libgpod writes 0x0000_8080_8080_8080 but iTunes
+    // actually writes 0x0000_8080_0303_8080 — verified from golden DB on iPod
+    // Classic. The low 4 bytes differ.
+    buf.write_u64::<LittleEndian>(0x0000_8080_0303_8080)
+        .unwrap(); // +0x134
     buf.write_u32::<LittleEndian>(0).unwrap();
     // +0x140
     buf.write_u32::<LittleEndian>(0).unwrap();
@@ -334,14 +353,17 @@ fn write_mhit(track: &IpodTrack, artwork_count: u32, album_id: u32, id_0x24: u64
         buf.write_u32::<LittleEndian>(0).unwrap(); // 28x zero padding
     }
     // +0x1E0
-    buf.write_u32::<LittleEndian>(0).unwrap(); // artist_id (set by DB rebuild)
+    buf.write_u32::<LittleEndian>(artist_id).unwrap(); // artist_id (references mhsd type 8)
     for _ in 0..4 {
         buf.write_u32::<LittleEndian>(0).unwrap(); // 4x zero
     }
     // +0x1F4
     buf.write_u32::<LittleEndian>(0).unwrap(); // composer_id
-    for _ in 0..20 {
-        buf.write_u32::<LittleEndian>(0).unwrap(); // 20x zero padding to 0x248
+                                               // 20x u32 padding to 0x248, except +0x20C = 2 (matches iTunes golden).
+    for i in 0..20 {
+        let off = 0x1F8 + i * 4;
+        let val: u32 = if off == 0x20C { 2 } else { 0 };
+        buf.write_u32::<LittleEndian>(val).unwrap();
     }
     // Pad from 0x248 (584) to 0x270 (624) to match iTunes header size.
     // Existing tracks (from iTunes) have 624-byte headers; mixing 584-byte
@@ -870,12 +892,33 @@ pub fn serialize(db: &IpodDatabase) -> Vec<u8> {
         .map(u64::from_le_bytes)
         .unwrap_or(db.db_id);
 
+    // Build dbid → artist_id map. Sequential IDs starting at 1, same ordering
+    // as the mhsd type 8 builder below (BTreeMap by artist name).
+    let mut artist_groups: std::collections::BTreeMap<String, u32> =
+        std::collections::BTreeMap::new();
+    let mut next_artist_id = 1u32;
+    let mut dbid_to_artist_id: std::collections::HashMap<u64, u32> =
+        std::collections::HashMap::new();
+    for track in &db.tracks {
+        if !track.artist.is_empty() {
+            let aid = *artist_groups
+                .entry(track.artist.clone())
+                .or_insert_with(|| {
+                    let id = next_artist_id;
+                    next_artist_id += 1;
+                    id
+                });
+            dbid_to_artist_id.insert(track.dbid, aid);
+        }
+    }
+
     // Build track dataset (mhsd type 1 = mhlt + mhits).
     let mut track_data = Vec::new();
     for track in &db.tracks {
         let art_count = art_counts.get(&track.dbid).copied().unwrap_or(0);
         let alb_id = dbid_to_group_id.get(&track.dbid).copied().unwrap_or(0);
-        track_data.extend(write_mhit(track, art_count, alb_id, id_0x24));
+        let art_id = dbid_to_artist_id.get(&track.dbid).copied().unwrap_or(0);
+        track_data.extend(write_mhit(track, art_count, alb_id, art_id, id_0x24));
     }
 
     let mhlt_header_size: u32 = 92;
@@ -966,25 +1009,13 @@ pub fn serialize(db: &IpodDatabase) -> Vec<u8> {
     // Type 4 = album list (mhla with mhia entries built from tracks).
     let mhsd4 = build_album_dataset(&db.tracks);
 
-    // Type 8 = artist list (mhli with mhii entries).
-    // Ported from libgpod's write_mhsd_artists / mk_mhli / mk_mhii.
+    // Type 8 = artist list (mhli with mhii entries). Reuses `artist_groups`
+    // built above so the mhii IDs match what's written into mhit +0x1E0.
     let mhsd8 = {
-        // Build unique artist entries with sequential IDs.
-        let mut artist_map: std::collections::BTreeMap<String, u32> =
-            std::collections::BTreeMap::new();
-        let mut next_artist_id = 1u32;
-        for track in &db.tracks {
-            if !track.artist.is_empty() {
-                artist_map.entry(track.artist.clone()).or_insert_with(|| {
-                    let id = next_artist_id;
-                    next_artist_id += 1;
-                    id
-                });
-            }
-        }
+        let artist_map = &artist_groups;
         // Build mhii entries (each: 80-byte header + mhod with artist name).
         let mut mhii_data = Vec::new();
-        for (artist_name, artist_id) in &artist_map {
+        for (artist_name, artist_id) in artist_map {
             let name_mhod = write_mhod(201, artist_name); // MHOD_ID_ALBUM_ARTIST_MHII
             let mhii_header_size: u32 = 80;
             let mhii_total = mhii_header_size + name_mhod.len() as u32;
