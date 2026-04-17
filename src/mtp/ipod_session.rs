@@ -263,20 +263,27 @@ impl DeviceSession for IpodSession {
         // The path can arrive in several shapes:
         //   * colon-separated iPod path: `:iPod_Control:Music:F00:hash.mp3`
         //   * slash-prefixed filesystem path: `/iPod_Control/Music/F00/hash.mp3`
-        //   * display path from collect_all_tracks: `Artist/Album/hash.mp3`
-        // Try each.
+        //   * display path from collect_all_tracks: `Artist/Album/Title.ext`
+        //   * `/Music/Artist/Album/Title.ext` (TUI prefixes with `/Music/`)
+        let needle = device_path.trim_start_matches('/');
+        let needle = needle.strip_prefix("Music/").unwrap_or(needle);
         let dbid = self
             .db
             .tracks
             .iter()
             .find(|t| {
+                if t.ipod_path == device_path {
+                    return true;
+                }
                 let colon = t.ipod_path.trim_start_matches(':');
                 let slash = colon.replace(':', "/");
-                let filename = t.ipod_path.rsplit(':').next().unwrap_or("");
-                let display = format!("{}/{}/{}", t.artist, t.album, filename);
-                t.ipod_path == device_path
-                    || slash == device_path.trim_start_matches('/')
-                    || display == device_path
+                if slash == device_path.trim_start_matches('/') {
+                    return true;
+                }
+                let ext = t.ipod_path.rsplit('.').next().unwrap_or("mp3");
+                let safe_title = t.title.replace('/', "_");
+                let display = format!("{}/{}/{}.{}", t.artist, t.album, safe_title, ext);
+                display == needle
             })
             .map(|t| t.dbid);
 
@@ -349,15 +356,18 @@ impl DeviceSession for IpodSession {
     }
 
     fn collect_all_tracks(&mut self, _path: &str) -> Result<Vec<DeviceEntry>, String> {
+        // Build "Artist/Album/Title.ext" — the TUI's build_device_index splits
+        // on '/' into (artist, album, filename) and strips the final extension
+        // for display. Using the track title (not the hashed on-device filename)
+        // gives the browse UI readable labels.
         let entries: Vec<DeviceEntry> = self
             .db
             .tracks
             .iter()
             .map(|t| {
-                // Build a display name in the Artist/Album/filename format
-                // that the TUI device browser expects.
-                let filename = t.ipod_path.rsplit(':').next().unwrap_or(&t.title);
-                let display_path = format!("{}/{}/{}", t.artist, t.album, filename);
+                let ext = t.ipod_path.rsplit('.').next().unwrap_or("mp3");
+                let safe_title = t.title.replace('/', "_"); // '/' breaks the splitn
+                let display_path = format!("{}/{}/{}.{}", t.artist, t.album, safe_title, ext);
 
                 DeviceEntry {
                     object_id: t.dbid,

@@ -55,6 +55,7 @@ pub struct DeviceInfo {
     pub usb_mode: Option<String>,
     pub manufacturer: Option<String>,
     pub model: Option<String>,
+    pub family: DeviceFamily,
 }
 
 /// Storage info from the MTP session.
@@ -191,6 +192,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                         usb_mode: zune_data.and_then(|d| d.usb_mode.clone()),
                         manufacturer: None,
                         model: None,
+                        family: detected.family,
                     };
                     let _ = event_tx.send(BgEvent::DeviceDetected(device_info));
 
@@ -228,6 +230,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                         usb_mode: zune_data.and_then(|d| d.usb_mode.clone()),
                                         manufacturer: Some("Microsoft".to_string()),
                                         model: Some(model.to_string()),
+                                        family: DeviceFamily::Zune,
                                     }));
                                     let _ =
                                         event_tx.send(BgEvent::SessionReady(Some(StorageInfo {
@@ -301,6 +304,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                         usb_mode: None,
                                         manufacturer: Some("Apple".to_string()),
                                         model: detected.model.clone(),
+                                        family: detected.family,
                                     }));
                                     let _ =
                                         event_tx.send(BgEvent::SessionReady(Some(StorageInfo {

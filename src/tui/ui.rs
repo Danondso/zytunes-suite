@@ -329,7 +329,10 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
     };
     let browse_prefix = match app.browse_mode {
         BrowseMode::Library => "",
-        BrowseMode::Device => "Zune: ",
+        BrowseMode::Device => match app.device.family {
+            Some(zytunes::device::DeviceFamily::Ipod) => "iPod: ",
+            _ => "Zune: ",
+        },
     };
 
     let title = format!(" {}{} ", browse_prefix, mode_label);
