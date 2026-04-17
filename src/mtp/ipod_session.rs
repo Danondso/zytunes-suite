@@ -29,14 +29,46 @@ impl IpodSession {
     }
 
     /// Write the database to disk (atomically, with hash58 signing).
-    fn flush(&self) -> Result<(), String> {
+    ///
+    /// Performs the libgpod-style end-of-sync bookkeeping:
+    /// 1. Reassigns all track IDs sequentially from 52 (matches libgpod's
+    ///    `prepare_itdb_for_write`)
+    /// 2. Writes iTunesDB + ArtworkDB via the ipod-db serializer (signs hash58)
+    /// 3. Deletes stale Play Counts / iTunesStats so the firmware regenerates
+    fn flush(&mut self) -> Result<(), String> {
+        self.db.reassign_track_ids();
         ipod_db::itunesdb_write::write_to_disk(&self.db, self.firewire_id.as_ref())
-            .map_err(|e| format!("Failed to write iTunesDB: {}", e))
+            .map_err(|e| format!("Failed to write iTunesDB: {}", e))?;
+
+        let itunes_dir = self.mount().join("iPod_Control").join("iTunes");
+        for stale in &["Play Counts", "iTunesStats", "PlayCounts.plist"] {
+            let p = itunes_dir.join(stale);
+            if p.exists() {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+        Ok(())
     }
 
     /// Mount point path.
     fn mount(&self) -> &std::path::Path {
         &self.db.mount_point
+    }
+
+    /// Delete the track with the given dbid: remove its file from disk,
+    /// drop it from the database, and flush. Used by `rm` and `rm_by_id`.
+    fn remove_track_by_dbid(&mut self, dbid: u64) -> Result<(), String> {
+        let track = self
+            .db
+            .find_track(dbid)
+            .ok_or_else(|| format!("Track with dbid 0x{:016x} not in database", dbid))?
+            .clone();
+        let real = ipod_db::fs::real_path(self.mount(), &track.ipod_path);
+        if real.exists() {
+            let _ = std::fs::remove_file(&real);
+        }
+        self.db.remove_track(dbid);
+        self.flush()
     }
 }
 
@@ -228,52 +260,43 @@ impl DeviceSession for IpodSession {
     }
 
     fn rm(&mut self, device_path: &str) -> Result<(), String> {
-        // Find the track by its iPod path.
-        let colon_path = if device_path.contains(':') {
-            device_path.to_string()
-        } else {
-            // Convert slash path like /Music/F00/file.mp3 to colon path.
-            device_path.replace('/', ":")
-        };
-
-        let track = self
+        // The path can arrive in several shapes:
+        //   * colon-separated iPod path: `:iPod_Control:Music:F00:hash.mp3`
+        //   * slash-prefixed filesystem path: `/iPod_Control/Music/F00/hash.mp3`
+        //   * display path from collect_all_tracks: `Artist/Album/hash.mp3`
+        // Try each.
+        let dbid = self
             .db
             .tracks
             .iter()
-            .find(|t| t.ipod_path == colon_path)
-            .cloned();
+            .find(|t| {
+                let colon = t.ipod_path.trim_start_matches(':');
+                let slash = colon.replace(':', "/");
+                let filename = t.ipod_path.rsplit(':').next().unwrap_or("");
+                let display = format!("{}/{}/{}", t.artist, t.album, filename);
+                t.ipod_path == device_path
+                    || slash == device_path.trim_start_matches('/')
+                    || display == device_path
+            })
+            .map(|t| t.dbid);
 
-        if let Some(track) = track {
-            // Remove file from filesystem.
-            let real = ipod_db::fs::real_path(self.mount(), &track.ipod_path);
-            if real.exists() {
-                let _ = std::fs::remove_file(&real);
-            }
-            // Remove from database.
-            self.db.remove_track(track.dbid);
-            self.flush()?;
-            Ok(())
-        } else {
-            // Try as a direct filesystem path.
-            let real = if device_path.starts_with('/') {
-                self.mount()
-                    .join(device_path.strip_prefix('/').unwrap_or(device_path))
-            } else {
-                ipod_db::fs::real_path(self.mount(), device_path)
-            };
-            if real.exists() {
-                std::fs::remove_file(&real)
-                    .map_err(|e| format!("Failed to remove {}: {}", real.display(), e))?;
-                Ok(())
-            } else {
-                Err(format!("Track not found: {}", device_path))
-            }
-        }
+        let Some(dbid) = dbid else {
+            return Err(format!("Track not found: {}", device_path));
+        };
+        self.remove_track_by_dbid(dbid)
     }
 
-    fn rm_by_id(&mut self, _object_id: u32) -> Result<(), String> {
-        // iPod doesn't use MTP object IDs. Use rm() with a path instead.
-        Err("rm_by_id not supported on iPod (use rm with path)".into())
+    fn rm_by_id(&mut self, object_id: u32) -> Result<(), String> {
+        // The TUI truncates our u64 dbid to u32 when calling rm_by_id.
+        // Match on the low 32 bits.
+        let dbid = self
+            .db
+            .tracks
+            .iter()
+            .find(|t| (t.dbid as u32) == object_id)
+            .map(|t| t.dbid)
+            .ok_or_else(|| format!("No track with low-32 dbid = 0x{:x}", object_id))?;
+        self.remove_track_by_dbid(dbid)
     }
 
     fn cleanup_empty_folders(&mut self) -> Result<usize, String> {
