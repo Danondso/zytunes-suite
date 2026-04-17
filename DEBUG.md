@@ -237,15 +237,14 @@ Possible explanations left:
 
 ## Remaining Leads
 
-### `iTunesControl` is 156MB
+### `iTunesControl` is 156MB — but libgpod doesn't touch it
 
-File size `156,237,824` bytes. Not documented in libgpod. Could be:
-- Pre-built index the firmware uses to avoid scanning F-dirs (if so,
-  new files at new paths get ignored)
-- Log / manifest of valid content
+File size `156,237,824` bytes. Grep of libgpod source shows the only
+reference is to the `iTunes_Control/` DIRECTORY (lowercase, for
+byte-order detection), NOT this file. libgpod successfully syncs to
+iPod Classic without reading or writing `iTunesControl`.
 
-**Inspect structure of iTunesControl** next — might be a magic-prefixed
-binary format, might be a concatenation of track data, etc.
+Therefore `iTunesControl` is NOT the filter — ruled out.
 
 ### `Extras.itdb` is a SQLite database
 
