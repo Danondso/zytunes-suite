@@ -168,4 +168,60 @@ to update.
 
 - 2026-04-16: Investigation started. Documented libgpod flow.
   Key finding: libgpod reassigns track IDs on every write (we don't).
-  Next step: test track ID reassignment.
+- 2026-04-16 (later): Ran track ID reassignment experiment. Still skips.
+  Added total_tracks, total_discs fields. Fixed id_0x24 at +0x124 (was
+  writing db_id from mhbd+0x18, correct is id_0x24 from mhbd+0x24). Made
+  all mhit headers uniform 624 bytes. Still skips.
+
+## Experiments Run (all FAILED to make new track playable)
+
+1. From-scratch mhit with libgpod-ported layout ❌
+2. 8-dataset output (types 1/3/2/4/8/6/10/5) ❌
+3. Clone working track's raw blob, patch metadata ❌
+4. Clone + add to sort indexes + add to letter indexes ❌
+5. Track ID reassignment (dense 52..N) ❌
+6. Uniform 624-byte headers ❌
+7. id_0x24 from mhbd+0x24 (not db_id from mhbd+0x18) ❌
+8. total_tracks, total_discs populated ❌
+
+## Remaining differences (new mhit vs golden working AAC mhit)
+
+These are still unfixed but may not matter:
+
+- `+0x080 artwork_size`: 0 (no artwork) vs real bytes (has artwork) — expected
+- `+0x0B8 pregap` / `+0x0BC samplecount` / `+0x0C8 postgap` — gapless info
+  we don't extract from the file
+- `+0x0CC unk204`: libgpod writes 0 for AAC, golden has `0x02000003`
+- `+0x134/0x138` mystery: libgpod `0x808080808080`, golden `0x00008080_03038080`
+- `+0x160 mhii_link`: 0 (no ArtworkDB entry) vs ArtworkDB id
+- `+0x1E0 artist_id`: 0 vs `0x218`
+- `+0x1F4 composer_id`: 0
+- `+0x20C` mystery byte
+
+## New Hypothesis: It's Not the Database
+
+We've ported libgpod faithfully for the parts that matter (mhit fields,
+mhods, datasets, checksum). We've tried binary cloning from working tracks.
+Nothing makes a NEW track play, even though the file itself plays fine when
+swapped into a working slot.
+
+Possible explanations left:
+1. **Incomplete ArtworkDB** — even for tracks without artwork, maybe the
+   firmware requires some entry. libgpod explicitly skips tracks without
+   artwork in `db-artwork-writer.c:1035`, but this is the one thing we
+   haven't tried.
+2. **Extras.itdb has a track manifest** we're not updating
+3. **Firmware track limit on this particular iPod** — maybe disk is full
+   or some internal counter overflowed
+4. **The iPod caches the DB** in a way that survives reboots and our DB
+   writes aren't invalidating the cache
+
+## Next Experiment (to try in a fresh session)
+
+Try writing an empty mhii entry in the ArtworkDB for our new track's dbid.
+libgpod skips this but maybe the iPod Classic firmware (or some firmware
+revision) requires it.
+
+Failing that, test with gtkpod or another known-good library on this
+specific iPod to see if it can add a track. If not, the iPod itself may
+be in a state that prevents modifications.
