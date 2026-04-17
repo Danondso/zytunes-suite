@@ -110,7 +110,9 @@ impl DeviceSession for IpodSession {
             .unwrap_or_else(|| "Unknown Album".into());
         let genre = tag.and_then(|t| t.genre().map(|s| s.to_string()));
         let track_number = tag.and_then(|t| t.track().map(|n| n as u16));
+        let total_tracks = tag.and_then(|t| t.track_total().map(|n| n as u16));
         let disc_number = tag.and_then(|t| t.disk().map(|n| n as u16));
+        let total_discs = tag.and_then(|t| t.disk_total().map(|n| n as u16));
         let year = tag.and_then(|t| t.year().map(|y| y as u16));
         let album_artist =
             tag.and_then(|t| t.get_string(&ItemKey::AlbumArtist).map(|s| s.to_string()));
@@ -185,7 +187,9 @@ impl DeviceSession for IpodSession {
         track.album_artist = album_artist;
         track.genre = genre;
         track.track_number = track_number;
+        track.total_tracks = total_tracks;
         track.disc_number = disc_number;
+        track.total_discs = total_discs;
         track.total_time_ms = if duration_ms > 0 {
             Some(duration_ms)
         } else {

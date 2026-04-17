@@ -84,10 +84,20 @@ fn main() {
     let artist = ffprobe_field(audio_path, "artist").unwrap_or_else(|| "Unknown Artist".into());
     let album = ffprobe_field(audio_path, "album").unwrap_or_else(|| "Unknown Album".into());
     let genre = ffprobe_field(audio_path, "genre");
-    let track_number = ffprobe_field(audio_path, "track")
+    let track_raw = ffprobe_field(audio_path, "track");
+    let track_number = track_raw
+        .as_ref()
         .and_then(|s| s.split('/').next().and_then(|n| n.parse::<u16>().ok()));
-    let disc_number = ffprobe_field(audio_path, "disc")
+    let total_tracks = track_raw
+        .as_ref()
+        .and_then(|s| s.split('/').nth(1).and_then(|n| n.parse::<u16>().ok()));
+    let disc_raw = ffprobe_field(audio_path, "disc");
+    let disc_number = disc_raw
+        .as_ref()
         .and_then(|s| s.split('/').next().and_then(|n| n.parse::<u16>().ok()));
+    let total_discs = disc_raw
+        .as_ref()
+        .and_then(|s| s.split('/').nth(1).and_then(|n| n.parse::<u16>().ok()));
     let year =
         ffprobe_field(audio_path, "date").and_then(|s| s[..4.min(s.len())].parse::<u16>().ok());
 
@@ -161,7 +171,9 @@ fn main() {
     track.album = album;
     track.genre = genre;
     track.track_number = track_number;
+    track.total_tracks = total_tracks;
     track.disc_number = disc_number;
+    track.total_discs = total_discs;
     track.total_time_ms = duration_ms;
     track.year = year;
     track.file_size = file_size;
@@ -173,6 +185,14 @@ fn main() {
 
     let dbid = db.add_track(track);
     println!("Added (dbid=0x{dbid:016x}), total: {}", db.tracks.len());
+
+    // Reassign all track IDs sequentially starting from 52 (libgpod-style).
+    // iPod Classic firmware may require dense track IDs.
+    db.reassign_track_ids();
+    println!(
+        "Reassigned track IDs: 52..{}",
+        52 + db.tracks.len() as u32 - 1
+    );
 
     let mut output = ipod_db::itunesdb_write::serialize(&db);
     let fwid = ipod_db::hash::parse_firewire_id(fwid_str).unwrap();

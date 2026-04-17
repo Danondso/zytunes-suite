@@ -176,7 +176,7 @@ fn parse_mhit(cur: &mut Cursor<&[u8]>, start: u64) -> crate::Result<IpodTrack> {
     let file_size = cur.read_u32::<LittleEndian>()?; // +36
     let total_time = cur.read_u32::<LittleEndian>()?; // +40
     let track_number = cur.read_u32::<LittleEndian>()?; // +44
-    let _total_tracks = cur.read_u32::<LittleEndian>()?; // +48
+    let total_tracks = cur.read_u32::<LittleEndian>()?; // +48
     let year = cur.read_u32::<LittleEndian>()?; // +52
     let bitrate = cur.read_u32::<LittleEndian>()?; // +56
     let sample_rate_raw = cur.read_u32::<LittleEndian>()?; // +60
@@ -189,7 +189,7 @@ fn parse_mhit(cur: &mut Cursor<&[u8]>, start: u64) -> crate::Result<IpodTrack> {
     let _last_played = cur.read_u32::<LittleEndian>()?; // +84   Mac timestamp
     let _date_added_to_device = cur.read_u32::<LittleEndian>()?; // +88   Mac timestamp
     let disc_number = cur.read_u32::<LittleEndian>()?; // +92
-    let _disc_total = cur.read_u32::<LittleEndian>()?; // +96
+    let total_discs = cur.read_u32::<LittleEndian>()?; // +96
     let _sort_order = cur.read_u32::<LittleEndian>()?; // +100
     let _date_added = cur.read_u32::<LittleEndian>()?; // +104  Mac timestamp
     let _date_released = cur.read_u32::<LittleEndian>()?; // +108  Mac timestamp
@@ -290,8 +290,18 @@ fn parse_mhit(cur: &mut Cursor<&[u8]>, start: u64) -> crate::Result<IpodTrack> {
         } else {
             None
         },
+        total_tracks: if total_tracks > 0 {
+            Some(total_tracks as u16)
+        } else {
+            None
+        },
         disc_number: if disc_number > 0 {
             Some(disc_number as u16)
+        } else {
+            None
+        },
+        total_discs: if total_discs > 0 {
+            Some(total_discs as u16)
         } else {
             None
         },
@@ -522,7 +532,9 @@ mod tests {
             album_artist: Some("Album Artist".into()),
             genre: Some("Rock".into()),
             track_number: Some(3),
+            total_tracks: None,
             disc_number: Some(1),
+            total_discs: None,
             total_time_ms: Some(240000),
             year: Some(2024),
             file_size: 5_000_000,
@@ -571,7 +583,9 @@ mod tests {
             album_artist: None,
             genre: None,
             track_number: None,
+            total_tracks: None,
             disc_number: None,
+            total_discs: None,
             total_time_ms: None,
             year: None,
             file_size: 1000,
@@ -591,7 +605,9 @@ mod tests {
             album_artist: None,
             genre: None,
             track_number: None,
+            total_tracks: None,
             disc_number: None,
+            total_discs: None,
             total_time_ms: None,
             year: None,
             file_size: 2000,
@@ -635,7 +651,9 @@ mod tests {
             album_artist: Some("AA".into()),
             genre: Some("Rock".into()),
             track_number: Some(7),
+            total_tracks: None,
             disc_number: Some(2),
+            total_discs: None,
             total_time_ms: Some(300000),
             year: Some(1999),
             file_size: 8_000_000,
@@ -682,7 +700,9 @@ mod tests {
             album_artist: None,
             genre: None,
             track_number: None,
+            total_tracks: None,
             disc_number: None,
+            total_discs: None,
             total_time_ms: None,
             year: None,
             file_size: 100,
@@ -730,7 +750,9 @@ mod tests {
             album_artist: None,
             genre: None,
             track_number: None,
+            total_tracks: None,
             disc_number: None,
+            total_discs: None,
             total_time_ms: None,
             year: None,
             file_size: 50,
@@ -837,7 +859,9 @@ mod tests {
             album_artist: None,
             genre: Some("Rock".into()),
             track_number: None,
+            total_tracks: None,
             disc_number: None,
+            total_discs: None,
             total_time_ms: None,
             year: None,
             file_size: 100,
@@ -857,7 +881,9 @@ mod tests {
             album_artist: None,
             genre: Some("Pop".into()),
             track_number: None,
+            total_tracks: None,
             disc_number: None,
+            total_discs: None,
             total_time_ms: None,
             year: None,
             file_size: 200,
@@ -905,7 +931,10 @@ mod tests {
         // Find first mhit and check header size is 624.
         let mhit_pos = bytes.windows(4).position(|w| w == b"mhit").unwrap();
         let mhit_hdr = u32::from_le_bytes(bytes[mhit_pos + 4..mhit_pos + 8].try_into().unwrap());
-        assert_eq!(mhit_hdr, 584, "mhit header should be 584 bytes (libgpod)");
+        assert_eq!(
+            mhit_hdr, 624,
+            "mhit header should be 624 bytes (iTunes format)"
+        );
     }
 
     #[test]
@@ -920,7 +949,9 @@ mod tests {
             album_artist: None,
             genre: None,
             track_number: None,
+            total_tracks: None,
             disc_number: None,
+            total_discs: None,
             total_time_ms: None,
             year: None,
             file_size: 100,
@@ -940,7 +971,9 @@ mod tests {
             album_artist: None,
             genre: None,
             track_number: None,
+            total_tracks: None,
             disc_number: None,
+            total_discs: None,
             total_time_ms: None,
             year: None,
             file_size: 200,
@@ -1003,7 +1036,9 @@ mod tests {
                 album_artist: None,
                 genre: None,
                 track_number: None,
+                total_tracks: None,
                 disc_number: None,
+                total_discs: None,
                 total_time_ms: None,
                 year: None,
                 file_size: 100,
@@ -1056,7 +1091,9 @@ mod tests {
             album_artist: None,
             genre: Some("Jazz".into()),
             track_number: Some(1),
+            total_tracks: None,
             disc_number: None,
+            total_discs: None,
             total_time_ms: Some(200000),
             year: Some(2020),
             file_size: 4_000_000,
@@ -1084,7 +1121,9 @@ mod tests {
             album_artist: Some("New AA".into()),
             genre: Some("Rock".into()),
             track_number: Some(5),
+            total_tracks: None,
             disc_number: Some(2),
+            total_discs: None,
             total_time_ms: Some(300000),
             year: Some(2025),
             file_size: 6_000_000,
@@ -1131,7 +1170,7 @@ mod tests {
         // Master playlist should have both tracks.
         assert_eq!(db3.playlists[0].track_ids.len(), 2);
 
-        // Verify mhit header size is 584 for both tracks (libgpod layout).
+        // Verify mhit header size is 624 for both tracks (iTunes format).
         let mhit_positions: Vec<usize> = bytes2
             .windows(4)
             .enumerate()
@@ -1141,10 +1180,7 @@ mod tests {
         assert_eq!(mhit_positions.len(), 2, "should have 2 mhit records");
         for pos in &mhit_positions {
             let hs = u32::from_le_bytes(bytes2[pos + 4..pos + 8].try_into().unwrap());
-            assert_eq!(
-                hs, 584,
-                "mhit header should be 584 bytes (libgpod standard)"
-            );
+            assert_eq!(hs, 624, "mhit header should be 624 bytes (iTunes format)");
         }
     }
 

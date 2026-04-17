@@ -164,7 +164,7 @@ fn build_track_mhods(track: &IpodTrack, _artwork_count: u32) -> Vec<Vec<u8>> {
 /// Field layout follows `references/libgpod/src/itdb_itunesdb.c` line 3956.
 /// Header size is 0x248 (584 bytes) — libgpod's standard. The iPod Classic
 /// firmware accepts this even though iTunes writes 0x270 (624).
-fn write_mhit(track: &IpodTrack, artwork_count: u32, album_id: u32, db_id: u64) -> Vec<u8> {
+fn write_mhit(track: &IpodTrack, artwork_count: u32, album_id: u32, id_0x24: u64) -> Vec<u8> {
     // If we have the raw blob (header + mhods) from a parsed database, replay
     // it verbatim. This preserves the exact mhod set, order, and content that
     // iTunes wrote — the firmware depends on this for playback routing.
@@ -172,8 +172,10 @@ fn write_mhit(track: &IpodTrack, artwork_count: u32, album_id: u32, db_id: u64) 
         return write_mhit_from_raw(raw, artwork_count);
     }
 
-    // libgpod uses 0x248 (584). iTunes uses 0x270 (624). Both work.
-    let header_size: u32 = 0x248;
+    // Match iTunes (0x270 = 624). libgpod writes 0x248 = 584, but when mixed
+    // with iTunes-written 624-byte headers in the same DB, some firmware
+    // versions reject the smaller ones. Pad to 624 for consistency.
+    let header_size: u32 = 0x270;
 
     let mhods = build_track_mhods(track, artwork_count);
     let num_mhods = mhods.len() as u32;
@@ -220,7 +222,8 @@ fn write_mhit(track: &IpodTrack, artwork_count: u32, album_id: u32, db_id: u64) 
     buf.write_u32::<LittleEndian>(track.track_number.unwrap_or(0) as u32)
         .unwrap(); // track_nr
                    // +0x30
-    buf.write_u32::<LittleEndian>(0).unwrap(); // tracks (total tracks in album)
+    buf.write_u32::<LittleEndian>(track.total_tracks.unwrap_or(0) as u32)
+        .unwrap(); // tracks (total tracks in album)
     buf.write_u32::<LittleEndian>(track.year.unwrap_or(0) as u32)
         .unwrap(); // year
     buf.write_u32::<LittleEndian>(track.bitrate.unwrap_or(0) as u32)
@@ -238,7 +241,8 @@ fn write_mhit(track: &IpodTrack, artwork_count: u32, album_id: u32, db_id: u64) 
     buf.write_u32::<LittleEndian>(track.disc_number.unwrap_or(0) as u32)
         .unwrap(); // cd_nr
                    // +0x60
-    buf.write_u32::<LittleEndian>(0).unwrap(); // cds (total discs)
+    buf.write_u32::<LittleEndian>(track.total_discs.unwrap_or(0) as u32)
+        .unwrap(); // cds (total discs)
     buf.write_u32::<LittleEndian>(0).unwrap(); // drm_userid
     buf.write_u32::<LittleEndian>(now).unwrap(); // time_added
     buf.write_u32::<LittleEndian>(0).unwrap(); // bookmark_time
@@ -306,7 +310,7 @@ fn write_mhit(track: &IpodTrack, artwork_count: u32, album_id: u32, db_id: u64) 
     }
     // +0x120
     buf.write_u32::<LittleEndian>(album_id).unwrap(); // album_id
-    buf.write_u64::<LittleEndian>(db_id).unwrap(); // +0x124 db persistent ID (from mhbd+0x24)
+    buf.write_u64::<LittleEndian>(id_0x24).unwrap(); // +0x124 id_0x24 (from mhbd+0x24, not db_id!)
     buf.write_u32::<LittleEndian>(track.file_size).unwrap(); // +0x12C size (duplicate)
                                                              // +0x130
     buf.write_u32::<LittleEndian>(0).unwrap();
@@ -338,6 +342,12 @@ fn write_mhit(track: &IpodTrack, artwork_count: u32, album_id: u32, db_id: u64) 
     buf.write_u32::<LittleEndian>(0).unwrap(); // composer_id
     for _ in 0..20 {
         buf.write_u32::<LittleEndian>(0).unwrap(); // 20x zero padding to 0x248
+    }
+    // Pad from 0x248 (584) to 0x270 (624) to match iTunes header size.
+    // Existing tracks (from iTunes) have 624-byte headers; mixing 584-byte
+    // new tracks with them causes the firmware to reject the smaller ones.
+    while buf.len() < header_size as usize {
+        buf.push(0);
     }
 
     debug_assert_eq!(
@@ -849,12 +859,23 @@ pub fn serialize(db: &IpodDatabase) -> Vec<u8> {
         dbid_to_group_id.insert(track.dbid, gid);
     }
 
+    // Read id_0x24 from mhbd header (+0x24, 8 bytes). Tracks reference this
+    // persistent DB ID at their mhit +0x124 — NOT the db_id at mhbd+0x18.
+    // libgpod calls this `itdb->priv->id_0x24`.
+    let id_0x24 = db
+        .raw_mhbd_header
+        .as_ref()
+        .and_then(|h| h.get(0x24..0x2C))
+        .and_then(|s| s.try_into().ok())
+        .map(u64::from_le_bytes)
+        .unwrap_or(db.db_id);
+
     // Build track dataset (mhsd type 1 = mhlt + mhits).
     let mut track_data = Vec::new();
     for track in &db.tracks {
         let art_count = art_counts.get(&track.dbid).copied().unwrap_or(0);
         let alb_id = dbid_to_group_id.get(&track.dbid).copied().unwrap_or(0);
-        track_data.extend(write_mhit(track, art_count, alb_id, db.db_id));
+        track_data.extend(write_mhit(track, art_count, alb_id, id_0x24));
     }
 
     let mhlt_header_size: u32 = 92;
