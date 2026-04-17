@@ -26,28 +26,18 @@ use std::io::Write;
 use crate::encoding::encode_utf16le;
 use crate::{IpodDatabase, IpodDbError, IpodTrack};
 
-/// Mac epoch offset: seconds between Unix epoch (1970-01-01) and Mac epoch (2001-01-01).
-const MAC_EPOCH_OFFSET: u64 = 978_307_200;
+/// Seconds between the Mac HFS epoch (1904-01-01) and Unix epoch (1970-01-01).
+/// The iPod uses the 1904-based HFS epoch for all timestamp fields, NOT the
+/// 2001-based Cocoa epoch.
+const HFS_EPOCH_OFFSET: u64 = 2_082_844_800;
 
-/// Current time as a Mac timestamp (seconds since 2001-01-01 00:00:00 UTC).
+/// Current time as a Mac HFS timestamp (seconds since 1904-01-01 00:00:00 UTC).
 fn mac_timestamp_now() -> u32 {
     let unix_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    // Mac timestamps are u32, wrapping is fine (won't overflow until ~2137).
-    unix_secs.saturating_sub(MAC_EPOCH_OFFSET) as u32
-}
-
-/// Strip leading articles ("The ", "A ", "An ") for sort keys.
-fn strip_article(s: &str) -> String {
-    let lower = s.to_lowercase();
-    for prefix in &["the ", "a ", "an "] {
-        if lower.starts_with(prefix) {
-            return s[prefix.len()..].to_string();
-        }
-    }
-    s.to_string()
+    unix_secs.wrapping_add(HFS_EPOCH_OFFSET) as u32
 }
 
 /// Write a little-endian u32 at an exact byte offset in a buffer.
@@ -71,7 +61,7 @@ fn write_mhod(mhod_type: u32, value: &str) -> Vec<u8> {
     buf.write_u32::<LittleEndian>(0).unwrap(); // padding
 
     // String sub-header.
-    buf.write_u32::<LittleEndian>(0).unwrap(); // string_position
+    buf.write_u32::<LittleEndian>(1).unwrap(); // unknown (always 1 in iTunes-written DBs)
     buf.write_u32::<LittleEndian>(string_bytes.len() as u32)
         .unwrap();
     buf.write_u32::<LittleEndian>(1).unwrap(); // encoding (1 = UTF-16LE)
@@ -81,56 +71,57 @@ fn write_mhod(mhod_type: u32, value: &str) -> Vec<u8> {
     buf
 }
 
-/// Write an mhit from a preserved raw header + rebuilt mhods.
-/// Patches only the fields we manage: total_size, num_mhods, artwork_count,
-/// has_artwork. Everything else (timestamps, media_type, hashes, gapless data)
-/// stays as the firmware originally wrote it.
-fn write_mhit_from_raw(
-    raw_header: &[u8],
-    track: &IpodTrack,
-    artwork_count: u32,
-    _album_id: u32,
-) -> Vec<u8> {
-    let header_size = u32::from_le_bytes(raw_header[4..8].try_into().unwrap());
+/// Replay a parsed track's raw bytes (mhit header + mhods) verbatim.
+///
+/// The raw blob captured during parse includes the exact mhod set, order, and
+/// content that iTunes wrote. The iPod firmware is sensitive to this — rebuilding
+/// mhods from metadata loses information the firmware depends on for playback.
+///
+/// We only patch artwork fields in the mhit header since those may change when
+/// artwork is added after parse.
+fn write_mhit_from_raw(raw_blob: &[u8], artwork_count: u32) -> Vec<u8> {
+    let mut buf = raw_blob.to_vec();
 
-    // Build child mhods (same as the from-scratch path).
-    let mhods = build_track_mhods(track, artwork_count);
-    let num_mhods = mhods.len() as u32;
-    let total_size = header_size + mhods.iter().map(|m| m.len() as u32).sum::<u32>();
-
-    let mut buf = raw_header.to_vec();
-    buf.resize(header_size as usize, 0);
-
-    // Patch managed fields.
-    put_u32_at(&mut buf, 8, total_size); // total_size
-    put_u32_at(&mut buf, 12, num_mhods); // num_mhods
-    put_u32_at(&mut buf, 132, artwork_count); // artwork_count
-    put_u32_at(&mut buf, 156, if artwork_count > 0 { 1 } else { 0 }); // has_artwork
-
-    for mhod in &mhods {
-        buf.extend_from_slice(mhod);
+    // Patch artwork fields if they changed.
+    // The offsets depend on the header size of the original blob:
+    // - iTunes 624-byte (0x270): artwork_count=u32@+132, has_artwork=u32@+156
+    // - libgpod 584-byte (0x248): artwork_count=u16@+0x7C, has_artwork=u8@+0xA4
+    let header_size = if buf.len() >= 8 {
+        u32::from_le_bytes(buf[4..8].try_into().unwrap_or([0; 4]))
+    } else {
+        0
+    };
+    if header_size == 0x270 && buf.len() >= 160 {
+        // iTunes layout (624-byte headers).
+        put_u32_at(&mut buf, 132, artwork_count);
+        put_u32_at(&mut buf, 156, if artwork_count > 0 { 1 } else { 0 });
+    } else if header_size == 0x248 && buf.len() >= 0xA5 {
+        // libgpod layout (584-byte headers).
+        buf[0x7C..0x7E].copy_from_slice(&(artwork_count as u16).to_le_bytes());
+        buf[0xA4] = if artwork_count > 0 { 1 } else { 2 };
     }
+
     buf
 }
 
-/// Build the child mhods for a track. Shared between from-scratch and from-raw paths.
+/// Build the child mhods for a new track (from-scratch path only).
+///
+/// For parsed tracks, the raw blob (header + mhods) is replayed verbatim.
+/// This function is only called for tracks added after parse.
 fn build_track_mhods(track: &IpodTrack, _artwork_count: u32) -> Vec<Vec<u8>> {
     let mut mhods = Vec::new();
 
-    // Title (type 1) — always present.
+    // Title (type 1).
     mhods.push(write_mhod(1, &track.title));
-
-    // Location (type 2) — always present.
-    mhods.push(write_mhod(2, &track.ipod_path));
-
-    // Album (type 3).
-    if !track.album.is_empty() {
-        mhods.push(write_mhod(3, &track.album));
-    }
 
     // Artist (type 4).
     if !track.artist.is_empty() {
         mhods.push(write_mhod(4, &track.artist));
+    }
+
+    // Album (type 3).
+    if !track.album.is_empty() {
+        mhods.push(write_mhod(3, &track.album));
     }
 
     // Genre (type 5).
@@ -138,35 +129,27 @@ fn build_track_mhods(track: &IpodTrack, _artwork_count: u32) -> Vec<Vec<u8>> {
         mhods.push(write_mhod(5, genre));
     }
 
-    // Filetype string (type 6).
-    let filetype_str = match track.filetype {
-        0x4d503320 => "MPEG audio file",
-        0x4d344120 => "AAC audio file",
-        0x4d345020 => "Protected AAC audio file",
-        0x57415620 => "WAV audio file",
-        0x574d4120 => "WMA audio file",
-        _ => "Audio file",
-    };
+    // Filetype string (type 6). The firmware uses this to select the decoder,
+    // so ALAC must say "Apple Lossless audio file", not "AAC audio file".
+    let filetype_str = track
+        .filetype_string
+        .as_deref()
+        .unwrap_or(match track.filetype {
+            0x4d503320 => "MPEG audio file",
+            0x4d344120 => "AAC audio file",
+            0x4d345020 => "Protected AAC audio file",
+            0x57415620 => "WAV audio file",
+            0x574d4120 => "WMA audio file",
+            _ => "Audio file",
+        });
     mhods.push(write_mhod(6, filetype_str));
+
+    // Location (type 2) — firmware needs this to find the file.
+    mhods.push(write_mhod(2, &track.ipod_path));
 
     // Album artist (type 14).
     if let Some(ref aa) = track.album_artist {
         mhods.push(write_mhod(14, aa));
-    }
-
-    // Sort string mhods.
-    if !track.artist.is_empty() {
-        mhods.push(write_mhod(22, &track.artist));
-    }
-    let sort_album_artist = track.album_artist.as_deref().unwrap_or(&track.artist);
-    if !sort_album_artist.is_empty() {
-        mhods.push(write_mhod(23, sort_album_artist));
-    }
-    if !track.title.is_empty() {
-        mhods.push(write_mhod(27, &strip_article(&track.title)));
-    }
-    if !track.album.is_empty() {
-        mhods.push(write_mhod(28, &strip_article(&track.album)));
     }
 
     mhods
@@ -176,19 +159,30 @@ fn build_track_mhods(track: &IpodTrack, _artwork_count: u32) -> Vec<Vec<u8>> {
 ///
 /// `artwork_count` is the number of thumbnail entries (0 if no artwork).
 /// `album_id` is the cross-reference into the mhsd type=4 album list.
-fn write_mhit(track: &IpodTrack, artwork_count: u32, album_id: u32) -> Vec<u8> {
-    // If we have a raw mhit header from a parsed database, replay it and only
-    // patch the fields we actively manage. This preserves all firmware-critical
-    // fields (media_type, gapless data, per-track hashes, timestamps, etc.)
-    // that we don't yet know how to generate from scratch.
+/// Write an mhit for a new track, ported from libgpod's mk_mhit.
+///
+/// Field layout follows `references/libgpod/src/itdb_itunesdb.c` line 3956.
+/// Header size is 0x248 (584 bytes) — libgpod's standard. The iPod Classic
+/// firmware accepts this even though iTunes writes 0x270 (624).
+fn write_mhit(
+    track: &IpodTrack,
+    artwork_count: u32,
+    album_id: u32,
+    artist_id: u32,
+    id_0x24: u64,
+) -> Vec<u8> {
+    // If we have the raw blob (header + mhods) from a parsed database, replay
+    // it verbatim. This preserves the exact mhod set, order, and content that
+    // iTunes wrote — the firmware depends on this for playback routing.
     if let Some(ref raw) = track.raw_mhit_header {
-        return write_mhit_from_raw(raw, track, artwork_count, album_id);
+        return write_mhit_from_raw(raw, artwork_count);
     }
 
-    // Header size 0x270 (624) matches iPod Classic/Video/Mini (db versions 0x73-0x75).
+    // Match iTunes (0x270 = 624). libgpod writes 0x248 = 584, but when mixed
+    // with iTunes-written 624-byte headers in the same DB, some firmware
+    // versions reject the smaller ones. Pad to 624 for consistency.
     let header_size: u32 = 0x270;
 
-    // Build child mhods (shared with the raw-header replay path).
     let mhods = build_track_mhods(track, artwork_count);
     let num_mhods = mhods.len() as u32;
     let mhod_bytes: usize = mhods.iter().map(|m| m.len()).sum();
@@ -196,107 +190,195 @@ fn write_mhit(track: &IpodTrack, artwork_count: u32, album_id: u32) -> Vec<u8> {
 
     let now = mac_timestamp_now();
     let sample_rate = track.sample_rate.unwrap_or(44100);
-    let sr = (sample_rate as u32) << 16;
-
-    // Core fields (+0 through +211), written sequentially.
-    let mut buf = Vec::with_capacity(total_size as usize);
-    buf.write_all(b"mhit").unwrap(); // +0
-    buf.write_u32::<LittleEndian>(header_size).unwrap(); // +4
-    buf.write_u32::<LittleEndian>(total_size).unwrap(); // +8
-    buf.write_u32::<LittleEndian>(num_mhods).unwrap(); // +12
-    buf.write_u32::<LittleEndian>(track.track_id).unwrap(); // +16
-    buf.write_u32::<LittleEndian>(1).unwrap(); // +20  visible
-    buf.write_u32::<LittleEndian>(track.filetype).unwrap(); // +24
-    buf.write_u8(1).unwrap(); // +28  type (1=audio, 2=video)
-    buf.write_u8(0).unwrap(); // +29  compilation
-    buf.write_u8(0).unwrap(); // +30  rating
-    buf.write_u8(0).unwrap(); // +31  padding
-    buf.write_u32::<LittleEndian>(now).unwrap(); // +32  date_modified (Mac timestamp)
-    buf.write_u32::<LittleEndian>(track.file_size).unwrap(); // +36
-    buf.write_u32::<LittleEndian>(track.total_time_ms.unwrap_or(0))
-        .unwrap(); // +40
-    buf.write_u32::<LittleEndian>(track.track_number.unwrap_or(0) as u32)
-        .unwrap(); // +44
-    buf.write_u32::<LittleEndian>(0).unwrap(); // +48  total_tracks
-    buf.write_u32::<LittleEndian>(track.year.unwrap_or(0) as u32)
-        .unwrap(); // +52
-    buf.write_u32::<LittleEndian>(track.bitrate.unwrap_or(0) as u32)
-        .unwrap(); // +56
-    buf.write_u32::<LittleEndian>(sr).unwrap(); // +60  sample_rate (fixed-point Hz<<16)
-    buf.write_u32::<LittleEndian>(0).unwrap(); // +64  volume_adjust
-    buf.write_u32::<LittleEndian>(0).unwrap(); // +68  start_time
-    buf.write_u32::<LittleEndian>(0).unwrap(); // +72  stop_time
-    buf.write_u32::<LittleEndian>(0).unwrap(); // +76  sound_check
-    buf.write_u32::<LittleEndian>(0).unwrap(); // +80  play_count
-    buf.write_u32::<LittleEndian>(0).unwrap(); // +84  last_played
-    buf.write_u32::<LittleEndian>(now).unwrap(); // +88  date_added_to_device (Mac timestamp)
-    buf.write_u32::<LittleEndian>(track.disc_number.unwrap_or(0) as u32)
-        .unwrap(); // +92
-    buf.write_u32::<LittleEndian>(0).unwrap(); // +96  disc_total
-    buf.write_u32::<LittleEndian>(0).unwrap(); // +100 sort_order
-    buf.write_u32::<LittleEndian>(now).unwrap(); // +104 date_added (Mac timestamp)
-    buf.write_u32::<LittleEndian>(0).unwrap(); // +108 date_released
-    buf.write_u64::<LittleEndian>(track.dbid).unwrap(); // +112 dbid
-    buf.write_u32::<LittleEndian>(0).unwrap(); // +120 checked
-    buf.write_u32::<LittleEndian>(0xffff_0000).unwrap(); // +124 app_rating (ref: always 0xffff0000+)
-    buf.write_u32::<LittleEndian>(0).unwrap(); // +128 bpm
-    buf.write_u32::<LittleEndian>(artwork_count).unwrap(); // +132 artwork_count
-                                                           // +136: sample_rate as IEEE 754 float (NOT fixed-point like +60).
+    let sr_fixed = (sample_rate as u32) << 16;
     let sr_float = (sample_rate as f32).to_bits();
-    buf.write_u32::<LittleEndian>(sr_float).unwrap(); // +136 sample_rate_float
-    buf.write_u32::<LittleEndian>(0).unwrap(); // +140 date_released2
-    buf.write_u32::<LittleEndian>(0x0c).unwrap(); // +144 explicit_flag (ref: always >= 0x0c)
-    buf.write_u32::<LittleEndian>(0).unwrap(); // +148 skip_count
-    buf.write_u32::<LittleEndian>(0).unwrap(); // +152 last_skipped
-    buf.write_u32::<LittleEndian>(if artwork_count > 0 { 1 } else { 0 })
-        .unwrap(); // +156 has_artwork
-    buf.write_u32::<LittleEndian>(0).unwrap(); // +160 skip_shuffling
-    buf.write_u32::<LittleEndian>(1).unwrap(); // +164 remember_playback_pos (ref: always 1 or 2)
-    buf.write_u64::<LittleEndian>(track.dbid).unwrap(); // +168 dbid2 (duplicate)
-    buf.write_u32::<LittleEndian>(0x0001_0000).unwrap(); // +176 lyrics_flag (ref: always 0x00010000+)
-    buf.write_u32::<LittleEndian>(0).unwrap(); // +180 movie_flag
-    buf.write_u32::<LittleEndian>(0).unwrap(); // +184 mark_unplayed
-    buf.write_u32::<LittleEndian>(track.file_size).unwrap(); // +188 size_on_disk
-    buf.write_u32::<LittleEndian>(now).unwrap(); // +192 date_modified2 (mirrors +32)
-    buf.write_u32::<LittleEndian>(0).unwrap(); // +196 per_track_hash (firmware may recompute)
-    buf.write_u32::<LittleEndian>(0).unwrap(); // +200 media_type_legacy
-    buf.write_u32::<LittleEndian>(1).unwrap(); // +204 (ref: 99% nonzero, typically 1)
-    buf.write_u32::<LittleEndian>(1).unwrap(); // +208 has_gapless_data
 
-    // Extended fields (+212 through +623). The iPod Classic firmware (db_version
-    // 0x75) requires several of these to be populated — zeroing them causes
-    // the firmware to reject the database entirely.
-    //
-    // Fields are written at their exact offsets via a position-indexed buffer.
-    // Unknown/unused fields stay zero.
-    buf.resize(header_size as usize, 0);
+    // Determine format-specific defaults (from libgpod itdb_track_set_defaults).
+    let is_mp3 = track.filetype == 0x4d503320;
+    let is_aac = track.filetype == 0x4d344120;
+    let unk126: u16 = if is_mp3 || is_aac { 0xffff } else { 0 };
+    let unk144: u16 = if is_mp3 {
+        0x000c
+    } else if is_aac {
+        0x0033
+    } else {
+        0
+    };
+    // unk204 at +0xCC: libgpod writes 1 for MP3, 0 for others. But iTunes
+    // actually writes 0x02000003 for AAC tracks (verified from golden DB).
+    // MP3s synced by iTunes play even with libgpod's value, so MP3=1 is fine.
+    // AAC tracks need the iTunes-compatible value or they skip on playback.
+    let unk204: u32 = if is_mp3 {
+        1
+    } else if is_aac {
+        0x0200_0003
+    } else {
+        0
+    };
 
-    // +248: gapless_encoding_drain (per-track, we don't have this — leave 0)
-    // +252: gapless_encoding_delay (per-track, we don't have this — leave 0)
-    // +256: has_gapless_encoding — set to 1 (firmware expects this on all tracks)
-    put_u32_at(&mut buf, 256, 1);
-    // +288: album_id — cross-reference into mhsd type=4 album list.
-    put_u32_at(&mut buf, 288, album_id);
-    // +292, +296: unknown constants (identical across all iTunes-written tracks).
-    put_u32_at(&mut buf, 292, 0xfc75_23d0);
-    put_u32_at(&mut buf, 296, 0xa999_476a);
-    // +300: secondary_id — reference shows this equals file_size, not dbid.
-    put_u32_at(&mut buf, 300, track.file_size);
-    // +308: media_type_detailed — audio type flags.
-    //        Reference shows 0x03038080 most common, 0x03038003 for some.
-    put_u32_at(&mut buf, 308, 0x0303_8080);
-    // +312: media subtype flags — 0x8080 for most audio, 0x8003 for some.
-    put_u32_at(&mut buf, 312, 0x0000_8080);
-    // +352: unknown — observed values 0x64..0x2a7. Set to 0x64 (100).
-    put_u32_at(&mut buf, 352, 0x64);
-    // +360: unknown — constant 1 on all tracks.
-    put_u32_at(&mut buf, 360, 1);
-    // +480: artist_id — reference shows constant 0x218 across all tracks.
-    put_u32_at(&mut buf, 480, 0x218);
-    // +500: per-track unique reference. Reference shows track_id + 1.
-    put_u32_at(&mut buf, 500, track.track_id.wrapping_add(1));
-    // +524: media_type — 1=audio. Reference shows ~49% set (only newer tracks).
-    put_u32_at(&mut buf, 524, 1);
+    // Sequential write matching libgpod mk_mhit field order exactly.
+    let mut buf = Vec::with_capacity(total_size as usize);
+    buf.write_all(b"mhit").unwrap(); // +0x00
+    buf.write_u32::<LittleEndian>(header_size).unwrap(); // +0x04
+    buf.write_u32::<LittleEndian>(total_size).unwrap(); // +0x08
+    buf.write_u32::<LittleEndian>(num_mhods).unwrap(); // +0x0C
+                                                       // +0x10
+    buf.write_u32::<LittleEndian>(track.track_id).unwrap(); // id
+    buf.write_u32::<LittleEndian>(1).unwrap(); // visible
+    buf.write_u32::<LittleEndian>(track.filetype).unwrap(); // filetype_marker (FourCC: MP3/M4A/WAV)
+    buf.write_u8(0).unwrap(); // +0x1C type1 (0=CBR, 1=VBR MP3)
+    buf.write_u8(if is_mp3 { 1 } else { 0 }).unwrap(); // +0x1D type2 (1=MP3, 0=AAC)
+    buf.write_u8(0).unwrap(); // +0x1E compilation
+    buf.write_u8(0).unwrap(); // +0x1F rating
+                              // +0x20
+    buf.write_u32::<LittleEndian>(now).unwrap(); // time_modified
+    buf.write_u32::<LittleEndian>(track.file_size).unwrap(); // size
+    buf.write_u32::<LittleEndian>(track.total_time_ms.unwrap_or(0))
+        .unwrap(); // tracklen
+    buf.write_u32::<LittleEndian>(track.track_number.unwrap_or(0) as u32)
+        .unwrap(); // track_nr
+                   // +0x30
+    buf.write_u32::<LittleEndian>(track.total_tracks.unwrap_or(0) as u32)
+        .unwrap(); // tracks (total tracks in album)
+    buf.write_u32::<LittleEndian>(track.year.unwrap_or(0) as u32)
+        .unwrap(); // year
+    buf.write_u32::<LittleEndian>(track.bitrate.unwrap_or(0) as u32)
+        .unwrap(); // bitrate
+    buf.write_u32::<LittleEndian>(sr_fixed).unwrap(); // samplerate (fixed-point)
+                                                      // +0x40
+    buf.write_u32::<LittleEndian>(0).unwrap(); // volume
+    buf.write_u32::<LittleEndian>(0).unwrap(); // starttime
+    buf.write_u32::<LittleEndian>(0).unwrap(); // stoptime
+    buf.write_u32::<LittleEndian>(0).unwrap(); // soundcheck
+                                               // +0x50
+    buf.write_u32::<LittleEndian>(0).unwrap(); // playcount
+    buf.write_u32::<LittleEndian>(0).unwrap(); // playcount2
+    buf.write_u32::<LittleEndian>(0).unwrap(); // time_played
+    buf.write_u32::<LittleEndian>(track.disc_number.unwrap_or(0) as u32)
+        .unwrap(); // cd_nr
+                   // +0x60
+    buf.write_u32::<LittleEndian>(track.total_discs.unwrap_or(0) as u32)
+        .unwrap(); // cds (total discs)
+    buf.write_u32::<LittleEndian>(0).unwrap(); // drm_userid
+    buf.write_u32::<LittleEndian>(now).unwrap(); // time_added
+    buf.write_u32::<LittleEndian>(0).unwrap(); // bookmark_time
+                                               // +0x70
+    buf.write_u64::<LittleEndian>(track.dbid).unwrap(); // dbid
+    buf.write_u8(0).unwrap(); // +0x78 checked
+    buf.write_u8(0).unwrap(); // +0x79 app_rating
+    buf.write_u16::<LittleEndian>(0).unwrap(); // +0x7A BPM
+    buf.write_u16::<LittleEndian>(artwork_count as u16).unwrap(); // +0x7C artwork_count
+    buf.write_u16::<LittleEndian>(unk126).unwrap(); // +0x7E unk126 (0xFFFF for MP3/AAC)
+                                                    // +0x80
+    buf.write_u32::<LittleEndian>(0).unwrap(); // artwork_size (JPEG bytes, 0 if none)
+    buf.write_u32::<LittleEndian>(0).unwrap(); // unk132
+    buf.write_u32::<LittleEndian>(sr_float).unwrap(); // +0x88 samplerate2 (IEEE float)
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +0x8C time_released
+                                               // +0x90
+    buf.write_u16::<LittleEndian>(unk144).unwrap(); // unk144 (0x0C=MP3, 0x33=AAC)
+    buf.write_u16::<LittleEndian>(0).unwrap(); // explicit_flag
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +0x94 unk148
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +0x98 unk152
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +0x9C skipcount
+                                               // +0xA0
+    buf.write_u32::<LittleEndian>(0).unwrap(); // last_skipped
+    buf.write_u8(if artwork_count > 0 { 1 } else { 2 }).unwrap(); // +0xA4 has_artwork (1=yes, 2=no)
+    buf.write_u8(0).unwrap(); // +0xA5 skip_when_shuffling
+    buf.write_u8(0).unwrap(); // +0xA6 remember_playback_position
+    buf.write_u8(0).unwrap(); // +0xA7 flag4
+    buf.write_u64::<LittleEndian>(track.dbid).unwrap(); // +0xA8 dbid2
+                                                        // +0xB0
+    buf.write_u8(0).unwrap(); // lyrics_flag
+    buf.write_u8(0).unwrap(); // movie_flag
+    buf.write_u8(0x01).unwrap(); // mark_unplayed (0x01 = normal music)
+    buf.write_u8(0).unwrap(); // unk179
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +0xB4 unk180
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +0xB8 pregap
+                                               // +0xBC samplecount: total PCM samples = duration_ms * sample_rate / 1000.
+                                               // The firmware needs this for gapless playback and seeking.
+    let samplecount: u64 = track
+        .total_time_ms
+        .map(|ms| (ms as u64) * (sample_rate as u64) / 1000)
+        .unwrap_or(0);
+    buf.write_u64::<LittleEndian>(samplecount).unwrap();
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +0xC4 unk196
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +0xC8 postgap
+    buf.write_u32::<LittleEndian>(unk204).unwrap(); // +0xCC unk204 (1=MP3, 0=other)
+                                                    // +0xD0
+    buf.write_u32::<LittleEndian>(0x0000_0001).unwrap(); // mediatype (1=audio)
+    buf.write_u32::<LittleEndian>(0).unwrap(); // season_nr
+    buf.write_u32::<LittleEndian>(0).unwrap(); // episode_nr
+    buf.write_u32::<LittleEndian>(0).unwrap(); // unk220
+                                               // +0xE0
+    for _ in 0..4 {
+        buf.write_u32::<LittleEndian>(0).unwrap(); // unk224..unk236
+    }
+    // +0xF0
+    buf.write_u32::<LittleEndian>(0).unwrap(); // unk240
+    buf.write_u32::<LittleEndian>(0).unwrap(); // unk244
+    buf.write_u32::<LittleEndian>(0).unwrap(); // gapless_data
+    buf.write_u32::<LittleEndian>(0).unwrap(); // unk252
+                                               // +0x100
+    buf.write_u16::<LittleEndian>(1).unwrap(); // gapless_track_flag (1 = has gapless info)
+    buf.write_u16::<LittleEndian>(0).unwrap(); // gapless_album_flag
+    for _ in 0..7 {
+        buf.write_u32::<LittleEndian>(0).unwrap(); // 7x zero padding
+    }
+    // +0x120
+    buf.write_u32::<LittleEndian>(album_id).unwrap(); // album_id
+    buf.write_u64::<LittleEndian>(id_0x24).unwrap(); // +0x124 id_0x24 (from mhbd+0x24, not db_id!)
+    buf.write_u32::<LittleEndian>(track.file_size).unwrap(); // +0x12C size (duplicate)
+                                                             // +0x130
+    buf.write_u32::<LittleEndian>(0).unwrap();
+    // +0x134 mystery constant. libgpod writes 0x0000_8080_8080_8080 but iTunes
+    // actually writes 0x0000_8080_0303_8080 — verified from golden DB on iPod
+    // Classic. The low 4 bytes differ.
+    buf.write_u64::<LittleEndian>(0x0000_8080_0303_8080)
+        .unwrap(); // +0x134
+    buf.write_u32::<LittleEndian>(0).unwrap();
+    // +0x140
+    buf.write_u32::<LittleEndian>(0).unwrap();
+    buf.write_u32::<LittleEndian>(0).unwrap();
+    buf.write_u32::<LittleEndian>(0).unwrap(); // +0x148 (0 for music, 0x00010001 for books)
+    for _ in 0..5 {
+        buf.write_u32::<LittleEndian>(0).unwrap(); // 5x zero
+    }
+    // +0x160
+    buf.write_u32::<LittleEndian>(0).unwrap(); // mhii_link (artwork DB link)
+    buf.write_u32::<LittleEndian>(0).unwrap();
+    buf.write_u32::<LittleEndian>(1).unwrap(); // +0x168 hardcoded 1
+    buf.write_u32::<LittleEndian>(0).unwrap();
+    // +0x170
+    for _ in 0..28 {
+        buf.write_u32::<LittleEndian>(0).unwrap(); // 28x zero padding
+    }
+    // +0x1E0
+    buf.write_u32::<LittleEndian>(artist_id).unwrap(); // artist_id (references mhsd type 8)
+    for _ in 0..4 {
+        buf.write_u32::<LittleEndian>(0).unwrap(); // 4x zero
+    }
+    // +0x1F4
+    buf.write_u32::<LittleEndian>(0).unwrap(); // composer_id
+                                               // 20x u32 padding to 0x248, except +0x20C = 2 (matches iTunes golden).
+    for i in 0..20 {
+        let off = 0x1F8 + i * 4;
+        let val: u32 = if off == 0x20C { 2 } else { 0 };
+        buf.write_u32::<LittleEndian>(val).unwrap();
+    }
+    // Pad from 0x248 (584) to 0x270 (624) to match iTunes header size.
+    // Existing tracks (from iTunes) have 624-byte headers; mixing 584-byte
+    // new tracks with them causes the firmware to reject the smaller ones.
+    while buf.len() < header_size as usize {
+        buf.push(0);
+    }
+
+    debug_assert_eq!(
+        buf.len(),
+        header_size as usize,
+        "mhit header size mismatch: wrote {} bytes, expected {}",
+        buf.len(),
+        header_size
+    );
 
     for mhod in &mhods {
         buf.extend_from_slice(mhod);
@@ -357,21 +439,20 @@ const SORT_TYPES: &[u32] = &[3, 5, 4, 7, 18, 35, 36, 29, 30, 31];
 
 /// Build a type-52 sort index mhod for a given sort type.
 ///
-/// The index is a permutation array: entry[i] = index of track that belongs at
-/// position i when sorted by the given field. The firmware uses this to build
-/// the browse UI without re-sorting on device.
+/// Ported from libgpod's mhod52_sort_* functions (itdb_itunesdb.c line 4151).
+/// Sort order uses collation keys with tiebreakers matching libgpod:
+///   title:    title
+///   album:    album → cd_nr → track_nr → title
+///   artist:   artist → album → cd_nr → track_nr → title
+///   genre:    genre → artist → album → cd_nr → track_nr → title
+///   composer: composer → album → cd_nr → track_nr → title
 ///
 /// Layout: mhod header (24) + sort_type (4) + count (4) + padding (40) + entries (count*4).
-/// The 40-byte padding block comes BEFORE entries — the firmware skips it.
 fn write_sort_index(tracks: &[IpodTrack], sort_type: u32) -> Vec<u8> {
     let count = tracks.len();
 
     let mut indices: Vec<usize> = (0..count).collect();
-    indices.sort_by(|&a, &b| {
-        let key_a = sort_key(&tracks[a], sort_type);
-        let key_b = sort_key(&tracks[b], sort_type);
-        key_a.cmp(&key_b)
-    });
+    indices.sort_by(|&a, &b| sort_compare(&tracks[a], &tracks[b], sort_type));
 
     let header_size: u32 = 24;
     let payload_size = 4 + 4 + 40 + (count as u32) * 4;
@@ -399,22 +480,83 @@ fn write_sort_index(tracks: &[IpodTrack], sort_type: u32) -> Vec<u8> {
     buf
 }
 
-/// Get the lowercase sort key for a track by sort type.
-/// Base: 3=title, 4=album, 5=artist, 7=genre, 18=composer.
-/// Extended: 29=sort_album_artist, 30=sort_composer, 31=sort_title,
-/// 35=sort_album, 36=sort_artist. Extended use the same base field data.
-fn sort_key(track: &IpodTrack, sort_type: u32) -> String {
+/// Build a collation key for a string, matching libgpod's approach.
+///
+/// Uses lowercasing as a simple locale-independent collation. libgpod uses
+/// `g_utf8_collate_key()` which is locale-dependent, but any consistent
+/// ordering works — the firmware uses the pre-computed index as-is.
+fn collate_key(s: &str) -> String {
+    s.to_lowercase()
+}
+
+/// Compare two tracks for a given sort type, with tiebreakers matching libgpod.
+///
+/// Ported from libgpod's mhod52_sort_* functions (itdb_itunesdb.c line 4151).
+fn sort_compare(a: &IpodTrack, b: &IpodTrack, sort_type: u32) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    let cmp_title = || collate_key(&a.title).cmp(&collate_key(&b.title));
+    let cmp_album = || collate_key(&a.album).cmp(&collate_key(&b.album));
+    let cmp_artist = || collate_key(&a.artist).cmp(&collate_key(&b.artist));
+    let cmp_genre = || {
+        let ga = a.genre.as_deref().unwrap_or("");
+        let gb = b.genre.as_deref().unwrap_or("");
+        collate_key(ga).cmp(&collate_key(gb))
+    };
+    let cmp_cd = || a.disc_number.unwrap_or(0).cmp(&b.disc_number.unwrap_or(0));
+    let cmp_track = || {
+        a.track_number
+            .unwrap_or(0)
+            .cmp(&b.track_number.unwrap_or(0))
+    };
+
     match sort_type {
-        3 | 31 => track.title.to_lowercase(),
-        4 | 35 => track.album.to_lowercase(),
-        5 | 36 => track.artist.to_lowercase(),
-        7 => track.genre.as_deref().unwrap_or("").to_lowercase(),
-        18 | 30 => String::new(), // composer — not tracked yet
-        29 => track
-            .album_artist
-            .as_deref()
-            .unwrap_or(&track.artist)
-            .to_lowercase(),
+        // title sort: title only
+        3 | 31 => cmp_title(),
+        // album sort: album → cd_nr → track_nr → title
+        4 | 35 => cmp_album()
+            .then_with(cmp_cd)
+            .then_with(cmp_track)
+            .then_with(cmp_title),
+        // artist sort: artist → album → cd_nr → track_nr → title
+        5 | 36 => cmp_artist()
+            .then_with(cmp_album)
+            .then_with(cmp_cd)
+            .then_with(cmp_track)
+            .then_with(cmp_title),
+        // genre sort: genre → artist → album → cd_nr → track_nr → title
+        7 => cmp_genre()
+            .then_with(cmp_artist)
+            .then_with(cmp_album)
+            .then_with(cmp_cd)
+            .then_with(cmp_track)
+            .then_with(cmp_title),
+        // composer sort: just title (we don't track composer)
+        18 | 30 => cmp_title(),
+        // album artist sort: same as artist
+        29 => {
+            let aa_a = a.album_artist.as_deref().unwrap_or(&a.artist);
+            let aa_b = b.album_artist.as_deref().unwrap_or(&b.artist);
+            collate_key(aa_a)
+                .cmp(&collate_key(aa_b))
+                .then_with(cmp_album)
+                .then_with(cmp_cd)
+                .then_with(cmp_track)
+                .then_with(cmp_title)
+        }
+        _ => Ordering::Equal,
+    }
+}
+
+/// Get the collation key for a track field by sort type (for letter index grouping).
+fn sort_key_for_letter(track: &IpodTrack, sort_type: u32) -> String {
+    match sort_type {
+        3 | 31 => collate_key(&track.title),
+        4 | 35 => collate_key(&track.album),
+        5 | 36 => collate_key(&track.artist),
+        7 => collate_key(track.genre.as_deref().unwrap_or("")),
+        18 | 30 => String::new(),
+        29 => collate_key(track.album_artist.as_deref().unwrap_or(&track.artist)),
         _ => String::new(),
     }
 }
@@ -434,15 +576,26 @@ fn write_letter_index(tracks: &[IpodTrack], sort_type: u32) -> Option<Vec<u8>> {
         return None;
     }
 
-    // Sort tracks by the same key used for type 52.
+    // Sort tracks by the same comparator used for type 52.
     let mut indices: Vec<usize> = (0..tracks.len()).collect();
-    indices.sort_by(|&a, &b| sort_key(&tracks[a], sort_type).cmp(&sort_key(&tracks[b], sort_type)));
+    indices.sort_by(|&a, &b| sort_compare(&tracks[a], &tracks[b], sort_type));
 
-    // Group by first character (uppercase).
+    // Group by first alphanumeric character (uppercase for alpha, '0' for digits).
+    // Ported from libgpod's jump_table_letter (itdb_itunesdb.c line 4225).
     let mut groups: Vec<(char, u32, u32)> = Vec::new(); // (letter, start_idx, count)
     for (sorted_pos, &track_idx) in indices.iter().enumerate() {
-        let key = sort_key(&tracks[track_idx], sort_type);
-        let first_char = key.chars().next().unwrap_or('\0').to_ascii_uppercase();
+        let key = sort_key_for_letter(&tracks[track_idx], sort_type);
+        let first_char = key
+            .chars()
+            .find(|c| c.is_alphanumeric())
+            .map(|c| {
+                if c.is_alphabetic() {
+                    c.to_ascii_uppercase()
+                } else {
+                    '0' // digits get '0' per libgpod
+                }
+            })
+            .unwrap_or('0');
         if let Some(last) = groups.last_mut() {
             if last.0 == first_char {
                 last.2 += 1;
@@ -728,12 +881,44 @@ pub fn serialize(db: &IpodDatabase) -> Vec<u8> {
         dbid_to_group_id.insert(track.dbid, gid);
     }
 
+    // Read id_0x24 from mhbd header (+0x24, 8 bytes). Tracks reference this
+    // persistent DB ID at their mhit +0x124 — NOT the db_id at mhbd+0x18.
+    // libgpod calls this `itdb->priv->id_0x24`.
+    let id_0x24 = db
+        .raw_mhbd_header
+        .as_ref()
+        .and_then(|h| h.get(0x24..0x2C))
+        .and_then(|s| s.try_into().ok())
+        .map(u64::from_le_bytes)
+        .unwrap_or(db.db_id);
+
+    // Build dbid → artist_id map. Sequential IDs starting at 1, same ordering
+    // as the mhsd type 8 builder below (BTreeMap by artist name).
+    let mut artist_groups: std::collections::BTreeMap<String, u32> =
+        std::collections::BTreeMap::new();
+    let mut next_artist_id = 1u32;
+    let mut dbid_to_artist_id: std::collections::HashMap<u64, u32> =
+        std::collections::HashMap::new();
+    for track in &db.tracks {
+        if !track.artist.is_empty() {
+            let aid = *artist_groups
+                .entry(track.artist.clone())
+                .or_insert_with(|| {
+                    let id = next_artist_id;
+                    next_artist_id += 1;
+                    id
+                });
+            dbid_to_artist_id.insert(track.dbid, aid);
+        }
+    }
+
     // Build track dataset (mhsd type 1 = mhlt + mhits).
     let mut track_data = Vec::new();
     for track in &db.tracks {
         let art_count = art_counts.get(&track.dbid).copied().unwrap_or(0);
         let alb_id = dbid_to_group_id.get(&track.dbid).copied().unwrap_or(0);
-        track_data.extend(write_mhit(track, art_count, alb_id));
+        let art_id = dbid_to_artist_id.get(&track.dbid).copied().unwrap_or(0);
+        track_data.extend(write_mhit(track, art_count, alb_id, art_id, id_0x24));
     }
 
     let mhlt_header_size: u32 = 92;
@@ -824,6 +1009,87 @@ pub fn serialize(db: &IpodDatabase) -> Vec<u8> {
     // Type 4 = album list (mhla with mhia entries built from tracks).
     let mhsd4 = build_album_dataset(&db.tracks);
 
+    // Type 8 = artist list (mhli with mhii entries). Reuses `artist_groups`
+    // built above so the mhii IDs match what's written into mhit +0x1E0.
+    let mhsd8 = {
+        let artist_map = &artist_groups;
+        // Build mhii entries (each: 80-byte header + mhod with artist name).
+        let mut mhii_data = Vec::new();
+        for (artist_name, artist_id) in artist_map {
+            let name_mhod = write_mhod(201, artist_name); // MHOD_ID_ALBUM_ARTIST_MHII
+            let mhii_header_size: u32 = 80;
+            let mhii_total = mhii_header_size + name_mhod.len() as u32;
+            let mut mhii = Vec::new();
+            mhii.write_all(b"mhii").unwrap();
+            mhii.write_u32::<LittleEndian>(mhii_header_size).unwrap();
+            mhii.write_u32::<LittleEndian>(mhii_total).unwrap();
+            mhii.write_u32::<LittleEndian>(1).unwrap(); // num children
+            mhii.write_u32::<LittleEndian>(*artist_id).unwrap(); // artist id
+            mhii.write_u64::<LittleEndian>(0).unwrap(); // sql_id
+            mhii.write_u32::<LittleEndian>(2).unwrap(); // unknown=2 per libgpod
+            let written = mhii.len();
+            for _ in 0..(mhii_header_size as usize - written) {
+                mhii.write_u8(0).unwrap();
+            }
+            mhii.extend(name_mhod);
+            mhii_data.extend(mhii);
+        }
+        // mhli header
+        let mhli_header_size: u32 = 92;
+        let mut mhli = Vec::new();
+        mhli.write_all(b"mhli").unwrap();
+        mhli.write_u32::<LittleEndian>(mhli_header_size).unwrap();
+        mhli.write_u32::<LittleEndian>(artist_map.len() as u32)
+            .unwrap();
+        let written = mhli.len();
+        for _ in 0..(mhli_header_size as usize - written) {
+            mhli.write_u8(0).unwrap();
+        }
+        mhli.extend(mhii_data);
+        // mhsd wrapper
+        let mhsd_hs: u32 = 96;
+        let mut mhsd = Vec::new();
+        mhsd.write_all(b"mhsd").unwrap();
+        mhsd.write_u32::<LittleEndian>(mhsd_hs).unwrap();
+        mhsd.write_u32::<LittleEndian>(mhsd_hs + mhli.len() as u32)
+            .unwrap();
+        mhsd.write_u32::<LittleEndian>(8).unwrap(); // type = artists
+        let written = mhsd.len();
+        for _ in 0..(mhsd_hs as usize - written) {
+            mhsd.write_u8(0).unwrap();
+        }
+        mhsd.extend(mhli);
+        mhsd
+    };
+
+    // Types 6 and 10 = empty datasets (libgpod writes these, purpose unknown).
+    let build_empty_mhsd = |ds_type: u32| -> Vec<u8> {
+        let mhlt_hs: u32 = 92;
+        let mut mhlt = Vec::new();
+        mhlt.write_all(b"mhlt").unwrap();
+        mhlt.write_u32::<LittleEndian>(mhlt_hs).unwrap();
+        mhlt.write_u32::<LittleEndian>(0).unwrap(); // 0 entries
+        let written = mhlt.len();
+        for _ in 0..(mhlt_hs as usize - written) {
+            mhlt.write_u8(0).unwrap();
+        }
+        let mhsd_hs: u32 = 96;
+        let mut mhsd = Vec::new();
+        mhsd.write_all(b"mhsd").unwrap();
+        mhsd.write_u32::<LittleEndian>(mhsd_hs).unwrap();
+        mhsd.write_u32::<LittleEndian>(mhsd_hs + mhlt.len() as u32)
+            .unwrap();
+        mhsd.write_u32::<LittleEndian>(ds_type).unwrap();
+        let written = mhsd.len();
+        for _ in 0..(mhsd_hs as usize - written) {
+            mhsd.write_u8(0).unwrap();
+        }
+        mhsd.extend(mhlt);
+        mhsd
+    };
+    let mhsd6 = build_empty_mhsd(6);
+    let mhsd10 = build_empty_mhsd(10);
+
     // Type 5 = smart playlists. Replay raw blob if available, otherwise empty.
     let mhsd5 = if let Some(ref raw) = db.raw_smart_playlists {
         raw.clone()
@@ -854,14 +1120,17 @@ pub fn serialize(db: &IpodDatabase) -> Vec<u8> {
     };
 
     // mhbd header (244 bytes for hash58 compatibility with iPod Classic).
-    // Dataset order matches original: 4 (albums), 1 (tracks), 3 (podcasts), 2 (playlists), 5 (smart).
+    // Dataset order matches libgpod: 1, 3, 2, 4, 8, 6, 10, 5.
     let mhbd_header_size: u32 = crate::hash::MHBD_HEADER_SIZE;
-    let num_datasets: u32 = 5;
+    let num_datasets: u32 = 8;
     let mhbd_total_size = mhbd_header_size
-        + mhsd4.len() as u32
         + mhsd1.len() as u32
         + mhsd3.len() as u32
         + mhsd2.len() as u32
+        + mhsd4.len() as u32
+        + mhsd8.len() as u32
+        + mhsd6.len() as u32
+        + mhsd10.len() as u32
         + mhsd5.len() as u32;
 
     // If we have a raw mhbd header from a parsed database, replay it to preserve
@@ -901,11 +1170,14 @@ pub fn serialize(db: &IpodDatabase) -> Vec<u8> {
         hdr
     };
 
-    // Dataset order: 4 (albums), 1 (tracks), 3 (podcasts), 2 (playlists), 5 (smart).
-    result.extend(mhsd4);
+    // Dataset order matches libgpod: 1, 3, 2, 4, 8, 6, 10, 5.
     result.extend(mhsd1);
     result.extend(mhsd3);
     result.extend(mhsd2);
+    result.extend(mhsd4);
+    result.extend(mhsd8);
+    result.extend(mhsd6);
+    result.extend(mhsd10);
     result.extend(mhsd5);
     result
 }

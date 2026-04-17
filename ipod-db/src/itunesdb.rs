@@ -176,7 +176,7 @@ fn parse_mhit(cur: &mut Cursor<&[u8]>, start: u64) -> crate::Result<IpodTrack> {
     let file_size = cur.read_u32::<LittleEndian>()?; // +36
     let total_time = cur.read_u32::<LittleEndian>()?; // +40
     let track_number = cur.read_u32::<LittleEndian>()?; // +44
-    let _total_tracks = cur.read_u32::<LittleEndian>()?; // +48
+    let total_tracks = cur.read_u32::<LittleEndian>()?; // +48
     let year = cur.read_u32::<LittleEndian>()?; // +52
     let bitrate = cur.read_u32::<LittleEndian>()?; // +56
     let sample_rate_raw = cur.read_u32::<LittleEndian>()?; // +60
@@ -189,7 +189,7 @@ fn parse_mhit(cur: &mut Cursor<&[u8]>, start: u64) -> crate::Result<IpodTrack> {
     let _last_played = cur.read_u32::<LittleEndian>()?; // +84   Mac timestamp
     let _date_added_to_device = cur.read_u32::<LittleEndian>()?; // +88   Mac timestamp
     let disc_number = cur.read_u32::<LittleEndian>()?; // +92
-    let _disc_total = cur.read_u32::<LittleEndian>()?; // +96
+    let total_discs = cur.read_u32::<LittleEndian>()?; // +96
     let _sort_order = cur.read_u32::<LittleEndian>()?; // +100
     let _date_added = cur.read_u32::<LittleEndian>()?; // +104  Mac timestamp
     let _date_released = cur.read_u32::<LittleEndian>()?; // +108  Mac timestamp
@@ -240,6 +240,7 @@ fn parse_mhit(cur: &mut Cursor<&[u8]>, start: u64) -> crate::Result<IpodTrack> {
     let mut album_artist = None;
     let mut genre = None;
     let mut ipod_path = String::new();
+    let mut filetype_string = None;
 
     for _ in 0..num_mhods {
         let mhod_start = cur.position();
@@ -251,6 +252,7 @@ fn parse_mhit(cur: &mut Cursor<&[u8]>, start: u64) -> crate::Result<IpodTrack> {
                 MhodType::Album => album = value,
                 MhodType::Artist => artist = value,
                 MhodType::Genre => genre = Some(value),
+                MhodType::Filetype => filetype_string = Some(value),
                 MhodType::AlbumArtist => album_artist = Some(value),
                 _ => {}
             }
@@ -260,10 +262,13 @@ fn parse_mhit(cur: &mut Cursor<&[u8]>, start: u64) -> crate::Result<IpodTrack> {
     // Ensure we're at end of mhit total size.
     cur.seek(SeekFrom::Start(start + total_size as u64))?;
 
-    // Capture raw mhit header for lossless replay on serialize.
+    // Capture the entire raw mhit (header + mhods) for lossless replay.
+    // The iPod firmware is sensitive to the exact mhod set, order, and content
+    // that iTunes wrote — rebuilding them from metadata loses information that
+    // the firmware depends on for playback routing.
     let raw_mhit_header = {
         let s = start as usize;
-        let end = s + header_size as usize;
+        let end = s + total_size as usize;
         let inner = cur.get_ref();
         if end <= inner.len() {
             Some(inner[s..end].to_vec())
@@ -285,8 +290,18 @@ fn parse_mhit(cur: &mut Cursor<&[u8]>, start: u64) -> crate::Result<IpodTrack> {
         } else {
             None
         },
+        total_tracks: if total_tracks > 0 {
+            Some(total_tracks as u16)
+        } else {
+            None
+        },
         disc_number: if disc_number > 0 {
             Some(disc_number as u16)
+        } else {
+            None
+        },
+        total_discs: if total_discs > 0 {
+            Some(total_discs as u16)
         } else {
             None
         },
@@ -309,6 +324,7 @@ fn parse_mhit(cur: &mut Cursor<&[u8]>, start: u64) -> crate::Result<IpodTrack> {
         },
         ipod_path,
         filetype,
+        filetype_string,
         raw_mhit_header,
     })
 }
@@ -516,7 +532,9 @@ mod tests {
             album_artist: Some("Album Artist".into()),
             genre: Some("Rock".into()),
             track_number: Some(3),
+            total_tracks: None,
             disc_number: Some(1),
+            total_discs: None,
             total_time_ms: Some(240000),
             year: Some(2024),
             file_size: 5_000_000,
@@ -524,6 +542,7 @@ mod tests {
             sample_rate: Some(44100),
             ipod_path: ":iPod_Control:Music:F00:abcdef.mp3".into(),
             filetype: 0x4d503320, // "MP3 "
+            filetype_string: None,
             raw_mhit_header: None,
         });
 
@@ -564,7 +583,9 @@ mod tests {
             album_artist: None,
             genre: None,
             track_number: None,
+            total_tracks: None,
             disc_number: None,
+            total_discs: None,
             total_time_ms: None,
             year: None,
             file_size: 1000,
@@ -572,6 +593,7 @@ mod tests {
             sample_rate: None,
             ipod_path: ":iPod_Control:Music:F00:a.mp3".into(),
             filetype: 0x4d503320,
+            filetype_string: None,
             raw_mhit_header: None,
         });
         let dbid2 = db.add_track(IpodTrack {
@@ -583,7 +605,9 @@ mod tests {
             album_artist: None,
             genre: None,
             track_number: None,
+            total_tracks: None,
             disc_number: None,
+            total_discs: None,
             total_time_ms: None,
             year: None,
             file_size: 2000,
@@ -591,6 +615,7 @@ mod tests {
             sample_rate: None,
             ipod_path: ":iPod_Control:Music:F01:b.mp3".into(),
             filetype: 0x4d503320,
+            filetype_string: None,
             raw_mhit_header: None,
         });
 
@@ -626,7 +651,9 @@ mod tests {
             album_artist: Some("AA".into()),
             genre: Some("Rock".into()),
             track_number: Some(7),
+            total_tracks: None,
             disc_number: Some(2),
+            total_discs: None,
             total_time_ms: Some(300000),
             year: Some(1999),
             file_size: 8_000_000,
@@ -634,6 +661,7 @@ mod tests {
             sample_rate: Some(48000),
             ipod_path: ":iPod_Control:Music:F05:XYZW.mp3".into(),
             filetype: 0x4d503320,
+            filetype_string: None,
             raw_mhit_header: None,
         });
 
@@ -672,7 +700,9 @@ mod tests {
             album_artist: None,
             genre: None,
             track_number: None,
+            total_tracks: None,
             disc_number: None,
+            total_discs: None,
             total_time_ms: None,
             year: None,
             file_size: 100,
@@ -680,6 +710,7 @@ mod tests {
             sample_rate: None,
             ipod_path: ":iPod_Control:Music:F00:a.mp3".into(),
             filetype: 0x4d503320,
+            filetype_string: None,
             raw_mhit_header: None,
         });
 
@@ -719,7 +750,9 @@ mod tests {
             album_artist: None,
             genre: None,
             track_number: None,
+            total_tracks: None,
             disc_number: None,
+            total_discs: None,
             total_time_ms: None,
             year: None,
             file_size: 50,
@@ -727,6 +760,7 @@ mod tests {
             sample_rate: None,
             ipod_path: ":iPod_Control:Music:F00:b.mp3".into(),
             filetype: 0x4d503320,
+            filetype_string: None,
             raw_mhit_header: None,
         });
 
@@ -825,7 +859,9 @@ mod tests {
             album_artist: None,
             genre: Some("Rock".into()),
             track_number: None,
+            total_tracks: None,
             disc_number: None,
+            total_discs: None,
             total_time_ms: None,
             year: None,
             file_size: 100,
@@ -833,6 +869,7 @@ mod tests {
             sample_rate: None,
             ipod_path: ":iPod_Control:Music:F00:a.mp3".into(),
             filetype: 0x4d503320,
+            filetype_string: None,
             raw_mhit_header: None,
         });
         db.add_track(IpodTrack {
@@ -844,7 +881,9 @@ mod tests {
             album_artist: None,
             genre: Some("Pop".into()),
             track_number: None,
+            total_tracks: None,
             disc_number: None,
+            total_discs: None,
             total_time_ms: None,
             year: None,
             file_size: 200,
@@ -852,6 +891,7 @@ mod tests {
             sample_rate: None,
             ipod_path: ":iPod_Control:Music:F01:b.mp3".into(),
             filetype: 0x4d503320,
+            filetype_string: None,
             raw_mhit_header: None,
         });
 
@@ -873,11 +913,11 @@ mod tests {
         cur.read_u32::<LittleEndian>().unwrap(); // db_type
         cur.read_u32::<LittleEndian>().unwrap(); // db_version
         let num_datasets = cur.read_u32::<LittleEndian>().unwrap();
-        assert_eq!(num_datasets, 5, "should have 5 datasets");
+        assert_eq!(num_datasets, 8, "should have 8 datasets (libgpod standard)");
 
-        // Walk datasets and check order: 4, 1, 3, 2, 5.
+        // Walk datasets and check order matches libgpod: 1, 3, 2, 4, 8, 6, 10, 5.
         cur.set_position(mhbd_hdr as u64);
-        let expected_types = [4, 1, 3, 2, 5];
+        let expected_types = [1, 3, 2, 4, 8, 6, 10, 5];
         for &expected in &expected_types {
             cur.read_exact(&mut magic).unwrap();
             assert_eq!(&magic, b"mhsd");
@@ -891,7 +931,10 @@ mod tests {
         // Find first mhit and check header size is 624.
         let mhit_pos = bytes.windows(4).position(|w| w == b"mhit").unwrap();
         let mhit_hdr = u32::from_le_bytes(bytes[mhit_pos + 4..mhit_pos + 8].try_into().unwrap());
-        assert_eq!(mhit_hdr, 624, "mhit header should be 624 bytes");
+        assert_eq!(
+            mhit_hdr, 624,
+            "mhit header should be 624 bytes (iTunes format)"
+        );
     }
 
     #[test]
@@ -906,7 +949,9 @@ mod tests {
             album_artist: None,
             genre: None,
             track_number: None,
+            total_tracks: None,
             disc_number: None,
+            total_discs: None,
             total_time_ms: None,
             year: None,
             file_size: 100,
@@ -914,6 +959,7 @@ mod tests {
             sample_rate: None,
             ipod_path: ":iPod_Control:Music:F00:a.mp3".into(),
             filetype: 0x4d503320,
+            filetype_string: None,
             raw_mhit_header: None,
         });
         db.add_track(IpodTrack {
@@ -925,7 +971,9 @@ mod tests {
             album_artist: None,
             genre: None,
             track_number: None,
+            total_tracks: None,
             disc_number: None,
+            total_discs: None,
             total_time_ms: None,
             year: None,
             file_size: 200,
@@ -933,6 +981,7 @@ mod tests {
             sample_rate: None,
             ipod_path: ":iPod_Control:Music:F01:b.mp3".into(),
             filetype: 0x4d503320,
+            filetype_string: None,
             raw_mhit_header: None,
         });
 
@@ -987,7 +1036,9 @@ mod tests {
                 album_artist: None,
                 genre: None,
                 track_number: None,
+                total_tracks: None,
                 disc_number: None,
+                total_discs: None,
                 total_time_ms: None,
                 year: None,
                 file_size: 100,
@@ -995,6 +1046,7 @@ mod tests {
                 sample_rate: None,
                 ipod_path: format!(":iPod_Control:Music:F0{i}:x.mp3"),
                 filetype: 0x4d503320,
+                filetype_string: None,
                 raw_mhit_header: None,
             });
         }
@@ -1039,7 +1091,9 @@ mod tests {
             album_artist: None,
             genre: Some("Jazz".into()),
             track_number: Some(1),
+            total_tracks: None,
             disc_number: None,
+            total_discs: None,
             total_time_ms: Some(200000),
             year: Some(2020),
             file_size: 4_000_000,
@@ -1067,7 +1121,9 @@ mod tests {
             album_artist: Some("New AA".into()),
             genre: Some("Rock".into()),
             track_number: Some(5),
+            total_tracks: None,
             disc_number: Some(2),
+            total_discs: None,
             total_time_ms: Some(300000),
             year: Some(2025),
             file_size: 6_000_000,
@@ -1114,7 +1170,7 @@ mod tests {
         // Master playlist should have both tracks.
         assert_eq!(db3.playlists[0].track_ids.len(), 2);
 
-        // Verify mhit header size is 624 for both tracks.
+        // Verify mhit header size is 624 for both tracks (iTunes format).
         let mhit_positions: Vec<usize> = bytes2
             .windows(4)
             .enumerate()
@@ -1124,7 +1180,7 @@ mod tests {
         assert_eq!(mhit_positions.len(), 2, "should have 2 mhit records");
         for pos in &mhit_positions {
             let hs = u32::from_le_bytes(bytes2[pos + 4..pos + 8].try_into().unwrap());
-            assert_eq!(hs, 624, "mhit header should be 624 bytes");
+            assert_eq!(hs, 624, "mhit header should be 624 bytes (iTunes format)");
         }
     }
 
@@ -1147,34 +1203,20 @@ mod tests {
         // Find the mhit.
         let mhit_pos = bytes.windows(4).position(|w| w == b"mhit").unwrap();
 
-        let date_modified =
-            u32::from_le_bytes(bytes[mhit_pos + 32..mhit_pos + 36].try_into().unwrap());
-        let date_added_to_device =
-            u32::from_le_bytes(bytes[mhit_pos + 88..mhit_pos + 92].try_into().unwrap());
-        let date_added =
-            u32::from_le_bytes(bytes[mhit_pos + 104..mhit_pos + 108].try_into().unwrap());
-        let date_modified2 =
-            u32::from_le_bytes(bytes[mhit_pos + 192..mhit_pos + 196].try_into().unwrap());
-        let size_on_disk =
-            u32::from_le_bytes(bytes[mhit_pos + 188..mhit_pos + 192].try_into().unwrap());
+        // libgpod layout: +0x20 = time_modified, +0x68 = time_added
+        let time_modified =
+            u32::from_le_bytes(bytes[mhit_pos + 0x20..mhit_pos + 0x24].try_into().unwrap());
+        let time_added =
+            u32::from_le_bytes(bytes[mhit_pos + 0x68..mhit_pos + 0x6C].try_into().unwrap());
 
-        // Mac epoch: timestamps should be > 700_000_000 (roughly 2023+).
+        // HFS epoch (1904-based): timestamps should be > 3_800_000_000 (roughly 2024+).
         assert!(
-            date_modified > 700_000_000,
-            "date_modified should be a Mac timestamp, got {date_modified}"
-        );
-        assert!(
-            date_added_to_device > 700_000_000,
-            "date_added_to_device should be a Mac timestamp, got {date_added_to_device}"
+            time_modified > 3_800_000_000,
+            "time_modified should be an HFS timestamp, got {time_modified}"
         );
         assert!(
-            date_added > 700_000_000,
-            "date_added should be a Mac timestamp, got {date_added}"
+            time_added > 3_800_000_000,
+            "time_added should be an HFS timestamp, got {time_added}"
         );
-        assert_eq!(
-            date_modified, date_modified2,
-            "date_modified2 should mirror date_modified"
-        );
-        assert_eq!(size_on_disk, 100, "size_on_disk should equal file_size");
     }
 }

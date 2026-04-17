@@ -15,16 +15,21 @@ use std::path::PathBuf;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("Usage: write_roundtrip <mount_path> <firewire_guid> [--add-test-track]");
-        eprintln!("  mount_path:     iPod mount (e.g. /Volumes/IPOD)");
-        eprintln!("  firewire_guid:  device serial (e.g. 000A2700215CDB22)");
-        eprintln!("  --add-test-track: optionally add a dummy track to test from-scratch mhit");
+        eprintln!("Usage: write_roundtrip <mount_path> <firewire_guid> [options]");
+        eprintln!("  mount_path:       iPod mount (e.g. /Volumes/IPOD)");
+        eprintln!("  firewire_guid:    device serial (e.g. 000A2700215CDB22)");
+        eprintln!("  --add-test-track: add a dummy track to test from-scratch mhit");
+        eprintln!("  --rebuild-from N: clear raw headers on tracks with track_id >= N");
         std::process::exit(1);
     }
 
     let mount = PathBuf::from(&args[1]);
     let fwid_str = &args[2];
     let add_test_track = args.iter().any(|a| a == "--add-test-track");
+    let rebuild_from: Option<u32> = args
+        .windows(2)
+        .find(|w| w[0] == "--rebuild-from")
+        .and_then(|w| w[1].parse().ok());
 
     let db_path = mount.join("iPod_Control/iTunes/iTunesDB");
     let original = std::fs::read(&db_path).unwrap();
@@ -39,6 +44,21 @@ fn main() {
     );
 
     let orig_track_count = db.tracks.len();
+
+    // Optionally clear raw headers to force from-scratch rebuild.
+    if let Some(min_tid) = rebuild_from {
+        let mut cleared = 0;
+        for track in &mut db.tracks {
+            if track.track_id >= min_tid {
+                track.clear_raw_header();
+                cleared += 1;
+            }
+        }
+        println!(
+            "Cleared raw headers on {} tracks (will rebuild from scratch)",
+            cleared
+        );
+    }
 
     if add_test_track {
         // Find a free F-dir slot.

@@ -33,13 +33,17 @@
   - perf: batch transcoding
   - UI: more bespoke panel for album art, have it resize instead of clip when it's responsive
   - ascii art album covers again, make it toggleable via a key
+  - marquee scroll long artist/track names in the sidebar and track table so truncated text is still fully readable
 - ** Code Audit**
   - Rule of threes should be observed, what code is duplicated > 3 times or two even if the code block is large
   - Rust best practices
   - files too big? 
-- ** iPod Support **
-  - What's it take? I bet we can, pure rust like the zune is gonna be the route first
-  - 
+- **iPod Support (remaining)** — core music sync + delete work, non-music features left
+  - **Photo sync** — iPod Classic has a Photos database (separate from iTunesDB) at `iPod_Control/Photos/Photo Database`. Uses `mhfd` container format (same as ArtworkDB). Needs ITHMB generation for iPod screen thumbnail + main preview sizes. Zune's `import_photo` is a reference for the public API (takes filename + JPEG bytes). libgpod has a photo writer in `db-artwork-writer.c::ipod_write_photo_db` we can port.
+  - **Video sync** — iPod Classic plays MP4/M4V with specific constraints (320x240/640x480, H.264 baseline). Videos go in `iPod_Control/Music/F*/` alongside audio (not a separate directory). iTunesDB entries use `mediatype = 0x02` at mhit +0xD0 (we hardcode `1` for audio). Need to: transcode to iPod-compatible MP4 via ffmpeg (zytunes already has `transcode_to_wmv` for Zune — similar pattern), set `mediatype = 2`, set video-specific mhod types.
+  - **User playlist sync from iTunes XML** — currently we only preserve the master playlist via raw blob replay. iTunes user playlists (type 2 mhsd, non-master mhyps) could be added from iTunes Library.xml parsing. Would need mhip writing per playlist member.
+  - **Storage/model detection** — like `zune_model_from_storage`, map storage capacity → iPod Classic model name (30GB / 60GB / 80GB / 120GB / 160GB).
+  - **Track rating write-back** — read `Play Counts` on connect, apply ratings/play counts back into the iTunesDB on next sync (currently we delete it like libgpod does, losing the data).
 - **Philips GoGear support** — user has a couple of units, worth attempting
   - Identify which models (VID/PID, firmware generation — SA/HDD vs Vibe vs Ariaz etc.)
   - Transport: most GoGears are UMS/MSC (plain mass storage) — no MTPZ/iTunesDB lift needed, just file copy + folder conventions
@@ -49,6 +53,7 @@
 
 ## Done
 
+- **iPod Classic music sync** — pure Rust iTunesDB parser/writer (`ipod-db` crate) with raw blob replay for lossless roundtrip of existing tracks + libgpod-ported from-scratch mhit writer for new tracks. Handles hash58 signing, ArtworkDB + ITHMB thumbnails for album art, 8-dataset output (types 1/3/2/4/8/6/10/5), sort indexes with libgpod-style tiebreakers, and case-sensitive extension normalization. `IpodBackend` + `IpodSession` integrate via `DeviceBackend` / `DeviceSession` traits — CLI and TUI auto-detect and connect to iPods alongside Zunes.
 - **Local audio playback** — play/pause/skip for local tracks via rodio (`tui/audio.rs`). Basic queue support integrated into TUI.
 - **Native IOKit USB backend** — replaced libusb/aft-mtp-cli with Apple's native IOKit for direct MTP/MTPZ communication via the `zune-mtp` workspace crate. Eliminates all external MTP tool dependencies.
 - **Device content view** — toggle between Library and Device browse modes (`v` key). Reuses artist/album/track panels for device content. Device tracks parsed from `/Music/Artist/Album/track` directory structure. `a` key removes tracks in device mode. Supports artist, album, and track-level removal.

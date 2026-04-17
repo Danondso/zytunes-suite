@@ -2,7 +2,7 @@ use std::sync::mpsc;
 use std::thread;
 
 use zytunes::device::{
-    DeviceBackend, DeviceCapabilities, DeviceFamily, ZuneBackend, ZuneDeviceData,
+    DeviceBackend, DeviceCapabilities, DeviceFamily, IpodBackend, ZuneBackend, ZuneDeviceData,
 };
 use zytunes::mtp::native::NativeSession;
 use zytunes::mtp::parse::DeviceEntry;
@@ -55,6 +55,7 @@ pub struct DeviceInfo {
     pub usb_mode: Option<String>,
     pub manufacturer: Option<String>,
     pub model: Option<String>,
+    pub family: DeviceFamily,
 }
 
 /// Storage info from the MTP session.
@@ -141,17 +142,38 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                     let _ = event_tx.send(BgEvent::LibraryLoaded(result));
                 }
                 BgCommand::Connect => {
-                    // Use the backend registry to detect and connect.
-                    let _ =
-                        event_tx.send(BgEvent::SyncMessage("Scanning USB for device...".into()));
+                    // Try each backend in order until one detects a device.
+                    let _ = event_tx.send(BgEvent::SyncMessage("Scanning for device...".into()));
 
-                    let backend = ZuneBackend;
-                    let detected = match backend.detect() {
-                        Ok(d) => d,
-                        Err(e) => {
-                            let _ = event_tx
-                                .send(BgEvent::SyncMessage(format!("Device not found: {}", e)));
-                            let _ = event_tx.send(BgEvent::SessionFailed(e));
+                    let backends: Vec<Box<dyn DeviceBackend>> =
+                        vec![Box::new(ZuneBackend), Box::new(IpodBackend)];
+
+                    let mut detected_result: Option<(
+                        Box<dyn DeviceBackend>,
+                        zytunes::device::DetectedDevice,
+                    )> = None;
+                    let mut last_err = String::from("No devices found");
+
+                    for backend in backends {
+                        match backend.detect() {
+                            Ok(d) => {
+                                detected_result = Some((backend, d));
+                                break;
+                            }
+                            Err(e) => {
+                                last_err = e;
+                            }
+                        }
+                    }
+
+                    let (backend, detected) = match detected_result {
+                        Some(pair) => pair,
+                        None => {
+                            let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                                "Device not found: {}",
+                                last_err
+                            )));
+                            let _ = event_tx.send(BgEvent::SessionFailed(last_err));
                             continue;
                         }
                     };
@@ -170,28 +192,29 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                         usb_mode: zune_data.and_then(|d| d.usb_mode.clone()),
                         manufacturer: None,
                         model: None,
+                        family: detected.family,
                     };
                     let _ = event_tx.send(BgEvent::DeviceDetected(device_info));
 
-                    let _ = event_tx.send(BgEvent::SyncMessage("MTPZ handshake...".into()));
-                    let native_log_tx = event_tx.clone();
-                    let native_log = move |msg: &str| {
-                        let _ = native_log_tx.send(BgEvent::SyncMessage(msg.to_string()));
-                    };
+                    // Open session — Zune uses NativeSession directly for vendor
+                    // ops, other backends use the generic open_session() path.
+                    let connect_result: Result<Box<dyn DeviceSession>, String> = if detected.family
+                        == DeviceFamily::Zune
+                    {
+                        let _ = event_tx.send(BgEvent::SyncMessage("MTPZ handshake...".into()));
+                        let native_log_tx = event_tx.clone();
+                        let native_log = move |msg: &str| {
+                            let _ = native_log_tx.send(BgEvent::SyncMessage(msg.to_string()));
+                        };
 
-                    // Open session via NativeSession directly so we can do
-                    // Zune-specific vendor ops before boxing.
-                    let zune_product_id = zune_data.map(|d| d.product_id).unwrap_or(0x0710);
-                    let connect_result: Result<Box<dyn DeviceSession>, String> =
+                        let zune_product_id = zune_data.map(|d| d.product_id).unwrap_or(0x0710);
                         match NativeSession::open(zune_product_id, &native_log) {
                             Ok(mut s) => {
                                 s.set_serial(detected.serial.clone());
-                                // Prefer MTP firmware version over USB bcdDevice.
                                 let fw = s
                                     .firmware_version
                                     .clone()
                                     .or_else(|| detected.firmware.clone());
-                                // Query storage for model detection before boxing.
                                 if let Ok((total, free)) = s.get_storage_info() {
                                     let model = zytunes::device::zune_model_from_storage(total);
                                     let used = total.saturating_sub(free);
@@ -207,6 +230,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                         usb_mode: zune_data.and_then(|d| d.usb_mode.clone()),
                                         manufacturer: Some("Microsoft".to_string()),
                                         model: Some(model.to_string()),
+                                        family: DeviceFamily::Zune,
                                     }));
                                     let _ =
                                         event_tx.send(BgEvent::SessionReady(Some(StorageInfo {
@@ -218,38 +242,31 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                 }
 
                                 // Zune-specific vendor operations.
-                                if detected.family == DeviceFamily::Zune {
-                                    // Query acquired items (podcasts, Zune-to-Zune shares).
-                                    match s.get_acquired_items_count() {
-                                        Ok(Some(count)) => {
-                                            let _ =
-                                                event_tx.send(BgEvent::AcquiredItemsCount(count));
-                                        }
-                                        Ok(None) => {
-                                            // Firmware doesn't support the query; silently skip.
-                                        }
-                                        Err(e) => {
-                                            let _ = event_tx.send(BgEvent::SyncMessage(format!(
-                                                "Could not query acquired items: {}",
-                                                e
-                                            )));
-                                        }
+                                match s.get_acquired_items_count() {
+                                    Ok(Some(count)) => {
+                                        let _ = event_tx.send(BgEvent::AcquiredItemsCount(count));
                                     }
-
-                                    // Query sync progress (vendor op 0x922f).
-                                    let sync_status = match s.get_sync_progress() {
-                                        Ok(Some(raw)) => Some(parse_sync_progress(&raw)),
-                                        Ok(None) => None,
-                                        Err(e) => {
-                                            let _ = event_tx.send(BgEvent::SyncMessage(format!(
-                                                "Sync progress query failed: {}",
-                                                e
-                                            )));
-                                            None
-                                        }
-                                    };
-                                    let _ = event_tx.send(BgEvent::DeviceSyncStatus(sync_status));
+                                    Ok(None) => {}
+                                    Err(e) => {
+                                        let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                                            "Could not query acquired items: {}",
+                                            e
+                                        )));
+                                    }
                                 }
+
+                                let sync_status = match s.get_sync_progress() {
+                                    Ok(Some(raw)) => Some(parse_sync_progress(&raw)),
+                                    Ok(None) => None,
+                                    Err(e) => {
+                                        let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                                            "Sync progress query failed: {}",
+                                            e
+                                        )));
+                                        None
+                                    }
+                                };
+                                let _ = event_tx.send(BgEvent::DeviceSyncStatus(sync_status));
 
                                 wire_log_sender(&mut s, &event_tx);
                                 let _ = event_tx.send(BgEvent::SyncMessage(
@@ -258,7 +275,52 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                 Ok(Box::new(s))
                             }
                             Err(e) => Err(e),
-                        };
+                        }
+                    } else {
+                        // Generic path for iPod and future backends.
+                        let log_tx = event_tx.clone();
+                        let log_sender = std::sync::mpsc::channel::<String>();
+                        // Forward log messages to event channel.
+                        let fwd_tx = event_tx.clone();
+                        std::thread::spawn(move || {
+                            for msg in log_sender.1 {
+                                let _ = fwd_tx.send(BgEvent::SyncMessage(msg));
+                            }
+                        });
+                        match backend.open_session(&detected, Some(log_sender.0)) {
+                            Ok(mut s) => {
+                                // Query storage for UI.
+                                if let Ok((total, free)) = s.get_storage_info() {
+                                    let used = total.saturating_sub(free);
+                                    let pct = if total > 0 {
+                                        (used * 100 / total) as u8
+                                    } else {
+                                        0
+                                    };
+                                    let _ = event_tx.send(BgEvent::DeviceDetected(DeviceInfo {
+                                        name: detected.name.clone(),
+                                        firmware_version: detected.firmware.clone(),
+                                        serial_number: detected.serial.clone(),
+                                        usb_mode: None,
+                                        manufacturer: Some("Apple".to_string()),
+                                        model: detected.model.clone(),
+                                        family: detected.family,
+                                    }));
+                                    let _ =
+                                        event_tx.send(BgEvent::SessionReady(Some(StorageInfo {
+                                            total_bytes: total,
+                                            free_bytes: free,
+                                            used_bytes: used,
+                                            used_percent: pct,
+                                        })));
+                                }
+                                let _ =
+                                    log_tx.send(BgEvent::SyncMessage("Connected to iPod".into()));
+                                Ok(s)
+                            }
+                            Err(e) => Err(e),
+                        }
+                    };
 
                     match connect_result {
                         Ok(s) => {

@@ -153,8 +153,12 @@ pub struct IpodTrack {
     pub genre: Option<String>,
     /// Track number on the album.
     pub track_number: Option<u16>,
+    /// Total tracks on the album.
+    pub total_tracks: Option<u16>,
     /// Disc number.
     pub disc_number: Option<u16>,
+    /// Total discs in the album set.
+    pub total_discs: Option<u16>,
     /// Total time in milliseconds.
     pub total_time_ms: Option<u32>,
     /// Year.
@@ -167,12 +171,31 @@ pub struct IpodTrack {
     pub sample_rate: Option<u16>,
     /// iPod-style path (colon-separated, e.g. ":iPod_Control:Music:F00:ABCD.mp3").
     pub ipod_path: String,
-    /// File type (1 = MP3, 2 = AAC/M4A, 4 = WAV).
+    /// File type code (0x4d503320 = MP3, 0x4d344120 = M4A/AAC/ALAC, etc).
     pub filetype: u32,
+    /// Filetype description string for mhod type 6 (e.g. "MPEG audio file",
+    /// "AAC audio file", "Apple Lossless audio file"). The iPod firmware uses
+    /// this to select the audio decoder. When `None`, derived from `filetype`.
+    pub filetype_string: Option<String>,
     /// Raw mhit header bytes (full 624-byte header from parsed database).
     /// When present, the serializer replays this and patches only the fields
     /// it actively manages (artwork_count, has_artwork, total_size, num_mhods).
     pub(crate) raw_mhit_header: Option<Vec<u8>>,
+}
+
+impl IpodTrack {
+    /// Clear the raw mhit header, forcing the serializer to rebuild it from
+    /// scratch using the track's metadata fields. Use this when the cached
+    /// header needs to be regenerated (e.g. after fixing field values).
+    pub fn clear_raw_header(&mut self) {
+        self.raw_mhit_header = None;
+    }
+
+    /// Mutable access to the raw mhit header bytes for field-level patching.
+    /// Returns `None` if the track was created from scratch (no parsed header).
+    pub fn raw_header_mut(&mut self) -> Option<&mut Vec<u8>> {
+        self.raw_mhit_header.as_mut()
+    }
 }
 
 /// A playlist in the iPod database.
@@ -266,6 +289,33 @@ impl IpodDatabase {
             pl.track_ids.retain(|&id| id != dbid);
         }
         Some(track)
+    }
+
+    /// Reassign all track IDs sequentially starting from 52, libgpod-style.
+    ///
+    /// Walks all tracks assigning `track_id = 52 + index`, patches the
+    /// `raw_mhit_header` bytes at +0x10 (track_id field) to match, and updates
+    /// the `next_track_id` counter. Playlist `track_ids` use dbids (not track
+    /// ids) so they don't need patching here — mhip writing looks up track_id
+    /// from the track list at serialize time.
+    ///
+    /// **Why**: the iPod Classic firmware may require dense, sequential track
+    /// IDs. Preserving original iTunes-assigned IDs (our default) creates
+    /// gaps when adding new tracks (existing IDs up to 398547, new track
+    /// gets 398548 with no siblings). libgpod reassigns from 52 every write.
+    pub fn reassign_track_ids(&mut self) {
+        const FIRST_IPOD_ID: u32 = 52;
+        for (i, track) in self.tracks.iter_mut().enumerate() {
+            let new_id = FIRST_IPOD_ID + i as u32;
+            track.track_id = new_id;
+            // Patch the raw blob's track_id field at +0x10 (offset 16).
+            if let Some(ref mut raw) = track.raw_mhit_header {
+                if raw.len() >= 20 {
+                    raw[16..20].copy_from_slice(&new_id.to_le_bytes());
+                }
+            }
+        }
+        self.next_track_id = FIRST_IPOD_ID + self.tracks.len() as u32;
     }
 
     /// Find a track by dbid.

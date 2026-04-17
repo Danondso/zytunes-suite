@@ -5,6 +5,11 @@
 //! FirewireGuid (USB serial number) via LCM + AES S-box + SHA1.
 //!
 //! Without a valid hash, the firmware rejects the database and shows "No Music".
+//!
+//! Algorithm description sourced from the public reverse-engineering work of
+//! the libgpod project (<https://sourceforge.net/projects/gtkpod/>) and the
+//! iPodLinux community. No source code from those projects is used here; this
+//! is an independent re-implementation. See `THIRD_PARTY.md`.
 
 use sha1::{Digest, Sha1};
 

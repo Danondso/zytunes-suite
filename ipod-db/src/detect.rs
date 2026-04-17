@@ -103,6 +103,16 @@ pub fn detect_ipods() -> Vec<DetectedIpod> {
         }
     }
 
+    // /Volumes/*/ (macOS)
+    if let Ok(entries) = std::fs::read_dir("/Volumes") {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                candidates.push(p);
+            }
+        }
+    }
+
     // Also check IPOD_MOUNT_PATH env var for explicit override.
     if let Ok(explicit) = std::env::var("IPOD_MOUNT_PATH") {
         let p = PathBuf::from(&explicit);

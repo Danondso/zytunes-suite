@@ -32,10 +32,14 @@ pub fn hash_filename(original_name: &str, dbid: u64) -> String {
     original_name.hash(&mut hasher);
     let hash = hasher.finish();
 
+    // Always lowercase the extension — iTunes writes .mp3 / .m4a / .wav,
+    // and the iPod Classic firmware appears to match filetype by comparing
+    // the extension string case-sensitively in some code paths.
     let ext = Path::new(original_name)
         .extension()
         .and_then(|e| e.to_str())
-        .unwrap_or("mp3");
+        .unwrap_or("mp3")
+        .to_lowercase();
 
     format!("{hash:016x}.{ext}")
 }

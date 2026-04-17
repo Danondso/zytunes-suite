@@ -252,6 +252,7 @@ pub struct DeviceState {
     pub manufacturer: Option<String>,
     pub model: Option<String>,
     pub usb_mode: Option<String>,
+    pub family: Option<zytunes::device::DeviceFamily>,
     pub storage: Option<StorageInfo>,
     pub tracks: Vec<DeviceEntry>,
     pub loading_tracks: bool,
@@ -279,6 +280,7 @@ impl DeviceState {
             manufacturer: None,
             model: None,
             usb_mode: None,
+            family: None,
             storage: None,
             tracks: Vec::new(),
             loading_tracks: false,
@@ -1483,6 +1485,7 @@ impl App {
                 self.device.manufacturer = info.manufacturer;
                 self.device.model = info.model;
                 self.device.usb_mode = info.usb_mode;
+                self.device.family = Some(info.family);
                 self.device.status = DeviceStatus::Connecting;
             }
             BgEvent::SessionReady(storage) => {
