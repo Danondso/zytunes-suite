@@ -198,6 +198,25 @@ These are still unfixed but may not matter:
 - `+0x1F4 composer_id`: 0
 - `+0x20C` mystery byte
 
+## Play Counts Hypothesis DISPROVEN (2026-04-16)
+
+Play Counts file has exactly 3883 entries (matching track count, one per
+track, 28 bytes each). Adding a track creates a count mismatch (DB says
+3884, Play Counts says 3883). libgpod deletes Play Counts after every
+write so the firmware regenerates it.
+
+Tested: delete Play Counts after import. Still skips.
+Conclusion: Play Counts count mismatch is NOT the filter.
+
+## ArtworkDB Hypothesis DISPROVEN (2026-04-16)
+
+Inspected the golden ArtworkDB (7,276 bytes) and found only **8 mhii
+entries** out of 3,883 tracks. 3,875 tracks play perfectly fine without
+any ArtworkDB reference. So the firmware does NOT require an mhii entry
+per track. Our new track lacking one cannot be the cause.
+
+This matches libgpod's behavior (skips tracks without thumbnails).
+
 ## New Hypothesis: It's Not the Database
 
 We've ported libgpod faithfully for the parts that matter (mhit fields,
@@ -216,12 +235,66 @@ Possible explanations left:
 4. **The iPod caches the DB** in a way that survives reboots and our DB
    writes aren't invalidating the cache
 
-## Next Experiment (to try in a fresh session)
+## Remaining Leads
 
-Try writing an empty mhii entry in the ArtworkDB for our new track's dbid.
-libgpod skips this but maybe the iPod Classic firmware (or some firmware
-revision) requires it.
+### `iTunesControl` is 156MB
 
-Failing that, test with gtkpod or another known-good library on this
-specific iPod to see if it can add a track. If not, the iPod itself may
-be in a state that prevents modifications.
+File size `156,237,824` bytes. Not documented in libgpod. Could be:
+- Pre-built index the firmware uses to avoid scanning F-dirs (if so,
+  new files at new paths get ignored)
+- Log / manifest of valid content
+
+**Inspect structure of iTunesControl** next — might be a magic-prefixed
+binary format, might be a concatenation of track data, etc.
+
+### `Extras.itdb` is a SQLite database
+
+Starts with "SQLite format 3". libgpod says Classic doesn't use SQLite,
+but the file exists. Maybe iTunes writes it and the firmware reads it.
+
+### The swap test proved it's NOT the file
+
+Replacing a working track's file (`F31/XXXX.m4a`) with the new
+audio showed the iPod playing the new audio under the existing library entry. So:
+- The file is iPod-compatible
+- The firmware DOES scan and play files at paths referenced by working
+  tracks
+
+**But** when we add a NEW track pointing to a NEW F-dir path, it doesn't
+work. This suggests the firmware has a "trusted paths" list (possibly
+iTunesControl) that doesn't include our new path.
+
+### Test with gtkpod as control
+
+If gtkpod can add a track to this specific iPod, the issue is our code.
+If gtkpod fails too, the iPod itself has some state issue.
+
+## Summary of What We've Tried
+
+| Experiment | Result |
+|-----------|--------|
+| From-scratch mhit, libgpod layout | ❌ Skip |
+| 8 datasets (1/3/2/4/8/6/10/5) | ❌ Skip |
+| Clone working track's raw blob | ❌ Skip |
+| Clone + sort/letter index updates | ❌ Skip |
+| Track ID reassignment (dense 52..N) | ❌ Skip |
+| Uniform 624-byte mhit headers | ❌ Skip |
+| Correct id_0x24 from mhbd+0x24 | ❌ Skip |
+| total_tracks, total_discs populated | ❌ Skip |
+| Play Counts deletion | ❌ Skip |
+
+Ruled out:
+- Sort indexes (cosmetic only per libgpod)
+- ArtworkDB (3875/3883 golden tracks have no mhii and play fine)
+- File format (swap test — file plays in working track's slot)
+- hash58 (pure roundtrip works)
+
+## Final Status
+
+Pure roundtrip: ✅ All existing tracks play
+New track sync: ❌ Track appears but skips on playback
+
+The gap is narrow and very specific — we write a bit-perfect database
+compared to what a working clone would be, but the firmware still won't
+play a track pointing to a new F-dir path. Leading theory: `iTunesControl`
+is a path manifest we're not updating.

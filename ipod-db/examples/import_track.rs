@@ -201,5 +201,20 @@ fn main() {
     let backup = db_path.with_extension("pre-import-bak");
     std::fs::copy(&db_path, &backup).unwrap();
     std::fs::write(&db_path, &output).unwrap();
-    println!("Written {} bytes. Eject and test.", output.len());
+    println!("Written {} bytes", output.len());
+
+    // Delete stale Play Counts / iTunesStats files. The firmware pairs these
+    // per-track with the iTunesDB, so a count mismatch after adding a track
+    // may cause new entries to be filtered. libgpod's playcounts_reset does
+    // this after every write (itdb_itunesdb.c:1206).
+    let itunes_dir = db_path.parent().unwrap();
+    for stale in &["Play Counts", "iTunesStats", "PlayCounts.plist"] {
+        let p = itunes_dir.join(stale);
+        if p.exists() {
+            std::fs::remove_file(&p).ok();
+            println!("Deleted stale: {}", stale);
+        }
+    }
+
+    println!("Eject and test.");
 }
