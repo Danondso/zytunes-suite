@@ -36,6 +36,11 @@ pub trait DeviceSession {
     fn prewarm_library(&mut self) -> Result<(), String> {
         Ok(())
     }
+    /// Refresh any locally-cached free-space metadata after operations that change
+    /// device storage (sync, delete). Without this, the next reconnect sees a
+    /// large diff between cached and current free bytes and invalidates the
+    /// track/library caches, forcing a slow re-enumeration. Default is a no-op.
+    fn refresh_storage_cache(&mut self, _free_bytes: u64) {}
     /// Import a photo to the device. Takes filename and pre-resized JPEG bytes.
     /// Returns the new MTP object ID.
     fn import_photo(&mut self, _filename: &str, _jpeg_data: &[u8]) -> Result<u64, String> {

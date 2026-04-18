@@ -495,6 +495,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                 used_bytes: used,
                                 used_percent: pct,
                             }));
+                            s.refresh_storage_cache(free);
                         }
 
                         let _ = event_tx.send(BgEvent::RemoveComplete { success, failed });
@@ -898,6 +899,12 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                         // re-enumerating already-synced content on next connect.
                         if success > 0 {
                             s.save_sync_progress();
+                            // Update the cached free-space header so the next
+                            // reconnect doesn't see a large diff and invalidate
+                            // the track + library caches.
+                            if let Ok((_, free)) = s.get_storage_info() {
+                                s.refresh_storage_cache(free);
+                            }
                         }
 
                         let _ = event_tx.send(BgEvent::SyncMessage(format!(

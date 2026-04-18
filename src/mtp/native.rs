@@ -242,6 +242,15 @@ impl TrackCache {
         }
     }
 
+    /// Update the `#free_bytes:` header in the existing cache file, preserving
+    /// all track entries. No-op when the cache is empty or missing — there's
+    /// nothing to keep valid until the first full save.
+    fn update_free_bytes(&self, free_bytes: u64) {
+        if let Some((_, tracks)) = self.load() {
+            self.save(&tracks, free_bytes);
+        }
+    }
+
     fn append(&self, entry: &DeviceEntry) {
         let path = match self.cache_path() {
             Some(p) => p,
@@ -1192,6 +1201,10 @@ impl DeviceSession for NativeSession {
         self.ensure_library()
     }
 
+    fn refresh_storage_cache(&mut self, free_bytes: u64) {
+        self.cache.update_free_bytes(free_bytes);
+    }
+
     fn save_sync_progress(&mut self) {
         let data = match self.session.get_sync_progress() {
             Ok(d) => d,
@@ -1884,6 +1897,38 @@ mod tests {
             let _ = std::fs::write(&p, "#free_bytes:5000000\n");
             assert!(cache.load().is_none());
             let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn track_cache_update_free_bytes_preserves_entries() {
+        let cache = make_cache(Some("update-free"));
+        let entries = vec![
+            sample_entry("Artist/Album/a.mp3", 1),
+            sample_entry("Artist/Album/b.mp3", 2),
+        ];
+        cache.save(&entries, 1_000_000);
+
+        cache.update_free_bytes(2_500_000);
+
+        let (free, loaded) = cache.load().unwrap();
+        assert_eq!(free, 2_500_000);
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].name, "Artist/Album/a.mp3");
+        assert_eq!(loaded[1].name, "Artist/Album/b.mp3");
+
+        cache.clear();
+    }
+
+    #[test]
+    fn track_cache_update_free_bytes_noop_when_empty() {
+        let cache = make_cache(Some("update-free-empty"));
+        // No prior save — file doesn't exist yet.
+        cache.update_free_bytes(5_000_000);
+        // Should not have created a file.
+        assert!(cache.load().is_none());
+        if let Some(p) = cache.cache_path() {
+            assert!(!p.exists());
         }
     }
 
