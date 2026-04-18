@@ -4,12 +4,18 @@ Follow-ups from the `/review`-style audit. Ordered roughly by impact.
 
 ## Structural
 
-### Device index full-rebuild on every delta
-`src/tui/app.rs:549-629`. `device_index_dirty` flag triggers a clear-and-resort
+### ~~Device index full-rebuild on every delta~~ (done)
+~~`src/tui/app.rs:549-629`. `device_index_dirty` flag triggers a clear-and-resort
 of `artists`, `albums`, `album_tracks`, `track_set` on any track addition —
 O(N²) during sync of many tracks. Incremental inserts into the BTreeMaps would
 keep it O(log N) per delta. Deduplicate in place; avoid the full resort of the
-artist list on each flush.
+artist list on each flush.~~
+
+Replaced with `DeviceState::add_indexed_track` / `remove_indexed_track`
+performing binary-search inserts and artist-scoped lookup-set rebuilds.
+`flush_device_index` now only triggers UI re-derivations
+(`rebuild_artist_device_status`, sidebar/retag). Initial load still uses
+`build_device_index` which drains `tracks` and replays via the incremental path.
 
 ### Sidebar stitches `"Artist — Album"` then splits it back
 `src/tui/app.rs:854-866` (and device branch 890-898). Builds

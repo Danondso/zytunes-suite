@@ -105,7 +105,7 @@ fn quick_random() -> usize {
         .unwrap_or(0)
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceTrackInfo {
     pub name: String,
     pub device_path: String,
@@ -294,6 +294,147 @@ impl DeviceState {
             sync_status: None,
         }
     }
+
+    /// Incrementally add a single device track to all index structures.
+    /// Used during sync deltas to avoid O(N²) full rebuilds.
+    pub fn add_indexed_track(&mut self, entry: &DeviceEntry) {
+        if entry.is_dir() {
+            return;
+        }
+        let (artist, album, display_name) = parse_device_track_parts(&entry.name);
+
+        if let Err(pos) = self.artists.binary_search(&artist) {
+            self.artists.insert(pos, artist.clone());
+        }
+
+        let albums = self.albums.entry(artist.clone()).or_default();
+        if let Err(pos) = albums.binary_search(&album) {
+            albums.insert(pos, album.clone());
+        }
+
+        self.album_tracks
+            .entry((artist.clone(), album.clone()))
+            .or_default()
+            .push(DeviceTrackInfo {
+                name: display_name.clone(),
+                device_path: format!("/Music/{}", entry.name),
+                size: entry.size,
+                object_id: entry.object_id,
+                artist: artist.clone(),
+                album,
+                track_number: entry.track_number,
+                disc_number: entry.disc_number,
+            });
+
+        let artist_key = normalize_for_match(&artist);
+        let raw = normalize_for_match(&display_name);
+        let stripped = normalize_for_match(zytunes::strip_track_number(display_name.trim()));
+        self.track_set.insert((artist_key.clone(), raw.clone()));
+        if stripped != raw {
+            self.track_set.insert((artist_key.clone(), stripped));
+        }
+        self.artist_track_names
+            .entry(artist_key)
+            .or_default()
+            .push(raw);
+    }
+
+    /// Incrementally remove a single device track identified by its relative name
+    /// (e.g. `"Artist/Album/track.mp3"`). Returns true if a track was found and removed.
+    pub fn remove_indexed_track(&mut self, relative_name: &str) -> bool {
+        let (artist, album, _display_name) = parse_device_track_parts(relative_name);
+        let device_path = format!("/Music/{}", relative_name);
+        let key = (artist.clone(), album.clone());
+
+        let Some(tracks) = self.album_tracks.get_mut(&key) else {
+            return false;
+        };
+        let before = tracks.len();
+        tracks.retain(|t| t.device_path != device_path);
+        if tracks.len() == before {
+            return false;
+        }
+        let album_now_empty = tracks.is_empty();
+
+        if album_now_empty {
+            self.album_tracks.remove(&key);
+            if let Some(albums) = self.albums.get_mut(&artist) {
+                albums.retain(|a| a != &album);
+                if albums.is_empty() {
+                    self.albums.remove(&artist);
+                    if let Ok(idx) = self.artists.binary_search(&artist) {
+                        self.artists.remove(idx);
+                    }
+                }
+            }
+        }
+
+        self.rebuild_lookup_for_artist(&artist);
+        true
+    }
+
+    /// Rebuild `track_set` and `artist_track_names` entries for a single artist.
+    /// Cheap because it only walks that artist's tracks, not the whole device.
+    fn rebuild_lookup_for_artist(&mut self, artist: &str) {
+        let artist_key = normalize_for_match(artist);
+        self.track_set.retain(|(a, _)| a != &artist_key);
+        self.artist_track_names.remove(&artist_key);
+
+        let mut names = Vec::new();
+        let mut extra_keys = Vec::new();
+        for ((a, _), tracks) in &self.album_tracks {
+            if normalize_for_match(a) != artist_key {
+                continue;
+            }
+            for dt in tracks {
+                let raw = normalize_for_match(&dt.name);
+                let stripped = normalize_for_match(zytunes::strip_track_number(dt.name.trim()));
+                if stripped != raw {
+                    extra_keys.push(stripped);
+                }
+                names.push(raw);
+            }
+        }
+        for raw in &names {
+            self.track_set.insert((artist_key.clone(), raw.clone()));
+        }
+        for stripped in extra_keys {
+            self.track_set.insert((artist_key.clone(), stripped));
+        }
+        if !names.is_empty() {
+            self.artist_track_names.insert(artist_key, names);
+        }
+    }
+}
+
+/// Parse a device-relative track name (e.g. `"Artist/Album/01 track.mp3"`) into
+/// (artist, album, display_name). Missing segments fall back to `Unknown Artist`
+/// and `Unknown Album`. The display name has its file extension stripped.
+fn parse_device_track_parts(name: &str) -> (String, String, String) {
+    let parts: Vec<&str> = name.splitn(3, '/').collect();
+    let (artist, album, filename) = match parts.len() {
+        3 => (
+            parts[0].to_string(),
+            parts[1].to_string(),
+            parts[2].to_string(),
+        ),
+        2 => (
+            parts[0].to_string(),
+            "Unknown Album".to_string(),
+            parts[1].to_string(),
+        ),
+        _ => (
+            "Unknown Artist".to_string(),
+            "Unknown Album".to_string(),
+            name.to_string(),
+        ),
+    };
+    let display_name = filename
+        .rfind('.')
+        .map(|pos| &filename[..pos])
+        .unwrap_or(&filename)
+        .to_string();
+    (artist, album, display_name)
 }
 
 pub struct SyncState {
@@ -696,11 +837,10 @@ impl App {
         }
     }
 
-    /// Rebuild device index if it was marked dirty by incremental updates.
+    /// Re-run UI-level derivations after incremental index changes.
     pub fn flush_device_index(&mut self) {
         if self.device_index_dirty {
             self.device_index_dirty = false;
-            self.build_device_index();
             self.rebuild_artist_device_status();
             if self.browse_mode == BrowseMode::Device {
                 self.refresh_sidebar();
@@ -710,87 +850,20 @@ impl App {
         }
     }
 
+    /// Full rebuild of the device index from `device.tracks`. Used for initial
+    /// load; individual add/remove events now update the index incrementally.
     pub fn build_device_index(&mut self) {
         self.device.artists.clear();
         self.device.albums.clear();
         self.device.album_tracks.clear();
-
-        let mut artist_set = std::collections::BTreeSet::new();
-
-        for entry in &self.device.tracks {
-            if entry.is_dir() {
-                continue;
-            }
-            // Name format from lsext-r: "Artist/Album/track.mp3"
-            let parts: Vec<&str> = entry.name.splitn(3, '/').collect();
-            let (artist, album, filename) = match parts.len() {
-                3 => (
-                    parts[0].to_string(),
-                    parts[1].to_string(),
-                    parts[2].to_string(),
-                ),
-                2 => (
-                    parts[0].to_string(),
-                    "Unknown Album".to_string(),
-                    parts[1].to_string(),
-                ),
-                _ => (
-                    "Unknown Artist".to_string(),
-                    "Unknown Album".to_string(),
-                    entry.name.clone(),
-                ),
-            };
-
-            // Strip file extension for display name.
-            let display_name = filename
-                .rfind('.')
-                .map(|pos| &filename[..pos])
-                .unwrap_or(&filename)
-                .to_string();
-
-            artist_set.insert(artist.clone());
-
-            self.device
-                .albums
-                .entry(artist.clone())
-                .or_default()
-                .push(album.clone());
-
-            let key = (artist.clone(), album.clone());
-            self.device
-                .album_tracks
-                .entry(key)
-                .or_default()
-                .push(DeviceTrackInfo {
-                    name: display_name,
-                    device_path: format!("/Music/{}", entry.name),
-                    size: entry.size,
-                    object_id: entry.object_id,
-                    artist,
-                    album,
-                    track_number: entry.track_number,
-                    disc_number: entry.disc_number,
-                });
-        }
-
-        self.device.artists = artist_set.into_iter().collect();
-
-        // Deduplicate album lists per artist.
-        for albums in self.device.albums.values_mut() {
-            albums.sort();
-            albums.dedup();
-        }
-
-        // Build precomputed match sets for on-device lookups.
-        self.device.track_set = device_track_set(&self.device);
+        self.device.track_set.clear();
         self.device.artist_track_names.clear();
-        for dt in self.device.album_tracks.values().flatten() {
-            self.device
-                .artist_track_names
-                .entry(normalize_for_match(&dt.artist))
-                .or_default()
-                .push(normalize_for_match(&dt.name));
+
+        let tracks = std::mem::take(&mut self.device.tracks);
+        for entry in &tracks {
+            self.device.add_indexed_track(entry);
         }
+        self.device.tracks = tracks;
     }
 
     /// Re-tag the currently displayed track list using precomputed device sets.
@@ -1592,14 +1665,16 @@ impl App {
                 }
             }
             BgEvent::DeviceTrackAdded(entry) => {
+                self.device.add_indexed_track(&entry);
                 self.device.tracks.push(entry);
                 self.device_index_dirty = true;
             }
             BgEvent::DeviceTrackRemoved(path) => {
                 // path is a full device path like "/Music/Artist/Album/track.mp3"
                 // but DeviceEntry.name is relative like "Artist/Album/track.mp3"
-                let relative = path.strip_prefix("/Music/").unwrap_or(&path);
+                let relative = path.strip_prefix("/Music/").unwrap_or(&path).to_string();
                 self.device.tracks.retain(|t| t.name != relative);
+                self.device.remove_indexed_track(&relative);
                 self.device_index_dirty = true;
             }
             BgEvent::Error(e) => {
@@ -2028,23 +2103,6 @@ fn normalize_for_match(s: &str) -> String {
         .to_string()
 }
 
-/// Build a set of (normalized artist, normalized track name) from device tracks.
-/// Inserts both the raw filename stem and the version with a leading track number
-/// prefix stripped, so we match regardless of naming convention.
-fn device_track_set(device: &DeviceState) -> HashSet<(String, String)> {
-    let mut set = HashSet::new();
-    for dt in device.album_tracks.values().flatten() {
-        let artist = normalize_for_match(&dt.artist);
-        let raw = normalize_for_match(&dt.name);
-        let stripped = normalize_for_match(zytunes::strip_track_number(dt.name.trim()));
-        set.insert((artist.clone(), raw.clone()));
-        if stripped != raw {
-            set.insert((artist, stripped));
-        }
-    }
-    set
-}
-
 pub fn format_with_commas(n: usize) -> String {
     let s = n.to_string();
     let mut result = String::with_capacity(s.len() + s.len() / 3);
@@ -2394,6 +2452,189 @@ mod tests {
         assert!(app.device.artists.is_empty());
         assert!(app.device.albums.is_empty());
         assert!(app.device.album_tracks.is_empty());
+    }
+
+    #[test]
+    fn add_indexed_track_updates_all_structures() {
+        let mut device = DeviceState::new();
+        device.add_indexed_track(&make_device_entry(
+            "Radiohead/OK Computer/01 Airbag.mp3",
+            1234,
+        ));
+
+        assert_eq!(device.artists, vec!["Radiohead"]);
+        assert_eq!(
+            device.albums.get("Radiohead").unwrap(),
+            &vec!["OK Computer".to_string()]
+        );
+        let tracks = device
+            .album_tracks
+            .get(&("Radiohead".into(), "OK Computer".into()))
+            .unwrap();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].name, "01 Airbag");
+        assert_eq!(
+            tracks[0].device_path,
+            "/Music/Radiohead/OK Computer/01 Airbag.mp3"
+        );
+
+        // Both the raw and track-number-stripped forms should be in track_set.
+        assert!(is_on_device(
+            "Radiohead",
+            "01 Airbag",
+            &with_connected(&device)
+        ));
+        assert!(is_on_device(
+            "Radiohead",
+            "Airbag",
+            &with_connected(&device)
+        ));
+    }
+
+    #[test]
+    fn add_indexed_track_inserts_artists_sorted() {
+        let mut device = DeviceState::new();
+        device.add_indexed_track(&make_device_entry("Zebra/A/t.mp3", 1));
+        device.add_indexed_track(&make_device_entry("Alpha/A/t.mp3", 1));
+        device.add_indexed_track(&make_device_entry("Mango/A/t.mp3", 1));
+
+        assert_eq!(device.artists, vec!["Alpha", "Mango", "Zebra"]);
+    }
+
+    #[test]
+    fn add_indexed_track_inserts_albums_sorted_and_deduped() {
+        let mut device = DeviceState::new();
+        device.add_indexed_track(&make_device_entry("Artist/Zed/t1.mp3", 1));
+        device.add_indexed_track(&make_device_entry("Artist/Alpha/t2.mp3", 1));
+        device.add_indexed_track(&make_device_entry("Artist/Alpha/t3.mp3", 1));
+
+        assert_eq!(
+            device.albums.get("Artist").unwrap(),
+            &vec!["Alpha".to_string(), "Zed".to_string()]
+        );
+    }
+
+    #[test]
+    fn add_indexed_track_skips_directories() {
+        let mut device = DeviceState::new();
+        device.add_indexed_track(&DeviceEntry {
+            object_id: 1,
+            storage_id: 65537,
+            format: "Association".to_string(),
+            size: 0,
+            name: "Music".to_string(),
+            ..Default::default()
+        });
+        assert!(device.artists.is_empty());
+        assert!(device.album_tracks.is_empty());
+    }
+
+    #[test]
+    fn remove_indexed_track_removes_album_and_artist_when_last() {
+        let mut device = DeviceState::new();
+        device.add_indexed_track(&make_device_entry("Artist/Album/song.mp3", 100));
+        device.add_indexed_track(&make_device_entry("Artist/Album/other.mp3", 200));
+
+        assert!(device.remove_indexed_track("Artist/Album/song.mp3"));
+        // Album still present — "other.mp3" remains.
+        assert!(device
+            .album_tracks
+            .contains_key(&("Artist".into(), "Album".into())));
+        assert_eq!(device.artists, vec!["Artist"]);
+
+        assert!(device.remove_indexed_track("Artist/Album/other.mp3"));
+        // Now album empty, artist pruned.
+        assert!(device.album_tracks.is_empty());
+        assert!(device.albums.is_empty());
+        assert!(device.artists.is_empty());
+    }
+
+    #[test]
+    fn remove_indexed_track_keeps_artist_when_other_album_remains() {
+        let mut device = DeviceState::new();
+        device.add_indexed_track(&make_device_entry("Artist/AlbumA/a.mp3", 1));
+        device.add_indexed_track(&make_device_entry("Artist/AlbumB/b.mp3", 1));
+
+        assert!(device.remove_indexed_track("Artist/AlbumA/a.mp3"));
+
+        assert_eq!(device.artists, vec!["Artist"]);
+        assert_eq!(
+            device.albums.get("Artist").unwrap(),
+            &vec!["AlbumB".to_string()]
+        );
+        assert!(!device
+            .album_tracks
+            .contains_key(&("Artist".into(), "AlbumA".into())));
+    }
+
+    #[test]
+    fn remove_indexed_track_clears_lookup_sets() {
+        let mut device = DeviceState::new();
+        device.add_indexed_track(&make_device_entry("Artist/Album/song.mp3", 1));
+        assert!(is_on_device("Artist", "song", &with_connected(&device)));
+
+        device.remove_indexed_track("Artist/Album/song.mp3");
+        assert!(!is_on_device("Artist", "song", &with_connected(&device)));
+    }
+
+    #[test]
+    fn remove_indexed_track_returns_false_for_missing_path() {
+        let mut device = DeviceState::new();
+        device.add_indexed_track(&make_device_entry("Artist/Album/song.mp3", 1));
+
+        assert!(!device.remove_indexed_track("Artist/Album/ghost.mp3"));
+        assert!(!device.remove_indexed_track("Nobody/Nowhere/x.mp3"));
+        // Existing track still there.
+        assert_eq!(device.artists, vec!["Artist"]);
+    }
+
+    #[test]
+    fn incremental_then_full_rebuild_produces_same_shape() {
+        let entries = vec![
+            make_device_entry("Beatles/Revolver/01 Taxman.mp3", 1),
+            make_device_entry("Beatles/Revolver/02 Eleanor Rigby.mp3", 1),
+            make_device_entry("Beatles/Abbey Road/01 Come Together.mp3", 1),
+            make_device_entry("Radiohead/OK Computer/01 Airbag.mp3", 1),
+        ];
+
+        let mut incremental = DeviceState::new();
+        for e in &entries {
+            incremental.add_indexed_track(e);
+        }
+
+        let mut app = App::new();
+        app.device.tracks = entries;
+        app.build_device_index();
+
+        assert_eq!(incremental.artists, app.device.artists);
+        assert_eq!(incremental.albums, app.device.albums);
+        assert_eq!(incremental.album_tracks, app.device.album_tracks);
+        assert_eq!(incremental.track_set, app.device.track_set);
+    }
+
+    /// Helper: clone the device state and mark it Connected so is_on_device works.
+    fn with_connected(device: &DeviceState) -> DeviceState {
+        DeviceState {
+            status: DeviceStatus::Connected,
+            name: None,
+            firmware: None,
+            serial: None,
+            manufacturer: None,
+            model: None,
+            usb_mode: None,
+            family: None,
+            storage: None,
+            tracks: device.tracks.clone(),
+            loading_tracks: false,
+            selected: 0,
+            artists: device.artists.clone(),
+            albums: device.albums.clone(),
+            album_tracks: device.album_tracks.clone(),
+            track_set: device.track_set.clone(),
+            artist_track_names: device.artist_track_names.clone(),
+            acquired_items: 0,
+            sync_status: None,
+        }
     }
 
     #[test]
@@ -2868,16 +3109,19 @@ mod tests {
         assert!(!app.show_keys);
     }
 
-    /// Helper to populate the precomputed match sets on DeviceState.
+    /// Helper to populate the precomputed match sets on DeviceState from a
+    /// pre-seeded `album_tracks` map.
     fn build_match_sets(device: &mut DeviceState) {
-        device.track_set = device_track_set(device);
+        device.track_set.clear();
         device.artist_track_names.clear();
-        for dt in device.album_tracks.values().flatten() {
-            device
-                .artist_track_names
-                .entry(normalize_for_match(&dt.artist))
-                .or_default()
-                .push(normalize_for_match(&dt.name));
+        let keys: Vec<String> = device
+            .album_tracks
+            .values()
+            .flatten()
+            .map(|dt| dt.artist.clone())
+            .collect();
+        for artist in keys {
+            device.rebuild_lookup_for_artist(&artist);
         }
     }
 
