@@ -53,9 +53,11 @@ struct CachedLibrary {
 }
 
 fn cache_dir() -> Option<std::path::PathBuf> {
-    if let Some(dir) = crate::paths::override_cache_dir() {
-        return Some(dir);
-    }
+    // The dirlib cache is keyed by a hash of the scan root (see
+    // `dirlib_cache_name`), so identical `~/Music` scans from different
+    // worktrees can safely share one entry. Keeping this at `$HOME/.cache`
+    // — and *not* consulting `ZYTUNES_CACHE_DIR` — avoids re-running the
+    // lofty pass for large libraries every time a new worktree spins up.
     let home = std::env::var("HOME").ok()?;
     Some(Path::new(&home).join(".cache").join("zytunes"))
 }
@@ -113,6 +115,30 @@ pub fn save_dirlib_cache(dir_path: &str, files: HashMap<String, CachedFile>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_dir_ignores_zytunes_cache_dir_override() {
+        // The dirlib cache deliberately lives under `$HOME/.cache/zytunes`
+        // regardless of `ZYTUNES_CACHE_DIR`, so big-library scans are
+        // reused across worktrees. Guard that contract.
+        let Some(home) = std::env::var("HOME").ok() else {
+            return; // Can't assert relative to HOME if it isn't set.
+        };
+        let prev = std::env::var("ZYTUNES_CACHE_DIR").ok();
+        std::env::set_var("ZYTUNES_CACHE_DIR", "/tmp/zytunes-should-be-ignored");
+
+        let got = cache_dir().expect("HOME is set");
+        assert_eq!(
+            got,
+            Path::new(&home).join(".cache").join("zytunes"),
+            "dirlib cache must stay under $HOME/.cache/zytunes, not follow ZYTUNES_CACHE_DIR"
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("ZYTUNES_CACHE_DIR", v),
+            None => std::env::remove_var("ZYTUNES_CACHE_DIR"),
+        }
+    }
 
     #[test]
     fn dirlib_cache_name_is_per_path() {
