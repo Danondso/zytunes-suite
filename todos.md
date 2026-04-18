@@ -76,6 +76,16 @@ wedges macOS already does.
 
 ## UX follow-ups
 
+### Dedupe-on-sync prompt
+After a sync completes (or on demand from the Device panel), detect duplicate
+tracks already on the device — same `(artist, album, track_name)` appearing
+under more than one `object_id`. Open a modal with a scrollable list of
+duplicate groups (one entry per group, expandable to show all copies with
+their object IDs and sizes) and let the user select which copies to remove.
+Reuse the existing bulk-remove path (`BgCommand::RemoveFromDevice`) so storage
+refresh and index updates fall out for free. Decide up front whether to keep
+the oldest vs. newest object ID by default.
+
 ### TUI contrast audit
 - Zune Original theme: the brown `main_bg` makes the existing border color
   nearly unreadable. Pick a lighter tint or switch to an accent-coloured

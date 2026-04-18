@@ -302,6 +302,13 @@ impl DeviceState {
             return;
         }
         let (artist, album, display_name) = parse_device_track_parts(&entry.name);
+        let device_path = format!("/Music/{}", entry.name);
+
+        if let Some(existing) = self.album_tracks.get(&(artist.clone(), album.clone())) {
+            if existing.iter().any(|t| t.device_path == device_path) {
+                return;
+            }
+        }
 
         if let Err(pos) = self.artists.binary_search(&artist) {
             self.artists.insert(pos, artist.clone());
@@ -317,7 +324,7 @@ impl DeviceState {
             .or_default()
             .push(DeviceTrackInfo {
                 name: display_name.clone(),
-                device_path: format!("/Music/{}", entry.name),
+                device_path,
                 size: entry.size,
                 object_id: entry.object_id,
                 artist: artist.clone(),
@@ -1556,12 +1563,27 @@ impl App {
             return;
         }
         self.sync.log.clear();
-        let items: Vec<SyncItem> = self
+        let all_items: Vec<SyncItem> = self
             .sync
             .queue
             .iter()
             .flat_map(|q| q.tracks.clone())
             .collect();
+        let total_before = all_items.len();
+        let items: Vec<SyncItem> = all_items
+            .into_iter()
+            .filter(|it| !is_on_device(&it.artist, &it.name, &self.device))
+            .collect();
+        let skipped = total_before - items.len();
+        if skipped > 0 {
+            self.sync
+                .log
+                .push(format!("Skipping {skipped} track(s) already on device"));
+        }
+        if items.is_empty() {
+            self.set_toast("All queued tracks already on device".into(), false);
+            return;
+        }
         let _ = cmd_tx.send(BgCommand::ExecuteSyncQueue(items));
     }
 
@@ -2302,6 +2324,78 @@ mod tests {
     }
 
     #[test]
+    fn execute_sync_filters_tracks_already_on_device() {
+        let mut app = App::new();
+        app.device.status = DeviceStatus::Connected;
+        // Populate device track_set with one track.
+        app.device.track_set.insert((
+            normalize_for_match("Queen"),
+            normalize_for_match("Bohemian Rhapsody"),
+        ));
+        app.sync.queue.push(QueuedItem {
+            label: "test".into(),
+            tracks: vec![
+                SyncItem {
+                    artist: "Queen".into(),
+                    album: "A Night at the Opera".into(),
+                    name: "Bohemian Rhapsody".into(),
+                    location: "/music/queen/bohemian.mp3".into(),
+                },
+                SyncItem {
+                    artist: "Queen".into(),
+                    album: "A Night at the Opera".into(),
+                    name: "Love of My Life".into(),
+                    location: "/music/queen/love.mp3".into(),
+                },
+            ],
+        });
+
+        let (tx, rx) = mpsc::channel();
+        app.execute_sync(&tx);
+
+        // Only the non-duplicate should be sent.
+        match rx.try_recv() {
+            Ok(BgCommand::ExecuteSyncQueue(items)) => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].name, "Love of My Life");
+            }
+            Ok(_) => panic!("expected ExecuteSyncQueue"),
+            Err(_) => panic!("no command dispatched"),
+        }
+        // Log should mention the skip.
+        assert!(app.sync.log.iter().any(|m| m.contains("Skipping 1")));
+    }
+
+    #[test]
+    fn execute_sync_all_on_device_shows_toast_and_sends_nothing() {
+        let mut app = App::new();
+        app.device.status = DeviceStatus::Connected;
+        app.device.track_set.insert((
+            normalize_for_match("Queen"),
+            normalize_for_match("Bohemian Rhapsody"),
+        ));
+        app.sync.queue.push(QueuedItem {
+            label: "test".into(),
+            tracks: vec![SyncItem {
+                artist: "Queen".into(),
+                album: "A Night at the Opera".into(),
+                name: "Bohemian Rhapsody".into(),
+                location: "/music/queen/bohemian.mp3".into(),
+            }],
+        });
+
+        let (tx, rx) = mpsc::channel();
+        app.execute_sync(&tx);
+
+        // Nothing dispatched.
+        assert!(rx.try_recv().is_err());
+        // Toast explains why.
+        let toast = app.toast_message.as_ref().expect("toast should be set");
+        assert!(toast.0.contains("already on device"));
+        assert!(!toast.2, "toast should be informational, not error");
+    }
+
+    #[test]
     fn move_up_down_bounds() {
         let mut app = App::new();
         app.sidebar_items = vec!["A".into(), "B".into(), "C".into()];
@@ -2512,6 +2606,33 @@ mod tests {
             device.albums.get("Artist").unwrap(),
             &vec!["Alpha".to_string(), "Zed".to_string()]
         );
+    }
+
+    #[test]
+    fn add_indexed_track_is_idempotent_on_same_path() {
+        let mut device = DeviceState::new();
+        let entry = make_device_entry("Artist/Album/song.mp3", 100);
+        device.add_indexed_track(&entry);
+        device.add_indexed_track(&entry);
+
+        assert_eq!(device.artists, vec!["Artist".to_string()]);
+        assert_eq!(
+            device.albums.get("Artist").unwrap(),
+            &vec!["Album".to_string()]
+        );
+        let tracks = device
+            .album_tracks
+            .get(&("Artist".into(), "Album".into()))
+            .unwrap();
+        assert_eq!(tracks.len(), 1);
+        let artist_key = normalize_for_match("Artist");
+        let names = device.artist_track_names.get(&artist_key).unwrap();
+        assert_eq!(names.len(), 1);
+        // A single remove should fully clear the index — no duplicate ghost
+        // entries left behind.
+        assert!(device.remove_indexed_track("Artist/Album/song.mp3"));
+        assert!(device.artists.is_empty());
+        assert!(device.album_tracks.is_empty());
     }
 
     #[test]
