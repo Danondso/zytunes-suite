@@ -172,7 +172,7 @@ pub struct TrackCache {
 
 impl TrackCache {
     fn new(serial: Option<String>) -> Self {
-        let cache_dir = std::env::var("HOME").ok().map(PathBuf::from);
+        let cache_dir = crate::paths::device_cache_base();
         TrackCache { serial, cache_dir }
     }
 
@@ -1274,12 +1274,12 @@ impl NativeSession {
     /// Path for the sync progress cache file.
     /// Path for the device library cache file.
     fn library_cache_path(&self) -> Option<PathBuf> {
-        let home = std::env::var("HOME").ok()?;
+        let base = crate::paths::device_cache_base()?;
         let filename = match &self.sync_cache_serial {
             Some(s) => format!(".zytunes-library-cache-{s}"),
             None => ".zytunes-library-cache".to_string(),
         };
-        Some(PathBuf::from(home).join(filename))
+        Some(base.join(filename))
     }
 
     /// Save the device library state to disk.
@@ -1306,12 +1306,12 @@ impl NativeSession {
     }
 
     fn sync_cache_path(&self) -> Option<PathBuf> {
-        let home = std::env::var("HOME").ok()?;
+        let base = crate::paths::device_cache_base()?;
         let filename = match &self.sync_cache_serial {
             Some(s) => format!(".zytunes-sync-progress-{s}"),
             None => ".zytunes-sync-progress".to_string(),
         };
-        Some(PathBuf::from(home).join(filename))
+        Some(base.join(filename))
     }
 
     /// Restore cached sync progress to the device.

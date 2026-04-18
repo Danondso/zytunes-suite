@@ -3,6 +3,7 @@ pub mod device;
 pub mod dirlib;
 pub mod library;
 pub mod mtp;
+pub mod paths;
 
 use device::{
     DetectedDevice, DeviceBackend, DeviceCapabilities, DeviceFamily, IpodBackend, ZuneBackend,

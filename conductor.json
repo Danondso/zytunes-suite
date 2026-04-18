@@ -1,8 +1,8 @@
 {
     "scripts": {
-        "setup": "cargo build",
-        "run": "cargo test",
-        "archive": "cargo clean"
+        "setup": "cargo fetch && cargo build",
+        "run": "cargo clippy --all-targets --all-features -- -D warnings && cargo test"
     },
-    "runScriptMode": "nonconcurrent"
+    "runScriptMode": "nonconcurrent",
+    "enterpriseDataPrivacy": true
 }

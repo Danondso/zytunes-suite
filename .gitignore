@@ -1,6 +1,7 @@
 /target
 /aft/build
 /tools
+/.zytunes-cache
 
 # Claude Code (keep skills tracked, ignore local config/memory)
 .claude/*

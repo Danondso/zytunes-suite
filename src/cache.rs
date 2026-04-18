@@ -53,6 +53,9 @@ struct CachedLibrary {
 }
 
 fn cache_dir() -> Option<std::path::PathBuf> {
+    if let Some(dir) = crate::paths::override_cache_dir() {
+        return Some(dir);
+    }
     let home = std::env::var("HOME").ok()?;
     Some(Path::new(&home).join(".cache").join("zytunes"))
 }
