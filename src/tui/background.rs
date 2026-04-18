@@ -1,6 +1,24 @@
 use std::sync::mpsc;
 use std::thread;
 
+/// True when `err` indicates the MTP session is effectively dead and no
+/// further bulk ops on this session will succeed — only a physical replug
+/// recovers. Observed cascade modes:
+///   - `0xe00002c0` (kIOReturnNoDevice): interface invalidated.
+///   - `0xe00002ed` (kIOReturnNotResponding): device stopped answering.
+///   - `"retry after ClearPipeStall"`: our transport tried to clear the
+///     stall and re-issue the op, and the retry itself failed. That means
+///     the pipe reset didn't recover the session.
+///   - `"ReadPipe timed out"`: a command's response never came. Once we've
+///     written a command and the device doesn't answer within its timeout,
+///     subsequent writes reliably cascade into pipe errors.
+fn is_device_gone(err: &str) -> bool {
+    err.contains("0xe00002c0")
+        || err.contains("0xe00002ed")
+        || err.contains("retry after ClearPipeStall")
+        || err.contains("ReadPipe timed out")
+}
+
 use zytunes::device::{
     DeviceBackend, DeviceCapabilities, DeviceFamily, IpodBackend, ZuneBackend, ZuneDeviceData,
 };
@@ -413,6 +431,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                         let total = items.len();
                         let mut success = 0usize;
                         let mut failed = 0usize;
+                        let mut session_dead = false;
 
                         let _ = event_tx.send(BgEvent::SyncMessage(format!(
                             "Removing {} tracks from device...",
@@ -456,6 +475,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                 }
                                 Err(e) => {
                                     failed += 1;
+                                    let gone = is_device_gone(&e);
                                     let _ = event_tx.send(BgEvent::SyncMessage(format!(
                                         "[{}/{}] Failed to remove \"{}\": {}",
                                         i + 1,
@@ -463,6 +483,15 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                         name,
                                         e
                                     )));
+                                    if gone {
+                                        session_dead = true;
+                                        let remaining = total - (i + 1);
+                                        let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                                            "Device disconnected — aborting removal ({} track(s) skipped). Replug and reconnect.",
+                                            remaining
+                                        )));
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -472,8 +501,10 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                             success, failed
                         )));
 
-                        // Clean up empty artist/album folders.
-                        if success > 0 {
+                        // Clean up empty artist/album folders. Skip when the
+                        // session is dead — the folder walk would just fail
+                        // and log another `NoDevice` error.
+                        if success > 0 && !session_dead {
                             match s.cleanup_empty_folders() {
                                 Ok(n) if n > 0 => {
                                     let _ = event_tx.send(BgEvent::SyncMessage(format!(
@@ -485,20 +516,30 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                             }
                         }
 
-                        // Update storage after removal.
-                        if let Ok((tot, free)) = s.get_storage_info() {
-                            let used = tot.saturating_sub(free);
-                            let pct = if tot > 0 { (used * 100 / tot) as u8 } else { 0 };
-                            let _ = event_tx.send(BgEvent::StorageUpdated(StorageInfo {
-                                total_bytes: tot,
-                                free_bytes: free,
-                                used_bytes: used,
-                                used_percent: pct,
-                            }));
-                            s.refresh_storage_cache(free);
+                        // Update storage after removal (same reason to skip
+                        // on a dead session).
+                        if !session_dead {
+                            if let Ok((tot, free)) = s.get_storage_info() {
+                                let used = tot.saturating_sub(free);
+                                let pct = if tot > 0 { (used * 100 / tot) as u8 } else { 0 };
+                                let _ = event_tx.send(BgEvent::StorageUpdated(StorageInfo {
+                                    total_bytes: tot,
+                                    free_bytes: free,
+                                    used_bytes: used,
+                                    used_percent: pct,
+                                }));
+                                s.refresh_storage_cache(free);
+                            }
                         }
 
                         let _ = event_tx.send(BgEvent::RemoveComplete { success, failed });
+
+                        if session_dead {
+                            session = None;
+                            let _ = event_tx.send(BgEvent::SessionFailed(
+                                "Device disconnected from USB".into(),
+                            ));
+                        }
                     } else {
                         let _ = event_tx.send(BgEvent::Error("No active session".into()));
                     }
@@ -750,6 +791,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                         let mut success = 0usize;
                         let mut failed = 0usize;
                         let mut cancelled = false;
+                        let mut session_dead = false;
 
                         let temp_dir = make_transcode_temp_dir();
                         let _ = std::fs::create_dir_all(&temp_dir);
@@ -882,6 +924,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                 }
                                 Err(e) => {
                                     failed += 1;
+                                    let gone = is_device_gone(&e);
                                     let _ = event_tx
                                         .send(BgEvent::SyncMessage(format!("  FAILED: {}", e)));
                                     let _ = event_tx.send(BgEvent::SyncTrackDone {
@@ -889,6 +932,15 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                         success: false,
                                         error: Some(e),
                                     });
+                                    if gone {
+                                        session_dead = true;
+                                        let remaining = sync_queue.len();
+                                        let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                                            "Device disconnected — aborting sync ({} track(s) skipped). Replug and reconnect.",
+                                            remaining
+                                        )));
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -912,6 +964,18 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                             success, failed
                         )));
                         let _ = event_tx.send(BgEvent::SyncComplete { success, failed });
+
+                        if session_dead {
+                            // Drop the now-useless session so subsequent commands
+                            // don't try to issue IOKit calls against a torn-down
+                            // interface. The TUI flips to Disconnected via
+                            // SessionFailed so the user gets a clear signal to
+                            // replug and reconnect.
+                            session = None;
+                            let _ = event_tx.send(BgEvent::SessionFailed(
+                                "Device disconnected from USB".into(),
+                            ));
+                        }
                     } else {
                         let _ = event_tx.send(BgEvent::Error("No active session".into()));
                     }
@@ -1002,6 +1066,38 @@ fn parse_storage_line(line: &str) -> Option<StorageInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_device_gone_matches_real_error_string() {
+        // Shape of real error strings observed in the cascade-to-death logs.
+        assert!(is_device_gone(
+            "USB error: WritePipe failed: 0xe00002c0 (retry after ClearPipeStall: 0xe00002c0)"
+        ));
+        assert!(is_device_gone(
+            "USB error: ReadPipe failed: 0xe00002c0 (retry after ClearPipeStall: 0xe00002c0)"
+        ));
+        // NotResponding: device stopped answering (observed after an art timeout).
+        assert!(is_device_gone("USB error: WritePipe failed: 0xe00002ed"));
+        // Retry-after-stall failed: the suffix alone means recovery failed.
+        assert!(is_device_gone(
+            "USB error: WritePipe failed: 0xe000404f (retry after ClearPipeStall: 0xe00002ed)"
+        ));
+        // Read timeout: once a command is in-flight and the response never
+        // comes, subsequent writes cascade.
+        assert!(is_device_gone("USB error: ReadPipe timed out (30s)"));
+        assert!(is_device_gone("USB error: ReadPipe timed out (90s)"));
+    }
+
+    #[test]
+    fn is_device_gone_ignores_other_usb_errors() {
+        // Transient or unrelated errors must NOT trip the bailout.
+        // A bare pipe error (no retry suffix) may still recover via our
+        // single-shot ClearPipeStall retry — only mark the session dead
+        // once the retry itself has been reported as failed.
+        assert!(!is_device_gone("USB error: WritePipe failed: 0xe000404f"));
+        assert!(!is_device_gone("MTP protocol error: bad response"));
+        assert!(!is_device_gone("IO error: file not found"));
+    }
 
     #[test]
     fn parse_storage_line_valid() {
