@@ -391,6 +391,10 @@ pub struct App {
     album_art_size: (u16, u16),
     /// Renderer style for album art: halfblock (Unicode half-block) or ascii (character ramp).
     pub album_art_style: AlbumArtStyle,
+    /// User preference for the now-playing panel. `None` means "auto" (show
+    /// whenever there's a track and the terminal is tall enough); `Some(false)`
+    /// force-hides the panel regardless. Persisted to `config.toml`.
+    pub show_player: Option<bool>,
     /// Background commands to send after event handling (main loop flushes these).
     pub pending_bg_commands: Vec<BgCommand>,
 }
@@ -473,7 +477,47 @@ impl App {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(AlbumArtStyle::Halfblock)
             },
+            show_player: crate::config::load().show_player,
             pending_bg_commands: Vec::new(),
+        }
+    }
+
+    /// Cycle through the three player-panel preferences:
+    /// `None` (auto) → `Some(false)` (force hide) → `Some(true)` (force show) → `None`.
+    /// Returns a user-facing label describing the new state. Persists the
+    /// choice to `config.toml`.
+    pub fn cycle_show_player(&mut self) -> &'static str {
+        let label = self.cycle_show_player_in_memory();
+        let pref = self.show_player;
+        crate::config::update(|c| c.show_player = pref);
+        label
+    }
+
+    /// In-memory half of [`cycle_show_player`]: advances the preference and
+    /// returns the label, without touching the on-disk config. Split out for
+    /// unit tests.
+    fn cycle_show_player_in_memory(&mut self) -> &'static str {
+        let (next, label) = match self.show_player {
+            None => (Some(false), "Player: hidden"),
+            Some(false) => (Some(true), "Player: always on"),
+            Some(true) => (None, "Player: auto"),
+        };
+        self.show_player = next;
+        label
+    }
+
+    /// Whether the now-playing panel should render at `height`, given the
+    /// user's preference and current playback state. This is the single
+    /// source of truth consumed by both `LayoutMetrics` and the pre-render
+    /// album-art pass.
+    pub fn should_show_player(&self, height: u16) -> bool {
+        if self.now_playing.is_none() {
+            return false;
+        }
+        match self.show_player {
+            Some(true) => true,
+            Some(false) => false,
+            None => height >= 20,
         }
     }
 
@@ -3106,5 +3150,84 @@ mod tests {
                 assert!(ramp.contains(&(ch as u8)), "unexpected glyph {:?}", ch);
             }
         }
+    }
+
+    #[test]
+    fn should_show_player_respects_playback_state() {
+        let mut app = App::new();
+        app.show_player = None;
+        // No now_playing — panel stays hidden regardless of pref or height.
+        assert!(!app.should_show_player(100));
+        app.show_player = Some(true);
+        assert!(!app.should_show_player(100));
+    }
+
+    #[test]
+    fn should_show_player_auto_uses_height_floor() {
+        let mut app = App::new();
+        app.now_playing = Some(NowPlaying {
+            track_name: "t".into(),
+            artist: "a".into(),
+            album: "al".into(),
+            duration_ms: 0,
+            elapsed_ms: 0,
+            state: PlaybackState::Playing,
+            track_index: 0,
+            playlist: Vec::new(),
+            paused_frame: None,
+        });
+        app.show_player = None;
+        assert!(!app.should_show_player(19));
+        assert!(app.should_show_player(20));
+    }
+
+    #[test]
+    fn should_show_player_force_hide_always_wins() {
+        let mut app = App::new();
+        app.now_playing = Some(NowPlaying {
+            track_name: "t".into(),
+            artist: "a".into(),
+            album: "al".into(),
+            duration_ms: 0,
+            elapsed_ms: 0,
+            state: PlaybackState::Playing,
+            track_index: 0,
+            playlist: Vec::new(),
+            paused_frame: None,
+        });
+        app.show_player = Some(false);
+        assert!(!app.should_show_player(100));
+    }
+
+    #[test]
+    fn should_show_player_force_show_ignores_height() {
+        // Force-show lets users see the panel on short terminals where auto
+        // would hide it. LayoutMetrics enforces the absolute floor.
+        let mut app = App::new();
+        app.now_playing = Some(NowPlaying {
+            track_name: "t".into(),
+            artist: "a".into(),
+            album: "al".into(),
+            duration_ms: 0,
+            elapsed_ms: 0,
+            state: PlaybackState::Playing,
+            track_index: 0,
+            playlist: Vec::new(),
+            paused_frame: None,
+        });
+        app.show_player = Some(true);
+        assert!(app.should_show_player(12));
+    }
+
+    #[test]
+    fn cycle_show_player_in_memory_rotates() {
+        let mut app = App::new();
+        app.show_player = None;
+        assert_eq!(app.cycle_show_player_in_memory(), "Player: hidden");
+        assert_eq!(app.show_player, Some(false));
+        assert_eq!(app.cycle_show_player_in_memory(), "Player: always on");
+        assert_eq!(app.show_player, Some(true));
+        assert_eq!(app.cycle_show_player_in_memory(), "Player: auto");
+        assert_eq!(app.show_player, None);
     }
 }

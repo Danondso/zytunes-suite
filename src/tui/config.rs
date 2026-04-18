@@ -8,6 +8,10 @@ pub struct Config {
     pub photo_dir: Option<String>,
     pub video_dir: Option<String>,
     pub album_art_style: Option<String>,
+    /// User preference for the now-playing panel. `None` means "auto" (show
+    /// when there's a track and the terminal is tall enough). `Some(false)`
+    /// force-hides the panel even when playback is active.
+    pub show_player: Option<bool>,
 }
 
 fn config_dir() -> Option<PathBuf> {
@@ -76,6 +80,20 @@ music_dir = "/home/user/Music"
         assert!(config.photo_dir.is_none());
         assert!(config.video_dir.is_none());
         assert!(config.album_art_style.is_none());
+        assert!(config.show_player.is_none());
+    }
+
+    #[test]
+    fn config_round_trip_show_player() {
+        for pref in [Some(true), Some(false), None] {
+            let config = Config {
+                show_player: pref,
+                ..Config::default()
+            };
+            let serialized = toml::to_string_pretty(&config).unwrap();
+            let deserialized: Config = toml::from_str(&serialized).unwrap();
+            assert_eq!(deserialized.show_player, pref);
+        }
     }
 
     #[test]
@@ -86,12 +104,14 @@ music_dir = "/home/user/Music"
             photo_dir: Some("/photos".into()),
             video_dir: Some("/videos".into()),
             album_art_style: Some("ascii".into()),
+            show_player: Some(true),
         };
         let serialized = toml::to_string_pretty(&config).unwrap();
         let deserialized: Config = toml::from_str(&serialized).unwrap();
         assert_eq!(deserialized.photo_dir.as_deref(), Some("/photos"));
         assert_eq!(deserialized.video_dir.as_deref(), Some("/videos"));
         assert_eq!(deserialized.album_art_style.as_deref(), Some("ascii"));
+        assert_eq!(deserialized.show_player, Some(true));
     }
 
     #[test]
@@ -102,6 +122,7 @@ music_dir = "/home/user/Music"
         assert!(config.photo_dir.is_none());
         assert!(config.video_dir.is_none());
         assert!(config.album_art_style.is_none());
+        assert!(config.show_player.is_none());
     }
 
     #[test]

@@ -105,8 +105,7 @@ fn run_loop(
             let right_w = middle_w.saturating_sub(sidebar_w + album_w + 2);
             // Available height below tracks: total browser height minus
             // a minimum of 4 rows for the track list, borders, footer, player.
-            let has_player = app.now_playing.is_some();
-            let show_player = has_player && ui::LayoutMetrics::show_now_playing(size.height);
+            let show_player = app.should_show_player(size.height);
             let overhead = 2 + 3 + if show_player { 9 } else { 0 }; // borders + footer + player
             let browser_h = size.height.saturating_sub(overhead as u16);
             let track_min = 4u16.min(app.track_list.len() as u16);
@@ -285,6 +284,10 @@ fn run_loop(
                     KeyCode::Char('T') => {
                         app.toggle_album_art_style();
                     }
+                    KeyCode::Char('P') => {
+                        let label = app.cycle_show_player();
+                        app.set_toast(label.to_string(), false);
+                    }
                     KeyCode::Char('v') => {
                         if app.browse_mode == BrowseMode::Device
                             || app.device.status == DeviceStatus::Connected
@@ -392,7 +395,14 @@ fn run_loop(
                         let content = app.sync.log.join("\n");
                         match std::fs::write(&path, &content) {
                             Ok(_) => {
-                                app.set_toast(format!("Log dumped to {}", path.display()), false)
+                                let path_str = path.display().to_string();
+                                let toast = match copy_to_clipboard(&path_str) {
+                                    Ok(()) => format!("Log dumped to {} (path copied)", path_str),
+                                    Err(e) => {
+                                        format!("Log dumped to {} (clipboard: {})", path_str, e)
+                                    }
+                                };
+                                app.set_toast(toast, false);
                             }
                             Err(e) => app.set_toast(format!("Log dump failed: {}", e), true),
                         }
@@ -471,6 +481,13 @@ fn run_loop(
     }
 
     Ok(())
+}
+
+/// Copy `text` to the system clipboard. Returns an error message on failure
+/// (headless session, missing DISPLAY, etc.) so the caller can surface it.
+fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    let mut clip = arboard::Clipboard::new().map_err(|e| e.to_string())?;
+    clip.set_text(text).map_err(|e| e.to_string())
 }
 
 fn confirm_device_removal(app: &mut App, cmd_tx: &mpsc::Sender<BgCommand>) {
