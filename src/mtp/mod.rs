@@ -29,6 +29,13 @@ pub trait DeviceSession {
     /// Save the device's sync progress to a local cache file.
     /// Called after a successful sync session. Default is a no-op.
     fn save_sync_progress(&mut self) {}
+    /// Pre-warm any internal write-side state (e.g. mapping artist/album folder
+    /// handles) so the first `import_track` call doesn't pay a one-time setup
+    /// cost. Called once during connect. Default is a no-op for backends that
+    /// don't need a separate library scan.
+    fn prewarm_library(&mut self) -> Result<(), String> {
+        Ok(())
+    }
     /// Import a photo to the device. Takes filename and pre-resized JPEG bytes.
     /// Returns the new MTP object ID.
     fn import_photo(&mut self, _filename: &str, _jpeg_data: &[u8]) -> Result<u64, String> {

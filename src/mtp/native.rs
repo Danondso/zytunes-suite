@@ -1188,6 +1188,10 @@ impl DeviceSession for NativeSession {
         self.session.get_storage_info(self.storage_id).mtp_err()
     }
 
+    fn prewarm_library(&mut self) -> Result<(), String> {
+        self.ensure_library()
+    }
+
     fn save_sync_progress(&mut self) {
         let data = match self.session.get_sync_progress() {
             Ok(d) => d,

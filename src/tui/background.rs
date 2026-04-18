@@ -354,6 +354,15 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                         let _ = event_tx.send(BgEvent::Error(e));
                                     }
                                 }
+
+                                // Pre-warm the write-side library mapping so the first
+                                // sync doesn't pause to scan existing artist/album folders.
+                                if let Err(e) = s.prewarm_library() {
+                                    let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                                        "Library pre-warm skipped: {}",
+                                        e
+                                    )));
+                                }
                             }
                         }
                         Err(e) => {
