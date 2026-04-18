@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 #[derive(Serialize, Deserialize, Default)]
@@ -12,6 +13,40 @@ pub struct Config {
     /// when there's a track and the terminal is tall enough). `Some(false)`
     /// force-hides the panel even when playback is active.
     pub show_player: Option<bool>,
+    /// User-defined custom themes keyed by theme name. Each entry inherits
+    /// missing fields from its `base` (or `iTunes 2004` when unset) and merges
+    /// into the theme picker alongside the built-ins.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub themes: BTreeMap<String, UserTheme>,
+}
+
+/// Configurable overrides for a custom theme. All fields are optional and
+/// fall back to the named `base` theme's value when absent.
+#[derive(Serialize, Deserialize, Default, Clone, Debug)]
+pub struct UserTheme {
+    pub base: Option<String>,
+    pub sidebar_bg: Option<String>,
+    pub sidebar_text: Option<String>,
+    pub selection_bg: Option<String>,
+    pub selection_text: Option<String>,
+    pub main_bg: Option<String>,
+    pub alt_row_bg: Option<String>,
+    pub border: Option<String>,
+    pub footer_bg: Option<String>,
+    pub footer_text: Option<String>,
+    pub header_text: Option<String>,
+    pub dim_text: Option<String>,
+    pub error_text: Option<String>,
+    pub success_text: Option<String>,
+    pub progress_bar: Option<String>,
+    pub progress_bg: Option<String>,
+    pub accent_secondary: Option<String>,
+    pub border_type: Option<String>,
+    pub header_modifier: Option<String>,
+    pub sidebar_modifier: Option<String>,
+    pub dim_modifier: Option<String>,
+    pub footer_modifier: Option<String>,
+    pub accent_anim: Option<String>,
 }
 
 fn config_dir() -> Option<PathBuf> {
@@ -105,6 +140,7 @@ music_dir = "/home/user/Music"
             video_dir: Some("/videos".into()),
             album_art_style: Some("ascii".into()),
             show_player: Some(true),
+            themes: BTreeMap::new(),
         };
         let serialized = toml::to_string_pretty(&config).unwrap();
         let deserialized: Config = toml::from_str(&serialized).unwrap();
@@ -123,6 +159,36 @@ music_dir = "/home/user/Music"
         assert!(config.video_dir.is_none());
         assert!(config.album_art_style.is_none());
         assert!(config.show_player.is_none());
+        assert!(config.themes.is_empty());
+    }
+
+    #[test]
+    fn config_parses_user_themes_table() {
+        let toml_str = r##"
+theme = "My Custom"
+
+[themes."My Custom"]
+base = "Gruvbox Dark"
+selection_bg = "#ff00aa"
+progress_bar = "#00ffaa"
+accent_anim = "pulse"
+"##;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let ut = config.themes.get("My Custom").expect("theme present");
+        assert_eq!(ut.base.as_deref(), Some("Gruvbox Dark"));
+        assert_eq!(ut.selection_bg.as_deref(), Some("#ff00aa"));
+        assert_eq!(ut.progress_bar.as_deref(), Some("#00ffaa"));
+        assert_eq!(ut.accent_anim.as_deref(), Some("pulse"));
+    }
+
+    #[test]
+    fn empty_themes_table_is_not_serialized() {
+        let config = Config::default();
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        assert!(
+            !serialized.contains("[themes"),
+            "empty themes table should be omitted; got:\n{serialized}"
+        );
     }
 
     #[test]

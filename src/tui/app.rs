@@ -10,7 +10,7 @@ use zytunes::mtp::parse::DeviceEntry;
 
 use crate::audio::{AudioCommand, AudioEvent};
 use crate::background::{BgCommand, BgEvent, StorageInfo, SyncItem};
-use crate::theme::{Theme, THEMES};
+use crate::theme::{all_themes, Theme};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Panel {
@@ -460,10 +460,10 @@ impl App {
             scan_phrase: None,
             scan_phrase_rotated_at: None,
             scan_samples: Vec::new(),
-            theme: &THEMES[0],
+            theme: all_themes()[0],
             show_theme_picker: false,
             theme_picker_index: 0,
-            theme_before_picker: &THEMES[0],
+            theme_before_picker: all_themes()[0],
             artist_device_status: BTreeMap::new(),
             album_device_status: BTreeMap::new(),
             album_art: None,
@@ -552,10 +552,11 @@ impl App {
     }
 
     pub fn theme_picker_move(&mut self, delta: isize) {
-        let len = THEMES.len();
+        let themes = all_themes();
+        let len = themes.len();
         self.theme_picker_index =
             (self.theme_picker_index as isize + delta).rem_euclid(len as isize) as usize;
-        self.theme = &THEMES[self.theme_picker_index];
+        self.theme = themes[self.theme_picker_index];
     }
 
     pub fn theme_picker_confirm(&mut self) {

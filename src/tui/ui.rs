@@ -1964,7 +1964,8 @@ fn draw_help_overlay(f: &mut Frame, app: &App) {
 fn draw_theme_picker(f: &mut Frame, app: &App) {
     let t = app.theme();
     let area = f.area();
-    let theme_count = theme::THEMES.len();
+    let themes = theme::all_themes();
+    let theme_count = themes.len();
     let width = 30u16.min(area.width.saturating_sub(4));
     let height = (theme_count as u16 + 2).min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(width)) / 2;
@@ -1982,7 +1983,7 @@ fn draw_theme_picker(f: &mut Frame, app: &App) {
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
-    let items: Vec<ListItem> = theme::THEMES
+    let items: Vec<ListItem> = themes
         .iter()
         .enumerate()
         .map(|(i, theme_entry)| {
