@@ -8,6 +8,17 @@ use crate::MtpError;
 use std::ffi::CString;
 use std::os::raw::c_void;
 
+/// True when `kr` is an IOKit system error (top 16 bits `0xe000`) that's
+/// worth attempting `ClearPipeStall` recovery against — pipe stalls
+/// (`0xe0004xxx`, `sub_iokit_usb`) and transient conditions like
+/// `kIOReturnNotResponding` / `kIOReturnAborted` (`0xe00002xx`,
+/// `sub_iokit_common`) that commonly wedge the bulk pipes and are typically
+/// clearable. Truly unrecoverable errors (device detached, permission denied)
+/// still fail on retry and get reported with both kr codes in the message.
+fn is_recoverable_iokit_error(kr: IOReturn) -> bool {
+    (kr as u32) & 0xffff_0000 == 0xe000_0000
+}
+
 /// USB transport using macOS IOKit for bulk I/O.
 pub struct IokitTransport {
     device: *mut *mut IOUSBDeviceInterface,
@@ -355,10 +366,29 @@ impl IokitTransport {
                     chunk.as_ptr() as *const c_void,
                     chunk.len() as UInt32,
                 );
-                if kr != kIOReturnSuccess {
-                    return Err(MtpError::Usb(format!("WritePipe failed: 0x{kr:08x}")));
+                if kr == kIOReturnSuccess {
+                    return Ok(chunk.len());
                 }
-                Ok(chunk.len())
+                if is_recoverable_iokit_error(kr) {
+                    // Clear any host-side stall (prior ReadPipe timeouts, cable
+                    // jostles, or Zune firmware hiccups can leave the OUT pipe
+                    // wedged — every subsequent write then fails with the same
+                    // error until the user physically replugs). Retry once.
+                    let _ = ((**self.interface).ClearPipeStall)(self.interface, self.pipe_out);
+                    let kr2 = ((**self.interface).WritePipe)(
+                        self.interface,
+                        self.pipe_out,
+                        chunk.as_ptr() as *const c_void,
+                        chunk.len() as UInt32,
+                    );
+                    if kr2 == kIOReturnSuccess {
+                        return Ok(chunk.len());
+                    }
+                    return Err(MtpError::Usb(format!(
+                        "WritePipe failed: 0x{kr:08x} (retry after ClearPipeStall: 0x{kr2:08x})"
+                    )));
+                }
+                Err(MtpError::Usb(format!("WritePipe failed: 0x{kr:08x}")))
             }
         })
     }
@@ -374,10 +404,26 @@ impl IokitTransport {
                 buf.as_mut_ptr() as *mut c_void,
                 &mut size,
             );
-            if kr != kIOReturnSuccess {
-                return Err(MtpError::Usb(format!("ReadPipe failed: 0x{kr:08x}")));
+            if kr == kIOReturnSuccess {
+                return Ok(size as usize);
             }
-            Ok(size as usize)
+            if is_recoverable_iokit_error(kr) {
+                let _ = ((**self.interface).ClearPipeStall)(self.interface, self.pipe_in);
+                let mut size2 = buf.len() as UInt32;
+                let kr2 = ((**self.interface).ReadPipe)(
+                    self.interface,
+                    self.pipe_in,
+                    buf.as_mut_ptr() as *mut c_void,
+                    &mut size2,
+                );
+                if kr2 == kIOReturnSuccess {
+                    return Ok(size2 as usize);
+                }
+                return Err(MtpError::Usb(format!(
+                    "ReadPipe failed: 0x{kr:08x} (retry after ClearPipeStall: 0x{kr2:08x})"
+                )));
+            }
+            Err(MtpError::Usb(format!("ReadPipe failed: 0x{kr:08x}")))
         }
     }
 
@@ -420,9 +466,15 @@ impl IokitTransport {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
         loop {
             if std::time::Instant::now() > deadline {
-                // Abort the pipe to unblock the read thread.
+                // Abort the pipe to unblock the read thread, then clear stalls
+                // on BOTH bulk pipes. If we only abort the IN pipe, the OUT
+                // pipe can remain out of sync with the device (it's still
+                // waiting to ACK data we gave up on), and every subsequent
+                // WritePipe call fails until the user physically replugs.
                 unsafe {
                     ((**self.interface).AbortPipe)(self.interface, self.pipe_in);
+                    ((**self.interface).ClearPipeStall)(self.interface, self.pipe_in);
+                    ((**self.interface).ClearPipeStall)(self.interface, self.pipe_out);
                 }
                 let _ = handle.join();
                 return Err(MtpError::Usb(format!(
@@ -448,7 +500,15 @@ impl IokitTransport {
 
     /// Read a full MTP container, reassembling multi-packet responses.
     pub fn read_container(&self) -> Result<Vec<u8>, MtpError> {
-        super::reassemble_container(|buf| self.read_with_timeout(buf, 30))
+        self.read_container_with_timeout(30)
+    }
+
+    /// Like `read_container` but with a caller-supplied timeout in seconds.
+    /// Used for operations that the Zune firmware handles slowly (e.g.
+    /// `SetObjectPropValue` writing album art to flash can take up to ~60s
+    /// under load; a 30s timeout there cascades into a wedged session).
+    pub fn read_container_with_timeout(&self, timeout_secs: u64) -> Result<Vec<u8>, MtpError> {
+        super::reassemble_container(|buf| self.read_with_timeout(buf, timeout_secs))
     }
 }
 
@@ -461,5 +521,30 @@ impl Drop for IokitTransport {
             ((**self.device).USBDeviceClose)(self.device);
             ((**self.device).Release)(self.device);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_recoverable_iokit_error_recognises_observed_codes() {
+        // USB subsystem error observed mid-sync (WritePipe failures after the
+        // OUT pipe stalled).
+        assert!(is_recoverable_iokit_error(0xe000404fu32 as IOReturn));
+        // Common IOKit error observed as the first failure (NotResponding).
+        assert!(is_recoverable_iokit_error(0xe00002edu32 as IOReturn));
+        // kIOUSBPipeStalled itself.
+        assert!(is_recoverable_iokit_error(kIOUSBPipeStalled));
+    }
+
+    #[test]
+    fn is_recoverable_iokit_error_rejects_non_iokit_codes() {
+        assert!(!is_recoverable_iokit_error(kIOReturnSuccess));
+        // Unrelated system namespace.
+        assert!(!is_recoverable_iokit_error(0x10000000));
+        // Arbitrary non-iokit negative value.
+        assert!(!is_recoverable_iokit_error(-1));
     }
 }

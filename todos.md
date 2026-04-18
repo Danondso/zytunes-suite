@@ -4,12 +4,18 @@ Follow-ups from the `/review`-style audit. Ordered roughly by impact.
 
 ## Structural
 
-### Device index full-rebuild on every delta
-`src/tui/app.rs:549-629`. `device_index_dirty` flag triggers a clear-and-resort
+### ~~Device index full-rebuild on every delta~~ (done)
+~~`src/tui/app.rs:549-629`. `device_index_dirty` flag triggers a clear-and-resort
 of `artists`, `albums`, `album_tracks`, `track_set` on any track addition —
 O(N²) during sync of many tracks. Incremental inserts into the BTreeMaps would
 keep it O(log N) per delta. Deduplicate in place; avoid the full resort of the
-artist list on each flush.
+artist list on each flush.~~
+
+Replaced with `DeviceState::add_indexed_track` / `remove_indexed_track`
+performing binary-search inserts and artist-scoped lookup-set rebuilds.
+`flush_device_index` now only triggers UI re-derivations
+(`rebuild_artist_device_status`, sidebar/retag). Initial load still uses
+`build_device_index` which drains `tracks` and replays via the incremental path.
 
 ### Sidebar stitches `"Artist — Album"` then splits it back
 `src/tui/app.rs:854-866` (and device branch 890-898). Builds
@@ -55,7 +61,30 @@ Delete or actually use. Each one is parsing + memory cost per track.
 - Or a custom `contains_ignore_case` that walks without allocating (awkward
   for non-ASCII, so the pre-compute is likely cleaner).
 
+## Linux transport parity
+
+### `LibusbTransport` has no stall recovery on write/read failures
+`zune-mtp/src/transport/libusb.rs`. The IOKit backend calls `ClearPipeStall`
+(with a one-shot retry) on recoverable USB errors from `WritePipe` / `ReadPipe`,
+and clears stalls on *both* bulk endpoints after a read timeout so the OUT
+pipe doesn't desync. The libusb backend does neither — a single transient
+stall (common during sync cascades, cable jostles, or Zune firmware hiccups)
+surfaces as a raw `rusb::Error` and the user has to replug. Add equivalent
+recovery via `DeviceHandle::clear_halt(endpoint)` on both bulk endpoints, with
+the same one-shot retry pattern, so Linux sync tolerates the same class of
+wedges macOS already does.
+
 ## UX follow-ups
+
+### Dedupe-on-sync prompt
+After a sync completes (or on demand from the Device panel), detect duplicate
+tracks already on the device — same `(artist, album, track_name)` appearing
+under more than one `object_id`. Open a modal with a scrollable list of
+duplicate groups (one entry per group, expandable to show all copies with
+their object IDs and sizes) and let the user select which copies to remove.
+Reuse the existing bulk-remove path (`BgCommand::RemoveFromDevice`) so storage
+refresh and index updates fall out for free. Decide up front whether to keep
+the oldest vs. newest object ID by default.
 
 ### TUI contrast audit
 - Zune Original theme: the brown `main_bg` makes the existing border color
