@@ -40,12 +40,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
+    // Load config first so user-defined themes are registered before the App
+    // samples the default theme.
+    let cfg = config::load();
+    theme::init_themes(&cfg.themes);
+
     // Create app state.
     let mut app = App::new();
     app.loading_library = true;
 
-    // Load config and apply theme.
-    let cfg = config::load();
     if let Some(ref theme_name) = cfg.theme {
         app.theme = theme::theme_by_name(theme_name);
     }

@@ -109,6 +109,7 @@ pub enum BgEvent {
     SyncComplete {
         success: usize,
         failed: usize,
+        skipped: usize,
     },
     RemoveProgress {
         current: usize,
@@ -959,11 +960,20 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                             }
                         }
 
+                        // Any items still in the queue were dropped by an
+                        // early exit (cancel or device-gone cascade) and
+                        // should be surfaced so the running tally matches
+                        // the user's mental model of the queue.
+                        let skipped = sync_queue.len();
                         let _ = event_tx.send(BgEvent::SyncMessage(format!(
-                            "Done: {} synced, {} failed",
-                            success, failed
+                            "Done: {} synced, {} skipped, {} failed",
+                            success, skipped, failed
                         )));
-                        let _ = event_tx.send(BgEvent::SyncComplete { success, failed });
+                        let _ = event_tx.send(BgEvent::SyncComplete {
+                            success,
+                            failed,
+                            skipped,
+                        });
 
                         if session_dead {
                             // Drop the now-useless session so subsequent commands

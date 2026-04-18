@@ -604,19 +604,221 @@ pub const ZUNE_ORIGINAL: Theme = Theme {
 };
 
 /// Look up a theme by name (case-insensitive). Falls back to the default theme
-/// (`THEMES[0]`) if no match is found.
+/// (`all_themes()[0]`) if no match is found. Searches the combined built-in +
+/// user-defined registry.
 pub fn theme_by_name(name: &str) -> &'static Theme {
-    THEMES
+    all_themes()
         .iter()
+        .copied()
         .find(|t| t.name.eq_ignore_ascii_case(name))
-        .unwrap_or(&THEMES[0])
+        .unwrap_or_else(|| all_themes()[0])
 }
 
-/// Position of `t` within `THEMES`, matched by name. Only called when opening
+/// Position of `t` within the combined theme list. Only called when opening
 /// the theme picker, so the linear scan cost is negligible. Pointer equality
 /// would be tempting but isn't reliable across uses of the `THEMES` const.
 pub fn theme_position(t: &Theme) -> usize {
-    THEMES.iter().position(|x| x.name == t.name).unwrap_or(0)
+    all_themes()
+        .iter()
+        .position(|x| x.name == t.name)
+        .unwrap_or(0)
+}
+
+// -- Combined registry: built-ins + user-defined themes from config --
+
+static ALL_THEMES: std::sync::OnceLock<Vec<&'static Theme>> = std::sync::OnceLock::new();
+static BUILTIN_REFS: std::sync::OnceLock<Vec<&'static Theme>> = std::sync::OnceLock::new();
+
+fn builtin_refs() -> &'static [&'static Theme] {
+    BUILTIN_REFS
+        .get_or_init(|| THEMES.iter().collect())
+        .as_slice()
+}
+
+/// Returns the combined theme list (built-ins + user-defined). Falls back to
+/// just the built-ins if [`init_themes`] has not been called (e.g. in unit
+/// tests that don't go through the TUI entry point).
+pub fn all_themes() -> &'static [&'static Theme] {
+    ALL_THEMES
+        .get()
+        .map(|v| v.as_slice())
+        .unwrap_or_else(builtin_refs)
+}
+
+/// Merge the user-defined `themes` from config into the global registry.
+/// Idempotent (subsequent calls are ignored). User themes whose `base` is
+/// missing, whose name collides with a built-in, or whose field strings fail
+/// to parse are logged to stderr and skipped.
+pub fn init_themes(user_themes: &std::collections::BTreeMap<String, crate::config::UserTheme>) {
+    if ALL_THEMES.get().is_some() {
+        return;
+    }
+    let mut combined: Vec<&'static Theme> = THEMES.iter().collect();
+    for (name, ut) in user_themes {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            eprintln!("zytunes: skipping user theme with empty name");
+            continue;
+        }
+        if THEMES.iter().any(|t| t.name.eq_ignore_ascii_case(trimmed)) {
+            eprintln!(
+                "zytunes: skipping user theme '{trimmed}' — name collides with a built-in theme"
+            );
+            continue;
+        }
+        match build_user_theme(trimmed, ut) {
+            Ok(t) => combined.push(Box::leak(Box::new(t))),
+            Err(e) => eprintln!("zytunes: skipping user theme '{trimmed}': {e}"),
+        }
+    }
+    let _ = ALL_THEMES.set(combined);
+}
+
+/// Parse a hex color string (`#rrggbb` or `#rgb`, case-insensitive). Returns
+/// `None` for any other format so callers can produce a pointed error message.
+pub fn parse_hex_color(s: &str) -> Option<Color> {
+    let hex = s.trim().strip_prefix('#')?;
+    match hex.len() {
+        6 => {
+            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+            Some(Color::Rgb(r, g, b))
+        }
+        3 => {
+            let mut bytes = [0u8; 3];
+            for (i, ch) in hex.chars().enumerate() {
+                let v = ch.to_digit(16)? as u8;
+                bytes[i] = (v << 4) | v;
+            }
+            Some(Color::Rgb(bytes[0], bytes[1], bytes[2]))
+        }
+        _ => None,
+    }
+}
+
+fn parse_color_opt(s: Option<&String>, fallback: Color, field: &str) -> Result<Color, String> {
+    match s {
+        Some(v) => parse_hex_color(v)
+            .ok_or_else(|| format!("invalid hex color for '{field}': {v:?} (expected #rrggbb)")),
+        None => Ok(fallback),
+    }
+}
+
+fn parse_border_type(s: Option<&String>, fallback: BorderType) -> Result<BorderType, String> {
+    let Some(v) = s else { return Ok(fallback) };
+    match v.trim().to_ascii_lowercase().as_str() {
+        "plain" => Ok(BorderType::Plain),
+        "rounded" => Ok(BorderType::Rounded),
+        "double" => Ok(BorderType::Double),
+        "thick" => Ok(BorderType::Thick),
+        "quadrantoutside" | "quadrant_outside" => Ok(BorderType::QuadrantOutside),
+        "quadrantinside" | "quadrant_inside" => Ok(BorderType::QuadrantInside),
+        _ => Err(format!(
+            "invalid border_type {v:?} (expected plain|rounded|double|thick|quadrantoutside|quadrantinside)"
+        )),
+    }
+}
+
+fn parse_modifier(s: Option<&String>, fallback: u16, field: &str) -> Result<u16, String> {
+    let Some(v) = s else { return Ok(fallback) };
+    let mut bits: u16 = 0;
+    for part in v.split(['+', '|', ',']) {
+        let part = part.trim();
+        if part.is_empty() || part.eq_ignore_ascii_case("none") {
+            continue;
+        }
+        match part.to_ascii_lowercase().as_str() {
+            "bold" => bits |= BOLD,
+            "dim" => bits |= DIM,
+            "italic" => bits |= ITALIC,
+            other => {
+                return Err(format!(
+                    "invalid {field} token {other:?} (expected bold|dim|italic|none)"
+                ))
+            }
+        }
+    }
+    Ok(bits)
+}
+
+fn parse_accent_anim(s: Option<&String>, fallback: AccentAnim) -> Result<AccentAnim, String> {
+    let Some(v) = s else { return Ok(fallback) };
+    match v.trim().to_ascii_lowercase().as_str() {
+        "none" => Ok(AccentAnim::None),
+        "pulse" => Ok(AccentAnim::Pulse),
+        "huecycle" | "hue_cycle" | "hue-cycle" => Ok(AccentAnim::HueCycle),
+        "colorshift" | "color_shift" | "color-shift" => Ok(AccentAnim::ColorShift),
+        _ => Err(format!(
+            "invalid accent_anim {v:?} (expected none|pulse|huecycle|colorshift)"
+        )),
+    }
+}
+
+/// Build a runtime `Theme` from a user config entry. Errors surface as human
+/// readable strings for the stderr log in [`init_themes`].
+///
+/// The resulting `Theme` leaks its `name` into `'static` storage; callers that
+/// keep the returned value alive beyond the process lifetime must account for
+/// that. In practice we only call this from `init_themes`, which leaks the
+/// whole `Theme` too.
+pub fn build_user_theme(name: &str, ut: &crate::config::UserTheme) -> Result<Theme, String> {
+    const DEFAULT_BASE: &str = "iTunes 2004";
+    let base_name = ut.base.as_deref().unwrap_or(DEFAULT_BASE);
+    let base = THEMES
+        .iter()
+        .find(|t| t.name.eq_ignore_ascii_case(base_name))
+        .ok_or_else(|| format!("base theme {base_name:?} is not a built-in"))?;
+
+    let static_name: &'static str = Box::leak(name.to_string().into_boxed_str());
+
+    Ok(Theme {
+        name: static_name,
+        sidebar_bg: parse_color_opt(ut.sidebar_bg.as_ref(), base.sidebar_bg, "sidebar_bg")?,
+        sidebar_text: parse_color_opt(ut.sidebar_text.as_ref(), base.sidebar_text, "sidebar_text")?,
+        selection_bg: parse_color_opt(ut.selection_bg.as_ref(), base.selection_bg, "selection_bg")?,
+        selection_text: parse_color_opt(
+            ut.selection_text.as_ref(),
+            base.selection_text,
+            "selection_text",
+        )?,
+        main_bg: parse_color_opt(ut.main_bg.as_ref(), base.main_bg, "main_bg")?,
+        alt_row_bg: parse_color_opt(ut.alt_row_bg.as_ref(), base.alt_row_bg, "alt_row_bg")?,
+        border: parse_color_opt(ut.border.as_ref(), base.border, "border")?,
+        footer_bg: parse_color_opt(ut.footer_bg.as_ref(), base.footer_bg, "footer_bg")?,
+        footer_text: parse_color_opt(ut.footer_text.as_ref(), base.footer_text, "footer_text")?,
+        header_text: parse_color_opt(ut.header_text.as_ref(), base.header_text, "header_text")?,
+        dim_text: parse_color_opt(ut.dim_text.as_ref(), base.dim_text, "dim_text")?,
+        error_text: parse_color_opt(ut.error_text.as_ref(), base.error_text, "error_text")?,
+        success_text: parse_color_opt(ut.success_text.as_ref(), base.success_text, "success_text")?,
+        progress_bar: parse_color_opt(ut.progress_bar.as_ref(), base.progress_bar, "progress_bar")?,
+        progress_bg: parse_color_opt(ut.progress_bg.as_ref(), base.progress_bg, "progress_bg")?,
+        border_type: parse_border_type(ut.border_type.as_ref(), base.border_type)?,
+        header_modifier: parse_modifier(
+            ut.header_modifier.as_ref(),
+            base.header_modifier,
+            "header_modifier",
+        )?,
+        sidebar_modifier: parse_modifier(
+            ut.sidebar_modifier.as_ref(),
+            base.sidebar_modifier,
+            "sidebar_modifier",
+        )?,
+        dim_modifier: parse_modifier(ut.dim_modifier.as_ref(), base.dim_modifier, "dim_modifier")?,
+        footer_modifier: parse_modifier(
+            ut.footer_modifier.as_ref(),
+            base.footer_modifier,
+            "footer_modifier",
+        )?,
+        accent_anim: parse_accent_anim(ut.accent_anim.as_ref(), base.accent_anim)?,
+        accent_secondary: parse_color_opt(
+            ut.accent_secondary.as_ref(),
+            base.accent_secondary,
+            "accent_secondary",
+        )?,
+        player_skin: base.player_skin,
+        spinner_set: base.spinner_set,
+    })
 }
 
 #[cfg(test)]
@@ -715,5 +917,135 @@ mod tests {
             Modifier::BOLD | Modifier::ITALIC
         );
         assert_eq!(Theme::modifier(NONE), Modifier::empty());
+    }
+
+    #[test]
+    fn parse_hex_color_accepts_six_digit() {
+        assert_eq!(
+            parse_hex_color("#ff00aa"),
+            Some(Color::Rgb(0xff, 0x00, 0xaa))
+        );
+        assert_eq!(parse_hex_color("#FFFFFF"), Some(Color::Rgb(255, 255, 255)));
+    }
+
+    #[test]
+    fn parse_hex_color_accepts_short_form() {
+        // "#abc" expands to "#aabbcc".
+        assert_eq!(parse_hex_color("#abc"), Some(Color::Rgb(0xaa, 0xbb, 0xcc)));
+    }
+
+    #[test]
+    fn parse_hex_color_rejects_malformed() {
+        assert!(parse_hex_color("ff00aa").is_none(), "missing #");
+        assert!(parse_hex_color("#ffgg00").is_none(), "non-hex digit");
+        assert!(parse_hex_color("#ff00").is_none(), "wrong length");
+        assert!(parse_hex_color("").is_none(), "empty");
+    }
+
+    #[test]
+    fn build_user_theme_inherits_from_base() {
+        let ut = crate::config::UserTheme {
+            base: Some("Gruvbox Dark".into()),
+            selection_bg: Some("#ff00aa".into()),
+            ..Default::default()
+        };
+        let base = theme_by_name("Gruvbox Dark");
+        let built = build_user_theme("Custom", &ut).expect("build succeeds");
+        assert_eq!(built.name, "Custom");
+        assert_eq!(built.selection_bg, Color::Rgb(0xff, 0x00, 0xaa));
+        // Untouched fields inherit from the base verbatim.
+        assert_eq!(built.sidebar_bg, base.sidebar_bg);
+        assert_eq!(built.border_type, base.border_type);
+        assert_eq!(built.accent_anim, base.accent_anim);
+    }
+
+    #[test]
+    fn build_user_theme_defaults_base_to_itunes() {
+        let ut = crate::config::UserTheme::default();
+        let built = build_user_theme("Blank", &ut).expect("default base works");
+        let itunes = theme_by_name("iTunes 2004");
+        assert_eq!(built.sidebar_bg, itunes.sidebar_bg);
+        assert_eq!(built.progress_bar, itunes.progress_bar);
+    }
+
+    #[test]
+    fn build_user_theme_rejects_unknown_base() {
+        let ut = crate::config::UserTheme {
+            base: Some("Not A Real Theme".into()),
+            ..Default::default()
+        };
+        assert!(build_user_theme("Broken", &ut).is_err());
+    }
+
+    #[test]
+    fn build_user_theme_rejects_bad_color() {
+        let ut = crate::config::UserTheme {
+            selection_bg: Some("not-a-color".into()),
+            ..Default::default()
+        };
+        let err = match build_user_theme("Broken", &ut) {
+            Err(e) => e,
+            Ok(_) => panic!("bad color should fail"),
+        };
+        assert!(err.contains("selection_bg"), "error mentions field: {err}");
+    }
+
+    #[test]
+    fn parse_modifier_accepts_combined_tokens() {
+        assert_eq!(
+            parse_modifier(Some(&"bold+italic".to_string()), 0, "x").unwrap(),
+            BOLD | ITALIC
+        );
+        assert_eq!(
+            parse_modifier(Some(&"Bold | Dim".to_string()), 0, "x").unwrap(),
+            BOLD | DIM
+        );
+        assert_eq!(
+            parse_modifier(Some(&"none".to_string()), BOLD, "x").unwrap(),
+            0,
+            "explicit 'none' overrides the base"
+        );
+    }
+
+    #[test]
+    fn parse_modifier_rejects_garbage() {
+        let err = parse_modifier(Some(&"bold+weird".to_string()), 0, "header").unwrap_err();
+        assert!(err.contains("header"), "error includes field: {err}");
+    }
+
+    #[test]
+    fn parse_border_type_round_trips_variants() {
+        for (s, expected) in [
+            ("plain", BorderType::Plain),
+            ("rounded", BorderType::Rounded),
+            ("double", BorderType::Double),
+            ("thick", BorderType::Thick),
+            ("quadrantoutside", BorderType::QuadrantOutside),
+        ] {
+            assert_eq!(
+                parse_border_type(Some(&s.to_string()), BorderType::Plain).unwrap(),
+                expected,
+                "variant {s}"
+            );
+        }
+        assert!(parse_border_type(Some(&"wavy".to_string()), BorderType::Plain).is_err());
+    }
+
+    #[test]
+    fn parse_accent_anim_variants() {
+        for (s, expected) in [
+            ("none", AccentAnim::None),
+            ("pulse", AccentAnim::Pulse),
+            ("huecycle", AccentAnim::HueCycle),
+            ("hue_cycle", AccentAnim::HueCycle),
+            ("colorshift", AccentAnim::ColorShift),
+        ] {
+            assert_eq!(
+                parse_accent_anim(Some(&s.to_string()), AccentAnim::None).unwrap(),
+                expected,
+                "variant {s}"
+            );
+        }
+        assert!(parse_accent_anim(Some(&"strobe".to_string()), AccentAnim::None).is_err());
     }
 }

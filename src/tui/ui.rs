@@ -320,6 +320,21 @@ fn draw_startup(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(paragraph, centered);
 }
 
+/// Foreground color for the sidebar's `✓`/`◐` sync-status glyph.
+///
+/// The unselected accent is `selection_bg` (the theme's highlight color).
+/// But the selected row *also* has `selection_bg` as its background, so that
+/// same color would render the glyph invisible. Falling back to
+/// `selection_text` keeps the glyph readable on the highlight without
+/// inventing a new palette slot.
+fn sidebar_icon_accent(theme: &theme::Theme, selected: bool) -> ratatui::style::Color {
+    if selected {
+        theme.selection_text
+    } else {
+        theme.selection_bg
+    }
+}
+
 fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
     let t = app.theme();
     let is_active = app.active_panel == Panel::Library;
@@ -414,9 +429,10 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
                         })
                     }
                 };
+                let accent_fg = sidebar_icon_accent(t, i == app.sidebar_selected);
                 match presence {
-                    Some(DevicePresence::Full) => ("✓ ", style.fg(t.selection_bg)),
-                    Some(DevicePresence::Partial) => ("◐ ", style.fg(t.selection_bg)),
+                    Some(DevicePresence::Full) => ("✓ ", style.fg(accent_fg)),
+                    Some(DevicePresence::Partial) => ("◐ ", style.fg(accent_fg)),
                     _ => ("  ", style),
                 }
             } else {
@@ -1964,7 +1980,8 @@ fn draw_help_overlay(f: &mut Frame, app: &App) {
 fn draw_theme_picker(f: &mut Frame, app: &App) {
     let t = app.theme();
     let area = f.area();
-    let theme_count = theme::THEMES.len();
+    let themes = theme::all_themes();
+    let theme_count = themes.len();
     let width = 30u16.min(area.width.saturating_sub(4));
     let height = (theme_count as u16 + 2).min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(width)) / 2;
@@ -1982,7 +1999,7 @@ fn draw_theme_picker(f: &mut Frame, app: &App) {
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
-    let items: Vec<ListItem> = theme::THEMES
+    let items: Vec<ListItem> = themes
         .iter()
         .enumerate()
         .map(|(i, theme_entry)| {
@@ -2325,6 +2342,33 @@ fn build_zune_art(screen_line1: &str, screen_line2: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sidebar_icon_accent_is_visible_on_selected_row() {
+        // Regression: the sync-status glyph used `selection_bg` as its
+        // foreground, which matched the selected row's background and hid
+        // the glyph. Selected rows must use a color that contrasts with
+        // `selection_bg`.
+        for theme in theme::THEMES.iter() {
+            let unselected = sidebar_icon_accent(theme, false);
+            let selected = sidebar_icon_accent(theme, true);
+            assert_eq!(
+                unselected, theme.selection_bg,
+                "{}: unselected accent should stay as the highlight color",
+                theme.name
+            );
+            assert_ne!(
+                selected, theme.selection_bg,
+                "{}: selected accent must not collide with the row background",
+                theme.name
+            );
+            assert_eq!(
+                selected, theme.selection_text,
+                "{}: selected accent should match the row text color",
+                theme.name
+            );
+        }
+    }
 
     #[test]
     fn junction_chars_matches_expected_glyphs() {

@@ -10,7 +10,7 @@ use zytunes::mtp::parse::DeviceEntry;
 
 use crate::audio::{AudioCommand, AudioEvent};
 use crate::background::{BgCommand, BgEvent, StorageInfo, SyncItem};
-use crate::theme::{Theme, THEMES};
+use crate::theme::{all_themes, Theme};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Panel {
@@ -608,10 +608,10 @@ impl App {
             scan_phrase: None,
             scan_phrase_rotated_at: None,
             scan_samples: Vec::new(),
-            theme: &THEMES[0],
+            theme: all_themes()[0],
             show_theme_picker: false,
             theme_picker_index: 0,
-            theme_before_picker: &THEMES[0],
+            theme_before_picker: all_themes()[0],
             artist_device_status: BTreeMap::new(),
             album_device_status: BTreeMap::new(),
             album_art: None,
@@ -700,10 +700,11 @@ impl App {
     }
 
     pub fn theme_picker_move(&mut self, delta: isize) {
-        let len = THEMES.len();
+        let themes = all_themes();
+        let len = themes.len();
         self.theme_picker_index =
             (self.theme_picker_index as isize + delta).rem_euclid(len as isize) as usize;
-        self.theme = &THEMES[self.theme_picker_index];
+        self.theme = themes[self.theme_picker_index];
     }
 
     pub fn theme_picker_confirm(&mut self) {
@@ -1726,14 +1727,23 @@ impl App {
                     );
                 }
             }
-            BgEvent::SyncComplete { success, failed } => {
+            BgEvent::SyncComplete {
+                success,
+                failed,
+                skipped,
+            } => {
                 self.sync.status = SyncStatus::Idle;
                 self.sync.queue.clear();
                 self.sync.queue_selected = 0;
-                self.set_toast(
-                    format!("Sync complete: {} done, {} failed", success, failed),
-                    failed > 0,
-                );
+                let msg = if skipped > 0 {
+                    format!(
+                        "Sync complete: {} done, {} skipped, {} failed",
+                        success, skipped, failed
+                    )
+                } else {
+                    format!("Sync complete: {} done, {} failed", success, failed)
+                };
+                self.set_toast(msg, failed > 0 || skipped > 0);
             }
             BgEvent::RemoveProgress {
                 current,
@@ -3015,6 +3025,7 @@ mod tests {
         app.handle_bg_event(BgEvent::SyncComplete {
             success: 3,
             failed: 1,
+            skipped: 0,
         });
         assert_eq!(app.sync.status, SyncStatus::Idle);
         assert!(app.sync.queue.is_empty());
@@ -3022,6 +3033,34 @@ mod tests {
         // failed > 0 means toast is_error
         let (_, _, is_error) = app.toast_message.as_ref().unwrap();
         assert!(is_error);
+    }
+
+    #[test]
+    fn handle_bg_event_sync_complete_with_skipped_shows_error_toast() {
+        let mut app = App::new();
+        app.handle_bg_event(BgEvent::SyncComplete {
+            success: 23,
+            failed: 1,
+            skipped: 2,
+        });
+        let (msg, _, is_error) = app.toast_message.as_ref().unwrap();
+        assert!(msg.contains("23 done"));
+        assert!(msg.contains("2 skipped"));
+        assert!(msg.contains("1 failed"));
+        assert!(is_error, "skipped > 0 must flag as error");
+    }
+
+    #[test]
+    fn handle_bg_event_sync_complete_no_skipped_hides_skipped_field() {
+        let mut app = App::new();
+        app.handle_bg_event(BgEvent::SyncComplete {
+            success: 5,
+            failed: 0,
+            skipped: 0,
+        });
+        let (msg, _, is_error) = app.toast_message.as_ref().unwrap();
+        assert!(!msg.contains("skipped"));
+        assert!(!is_error);
     }
 
     #[test]
