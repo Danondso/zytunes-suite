@@ -17,7 +17,7 @@ A Rust CLI tool for syncing music to a Microsoft Zune 30 from macOS and Linux.
 - **File listing** — `ls [path]` enumerates storage and prints the device's directory tree
 - **Music push** — `push <files...>` uploads music files to the Zune with proper metadata via `zune-import`
 - **Music removal** — `rm <device-paths...>` removes files/folders from the device (leaf-first for directories)
-- **Music library sync** — `sync <type> <name>` syncs tracks by artist, album, or track name by scanning a local music folder. Detects duplicates already on device and skips them
+- **Music library sync** — `sync <type> <name>` syncs tracks by artist, album, or track name by scanning a local music folder. Detects duplicates already on device and skips them. The TUI's queued sync also filters out tracks already on the device before dispatching the sync
 - **Auto-transcoding** — non-native formats (FLAC, OGG, WAV, M4A, OPUS, ALAC, AIFF) are transcoded to MP3 via ffmpeg with album art resized to 200x200 (Zune 30 constraint)
 - **MP3 passthrough** — native formats (MP3, WMA, AAC) skip transcoding entirely
 - **Library browsing** — `library [query]` browses/searches your music library
@@ -25,6 +25,7 @@ A Rust CLI tool for syncing music to a Microsoft Zune 30 from macOS and Linux.
 - **Interactive TUI** — `zytunes-tui` launches a terminal UI (ratatui) for browsing your music library, connecting to the device, managing a sync queue, and monitoring sync progress. Library scanning runs in the background on startup. TUI displays sync status on the Zune ASCII art screen including loading spinner, track count, syncing spinner, and queue count
 - **Device content browsing** — the TUI can browse tracks on the connected Zune organized by artist/album, toggled with `v`. The device library is indexed from the device's Music directory structure (`Artist/Album/Track`)
 - **Device track removal** — in device view mode, `a`/`A` removes selected tracks, albums, or artists from the device. Progress is shown during removal and the device track list auto-refreshes afterward
+- **USB resilience (macOS)** — the native IOKit backend recovers from transient pipe stalls via `ClearPipeStall` with a one-shot retry on both read and write paths. Read timeouts clear stalls on both bulk endpoints so the OUT pipe stays in sync with the device. When a sync/remove cascade indicates the USB session is truly gone (device unplug, `NotResponding`, unrecoverable stall, read timeout) the TUI aborts remaining work, clears the session, and prompts the user to replug
 - **Theming** — the TUI includes 16 built-in color themes (iTunes 2004, Gruvbox Dark/Light, Everforest Dark/Light, Tokyo Night, IBM Mainframe, Amber CRT, Windows 95, System 7, BIOS, Red Sands, Newport Lights, NeXTSTEP, WinAmp Classic, Zune Original). Press `t` to open the theme picker. Selected theme is persisted to `~/.config/zytunes/config.toml`
 - **Native IOKit USB backend** — the `zune-mtp` crate provides direct MTP/MTPZ communication via Apple's IOKit framework, bypassing libusb. This is the sole backend for all device operations, supporting listing, import, removal, and track collection
 
@@ -138,7 +139,8 @@ The TUI works in any EAW-compliant terminal (Alacritty, kitty, wezterm, Zed's em
 2. Press `c` to connect to the Zune (auto-detects via USB, performs MTPZ handshake)
 3. Press `S` or switch to the queue and press `Enter` to start syncing
 4. Non-native formats are auto-transcoded to MP3, album art resized to 200x200
-5. Progress and results appear in the log panel; device track list auto-refreshes on completion
+5. Progress and results appear in the log panel; device track list auto-refreshes on completion. Tracks already on the device are skipped automatically and noted in the log
+6. If the device disconnects mid-sync (unplug, unrecoverable stall), the TUI aborts remaining items, drops the session, and tells you to replug
 
 ## Claude Code Skills
 
@@ -213,6 +215,7 @@ USB-level debug logging can be enabled via environment variables:
 
 ```
 IOKIT_USB_DEBUG=1 cargo run       # Trace native IOKit USB reads/writes
+ZYTUNES_DUMP_ART=1 cargo run      # Dump the exact JPEG bytes sent for album art to /tmp/zytunes-last-art.jpg
 ```
 
 ## Architecture
@@ -237,9 +240,9 @@ This appears to be a fundamental incompatibility between libusb's macOS backend 
 ### Native IOKit backend (zune-mtp)
 
 The `zune-mtp/` workspace crate provides a pure-Rust native IOKit MTP/MTPZ implementation:
-- **transport.rs** — IOKit USB transport: device/interface discovery via `IOServiceMatching`, bulk pipe read/write via `IOUSBInterfaceInterface` vtables
+- **transport.rs** — IOKit USB transport: device/interface discovery via `IOServiceMatching`, bulk pipe read/write via `IOUSBInterfaceInterface` vtables. Automatic `ClearPipeStall` recovery (with a one-shot retry) on recoverable IOKit errors from both `WritePipe` and `ReadPipe`; on read timeouts the transport clears stalls on both bulk endpoints so the OUT pipe does not desync. `read_container_with_timeout(secs)` lets callers supply longer windows for slow operations (e.g. album-art commits to flash)
 - **container.rs** — MTP/PTP container format: command, data, and response container building and parsing
-- **session.rs** — MTP session management: OpenSession, GetDeviceInfo, GetStorageIDs, GetStorageInfo, GetObjectHandles, GetObjectInfo, SendObjectInfo/SendObject, DeleteObject, SetDevicePropValue, GetObjectPropsSupported, GetObjectPropList, SetObjectPropValue, SendObjectPropList, GetObjectReferences, SetObjectReferences
+- **session.rs** — MTP session management: OpenSession, GetDeviceInfo, GetStorageIDs, GetStorageInfo, GetObjectHandles, GetObjectInfo, SendObjectInfo/SendObject, DeleteObject, SetDevicePropValue, GetObjectPropsSupported, GetObjectPropList, SetObjectPropValue, SendObjectPropList, GetObjectReferences, SetObjectReferences. `SetObjectPropValue` uses a 45 s response timeout because the Zune can take many seconds to commit large values (album art) to flash
 - **mtpz.rs** — Full MTPZ handshake: SessionInitiatorVersionInfo setup, RSA-1024 signature, AES-128-CBC decryption, CMAC verification, certificate exchange
 - **proplist.rs** — MTP ObjectPropList builder for SendObjectPropList: constructs binary property list payloads with string, u16, and u32 property types
 - **iokit_ffi.rs** — Raw FFI declarations for IOKit/CoreFoundation (IOUSBDeviceInterface, IOUSBInterfaceInterface vtables)
@@ -288,7 +291,7 @@ Error codes encountered during development and what they mean in the Zune contex
 zune-mtp/            — native IOKit MTP/MTPZ library (workspace crate)
   src/
     lib.rs           — crate root, public API
-    transport.rs     — IOKit USB transport (device open, bulk read/write)
+    transport.rs     — IOKit USB transport (device open, bulk read/write, ClearPipeStall recovery)
     container.rs     — MTP/PTP container format (build/parse commands, data, responses)
     session.rs       — MTP session (open, object operations, property lists, object references)
     mtpz.rs          — MTPZ authentication (RSA, AES-CBC, CMAC, certificate exchange)
