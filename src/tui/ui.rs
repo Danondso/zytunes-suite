@@ -46,9 +46,14 @@ pub(crate) struct LayoutMetrics {
 }
 
 impl LayoutMetrics {
-    fn new(area: Rect, show_keys: bool, has_album_browser: bool, has_player: bool) -> Self {
+    /// `show_player` is the final resolved decision from the caller — it
+    /// already accounts for the user's preference and the current playback
+    /// state. LayoutMetrics itself only enforces the hard height floor below
+    /// which the panel can't physically fit.
+    fn new(area: Rect, show_keys: bool, has_album_browser: bool, show_player: bool) -> Self {
         let w = area.width;
         let h = area.height;
+        let show_now_playing = show_player && h >= 12;
 
         if w < 100 {
             // Compact: hide device panel, force-hide keys, narrow sidebar.
@@ -57,7 +62,7 @@ impl LayoutMetrics {
                 sidebar_width: 20,
                 album_width: if has_album_browser { 22 } else { 0 },
                 keys_width: 0,
-                show_now_playing: has_player && h >= 20,
+                show_now_playing,
                 show_zip_art: false,
                 footer_left_width: 12,
                 player_art_width: 0,
@@ -69,7 +74,7 @@ impl LayoutMetrics {
                 sidebar_width: 24,
                 album_width: if has_album_browser { 24 } else { 0 },
                 keys_width: 0,
-                show_now_playing: has_player && h >= 20,
+                show_now_playing,
                 show_zip_art: true,
                 footer_left_width: 16,
                 player_art_width: 14,
@@ -81,7 +86,7 @@ impl LayoutMetrics {
                 sidebar_width: if has_album_browser { 24 } else { 28 },
                 album_width: if has_album_browser { 30 } else { 0 },
                 keys_width: if show_keys { 24 } else { 0 },
-                show_now_playing: has_player && h >= 20,
+                show_now_playing,
                 show_zip_art: true,
                 footer_left_width: 16,
                 player_art_width: 16,
@@ -109,11 +114,6 @@ impl LayoutMetrics {
             )
         }
     }
-
-    /// Whether the now-playing panel should be shown at the given height.
-    pub(crate) fn show_now_playing(height: u16) -> bool {
-        height >= 20
-    }
 }
 
 fn throbber_symbol(state: &ThrobberState, theme: &theme::Theme) -> String {
@@ -138,7 +138,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         size,
         app.show_keys,
         app.has_album_browser(),
-        app.now_playing.is_some(),
+        app.should_show_player(size.height),
     );
 
     // Outer horizontal: device left | middle content | keys right
@@ -426,7 +426,12 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
             let cursor_w = disp_width(cursor);
             let icon_w = disp_width(icon);
             let max_name = inner_w.saturating_sub(cursor_w + icon_w);
-            let name_trunc = truncate(name, max_name).to_string();
+            let is_selected = i == app.sidebar_selected;
+            let name_trunc = if is_selected && disp_width(name) > max_name && max_name > 0 {
+                marquee(name, max_name, app.anim_frame)
+            } else {
+                truncate(name, max_name).to_string()
+            };
             // Pad to full row width so the selection background reaches the
             // right border (see album browser for rationale).
             let used = cursor_w + icon_w + disp_width(&name_trunc);
@@ -884,10 +889,17 @@ fn draw_album_track_list(f: &mut Frame, app: &App, area: Rect) {
             .unwrap_or_default();
         let dur = track.duration_ms.map(format_duration).unwrap_or_default();
 
-        let display_name = if track.on_device {
+        let name_raw = if track.on_device {
             format!("✓ {}", track.name)
         } else {
             track.name.clone()
+        };
+        // Name column width = total - 4 (num) - 6 (duration) - 2 (column gutters).
+        let name_w = (area.width as usize).saturating_sub(12);
+        let display_name = if is_selected && disp_width(&name_raw) > name_w && name_w > 0 {
+            marquee(&name_raw, name_w, app.anim_frame)
+        } else {
+            name_raw
         };
 
         flat_rows.push((
@@ -1013,10 +1025,21 @@ fn draw_track_table(f: &mut Frame, app: &App, area: Rect) {
                 .replace(" audio file", "")
                 .replace("MPEG", "MP3");
 
-            let display_name = if track.on_device {
+            let name_raw = if track.on_device {
                 format!("✓ {}", track.name)
             } else {
                 track.name.clone()
+            };
+            // Table name column is ~30% of the flex area (widths below sum to
+            // 75% + 16 fixed cols). Estimate the rendered width so the selected
+            // row's marquee matches what ratatui will actually show.
+            let flex = (inner.width as usize).saturating_sub(16);
+            let name_w = flex * 30 / 100;
+            let is_row_selected = i == app.track_selected;
+            let display_name = if is_row_selected && disp_width(&name_raw) > name_w && name_w > 0 {
+                marquee(&name_raw, name_w, app.anim_frame)
+            } else {
+                name_raw
             };
 
             Row::new(vec![
@@ -1446,6 +1469,7 @@ fn draw_keys_panel(f: &mut Frame, app: &App, area: Rect) {
         ("v", "Lib/Device view"),
         ("t", "Theme picker"),
         ("T", "Art style"),
+        ("P", "Player panel"),
         ("/", "Search"),
         ("c", "Connect"),
         ("X", "Clear cache"),
@@ -1890,6 +1914,16 @@ fn draw_help_overlay(f: &mut Frame, app: &App) {
         "  v           Toggle Library / Device view",
         "  t           Theme picker",
         "  T           Toggle album art style (halfblock/ASCII)",
+        "  P           Cycle player panel (auto / hidden / always)",
+        "",
+        "  Playback",
+        "  Space       Play / pause selected track",
+        "  n / p       Next / previous track in playlist",
+        "  < / >       Seek -/+ 5 seconds",
+        "",
+        "  Logs",
+        "  PgUp/PgDn   Scroll sync log",
+        "  L           Dump log to /tmp (copies path to clipboard)",
         "",
         "  Library",
         "  /           Search sidebar",
@@ -2628,13 +2662,21 @@ mod tests {
 
     #[test]
     fn layout_metrics_short_hides_now_playing() {
-        let area = Rect::new(0, 0, 160, 19);
+        // LayoutMetrics only enforces the absolute floor below which the panel
+        // can't physically fit. Height-vs-auto semantics live in
+        // `App::should_show_player`, which is the input here.
+        let area = Rect::new(0, 0, 160, 11);
         let m = LayoutMetrics::new(area, false, false, true);
-        assert!(!m.show_now_playing);
+        assert!(!m.show_now_playing, "height 11 < 12-row floor");
 
-        let area = Rect::new(0, 0, 160, 20);
+        let area = Rect::new(0, 0, 160, 12);
         let m = LayoutMetrics::new(area, false, false, true);
-        assert!(m.show_now_playing);
+        assert!(m.show_now_playing, "height 12 meets floor");
+
+        // Force-hide wins regardless of height.
+        let area = Rect::new(0, 0, 160, 40);
+        let m = LayoutMetrics::new(area, false, false, false);
+        assert!(!m.show_now_playing);
     }
 
     #[test]
