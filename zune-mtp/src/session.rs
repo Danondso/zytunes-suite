@@ -294,7 +294,12 @@ impl MtpSession {
                 .write(&data_container[CONTAINER_HEADER_SIZE..])?;
         }
 
-        let resp = self.transport.read_container()?;
+        // SendObject commits the payload to flash before ACKing; on the Zune
+        // 30's USB 1.1 link a multi-MB track can take tens of seconds,
+        // especially when it lands right after an art commit. Use the same
+        // 45s window we give SetObjectPropValue so transient slow commits
+        // don't cascade into a wedged session.
+        let resp = self.transport.read_container_with_timeout(45)?;
         let hdr = ContainerHeader::parse(&resp)
             .ok_or(MtpError::Protocol("Bad SendObject response".to_string()))?;
         if !hdr.is_ok() {

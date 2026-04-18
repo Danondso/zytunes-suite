@@ -1727,14 +1727,23 @@ impl App {
                     );
                 }
             }
-            BgEvent::SyncComplete { success, failed } => {
+            BgEvent::SyncComplete {
+                success,
+                failed,
+                skipped,
+            } => {
                 self.sync.status = SyncStatus::Idle;
                 self.sync.queue.clear();
                 self.sync.queue_selected = 0;
-                self.set_toast(
-                    format!("Sync complete: {} done, {} failed", success, failed),
-                    failed > 0,
-                );
+                let msg = if skipped > 0 {
+                    format!(
+                        "Sync complete: {} done, {} skipped, {} failed",
+                        success, skipped, failed
+                    )
+                } else {
+                    format!("Sync complete: {} done, {} failed", success, failed)
+                };
+                self.set_toast(msg, failed > 0 || skipped > 0);
             }
             BgEvent::RemoveProgress {
                 current,
@@ -3016,6 +3025,7 @@ mod tests {
         app.handle_bg_event(BgEvent::SyncComplete {
             success: 3,
             failed: 1,
+            skipped: 0,
         });
         assert_eq!(app.sync.status, SyncStatus::Idle);
         assert!(app.sync.queue.is_empty());
@@ -3023,6 +3033,34 @@ mod tests {
         // failed > 0 means toast is_error
         let (_, _, is_error) = app.toast_message.as_ref().unwrap();
         assert!(is_error);
+    }
+
+    #[test]
+    fn handle_bg_event_sync_complete_with_skipped_shows_error_toast() {
+        let mut app = App::new();
+        app.handle_bg_event(BgEvent::SyncComplete {
+            success: 23,
+            failed: 1,
+            skipped: 2,
+        });
+        let (msg, _, is_error) = app.toast_message.as_ref().unwrap();
+        assert!(msg.contains("23 done"));
+        assert!(msg.contains("2 skipped"));
+        assert!(msg.contains("1 failed"));
+        assert!(is_error, "skipped > 0 must flag as error");
+    }
+
+    #[test]
+    fn handle_bg_event_sync_complete_no_skipped_hides_skipped_field() {
+        let mut app = App::new();
+        app.handle_bg_event(BgEvent::SyncComplete {
+            success: 5,
+            failed: 0,
+            skipped: 0,
+        });
+        let (msg, _, is_error) = app.toast_message.as_ref().unwrap();
+        assert!(!msg.contains("skipped"));
+        assert!(!is_error);
     }
 
     #[test]
