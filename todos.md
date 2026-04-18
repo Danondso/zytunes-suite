@@ -61,6 +61,19 @@ Delete or actually use. Each one is parsing + memory cost per track.
 - Or a custom `contains_ignore_case` that walks without allocating (awkward
   for non-ASCII, so the pre-compute is likely cleaner).
 
+## Linux transport parity
+
+### `LibusbTransport` has no stall recovery on write/read failures
+`zune-mtp/src/transport/libusb.rs`. The IOKit backend calls `ClearPipeStall`
+(with a one-shot retry) on recoverable USB errors from `WritePipe` / `ReadPipe`,
+and clears stalls on *both* bulk endpoints after a read timeout so the OUT
+pipe doesn't desync. The libusb backend does neither — a single transient
+stall (common during sync cascades, cable jostles, or Zune firmware hiccups)
+surfaces as a raw `rusb::Error` and the user has to replug. Add equivalent
+recovery via `DeviceHandle::clear_halt(endpoint)` on both bulk endpoints, with
+the same one-shot retry pattern, so Linux sync tolerates the same class of
+wedges macOS already does.
+
 ## UX follow-ups
 
 ### TUI contrast audit

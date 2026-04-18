@@ -438,7 +438,11 @@ impl MtpSession {
                 .write(&data_container[CONTAINER_HEADER_SIZE..])?;
         }
 
-        let resp = self.transport.read_container()?;
+        // Large prop writes (album art in particular) can take many seconds
+        // to commit to flash under load. 30s (the default) is too tight, but
+        // 90s is excruciating when the device has wedged and isn't coming
+        // back. 45s is a workable compromise.
+        let resp = self.transport.read_container_with_timeout(45)?;
         let hdr = ContainerHeader::parse(&resp).ok_or(MtpError::Protocol(
             "Bad SetObjectPropValue response".to_string(),
         ))?;

@@ -208,7 +208,12 @@ impl LibusbTransport {
 
     /// Read a full MTP container, reassembling multi-packet responses.
     pub fn read_container(&self) -> Result<Vec<u8>, MtpError> {
-        super::reassemble_container(|buf| self.read_with_timeout(buf, 30))
+        self.read_container_with_timeout(30)
+    }
+
+    /// Like `read_container` but with a caller-supplied timeout in seconds.
+    pub fn read_container_with_timeout(&self, timeout_secs: u64) -> Result<Vec<u8>, MtpError> {
+        super::reassemble_container(|buf| self.read_with_timeout(buf, timeout_secs))
     }
 }
 
