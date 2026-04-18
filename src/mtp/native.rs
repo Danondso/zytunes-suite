@@ -243,12 +243,30 @@ impl TrackCache {
     }
 
     /// Update the `#free_bytes:` header in the existing cache file, preserving
-    /// all track entries. No-op when the cache is empty or missing — there's
-    /// nothing to keep valid until the first full save.
+    /// all track entries. No-op when the cache is empty, missing, or has no
+    /// tracks — there's nothing to keep valid until the first full save.
+    ///
+    /// Rewrites only the header line and re-emits the rest of the file
+    /// verbatim, avoiding the parse + re-serialize cost of `load()` + `save()`.
     fn update_free_bytes(&self, free_bytes: u64) {
-        if let Some((_, tracks)) = self.load() {
-            self.save(&tracks, free_bytes);
+        let path = match self.cache_path() {
+            Some(p) => p,
+            None => return,
+        };
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let Some(rest) = content
+            .strip_prefix("#free_bytes:")
+            .and_then(|s| s.split_once('\n').map(|(_, r)| r))
+        else {
+            return;
+        };
+        if rest.trim().is_empty() {
+            return;
         }
+        let _ = std::fs::write(path, format!("#free_bytes:{free_bytes}\n{rest}"));
     }
 
     fn append(&self, entry: &DeviceEntry) {
@@ -322,6 +340,11 @@ pub struct NativeSession {
     pub firmware_version: Option<String>,
     /// Cached video entries from the last ZMDB parse.
     zmdb_video_cache: Option<Vec<DeviceEntry>>,
+    /// True once an album-art write has failed in this session. When set,
+    /// subsequent tracks skip art entirely — one bad JPEG can leave the MTP
+    /// session too fragile to keep calling SetObjectPropValue, and each
+    /// retry costs a ~45s ReadPipe timeout.
+    art_disabled: bool,
 }
 
 impl NativeSession {
@@ -466,6 +489,7 @@ impl NativeSession {
             sync_restored: false,
             firmware_version,
             zmdb_video_cache: None,
+            art_disabled: false,
         })
     }
 
@@ -788,6 +812,7 @@ impl NativeSession {
         });
 
         self.save_library_cache();
+        self.log_msg("Device library ready");
 
         Ok(())
     }
@@ -1206,8 +1231,13 @@ impl DeviceSession for NativeSession {
     }
 
     fn save_sync_progress(&mut self) {
-        let data = match self.session.get_sync_progress() {
-            Ok(d) => d,
+        // Route through the firmware-guarded helper: pre-3.0 Zunes (and any
+        // device that explicitly rejects the vendor op) quietly return None
+        // instead of producing a user-visible "device rejected operation"
+        // warning at the end of every sync.
+        let data = match self.get_sync_progress() {
+            Ok(Some(d)) => d,
+            Ok(None) => return,
             Err(e) => {
                 self.log_msg(&format!("Could not read sync progress: {e}"));
                 return;
@@ -1363,6 +1393,9 @@ impl NativeSession {
 
     /// Try to extract and set album art on the device. Logs but doesn't fail on errors.
     fn try_set_album_art(&mut self, local_path: &str, album_obj_id: u32) {
+        if self.art_disabled {
+            return;
+        }
         let supported = self
             .library
             .as_ref()
@@ -1380,6 +1413,11 @@ impl NativeSession {
             }
         };
         self.log_msg(&format!("Setting album art ({} bytes)", jpeg_data.len()));
+        // Diagnostic: dump the exact bytes we're about to send so failures
+        // can be inspected with `file`, `identify`, `exiftool`, etc.
+        if std::env::var("ZYTUNES_DUMP_ART").is_ok() {
+            let _ = std::fs::write("/tmp/zytunes-last-art.jpg", &jpeg_data);
+        }
         let mut art_data = Vec::with_capacity(4 + jpeg_data.len());
         art_data.extend_from_slice(&(jpeg_data.len() as u32).to_le_bytes());
         art_data.extend_from_slice(&jpeg_data);
@@ -1389,7 +1427,17 @@ impl NativeSession {
             &art_data,
         ) {
             Ok(_) => self.log_msg("Album art set successfully"),
-            Err(e) => self.log_msg(&format!("Album art failed: {}", e)),
+            Err(e) => {
+                // One art failure typically means the Zune's JPEG decoder
+                // wedged. Further SetObjectPropValue calls will each burn
+                // a ~45s read timeout and keep the session degraded, so
+                // skip art for the remainder of this session.
+                self.art_disabled = true;
+                self.log_msg(&format!(
+                    "Album art failed ({}); skipping art for remaining tracks",
+                    e
+                ));
+            }
         }
     }
 }
@@ -1429,7 +1477,23 @@ fn format_name(format: u16) -> String {
 
 /// Extract album art from an audio file, resized to 200x200 JPEG.
 /// Uses lofty for extraction and image crate for resizing. Works entirely in-memory.
+/// Extract and re-encode album art as a conservative 200x200 baseline JPEG.
+///
+/// We go through explicit RGB8 and a concrete `JpegEncoder` (rather than
+/// `DynamicImage::write_to(Jpeg)`) to keep the output defensive:
+///   - Force RGB8: strips alpha / palette / CMYK / grayscale / 16-bit quirks.
+///   - Explicit baseline quality: no progressive scan, no surprise defaults.
+///   - No ICC / EXIF / XMP carried over from the source picture.
+///   - Validate SOI/EOI markers so we never hand the Zune a truncated stream.
+///
+/// Context: the Zune 30 firmware occasionally wedges (ReadPipe timeout with
+/// no response code) when `SetObjectPropValue` is called with certain JPEGs.
+/// A single wedge poisons the whole MTP session. Normalizing the output
+/// through a minimal, metadata-free encoder drops the probability of hitting
+/// the decoder bug.
 fn extract_album_art(path: &str) -> Option<Vec<u8>> {
+    use image::codecs::jpeg::JpegEncoder;
+    use image::ExtendedColorType;
     use lofty::file::TaggedFileExt;
 
     let tagged = lofty::probe::read_from_path(path).ok()?;
@@ -1437,16 +1501,21 @@ fn extract_album_art(path: &str) -> Option<Vec<u8>> {
     let pic = tag.pictures().first()?;
     let img = image::load_from_memory(pic.data()).ok()?;
     let resized = img.resize_exact(200, 200, image::imageops::FilterType::Lanczos3);
-    let mut jpeg_buf = std::io::Cursor::new(Vec::new());
-    resized
-        .write_to(&mut jpeg_buf, image::ImageFormat::Jpeg)
+    let rgb = resized.to_rgb8();
+    let mut jpeg_buf: Vec<u8> = Vec::with_capacity(16 * 1024);
+    let mut encoder = JpegEncoder::new_with_quality(&mut jpeg_buf, 85);
+    encoder
+        .encode(rgb.as_raw(), 200, 200, ExtendedColorType::Rgb8)
         .ok()?;
-    let data = jpeg_buf.into_inner();
-    if data.is_empty() {
-        None
-    } else {
-        Some(data)
+    // Sanity: baseline JPEG starts with FFD8 (SOI) and ends with FFD9 (EOI).
+    // If the encoder produced something truncated, don't send it.
+    if jpeg_buf.len() < 4
+        || jpeg_buf[..2] != [0xFF, 0xD8]
+        || jpeg_buf[jpeg_buf.len() - 2..] != [0xFF, 0xD9]
+    {
+        return None;
     }
+    Some(jpeg_buf)
 }
 
 /// Read metadata from an audio file using lofty (supports all formats).
@@ -1930,6 +1999,44 @@ mod tests {
         if let Some(p) = cache.cache_path() {
             assert!(!p.exists());
         }
+    }
+
+    #[test]
+    fn track_cache_update_free_bytes_noop_when_header_only() {
+        let cache = make_cache(Some("update-free-header-only"));
+        let path = cache.cache_path().unwrap();
+        std::fs::write(&path, "#free_bytes:1000\n").unwrap();
+        cache.update_free_bytes(9_999);
+        // Header-only caches carry no entries worth preserving, so the file
+        // should be left untouched rather than having its header mutated.
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "#free_bytes:1000\n"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn track_cache_update_free_bytes_preserves_payload_bytes() {
+        let cache = make_cache(Some("update-free-bytewise"));
+        let entries = vec![
+            sample_entry("Artist/Album/a.mp3", 1),
+            sample_entry("Artist/Album/b.mp3", 2),
+        ];
+        cache.save(&entries, 1_000_000);
+
+        let path = cache.cache_path().unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let payload_before = before.split_once('\n').unwrap().1;
+
+        cache.update_free_bytes(42);
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.starts_with("#free_bytes:42\n"));
+        let payload_after = after.split_once('\n').unwrap().1;
+        assert_eq!(payload_before, payload_after);
+
+        cache.clear();
     }
 
     #[test]
