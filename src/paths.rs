@@ -1,15 +1,20 @@
 //! Resolve runtime cache locations with per-worktree isolation support.
 //!
-//! zytunes' device caches (track list, library handles, sync progress) and
-//! the `dirlib` file-metadata cache normally live under `$HOME`. When
-//! running zytunes from multiple git worktrees (e.g., Conductor), those
-//! caches are keyed only by device serial or music-root path — not by
-//! worktree — so branch-specific schema changes can clobber each other.
+//! zytunes' device caches (track list, library handles, sync progress)
+//! normally live under `$HOME` and are keyed only by device serial — not
+//! by worktree — so branch-specific schema changes can clobber each
+//! other when running multiple git worktrees (e.g., Conductor).
 //!
-//! `ZYTUNES_CACHE_DIR`, when set, redirects all caches into one directory.
-//! A workspace-level `.cargo/config.toml` points it at `./.zytunes-cache`
-//! for any `cargo run`/`cargo test` from the tree, giving each worktree
-//! its own cache without requiring users to manage env vars.
+//! `ZYTUNES_CACHE_DIR`, when set, redirects those device caches into one
+//! directory. A workspace-level `.cargo/config.toml` points it at
+//! `./.zytunes-cache` for any `cargo run`/`cargo test` from the tree,
+//! giving each worktree its own device cache without requiring users to
+//! manage env vars.
+//!
+//! The `dirlib` file-metadata cache deliberately does **not** honor this
+//! override: it's keyed by a hash of the scan-root path, so worktrees
+//! pointing at the same `~/Music` can reuse one cached scan and avoid
+//! re-running the lofty pass on every new worktree. See `src/cache.rs`.
 
 use std::path::PathBuf;
 
