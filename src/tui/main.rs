@@ -397,7 +397,9 @@ fn run_loop(
                             Ok(_) => {
                                 let path_str = path.display().to_string();
                                 let toast = match copy_to_clipboard(&path_str) {
-                                    Ok(()) => format!("Log dumped to {} (path copied)", path_str),
+                                    Ok(()) => {
+                                        format!("Log dumped to {} (copied to clipboard)", path_str)
+                                    }
                                     Err(e) => {
                                         format!("Log dumped to {} (clipboard: {})", path_str, e)
                                     }
