@@ -352,7 +352,7 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
 
     let title = format!(" {}{} ", browse_prefix, mode_label);
     let border_style = if is_active {
-        Style::default().fg(t.selection_bg)
+        t.active_border()
     } else {
         t.border()
     };
@@ -483,7 +483,7 @@ fn draw_album_browser(f: &mut Frame, app: &App, area: Rect) {
         truncate(&artist, area.width.saturating_sub(4) as usize)
     );
     let border_style = if is_active {
-        Style::default().fg(t.selection_bg)
+        t.active_border()
     } else {
         Style::default().fg(t.accent_secondary)
     };
@@ -590,7 +590,7 @@ fn draw_album_detail(f: &mut Frame, app: &App, area: Rect, show_zip_art: bool) {
     let t = app.theme();
     let is_active = app.active_panel == Panel::TrackList;
     let border_style = if is_active {
-        Style::default().fg(t.selection_bg)
+        t.active_border()
     } else {
         t.border()
     };
@@ -959,7 +959,7 @@ fn draw_track_table(f: &mut Frame, app: &App, area: Rect) {
     let is_active = app.active_panel == Panel::TrackList;
     let title = format!(" Tracks ({}) ", app.track_list.len());
     let border_style = if is_active {
-        Style::default().fg(t.selection_bg)
+        t.active_border()
     } else {
         t.border()
     };
@@ -1103,7 +1103,7 @@ fn draw_device_info(f: &mut Frame, app: &App, area: Rect) {
     let t = app.theme();
     let is_active = app.active_panel == Panel::Device;
     let border_style = if is_active {
-        Style::default().fg(t.selection_bg)
+        t.active_border()
     } else {
         t.border()
     };
@@ -1316,7 +1316,7 @@ fn draw_sync_queue(f: &mut Frame, app: &App, area: Rect) {
     let t = app.theme();
     let is_active = app.active_panel == Panel::SyncQueue;
     let border_style = if is_active {
-        Style::default().fg(t.selection_bg)
+        t.active_border()
     } else {
         t.border()
     };

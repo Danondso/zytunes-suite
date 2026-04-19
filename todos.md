@@ -86,14 +86,25 @@ Reuse the existing bulk-remove path (`BgCommand::RemoveFromDevice`) so storage
 refresh and index updates fall out for free. Decide up front whether to keep
 the oldest vs. newest object ID by default.
 
-### TUI contrast audit
-- Zune Original theme: the brown `main_bg` makes the existing border color
-  nearly unreadable. Pick a lighter tint or switch to an accent-coloured
-  border for that theme.
-- Active-panel highlighting in general is hard to see — the current
+### ~~TUI contrast audit~~ (done)
+- ~~Zune Original theme: the brown `main_bg` makes the existing border color
+  nearly unreadable.~~
+- ~~Active-panel highlighting in general is hard to see — the current
   `selection_bg` border tint doesn't stand out enough from the inactive
-  border color on several themes. Consider a thicker border, brighter
-  accent, or inverting the title bar for the active panel.
-- Sweep every theme for contrast issues once the scheme changes: sidebar
-  text on sidebar_bg, alt_row on main_bg, dim_text on main_bg, and the
-  active-vs-inactive border pair.
+  border color on several themes.~~
+- ~~Sweep every theme for contrast issues once the scheme changes.~~
+
+Zune Original: `border` changed from `(42,42,42)` (near-invisible on the
+chocolate `main_bg`) to a warm tan `(188,134,92)`, and `dim_text` moved
+from a cool gray `(110,110,110)` to a warmer `(180,150,120)` so dim rows
+stay legible on the brown. Active-panel focus now routes through
+`Theme::active_border()` — `selection_bg` foreground plus `BOLD` — applied
+to every panel (Library/Albums/TrackList/Device/SyncQueue/album-detail)
+so the focused border pops even on themes where `selection_bg` sits close
+to the inactive `border` in luminance. Two regression tests guard the
+change: `active_border_is_distinguishable_from_inactive` (every theme
+must carry BOLD + `selection_bg`) and `zune_original_border_contrasts_main_bg`
+(luminance delta > 60). Remaining per-theme pairs (sidebar text on
+sidebar_bg, alt_row on main_bg) reviewed and left as-is — alt rows are
+intentionally subtle, and sidebar text is already high-contrast on every
+built-in.

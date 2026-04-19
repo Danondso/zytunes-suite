@@ -108,6 +108,15 @@ impl Theme {
         Style::default().fg(self.border)
     }
 
+    /// Border style for the currently focused panel. Adds `BOLD` so the panel
+    /// pops even on themes where `selection_bg` is close in luminance to
+    /// `border` (the inactive-vs-active contrast audited in `todos.md`).
+    pub fn active_border(&self) -> Style {
+        Style::default()
+            .fg(self.selection_bg)
+            .add_modifier(Modifier::BOLD)
+    }
+
     pub fn error(&self) -> Style {
         Style::default().fg(self.error_text)
     }
@@ -583,11 +592,14 @@ pub const ZUNE_ORIGINAL: Theme = Theme {
     // Warm chocolate matching the original Zune 30 brown hardware finish.
     main_bg: Color::Rgb(92, 51, 23),
     alt_row_bg: Color::Rgb(77, 43, 19),
-    border: Color::Rgb(42, 42, 42),
+    // Warm tan so the border reads against the brown main_bg; the old
+    // near-black (42,42,42) was invisible against (92,51,23).
+    border: Color::Rgb(188, 134, 92),
     footer_bg: Color::Rgb(20, 20, 20),
     footer_text: Color::Rgb(235, 141, 0),
     header_text: Color::Rgb(232, 0, 164),
-    dim_text: Color::Rgb(110, 110, 110),
+    // Warm muted tan rather than cool gray so dim rows stay legible on brown.
+    dim_text: Color::Rgb(180, 150, 120),
     error_text: Color::Rgb(255, 80, 80),
     success_text: Color::Rgb(166, 226, 46),
     progress_bar: Color::Rgb(232, 0, 164),
@@ -1029,6 +1041,54 @@ mod tests {
             );
         }
         assert!(parse_border_type(Some(&"wavy".to_string()), BorderType::Plain).is_err());
+    }
+
+    #[test]
+    fn active_border_is_distinguishable_from_inactive() {
+        // Regression: active-panel borders used plain `selection_bg` with no
+        // weight, which on several themes sat too close to the inactive
+        // `border` color to be obvious. `active_border` must differ both in
+        // color and in modifier so the focused panel is visible on every
+        // theme.
+        for t in THEMES {
+            let active = t.active_border();
+            let inactive = t.border();
+            assert!(
+                active.add_modifier.contains(Modifier::BOLD),
+                "{}: active_border must be BOLD",
+                t.name
+            );
+            assert_eq!(
+                active.fg,
+                Some(t.selection_bg),
+                "{}: active_border fg should be selection_bg",
+                t.name
+            );
+            assert_eq!(
+                inactive.fg,
+                Some(t.border),
+                "{}: inactive border fg should be theme.border",
+                t.name
+            );
+        }
+    }
+
+    #[test]
+    fn zune_original_border_contrasts_main_bg() {
+        // Regression: the old (42,42,42) border was near-invisible against
+        // the brown (92,51,23) main_bg. Guard the fix by requiring the border
+        // luminance to sit meaningfully above the background's.
+        fn lum(c: Color) -> f32 {
+            let Color::Rgb(r, g, b) = c else {
+                panic!("Zune Original colors must be RGB");
+            };
+            0.2126 * (r as f32) + 0.7152 * (g as f32) + 0.0722 * (b as f32)
+        }
+        let delta = lum(ZUNE_ORIGINAL.border) - lum(ZUNE_ORIGINAL.main_bg);
+        assert!(
+            delta > 60.0,
+            "border luminance must be clearly brighter than main_bg (delta={delta})"
+        );
     }
 
     #[test]
