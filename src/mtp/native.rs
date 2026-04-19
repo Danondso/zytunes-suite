@@ -1396,6 +1396,17 @@ impl NativeSession {
         if self.art_disabled {
             return;
         }
+        // Pre-3.0 Zune firmware accepts the SetObjectPropValue command +
+        // data writes for REPRESENTATIVE_SAMPLE_DATA, but its prop handler
+        // never returns a response for non-trivial JPEGs — every art write
+        // burns a 45 s ReadPipe timeout and leaves the bulk pipes desynced
+        // (see tools/mtp-probe/src/album_art_check.rs). Skip art entirely
+        // on these devices; music still syncs cleanly.
+        if !self.supports_modern_vendor_ops() {
+            self.log_msg("Album art skipped (pre-3.0 firmware)");
+            self.art_disabled = true;
+            return;
+        }
         let supported = self
             .library
             .as_ref()
