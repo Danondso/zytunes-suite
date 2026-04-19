@@ -10,6 +10,9 @@
 //! cargo run -p zune-mtp --example probe_bulk_query
 //! ```
 //!
+//! By default it targets a Zune 30 (pid=0x0710). Set `ZUNE_PID` in hex to
+//! target a different model — e.g. `ZUNE_PID=063e` for a Zune HD.
+//!
 //! No writes are made. Paste the output back when asking for help.
 
 use std::time::Instant;
@@ -35,6 +38,7 @@ fn prop_label(code: u16) -> &'static str {
         0xDC41 => "PersistentUID",
         0xDC44 => "Name",
         0xDC46 => "Artist",
+        0xDAB9 => "ArtistID (MTP ext)",
         0xDC48 => "Composer",
         0xDC4A => "Date",
         0xDC4B => "Genre",
@@ -56,8 +60,12 @@ fn main() {
 
     println!("=== Zune MTP bulk-query probe ===");
     println!();
-    print!("Opening USB session... ");
-    let mut session = match MtpSession::open(0x045e, 0x0710) {
+    let pid = std::env::var("ZUNE_PID")
+        .ok()
+        .and_then(|s| u16::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+        .unwrap_or(0x0710);
+    print!("Opening USB session (pid=0x{pid:04x})... ");
+    let mut session = match MtpSession::open(0x045e, pid) {
         Ok(s) => {
             println!("ok");
             s
