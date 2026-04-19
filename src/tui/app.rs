@@ -33,6 +33,60 @@ pub enum BrowseMode {
     Device,
 }
 
+/// A single sidebar row, either a bare artist entry or a paired
+/// (artist, album) entry. Storing the parts structured avoids the previous
+/// `format!("{} — {}")` / `split_once(" — ")` round-trip that every lookup
+/// had to unpack.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SidebarEntry {
+    Artist(String),
+    Album { artist: String, album: String },
+}
+
+impl SidebarEntry {
+    /// Human-readable label for rendering (also used as the queue-item label).
+    pub fn display(&self) -> std::borrow::Cow<'_, str> {
+        match self {
+            SidebarEntry::Artist(a) => std::borrow::Cow::Borrowed(a.as_str()),
+            SidebarEntry::Album { artist, album } => {
+                std::borrow::Cow::Owned(format!("{} \u{2014} {}", artist, album))
+            }
+        }
+    }
+
+    /// Key used for first-letter jump navigation. Both variants key off the
+    /// artist name so navigation is uniform across sidebar modes.
+    pub fn nav_key(&self) -> &str {
+        match self {
+            SidebarEntry::Artist(a) => a.as_str(),
+            SidebarEntry::Album { artist, .. } => artist.as_str(),
+        }
+    }
+
+    /// Case-insensitive substring match for `/` search. Album variant matches
+    /// on either artist or album so users can type either to filter.
+    pub fn matches_query(&self, query_lower: &str) -> bool {
+        match self {
+            SidebarEntry::Artist(a) => a.to_lowercase().contains(query_lower),
+            SidebarEntry::Album { artist, album } => {
+                artist.to_lowercase().contains(query_lower)
+                    || album.to_lowercase().contains(query_lower)
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for SidebarEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SidebarEntry::Artist(a) => f.write_str(a),
+            SidebarEntry::Album { artist, album } => {
+                write!(f, "{} \u{2014} {}", artist, album)
+            }
+        }
+    }
+}
+
 /// Which field of a track sample a loading phrase refers to.
 #[derive(Copy, Clone)]
 enum ScanField {
@@ -380,6 +434,32 @@ impl DeviceState {
         true
     }
 
+    /// Check if a track identified by pre-normalized `(artist_key, name_key)`
+    /// is on the device. Callers that already hold normalized keys (e.g.
+    /// cached on `TrackInfo`) should use this directly to avoid re-allocating
+    /// in hot paths.
+    pub fn contains_track(&self, artist_key: &str, name_key: &str) -> bool {
+        if self.status != DeviceStatus::Connected || self.track_set.is_empty() {
+            return false;
+        }
+        // Fast path: direct (artist, name) hit in the precomputed set.
+        if self
+            .track_set
+            .contains(&(artist_key.to_string(), name_key.to_string()))
+        {
+            return true;
+        }
+        // Fallback: bidirectional substring check against the artist's device
+        // tracks (handles filenames with added/stripped track numbers or
+        // incidental prefixes that the normalizer alone can't reconcile).
+        if let Some(device_names) = self.artist_track_names.get(artist_key) {
+            return device_names
+                .iter()
+                .any(|dn| dn.contains(name_key) || name_key.contains(dn.as_str()));
+        }
+        false
+    }
+
     /// Rebuild `track_set` and `artist_track_names` entries for a single artist.
     /// Cheap because it only walks that artist's tracks, not the whole device.
     fn rebuild_lookup_for_artist(&mut self, artist: &str) {
@@ -482,7 +562,7 @@ pub struct App {
     pub active_panel: Panel,
     pub library: Option<Box<dyn MusicLibrary>>,
     pub sidebar_mode: SidebarMode,
-    pub sidebar_items: Vec<String>,
+    pub sidebar_items: Vec<SidebarEntry>,
     pub sidebar_selected: usize,
     pub sidebar_scroll: usize,
     /// Per-mode saved selection positions: [Artists, Albums] x [Library, Device]
@@ -567,6 +647,45 @@ pub struct TrackInfo {
     pub track_number: Option<u32>,
     pub disc_number: Option<u32>,
     pub on_device: bool,
+    /// Pre-normalized (lowercased, trimmed, edge-stripped) artist key.
+    /// Computed once at construction so hot paths (`retag_on_device`, per-frame
+    /// filter passes) do not re-allocate on every render.
+    pub artist_key: String,
+    /// Pre-normalized track-name key, paired with `artist_key` for device lookup.
+    pub name_key: String,
+}
+
+impl TrackInfo {
+    /// Construct a `TrackInfo`, precomputing match keys so on-device lookups
+    /// avoid re-normalizing per render.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        name: String,
+        artist: String,
+        album: String,
+        duration_ms: Option<u64>,
+        kind: Option<String>,
+        location: Option<String>,
+        track_number: Option<u32>,
+        disc_number: Option<u32>,
+        on_device: bool,
+    ) -> Self {
+        let artist_key = normalize_for_match(&artist);
+        let name_key = normalize_for_match(&name);
+        TrackInfo {
+            name,
+            artist,
+            album,
+            duration_ms,
+            kind,
+            location,
+            track_number,
+            disc_number,
+            on_device,
+            artist_key,
+            name_key,
+        }
+    }
 }
 
 impl App {
@@ -875,9 +994,11 @@ impl App {
     }
 
     /// Re-tag the currently displayed track list using precomputed device sets.
+    /// Uses the `TrackInfo`-cached `(artist_key, name_key)` so this runs with
+    /// zero allocations even during live sync cascades.
     fn retag_on_device(&mut self) {
         for t in &mut self.track_list {
-            t.on_device = is_on_device(&t.artist, &t.name, &self.device);
+            t.on_device = self.device.contains_track(&t.artist_key, &t.name_key);
         }
     }
 
@@ -955,8 +1076,8 @@ impl App {
             Panel::TrackList => {
                 if let Some(track) = self.track_list.get(self.track_selected) {
                     // Find the DeviceTrackInfo with matching name in current context.
-                    if let Some(item) = self.sidebar_items.get(self.sidebar_selected) {
-                        let (artist, album) = self.resolve_device_artist_album(item);
+                    if let Some(entry) = self.sidebar_items.get(self.sidebar_selected) {
+                        let (artist, album) = self.resolve_device_artist_album(entry);
                         if let Some(tracks) = self.device.album_tracks.get(&(artist, album)) {
                             if let Some(dt) = tracks.iter().find(|dt| dt.name == track.name) {
                                 return vec![(dt.device_path.clone(), dt.object_id)];
@@ -980,8 +1101,8 @@ impl App {
                 Vec::new()
             }
             Panel::Library => {
-                if let Some(item) = self.sidebar_items.get(self.sidebar_selected) {
-                    self.collect_sidebar_removal_paths(item)
+                if let Some(entry) = self.sidebar_items.get(self.sidebar_selected) {
+                    self.collect_sidebar_removal_paths(entry)
                 } else {
                     Vec::new()
                 }
@@ -990,54 +1111,48 @@ impl App {
         }
     }
 
-    fn collect_sidebar_removal_paths(&self, item: &str) -> Vec<(String, u64)> {
-        match self.sidebar_mode {
-            SidebarMode::Artists => {
-                let Some(albums) = self.device.albums.get(item) else {
+    fn collect_sidebar_removal_paths(&self, entry: &SidebarEntry) -> Vec<(String, u64)> {
+        match entry {
+            SidebarEntry::Artist(artist) => {
+                let Some(albums) = self.device.albums.get(artist) else {
                     return Vec::new();
                 };
                 let mut items = Vec::new();
                 for album in albums {
-                    let key = (item.to_string(), album.clone());
+                    let key = (artist.clone(), album.clone());
                     if let Some(tracks) = self.device.album_tracks.get(&key) {
                         items.extend(tracks.iter().map(|t| (t.device_path.clone(), t.object_id)));
                     }
                 }
                 items
             }
-            SidebarMode::Albums => {
-                let (artist, album) = self.resolve_device_artist_album(item);
-                self.device
-                    .album_tracks
-                    .get(&(artist, album))
-                    .map(|tracks| {
-                        tracks
-                            .iter()
-                            .map(|t| (t.device_path.clone(), t.object_id))
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            }
+            SidebarEntry::Album { artist, album } => self
+                .device
+                .album_tracks
+                .get(&(artist.clone(), album.clone()))
+                .map(|tracks| {
+                    tracks
+                        .iter()
+                        .map(|t| (t.device_path.clone(), t.object_id))
+                        .collect()
+                })
+                .unwrap_or_default(),
         }
     }
 
-    fn resolve_device_artist_album(&self, item: &str) -> (String, String) {
-        match self.sidebar_mode {
-            SidebarMode::Artists => {
+    /// Resolve a sidebar entry to an `(artist, album)` pair using the current
+    /// album-browser selection when the entry is Artist-scoped.
+    fn resolve_device_artist_album(&self, entry: &SidebarEntry) -> (String, String) {
+        match entry {
+            SidebarEntry::Artist(artist) => {
                 let album = self
                     .album_list
                     .get(self.album_selected)
                     .map(|a| a.name.clone())
                     .unwrap_or_default();
-                (item.to_string(), album)
+                (artist.clone(), album)
             }
-            SidebarMode::Albums => {
-                if let Some((artist, album)) = item.split_once(" \u{2014} ") {
-                    (artist.to_string(), album.to_string())
-                } else {
-                    (item.to_string(), String::new())
-                }
-            }
+            SidebarEntry::Album { artist, album } => (artist.clone(), album.clone()),
         }
     }
 
@@ -1073,27 +1188,55 @@ impl App {
                 };
 
                 self.sidebar_items = match self.sidebar_mode {
-                    SidebarMode::Artists => {
-                        lib.artists().into_iter().map(|s| s.to_string()).collect()
-                    }
+                    SidebarMode::Artists => lib
+                        .artists()
+                        .into_iter()
+                        .map(|s| SidebarEntry::Artist(s.to_string()))
+                        .collect(),
                     SidebarMode::Albums => lib
                         .albums()
                         .into_iter()
-                        .map(|(artist, album)| format!("{} \u{2014} {}", artist, album))
+                        .map(|(artist, album)| SidebarEntry::Album {
+                            artist: artist.to_string(),
+                            album: album.to_string(),
+                        })
                         .collect(),
                 };
             }
             BrowseMode::Device => {
                 self.sidebar_items = match self.sidebar_mode {
-                    SidebarMode::Artists => self.device.artists.clone(),
+                    SidebarMode::Artists => self
+                        .device
+                        .artists
+                        .iter()
+                        .map(|a| SidebarEntry::Artist(a.clone()))
+                        .collect(),
                     SidebarMode::Albums => {
-                        let mut items = Vec::new();
+                        let mut items: Vec<SidebarEntry> = Vec::new();
                         for (artist, albums) in &self.device.albums {
                             for album in albums {
-                                items.push(format!("{} \u{2014} {}", artist, album));
+                                items.push(SidebarEntry::Album {
+                                    artist: artist.clone(),
+                                    album: album.clone(),
+                                });
                             }
                         }
-                        items.sort();
+                        // Sort by (artist, album) — matches the previous
+                        // string-sort of "Artist — Album" for pairs that do
+                        // not include an em-dash in the artist name.
+                        items.sort_by(|a, b| match (a, b) {
+                            (
+                                SidebarEntry::Album {
+                                    artist: aa,
+                                    album: ab,
+                                },
+                                SidebarEntry::Album {
+                                    artist: ba,
+                                    album: bb,
+                                },
+                            ) => aa.cmp(ba).then_with(|| ab.cmp(bb)),
+                            _ => std::cmp::Ordering::Equal,
+                        });
                         items
                     }
                 };
@@ -1102,8 +1245,7 @@ impl App {
 
         if self.search_active && !self.search_query.is_empty() {
             let q = self.search_query.to_lowercase();
-            self.sidebar_items
-                .retain(|item| item.to_lowercase().contains(&q));
+            self.sidebar_items.retain(|item| item.matches_query(&q));
         }
 
         self.restore_sidebar_pos();
@@ -1115,13 +1257,13 @@ impl App {
     }
 
     pub fn select_sidebar_item(&mut self) {
-        let item = match self.sidebar_items.get(self.sidebar_selected) {
-            Some(i) => i.clone(),
+        let entry = match self.sidebar_items.get(self.sidebar_selected) {
+            Some(e) => e.clone(),
             None => return,
         };
 
         if self.browse_mode == BrowseMode::Device {
-            self.select_sidebar_item_device(&item);
+            self.select_sidebar_item_device(&entry);
             return;
         }
 
@@ -1130,23 +1272,23 @@ impl App {
             None => return,
         };
 
-        match self.sidebar_mode {
-            SidebarMode::Artists => {
-                let tracks = lib.artist_tracks(&item);
+        match &entry {
+            SidebarEntry::Artist(artist) => {
+                let tracks = lib.artist_tracks(artist);
                 let mut album_map: std::collections::BTreeMap<String, (Option<u32>, usize)> =
                     std::collections::BTreeMap::new();
                 for t in &tracks {
-                    let entry = album_map.entry(t.album.clone()).or_insert((t.year, 0));
-                    entry.1 += 1;
-                    if entry.0.is_none() && t.year.is_some() {
-                        entry.0 = t.year;
+                    let e = album_map.entry(t.album.clone()).or_insert((t.year, 0));
+                    e.1 += 1;
+                    if e.0.is_none() && t.year.is_some() {
+                        e.0 = t.year;
                     }
                 }
                 self.album_list = album_map
                     .into_iter()
                     .map(|(name, (year, count))| AlbumInfo {
                         name,
-                        artist: item.clone(),
+                        artist: artist.clone(),
                         year,
                         track_count: count,
                     })
@@ -1161,13 +1303,9 @@ impl App {
                 self.album_selected = 0;
                 self.select_album();
             }
-            SidebarMode::Albums => {
+            SidebarEntry::Album { album, .. } => {
                 self.album_list.clear();
-                self.track_list = if let Some((_, album)) = item.split_once(" \u{2014} ") {
-                    tracks_to_info(lib.album_tracks(album), &self.device)
-                } else {
-                    Vec::new()
-                };
+                self.track_list = tracks_to_info(lib.album_tracks(album), &self.device);
                 self.sort_tracks();
                 self.track_selected = 0;
                 self.track_scroll = 0;
@@ -1176,22 +1314,22 @@ impl App {
         }
     }
 
-    fn select_sidebar_item_device(&mut self, item: &str) {
-        match self.sidebar_mode {
-            SidebarMode::Artists => {
-                if let Some(albums) = self.device.albums.get(item) {
+    fn select_sidebar_item_device(&mut self, entry: &SidebarEntry) {
+        match entry {
+            SidebarEntry::Artist(artist) => {
+                if let Some(albums) = self.device.albums.get(artist) {
                     self.album_list = albums
                         .iter()
                         .map(|album_name| {
                             let count = self
                                 .device
                                 .album_tracks
-                                .get(&(item.to_string(), album_name.clone()))
+                                .get(&(artist.clone(), album_name.clone()))
                                 .map(|t| t.len())
                                 .unwrap_or(0);
                             AlbumInfo {
                                 name: album_name.clone(),
-                                artist: item.to_string(),
+                                artist: artist.clone(),
                                 year: None,
                                 track_count: count,
                             }
@@ -1201,17 +1339,13 @@ impl App {
                     self.select_album();
                 }
             }
-            SidebarMode::Albums => {
+            SidebarEntry::Album { artist, album } => {
                 self.album_list.clear();
-                if let Some((artist, album)) = item.split_once(" \u{2014} ") {
-                    let key = (artist.to_string(), album.to_string());
-                    self.track_list = match self.device.album_tracks.get(&key) {
-                        Some(tracks) => device_tracks_to_info(tracks),
-                        None => Vec::new(),
-                    };
-                } else {
-                    self.track_list = Vec::new();
-                }
+                let key = (artist.clone(), album.clone());
+                self.track_list = match self.device.album_tracks.get(&key) {
+                    Some(tracks) => device_tracks_to_info(tracks),
+                    None => Vec::new(),
+                };
                 self.track_selected = 0;
                 self.track_scroll = 0;
             }
@@ -1446,9 +1580,11 @@ impl App {
             return;
         }
         let count = items.len();
+        // Label holds the canonical name only. The queue renderer appends the
+        // live track count so it stays accurate as tracks drain during sync.
         let label = match self.sidebar_items.get(self.sidebar_selected) {
-            Some(name) => format!("{} ({} tracks)", name, count),
-            None => format!("{} tracks", count),
+            Some(entry) => entry.to_string(),
+            None => "Tracks".to_string(),
         };
         self.sync.queue.push(QueuedItem {
             label,
@@ -1459,61 +1595,88 @@ impl App {
     }
 
     pub fn add_sidebar_item_to_queue(&mut self) {
-        let item = match self.sidebar_items.get(self.sidebar_selected) {
-            Some(i) => i.clone(),
+        let entry = match self.sidebar_items.get(self.sidebar_selected) {
+            Some(e) => e.clone(),
             None => return,
         };
 
-        if self.sidebar_mode == SidebarMode::Artists {
-            // For artists, gather ALL tracks across all albums.
-            let lib = match &self.library {
-                Some(l) => l,
-                None => return,
-            };
-            let tracks = lib.artist_tracks(&item);
-            let mut items = Vec::new();
-            for t in &tracks {
-                if let Some(ref loc) = t.location {
-                    items.push(SyncItem {
-                        artist: t.artist.clone(),
-                        album: t.album.clone(),
-                        name: t.name.clone(),
-                        location: loc.clone(),
-                    });
+        match &entry {
+            SidebarEntry::Artist(artist) => {
+                // For artists, gather ALL tracks across all albums.
+                let lib = match &self.library {
+                    Some(l) => l,
+                    None => return,
+                };
+                let tracks = lib.artist_tracks(artist);
+                let mut items = Vec::new();
+                for t in &tracks {
+                    if let Some(ref loc) = t.location {
+                        items.push(SyncItem {
+                            artist: t.artist.clone(),
+                            album: t.album.clone(),
+                            name: t.name.clone(),
+                            location: loc.clone(),
+                        });
+                    }
                 }
+                if items.is_empty() {
+                    self.set_toast("No tracks with file locations".into(), true);
+                    return;
+                }
+                let count = items.len();
+                // Label holds the artist name only; the queue renderer appends
+                // the live count so it updates as tracks drain during sync.
+                self.sync.queue.push(QueuedItem {
+                    label: artist.clone(),
+                    tracks: items,
+                });
+                self.set_toast(format!("Added {} tracks to queue", count), false);
+                self.forward_last_queue_item_if_syncing();
             }
-            if items.is_empty() {
-                self.set_toast("No tracks with file locations".into(), true);
-                return;
+            SidebarEntry::Album { .. } => {
+                // For albums, select to populate track list, then add all.
+                // (add_all_visible_to_queue handles the forward itself.)
+                self.select_sidebar_item();
+                self.add_all_visible_to_queue();
             }
-            let count = items.len();
-            self.sync.queue.push(QueuedItem {
-                label: format!("{} ({} tracks)", item, count),
-                tracks: items,
-            });
-            self.set_toast(format!("Added {} tracks to queue", count), false);
-            self.forward_last_queue_item_if_syncing();
-        } else {
-            // For albums, select to populate track list, then add all.
-            // (add_all_visible_to_queue handles the forward itself.)
-            self.select_sidebar_item();
-            self.add_all_visible_to_queue();
         }
     }
 
     /// If a sync is currently in flight, forward the tracks of the most
     /// recently pushed queue entry to the background worker so they get
     /// picked up by the running sync instead of being orphaned when the
-    /// queue is cleared on completion.
+    /// queue is cleared on completion. Mirrors the `execute_sync` dedup
+    /// filter so tracks already on the device (including ones the current
+    /// sync just uploaded) are not re-sent.
     fn forward_last_queue_item_if_syncing(&mut self) {
         if !matches!(self.sync.status, SyncStatus::Running { .. }) {
             return;
         }
-        if let Some(item) = self.sync.queue.last() {
-            if !item.tracks.is_empty() {
-                self.pending_bg_commands
-                    .push(BgCommand::AppendSyncQueue(item.tracks.clone()));
-            }
+        let Some(item) = self.sync.queue.last() else {
+            return;
+        };
+        let total = item.tracks.len();
+        let forward: Vec<SyncItem> = item
+            .tracks
+            .iter()
+            .filter(|it| !is_on_device(&it.artist, &it.name, &self.device))
+            .cloned()
+            .collect();
+        let skipped = total - forward.len();
+        if skipped > 0 {
+            self.sync.log.push(format!(
+                "Appended mid-sync: {n} new {trk}; {skipped} already on device",
+                n = forward.len(),
+                trk = if forward.len() == 1 {
+                    "track"
+                } else {
+                    "tracks"
+                },
+            ));
+        }
+        if !forward.is_empty() {
+            self.pending_bg_commands
+                .push(BgCommand::AppendSyncQueue(forward));
         }
     }
 
@@ -1576,15 +1739,27 @@ impl App {
             .filter(|it| !is_on_device(&it.artist, &it.name, &self.device))
             .collect();
         let skipped = total_before - items.len();
-        if skipped > 0 {
-            self.sync
-                .log
-                .push(format!("Skipping {skipped} track(s) already on device"));
-        }
         if items.is_empty() {
             self.set_toast("All queued tracks already on device".into(), false);
             return;
         }
+        // Always log a single line summarising the sync plan, with both the
+        // "will sync" count and the "already on device" count visible. The
+        // grammar is matched (1 track vs N tracks) so it reads cleanly in
+        // either singular or plural.
+        let n = items.len();
+        let plan = if skipped > 0 {
+            format!(
+                "Syncing {n} new {trk}; {skipped} already on device",
+                trk = if n == 1 { "track" } else { "tracks" }
+            )
+        } else {
+            format!(
+                "Syncing {n} {trk}",
+                trk = if n == 1 { "track" } else { "tracks" }
+            )
+        };
+        self.sync.log.push(plan);
         let _ = cmd_tx.send(BgCommand::ExecuteSyncQueue(items));
     }
 
@@ -1917,9 +2092,10 @@ impl App {
                 if self.sidebar_items.is_empty() {
                     return;
                 }
-                let current_char = first_char_upper(&self.sidebar_items[self.sidebar_selected]);
+                let current_char =
+                    first_char_upper(self.sidebar_items[self.sidebar_selected].nav_key());
                 for i in (self.sidebar_selected + 1)..self.sidebar_items.len() {
-                    if first_char_upper(&self.sidebar_items[i]) != current_char {
+                    if first_char_upper(self.sidebar_items[i].nav_key()) != current_char {
                         self.sidebar_selected = i;
                         self.save_sidebar_pos();
                         if self.sidebar_mode == SidebarMode::Artists {
@@ -1966,14 +2142,19 @@ impl App {
                 if self.sidebar_selected == 0 {
                     self.sidebar_selected = self.sidebar_items.len() - 1;
                 } else {
-                    let current_char = first_char_upper(&self.sidebar_items[self.sidebar_selected]);
+                    let current_char =
+                        first_char_upper(self.sidebar_items[self.sidebar_selected].nav_key());
                     let mut i = self.sidebar_selected;
-                    while i > 0 && first_char_upper(&self.sidebar_items[i - 1]) == current_char {
+                    while i > 0
+                        && first_char_upper(self.sidebar_items[i - 1].nav_key()) == current_char
+                    {
                         i -= 1;
                     }
                     if i > 0 {
-                        let prev_char = first_char_upper(&self.sidebar_items[i - 1]);
-                        while i > 0 && first_char_upper(&self.sidebar_items[i - 1]) == prev_char {
+                        let prev_char = first_char_upper(self.sidebar_items[i - 1].nav_key());
+                        while i > 0
+                            && first_char_upper(self.sidebar_items[i - 1].nav_key()) == prev_char
+                        {
                             i -= 1;
                         }
                         self.sidebar_selected = i;
@@ -2060,7 +2241,9 @@ fn tracks_to_info(tracks: Vec<&Track>, device: &DeviceState) -> Vec<TrackInfo> {
     tracks
         .into_iter()
         .map(|t| {
-            let on_device = is_on_device(&t.artist, &t.name, device);
+            let artist_key = normalize_for_match(&t.artist);
+            let name_key = normalize_for_match(&t.name);
+            let on_device = device.contains_track(&artist_key, &name_key);
             TrackInfo {
                 name: t.name.clone(),
                 artist: t.artist.clone(),
@@ -2071,6 +2254,8 @@ fn tracks_to_info(tracks: Vec<&Track>, device: &DeviceState) -> Vec<TrackInfo> {
                 track_number: t.track_number,
                 disc_number: t.disc_number,
                 on_device,
+                artist_key,
+                name_key,
             }
         })
         .collect()
@@ -2087,40 +2272,33 @@ fn presence_from_counts(matched: usize, total: usize) -> DevicePresence {
     }
 }
 
-/// Check if a single track is on device using the precomputed sets.
+/// Check if a single track is on device. Normalizes the inputs on the fly —
+/// callers that already have pre-normalized keys (e.g. on `TrackInfo`) should
+/// call `DeviceState::contains_track` directly to avoid the allocations.
 fn is_on_device(artist: &str, name: &str, device: &DeviceState) -> bool {
     if device.status != DeviceStatus::Connected || device.track_set.is_empty() {
         return false;
     }
     let artist_key = normalize_for_match(artist);
     let name_key = normalize_for_match(name);
-    if device
-        .track_set
-        .contains(&(artist_key.clone(), name_key.clone()))
-    {
-        return true;
-    }
-    if let Some(device_names) = device.artist_track_names.get(&artist_key) {
-        return device_names
-            .iter()
-            .any(|dn| dn.contains(&name_key) || name_key.contains(dn.as_str()));
-    }
-    false
+    device.contains_track(&artist_key, &name_key)
 }
 
 fn device_tracks_to_info(tracks: &[DeviceTrackInfo]) -> Vec<TrackInfo> {
     tracks
         .iter()
-        .map(|dt| TrackInfo {
-            name: dt.name.clone(),
-            artist: dt.artist.clone(),
-            album: dt.album.clone(),
-            duration_ms: None,
-            kind: None,
-            location: None,
-            track_number: dt.track_number,
-            disc_number: dt.disc_number,
-            on_device: false,
+        .map(|dt| {
+            TrackInfo::new(
+                dt.name.clone(),
+                dt.artist.clone(),
+                dt.album.clone(),
+                None,
+                None,
+                None,
+                dt.track_number,
+                dt.disc_number,
+                false,
+            )
         })
         .collect()
 }
@@ -2240,17 +2418,17 @@ mod tests {
             current: 1,
             total: 5,
         };
-        app.track_list.push(TrackInfo {
-            name: "Idioteque".into(),
-            artist: "Radiohead".into(),
-            album: "Kid A".into(),
-            duration_ms: None,
-            kind: None,
-            location: Some("/tmp/idioteque.mp3".into()),
-            track_number: None,
-            disc_number: None,
-            on_device: false,
-        });
+        app.track_list.push(TrackInfo::new(
+            "Idioteque".into(),
+            "Radiohead".into(),
+            "Kid A".into(),
+            None,
+            None,
+            Some("/tmp/idioteque.mp3".into()),
+            None,
+            None,
+            false,
+        ));
         app.track_selected = 0;
 
         app.add_selected_track_to_queue();
@@ -2273,20 +2451,113 @@ mod tests {
     }
 
     #[test]
+    fn mid_sync_append_filters_already_on_device() {
+        // When a user queues a track mid-sync that's already on the device
+        // (say, because the current sync just uploaded it), the append path
+        // must not re-send it to the worker — otherwise the Zune stores a
+        // duplicate under a new object ID.
+        let mut app = App::new();
+        app.sync.status = SyncStatus::Running {
+            current: 1,
+            total: 5,
+        };
+        app.device.status = DeviceStatus::Connected;
+        app.device.track_set.insert((
+            normalize_for_match("Queen"),
+            normalize_for_match("Bohemian Rhapsody"),
+        ));
+        // Two tracks queued; only the second is new to the device.
+        app.sync.queue.push(QueuedItem {
+            label: "mix".into(),
+            tracks: vec![
+                SyncItem {
+                    artist: "Queen".into(),
+                    album: "A Night at the Opera".into(),
+                    name: "Bohemian Rhapsody".into(),
+                    location: "/music/a.mp3".into(),
+                },
+                SyncItem {
+                    artist: "Queen".into(),
+                    album: "A Night at the Opera".into(),
+                    name: "Love of My Life".into(),
+                    location: "/music/b.mp3".into(),
+                },
+            ],
+        });
+
+        app.forward_last_queue_item_if_syncing();
+
+        let appended = app
+            .pending_bg_commands
+            .iter()
+            .filter_map(|cmd| match cmd {
+                BgCommand::AppendSyncQueue(items) => Some(items.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(appended.len(), 1);
+        assert_eq!(appended[0].len(), 1, "duplicate should be filtered out");
+        assert_eq!(appended[0][0].name, "Love of My Life");
+
+        // The skip should be logged so the user sees what was deduplicated.
+        assert!(
+            app.sync
+                .log
+                .iter()
+                .any(|m| m.contains("Appended mid-sync") && m.contains("1 already on device")),
+            "expected skip-summary log line, got {:?}",
+            app.sync.log
+        );
+    }
+
+    #[test]
+    fn mid_sync_append_all_on_device_sends_nothing() {
+        let mut app = App::new();
+        app.sync.status = SyncStatus::Running {
+            current: 1,
+            total: 5,
+        };
+        app.device.status = DeviceStatus::Connected;
+        app.device.track_set.insert((
+            normalize_for_match("Queen"),
+            normalize_for_match("Bohemian Rhapsody"),
+        ));
+        app.sync.queue.push(QueuedItem {
+            label: "dup".into(),
+            tracks: vec![SyncItem {
+                artist: "Queen".into(),
+                album: "A Night at the Opera".into(),
+                name: "Bohemian Rhapsody".into(),
+                location: "/music/a.mp3".into(),
+            }],
+        });
+
+        app.forward_last_queue_item_if_syncing();
+
+        // Nothing to forward — no AppendSyncQueue should be emitted.
+        assert!(
+            !app.pending_bg_commands
+                .iter()
+                .any(|cmd| matches!(cmd, BgCommand::AppendSyncQueue(_))),
+            "expected no AppendSyncQueue when every track is already on device",
+        );
+    }
+
+    #[test]
     fn adding_track_when_idle_does_not_forward() {
         let mut app = App::new();
         assert!(matches!(app.sync.status, SyncStatus::Idle));
-        app.track_list.push(TrackInfo {
-            name: "Creep".into(),
-            artist: "Radiohead".into(),
-            album: "Pablo Honey".into(),
-            duration_ms: None,
-            kind: None,
-            location: Some("/tmp/creep.mp3".into()),
-            track_number: None,
-            disc_number: None,
-            on_device: false,
-        });
+        app.track_list.push(TrackInfo::new(
+            "Creep".into(),
+            "Radiohead".into(),
+            "Pablo Honey".into(),
+            None,
+            None,
+            Some("/tmp/creep.mp3".into()),
+            None,
+            None,
+            false,
+        ));
         app.track_selected = 0;
 
         app.add_selected_track_to_queue();
@@ -2372,8 +2643,148 @@ mod tests {
             Ok(_) => panic!("expected ExecuteSyncQueue"),
             Err(_) => panic!("no command dispatched"),
         }
-        // Log should mention the skip.
-        assert!(app.sync.log.iter().any(|m| m.contains("Skipping 1")));
+        // Log should summarise both the planned sync count and the skip count
+        // on a single line so the user sees what's actually about to happen.
+        assert!(
+            app.sync
+                .log
+                .iter()
+                .any(|m| m.contains("Syncing 1") && m.contains("1 already on device")),
+            "expected combined summary line, got {:?}",
+            app.sync.log
+        );
+    }
+
+    #[test]
+    fn execute_sync_without_duplicates_logs_plain_plan() {
+        let mut app = App::new();
+        app.device.status = DeviceStatus::Connected;
+        app.sync.queue.push(QueuedItem {
+            label: "test".into(),
+            tracks: vec![
+                SyncItem {
+                    artist: "Queen".into(),
+                    album: "A Night at the Opera".into(),
+                    name: "Bohemian Rhapsody".into(),
+                    location: "/music/queen/bohemian.mp3".into(),
+                },
+                SyncItem {
+                    artist: "Queen".into(),
+                    album: "A Night at the Opera".into(),
+                    name: "Love of My Life".into(),
+                    location: "/music/queen/love.mp3".into(),
+                },
+            ],
+        });
+
+        let (tx, _rx) = mpsc::channel();
+        app.execute_sync(&tx);
+
+        // When nothing is skipped, the log should just state the count —
+        // no trailing "; 0 already on device" noise.
+        assert!(
+            app.sync.log.iter().any(|m| m == "Syncing 2 tracks"),
+            "expected plain plan, got {:?}",
+            app.sync.log
+        );
+        assert!(
+            !app.sync.log.iter().any(|m| m.contains("already on device")),
+            "skip phrase must not appear when skip=0: {:?}",
+            app.sync.log
+        );
+    }
+
+    #[test]
+    fn execute_sync_plan_is_singular_for_one_track() {
+        let mut app = App::new();
+        app.device.status = DeviceStatus::Connected;
+        app.sync.queue.push(QueuedItem {
+            label: "test".into(),
+            tracks: vec![SyncItem {
+                artist: "Queen".into(),
+                album: "A Night at the Opera".into(),
+                name: "Bohemian Rhapsody".into(),
+                location: "/music/queen/bohemian.mp3".into(),
+            }],
+        });
+
+        let (tx, _rx) = mpsc::channel();
+        app.execute_sync(&tx);
+
+        // Grammar check: "1 track" (singular), not "1 tracks".
+        assert!(
+            app.sync.log.iter().any(|m| m == "Syncing 1 track"),
+            "expected singular form, got {:?}",
+            app.sync.log
+        );
+    }
+
+    #[test]
+    fn queue_labels_do_not_bake_track_count() {
+        // Queue-entry labels should hold the canonical name only — the UI is
+        // responsible for rendering the live count, so baking "(N tracks)"
+        // into the label produces the duplicated "(N tracks) (N tracks)"
+        // we used to print.
+        use zytunes::library::Track;
+        struct OneArtist;
+        impl zytunes::library::MusicLibrary for OneArtist {
+            fn artists(&self) -> Vec<&str> {
+                vec!["Queen"]
+            }
+            fn albums(&self) -> Vec<(&str, &str)> {
+                vec![("Queen", "A Night at the Opera")]
+            }
+            fn artist_tracks(&self, _: &str) -> Vec<&Track> {
+                Vec::new()
+            }
+            fn album_tracks(&self, _: &str) -> Vec<&Track> {
+                Vec::new()
+            }
+            fn album_tracks_by_artist(&self, _: &str, _: &str) -> Vec<&Track> {
+                Vec::new()
+            }
+            fn tracks_by_name(&self, _: &str) -> Vec<&Track> {
+                Vec::new()
+            }
+            fn track_count(&self) -> usize {
+                0
+            }
+            fn all_tracks(&self) -> Vec<&Track> {
+                Vec::new()
+            }
+            fn music_folder(&self) -> Option<&str> {
+                None
+            }
+        }
+
+        let mut app = App::new();
+        app.library = Some(Box::new(OneArtist));
+        // refresh_sidebar clears track_list, so seed it afterwards.
+        app.refresh_sidebar();
+        app.sidebar_selected = 0;
+        app.track_list = vec![TrackInfo::new(
+            "Bohemian Rhapsody".into(),
+            "Queen".into(),
+            "A Night at the Opera".into(),
+            None,
+            None,
+            Some("/music/queen/bohemian.mp3".into()),
+            None,
+            None,
+            false,
+        )];
+        app.add_all_visible_to_queue();
+
+        assert_eq!(app.sync.queue.len(), 1);
+        let label = &app.sync.queue[0].label;
+        assert!(
+            !label.contains("tracks"),
+            "label must not include track count, got {label:?}",
+        );
+        assert!(
+            !label.contains("(1"),
+            "label must not include parenthesised count, got {label:?}",
+        );
     }
 
     #[test]
@@ -2408,7 +2819,11 @@ mod tests {
     #[test]
     fn move_up_down_bounds() {
         let mut app = App::new();
-        app.sidebar_items = vec!["A".into(), "B".into(), "C".into()];
+        app.sidebar_items = vec![
+            SidebarEntry::Artist("A".into()),
+            SidebarEntry::Artist("B".into()),
+            SidebarEntry::Artist("C".into()),
+        ];
         app.active_panel = Panel::Library;
 
         app.move_up(); // already at 0
@@ -2782,7 +3197,7 @@ mod tests {
         app.build_device_index();
         app.browse_mode = BrowseMode::Device;
         app.sidebar_mode = SidebarMode::Artists;
-        app.sidebar_items = vec!["Art".into()];
+        app.sidebar_items = vec![SidebarEntry::Artist("Art".into())];
         app.sidebar_selected = 0;
         app.select_sidebar_item();
 
@@ -2826,10 +3241,10 @@ mod tests {
         let mut app = App::new();
         app.active_panel = Panel::Library;
         app.sidebar_items = vec![
-            "Apple".into(),
-            "Avocado".into(),
-            "Banana".into(),
-            "Cherry".into(),
+            SidebarEntry::Artist("Apple".into()),
+            SidebarEntry::Artist("Avocado".into()),
+            SidebarEntry::Artist("Banana".into()),
+            SidebarEntry::Artist("Cherry".into()),
         ];
         app.sidebar_selected = 0;
         app.skip_forward(); // A -> B
@@ -3126,10 +3541,10 @@ mod tests {
         let mut app = App::new();
         // Populate sidebar items directly (simulating a loaded library sidebar)
         app.sidebar_items = vec![
-            "Beatles".into(),
-            "Beach Boys".into(),
-            "Radiohead".into(),
-            "Rolling Stones".into(),
+            SidebarEntry::Artist("Beatles".into()),
+            SidebarEntry::Artist("Beach Boys".into()),
+            SidebarEntry::Artist("Radiohead".into()),
+            SidebarEntry::Artist("Rolling Stones".into()),
         ];
         // Activate search with a query
         app.search_active = true;
@@ -3146,8 +3561,12 @@ mod tests {
         app.sidebar_mode = SidebarMode::Artists;
         app.refresh_sidebar();
         assert_eq!(app.sidebar_items.len(), 2);
-        assert!(app.sidebar_items.contains(&"Beatles".to_string()));
-        assert!(app.sidebar_items.contains(&"Beach Boys".to_string()));
+        assert!(app
+            .sidebar_items
+            .contains(&SidebarEntry::Artist("Beatles".into())));
+        assert!(app
+            .sidebar_items
+            .contains(&SidebarEntry::Artist("Beach Boys".into())));
     }
 
     #[test]
@@ -3320,6 +3739,122 @@ mod tests {
         assert!(
             !is_on_device("Artist", "Test", &device),
             "should return false when disconnected"
+        );
+    }
+
+    #[test]
+    fn sidebar_entry_display_matches_legacy_stitched_form() {
+        // Legacy string format used " — " (em-dash) between artist and album.
+        // Existing persisted preferences and UI snapshots rely on exactly that
+        // shape, so the structured display must reproduce it verbatim.
+        let a = SidebarEntry::Artist("Queen".into());
+        assert_eq!(a.display(), "Queen");
+        assert_eq!(format!("{}", a), "Queen");
+        let alb = SidebarEntry::Album {
+            artist: "Queen".into(),
+            album: "A Night at the Opera".into(),
+        };
+        assert_eq!(alb.display(), "Queen \u{2014} A Night at the Opera");
+        assert_eq!(format!("{}", alb), "Queen \u{2014} A Night at the Opera");
+    }
+
+    #[test]
+    fn sidebar_entry_matches_query_album_matches_either_side() {
+        let a = SidebarEntry::Album {
+            artist: "Radiohead".into(),
+            album: "OK Computer".into(),
+        };
+        assert!(a.matches_query("radio"), "matches on artist");
+        assert!(a.matches_query("computer"), "matches on album");
+        assert!(!a.matches_query("idioteque"));
+    }
+
+    #[test]
+    fn sidebar_entry_nav_key_is_artist_for_both_variants() {
+        let a = SidebarEntry::Artist("Beatles".into());
+        let alb = SidebarEntry::Album {
+            artist: "Beatles".into(),
+            album: "Revolver".into(),
+        };
+        // First-letter jump navigation must behave the same whether we're in
+        // Artists or Albums sidebar mode — both key off the artist name.
+        assert_eq!(a.nav_key(), "Beatles");
+        assert_eq!(alb.nav_key(), "Beatles");
+    }
+
+    #[test]
+    fn track_info_new_precomputes_match_keys() {
+        let ti = TrackInfo::new(
+            "  The Song  ".into(),
+            "*NSYNC".into(),
+            "Album".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        // Keys should be normalized (lowercased, edge-stripped) so device
+        // lookup runs against the same form used in `track_set`.
+        assert_eq!(ti.artist_key, normalize_for_match("*NSYNC"));
+        assert_eq!(ti.name_key, normalize_for_match("  The Song  "));
+    }
+
+    #[test]
+    fn retag_on_device_uses_precomputed_keys() {
+        // Populate device state so "Queen / Bohemian Rhapsody" matches.
+        let mut app = App::new();
+        app.device.status = DeviceStatus::Connected;
+        app.device.album_tracks.insert(
+            ("Queen".into(), "A Night at the Opera".into()),
+            vec![DeviceTrackInfo {
+                name: "01 Bohemian Rhapsody".into(),
+                device_path: "/Music/Queen/A Night at the Opera/01 Bohemian Rhapsody.mp3".into(),
+                size: 1000,
+                object_id: 1,
+                artist: "Queen".into(),
+                album: "A Night at the Opera".into(),
+                track_number: None,
+                disc_number: None,
+            }],
+        );
+        build_match_sets(&mut app.device);
+
+        // Two tracks: one should match, one should not.
+        app.track_list = vec![
+            TrackInfo::new(
+                "Bohemian Rhapsody".into(),
+                "Queen".into(),
+                "A Night at the Opera".into(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+            ),
+            TrackInfo::new(
+                "Somebody to Love".into(),
+                "Queen".into(),
+                "A Day at the Races".into(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+            ),
+        ];
+        app.retag_on_device();
+
+        assert!(
+            app.track_list[0].on_device,
+            "precomputed keys should match Bohemian Rhapsody"
+        );
+        assert!(
+            !app.track_list[1].on_device,
+            "precomputed keys should miss Somebody to Love"
         );
     }
 

@@ -26,7 +26,8 @@ fn char_disp_width(c: char) -> usize {
 use crate::anim;
 use crate::app::{
     format_duration, format_with_commas, AlbumArtCache, App, BrowseMode, DevicePresence,
-    DeviceStatus, NowPlaying, Panel, PlaybackState, SidebarMode, SortColumn, SyncStatus,
+    DeviceStatus, NowPlaying, Panel, PlaybackState, SidebarEntry, SidebarMode, SortColumn,
+    SyncStatus,
 };
 use crate::theme;
 
@@ -406,7 +407,7 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
         .enumerate()
         .skip(scroll)
         .take(visible_height)
-        .map(|(i, name)| {
+        .map(|(i, entry)| {
             let style = if i == app.sidebar_selected {
                 t.sidebar_item_selected()
             } else {
@@ -417,17 +418,14 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
             } else {
                 "  "
             };
+            let name = entry.display();
             let (icon, icon_style) = if show_device_status {
-                let presence = match app.sidebar_mode {
-                    SidebarMode::Artists => app.artist_device_status.get(name).copied(),
-                    SidebarMode::Albums => {
-                        // Sidebar entries are "Artist — Album" (em dash).
-                        name.split_once(" \u{2014} ").and_then(|(artist, album)| {
-                            app.album_device_status
-                                .get(&(artist.to_string(), album.to_string()))
-                                .copied()
-                        })
-                    }
+                let presence = match entry {
+                    SidebarEntry::Artist(artist) => app.artist_device_status.get(artist).copied(),
+                    SidebarEntry::Album { artist, album } => app
+                        .album_device_status
+                        .get(&(artist.clone(), album.clone()))
+                        .copied(),
                 };
                 let accent_fg = sidebar_icon_accent(t, i == app.sidebar_selected);
                 match presence {
@@ -443,10 +441,10 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
             let icon_w = disp_width(icon);
             let max_name = inner_w.saturating_sub(cursor_w + icon_w);
             let is_selected = i == app.sidebar_selected;
-            let name_trunc = if is_selected && disp_width(name) > max_name && max_name > 0 {
-                marquee(name, max_name, app.anim_frame)
+            let name_trunc = if is_selected && disp_width(&name) > max_name && max_name > 0 {
+                marquee(&name, max_name, app.anim_frame)
             } else {
-                truncate(name, max_name).to_string()
+                truncate(&name, max_name).to_string()
             };
             // Pad to full row width so the selection background reaches the
             // right border (see album browser for rationale).
@@ -473,14 +471,14 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
 fn draw_album_browser(f: &mut Frame, app: &App, area: Rect) {
     let t = app.theme();
     let is_active = app.active_panel == Panel::Albums;
-    let artist = app
+    let header = app
         .sidebar_items
         .get(app.sidebar_selected)
-        .cloned()
+        .map(|e| e.display().into_owned())
         .unwrap_or_default();
     let title = format!(
         " {} ",
-        truncate(&artist, area.width.saturating_sub(4) as usize)
+        truncate(&header, area.width.saturating_sub(4) as usize)
     );
     let border_style = if is_active {
         t.active_border()
@@ -1344,6 +1342,43 @@ fn draw_sync_queue(f: &mut Frame, app: &App, area: Rect) {
                 Paragraph::new(status_line).style(Style::default().fg(track_color)),
                 chunks[0],
             );
+
+            // Render the queue list below the progress line so mid-sync
+            // additions are visible. Without this, the whole queue panel is
+            // just the progress header and users can't see items they
+            // enqueued while the sync was running.
+            if !app.sync.queue.is_empty() {
+                let row_w = chunks[1].width as usize;
+                let items: Vec<ListItem> = app
+                    .sync
+                    .queue
+                    .iter()
+                    .enumerate()
+                    .map(|(i, q)| {
+                        let is_selected = i == app.sync.queue_selected && is_active;
+                        let style = if is_selected {
+                            t.sidebar_item_selected()
+                        } else {
+                            Style::default().fg(t.sidebar_text).bg(t.main_bg)
+                        };
+                        let cursor = if is_selected { "> " } else { "  " };
+                        let n = q.tracks.len();
+                        let suffix =
+                            format!(" ({} {})", n, if n == 1 { "track" } else { "tracks" });
+                        let cursor_w = disp_width(cursor);
+                        let suffix_w = disp_width(&suffix);
+                        let max_label = row_w.saturating_sub(cursor_w + suffix_w);
+                        let label_trunc =
+                            if is_selected && disp_width(&q.label) > max_label && max_label > 0 {
+                                marquee(&q.label, max_label, app.anim_frame)
+                            } else {
+                                truncate(&q.label, max_label).to_string()
+                            };
+                        ListItem::new(format!("{}{}{}", cursor, label_trunc, suffix)).style(style)
+                    })
+                    .collect();
+                f.render_widget(List::new(items), chunks[1]);
+            }
         }
         SyncStatus::Idle => {
             if app.browse_mode == BrowseMode::Device && !app.removal_queue.is_empty() {
@@ -1392,26 +1427,45 @@ fn draw_sync_queue(f: &mut Frame, app: &App, area: Rect) {
                     let p = Paragraph::new("Press 'a' to add.").style(t.dim());
                     f.render_widget(p, inner);
                 } else {
+                    let chunks = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Min(2), Constraint::Length(1)])
+                        .split(inner);
+                    let row_w = chunks[0].width as usize;
+
                     let items: Vec<ListItem> = app
                         .sync
                         .queue
                         .iter()
                         .enumerate()
                         .map(|(i, q)| {
-                            let style = if i == app.sync.queue_selected && is_active {
+                            let is_selected = i == app.sync.queue_selected && is_active;
+                            let style = if is_selected {
                                 t.sidebar_item_selected()
                             } else {
                                 Style::default().fg(t.sidebar_text).bg(t.main_bg)
                             };
-                            ListItem::new(format!("  {} ({} tracks)", q.label, q.tracks.len()))
+                            // Cursor mirrors the sidebar: "> " on the selected
+                            // row, "  " elsewhere, so padding and selection
+                            // background stay consistent.
+                            let cursor = if is_selected { "> " } else { "  " };
+                            let n = q.tracks.len();
+                            let suffix =
+                                format!(" ({} {})", n, if n == 1 { "track" } else { "tracks" });
+                            let cursor_w = disp_width(cursor);
+                            let suffix_w = disp_width(&suffix);
+                            let max_label = row_w.saturating_sub(cursor_w + suffix_w);
+                            let label_trunc =
+                                if is_selected && disp_width(&q.label) > max_label && max_label > 0
+                                {
+                                    marquee(&q.label, max_label, app.anim_frame)
+                                } else {
+                                    truncate(&q.label, max_label).to_string()
+                                };
+                            ListItem::new(format!("{}{}{}", cursor, label_trunc, suffix))
                                 .style(style)
                         })
                         .collect();
-
-                    let chunks = Layout::default()
-                        .direction(Direction::Vertical)
-                        .constraints([Constraint::Min(2), Constraint::Length(1)])
-                        .split(inner);
 
                     let list = List::new(items);
                     f.render_widget(list, chunks[0]);

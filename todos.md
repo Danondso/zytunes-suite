@@ -17,16 +17,28 @@ performing binary-search inserts and artist-scoped lookup-set rebuilds.
 (`rebuild_artist_device_status`, sidebar/retag). Initial load still uses
 `build_device_index` which drains `tracks` and replays via the incremental path.
 
-### Sidebar stitches `"Artist — Album"` then splits it back
-`src/tui/app.rs:854-866` (and device branch 890-898). Builds
-`format!("{} \u{2014} {}", artist, album)` for display, then downstream code
-parses it with `split_once(" \u{2014} ")` to recover the parts. Store
-`(artist_idx, album_idx)` or a small enum; format only at render time.
+### ~~Sidebar stitches `"Artist — Album"` then splits it back~~ (done)
+Replaced `Vec<String>` with `Vec<SidebarEntry>` (`Artist(String)` or
+`Album { artist, album }`). `refresh_sidebar` builds the structured form
+directly; `select_sidebar_item`, `collect_sidebar_removal_paths`,
+`resolve_device_artist_album`, and the `add_sidebar_item_to_queue` queue
+label all match on the variant. `display()` / `fmt::Display` produces the
+legacy `"Artist \u{2014} Album"` string at render time only; ui.rs reads
+device-status icons directly from the variant without splitting. Three
+regression tests guard the behavior (`sidebar_entry_display_matches_legacy_stitched_form`,
+`sidebar_entry_matches_query_album_matches_either_side`,
+`sidebar_entry_nav_key_is_artist_for_both_variants`).
 
-### `is_on_device` / `normalize_for_match` run per render
-`src/tui/app.rs:1805-1820, 1845`. Normalization happens on every track during
-filter/render passes. Pre-normalize when building `device.track_set` and
-`device.artist_track_names` so lookup is a direct set membership test.
+### ~~`is_on_device` / `normalize_for_match` run per render~~ (done)
+`TrackInfo` now carries pre-normalized `artist_key` / `name_key` fields
+(populated via `TrackInfo::new`); `retag_on_device` dispatches through
+`DeviceState::contains_track(&artist_key, &name_key)` with zero allocations
+on the hot flush path. `is_on_device(raw_artist, raw_name, device)` remains
+as a wrapper for callers that still hold raw strings (`rebuild_artist_device_status`,
+`execute_sync`), delegating to `contains_track` after one normalize per
+call site. Regression tests cover the precompute
+(`track_info_new_precomputes_match_keys`) and the flush path
+(`retag_on_device_uses_precomputed_keys`).
 
 ### `MtpResultExt` discards `MtpError` variants at the session boundary
 `src/mtp/native.rs`. The `DeviceSession` trait returns `Result<T, String>`, so
@@ -63,16 +75,21 @@ Delete or actually use. Each one is parsing + memory cost per track.
 
 ## Linux transport parity
 
-### `LibusbTransport` has no stall recovery on write/read failures
-`zune-mtp/src/transport/libusb.rs`. The IOKit backend calls `ClearPipeStall`
-(with a one-shot retry) on recoverable USB errors from `WritePipe` / `ReadPipe`,
-and clears stalls on *both* bulk endpoints after a read timeout so the OUT
-pipe doesn't desync. The libusb backend does neither — a single transient
-stall (common during sync cascades, cable jostles, or Zune firmware hiccups)
-surfaces as a raw `rusb::Error` and the user has to replug. Add equivalent
-recovery via `DeviceHandle::clear_halt(endpoint)` on both bulk endpoints, with
-the same one-shot retry pattern, so Linux sync tolerates the same class of
-wedges macOS already does.
+### ~~`LibusbTransport` has no stall recovery on write/read failures~~ (done)
+`LibusbTransport::write` and `LibusbTransport::read` now classify recoverable
+`rusb::Error` cases (`Pipe`, `Io`, `Interrupted`, `Overflow`) via
+`is_recoverable_libusb_error`, call `DeviceHandle::clear_halt(endpoint)` on
+the affected bulk endpoint, and retry once — matching the IOKit backend's
+`ClearPipeStall` pattern. `read_with_timeout` clears stalls on BOTH bulk
+endpoints on a `Timeout` so the OUT pipe can't desync the way the IOKit
+timeout path already guards against. Failure messages use `retry after
+clear_halt` / `read_bulk timed out` wording, and `is_device_gone` in
+`tui/background.rs` now matches those Linux phrasings alongside the
+existing IOKit strings so the cascade-to-dead detection fires on Linux.
+Two classifier tests guard recoverable vs terminal cases
+(`is_recoverable_libusb_error_{recognises_stall_and_transients,rejects_terminal_conditions}`),
+and `is_device_gone` has an extended case covering the Linux-form error
+strings.
 
 ## UX follow-ups
 
