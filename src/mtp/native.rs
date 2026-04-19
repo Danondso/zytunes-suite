@@ -291,10 +291,11 @@ impl TrackCache {
 
     fn remove(&self, device_path: &str) {
         let path_suffix = device_path.trim_start_matches("/Music/");
+        let prefix = format!("{path_suffix}/");
         self.filter_cache(|line| {
             line.splitn(5, '\t')
                 .nth(4)
-                .map(|name| name != path_suffix)
+                .map(|name| name != path_suffix && !name.starts_with(&prefix))
                 .unwrap_or(true)
         });
     }
@@ -1054,13 +1055,14 @@ impl DeviceSession for NativeSession {
 
     fn rm(&mut self, device_path: &str) -> Result<(), String> {
         let handle = self.resolve_path(device_path)?;
-        self.session.delete_object(handle).mtp_err()?;
+        self.delete_recursive(handle)?;
         self.cache.remove(device_path);
+        self.invalidate_library_for_path(device_path);
         Ok(())
     }
 
     fn rm_by_id(&mut self, object_id: u32) -> Result<(), String> {
-        self.session.delete_object(object_id).mtp_err()?;
+        self.delete_recursive(object_id)?;
         self.cache.remove_by_id(object_id);
         Ok(())
     }
@@ -1338,6 +1340,62 @@ impl NativeSession {
         }
     }
 
+    /// Delete a handle and, if it's an association (folder), its children first.
+    /// Zune firmware does NOT cascade folder deletion for us: deleting a folder
+    /// handle leaves the child objects orphaned on the device. Walk the
+    /// hierarchy bottom-up so every descendant is gone before the parent.
+    fn delete_recursive(&mut self, handle: u32) -> Result<(), String> {
+        let is_folder = self
+            .session
+            .get_object_info(handle)
+            .map(|info| info.object_format == ASSOCIATION_FORMAT)
+            .unwrap_or(false);
+        if is_folder {
+            let children = self
+                .session
+                .get_object_handles(self.storage_id, handle)
+                .unwrap_or_default();
+            for child in children {
+                self.delete_recursive(child)?;
+            }
+        }
+        self.session.delete_object(handle).mtp_err()
+    }
+
+    /// Drop matching artist/album entries from the in-memory library and
+    /// re-save the cache. Without this, a subsequent sync re-uses stale
+    /// MTP handles for the deleted parent folder — on v1.4 firmware the
+    /// resulting `send_object_prop_list` against a dead parent halts the
+    /// OUT bulk pipe and cascades every queued track. See findings.md.
+    fn invalidate_library_for_path(&mut self, device_path: &str) {
+        let parts: Vec<&str> = device_path
+            .trim_start_matches('/')
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect();
+        if parts.first().copied() != Some("Music") || parts.len() < 2 {
+            return;
+        }
+        let artist = parts[1].to_string();
+        if self.library.is_none() {
+            self.library = self.load_library_cache();
+        }
+        let Some(lib) = self.library.as_mut() else {
+            return;
+        };
+        match parts.len() {
+            2 => {
+                lib.albums.retain(|(a, _), _| a != &artist);
+                lib.artists.remove(&artist);
+            }
+            _ => {
+                let album = parts[2].to_string();
+                lib.albums.remove(&(artist, album));
+            }
+        }
+        self.save_library_cache();
+    }
+
     /// Delete the device library cache file.
     fn clear_library_cache(&self) {
         if let Some(path) = self.library_cache_path() {
@@ -1394,17 +1452,6 @@ impl NativeSession {
     /// Try to extract and set album art on the device. Logs but doesn't fail on errors.
     fn try_set_album_art(&mut self, local_path: &str, album_obj_id: u32) {
         if self.art_disabled {
-            return;
-        }
-        // Pre-3.0 Zune firmware accepts the SetObjectPropValue command +
-        // data writes for REPRESENTATIVE_SAMPLE_DATA, but its prop handler
-        // never returns a response for non-trivial JPEGs — every art write
-        // burns a 45 s ReadPipe timeout and leaves the bulk pipes desynced
-        // (see tools/mtp-probe/src/album_art_check.rs). Skip art entirely
-        // on these devices; music still syncs cleanly.
-        if !self.supports_modern_vendor_ops() {
-            self.log_msg("Album art skipped (pre-3.0 firmware)");
-            self.art_disabled = true;
             return;
         }
         let supported = self
@@ -1518,15 +1565,39 @@ fn extract_album_art(path: &str) -> Option<Vec<u8>> {
     encoder
         .encode(rgb.as_raw(), 200, 200, ExtendedColorType::Rgb8)
         .ok()?;
+
+    // Round-trip pass: decode the freshly encoded JPEG and re-encode at the
+    // same quality. mtp-probe album-art-check showed v1.4 firmware hangs on
+    // certain first-pass byte patterns (e.g. a ~21 KB first-pass JPEG) but
+    // accepts the round-tripped output (20938 bytes) from the same source.
+    // Re-encoding from already-quantized DCT data smooths the high-frequency
+    // content just enough to dodge the firmware's prop-handler bug.
+    let final_buf = match image::load_from_memory(&jpeg_buf) {
+        Ok(img2) => {
+            let rgb2 = img2.to_rgb8();
+            let mut buf2: Vec<u8> = Vec::with_capacity(jpeg_buf.len());
+            let mut enc2 = JpegEncoder::new_with_quality(&mut buf2, 85);
+            if enc2
+                .encode(rgb2.as_raw(), 200, 200, ExtendedColorType::Rgb8)
+                .is_ok()
+            {
+                buf2
+            } else {
+                jpeg_buf
+            }
+        }
+        Err(_) => jpeg_buf,
+    };
+
     // Sanity: baseline JPEG starts with FFD8 (SOI) and ends with FFD9 (EOI).
     // If the encoder produced something truncated, don't send it.
-    if jpeg_buf.len() < 4
-        || jpeg_buf[..2] != [0xFF, 0xD8]
-        || jpeg_buf[jpeg_buf.len() - 2..] != [0xFF, 0xD9]
+    if final_buf.len() < 4
+        || final_buf[..2] != [0xFF, 0xD8]
+        || final_buf[final_buf.len() - 2..] != [0xFF, 0xD9]
     {
         return None;
     }
-    Some(jpeg_buf)
+    Some(final_buf)
 }
 
 /// Read metadata from an audio file using lofty (supports all formats).
@@ -1932,6 +2003,57 @@ mod tests {
         let (_, loaded) = cache.load().unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].name, "Artist/Album/keep.mp3");
+
+        if let Some(p) = cache.cache_path() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn track_cache_remove_folder_clears_children() {
+        // Regression: rm of an album folder must clear every track entry
+        // under it, not just an exact-name match. Without this, sync would
+        // dedup the orphaned tracks as "already on device" and never
+        // re-push them.
+        let cache = make_cache(Some("remove-folder"));
+        let entries = vec![
+            sample_entry("Artist/AlbumA/song1.mp3", 1),
+            sample_entry("Artist/AlbumA/song2.mp3", 2),
+            sample_entry("Artist/AlbumB/song3.mp3", 3),
+            sample_entry("OtherArtist/AlbumA/song4.mp3", 4),
+        ];
+        cache.save(&entries, 0);
+
+        cache.remove("/Music/Artist/AlbumA");
+
+        let (_, loaded) = cache.load().unwrap();
+        let names: Vec<&str> = loaded.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["Artist/AlbumB/song3.mp3", "OtherArtist/AlbumA/song4.mp3"]
+        );
+
+        if let Some(p) = cache.cache_path() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn track_cache_remove_does_not_match_partial_prefix() {
+        // "/Music/Album" must not also clobber "Album-Live/..." — the prefix
+        // check has to use a path-segment boundary.
+        let cache = make_cache(Some("remove-partial"));
+        let entries = vec![
+            sample_entry("Album/song.mp3", 1),
+            sample_entry("Album-Live/song.mp3", 2),
+        ];
+        cache.save(&entries, 0);
+
+        cache.remove("/Music/Album");
+
+        let (_, loaded) = cache.load().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "Album-Live/song.mp3");
 
         if let Some(p) = cache.cache_path() {
             let _ = std::fs::remove_file(p);
