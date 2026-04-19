@@ -333,6 +333,7 @@ impl TrackCache {
 pub struct NativeSession {
     session: MtpSession,
     storage_id: u32,
+    product_id: u16,
     log: Option<std::sync::mpsc::Sender<String>>,
     library: Option<DeviceLibrary>,
     cache: TrackCache,
@@ -483,6 +484,7 @@ impl NativeSession {
         Ok(NativeSession {
             session,
             storage_id,
+            product_id,
             log: None,
             library: None,
             cache: TrackCache::new(None),
@@ -658,26 +660,39 @@ impl NativeSession {
 
         // Try loading from disk cache first.
         if let Some(cached_lib) = self.load_library_cache() {
-            self.log_msg(&format!(
-                "Loaded library cache ({} artists, {} albums)",
-                cached_lib.artists.len(),
-                cached_lib.albums.len()
-            ));
-            self.library = Some(cached_lib);
-            return Ok(());
+            // Self-correct caches written before the HD-specific
+            // artist_supported default existed — HD (pid=0x063e) requires
+            // artist_supported=true or tracks file as "Unknown Artist".
+            let expected_artist_supported = self.product_id == 0x063e;
+            if cached_lib.caps.artist_supported != expected_artist_supported {
+                self.log_msg(&format!(
+                    "Library cache has artist_supported={}, expected {} for pid=0x{:04x} — rebuilding",
+                    cached_lib.caps.artist_supported, expected_artist_supported, self.product_id
+                ));
+            } else {
+                self.log_msg(&format!(
+                    "Loaded library cache ({} artists, {} albums)",
+                    cached_lib.artists.len(),
+                    cached_lib.albums.len()
+                ));
+                self.library = Some(cached_lib);
+                return Ok(());
+            }
         }
 
         self.log_msg("Initializing device library...");
 
-        // Use known Zune 30 capabilities instead of probing.
-        // GetObjectPropsSupported (0x9806) leaves the Zune's MTP session in a
-        // broken state on both macOS and Linux — subsequent GetObjectHandles
-        // calls fail with 0x2006 (Parameter Not Supported). Since we only
-        // target the Zune 30, hard-code the known values:
-        //   artist_supported = false (safe path using Music/ subfolders)
-        //   album_date_supported = true
-        //   album_cover_supported = true
-        let (artist_supported, album_date_supported, album_cover_supported) = (false, true, true);
+        // GetObjectPropsSupported (0x9806) wedges both the Zune 30 and the
+        // Zune HD (returns 0x2002 on HD; leaves the session broken on 30),
+        // so we don't probe — per-model knowns are baked in here instead.
+        //
+        // Zune HD (pid=0x063e) requires tracks to reference an AbstractAudio
+        // Artist object via PROP_ARTIST_ID (0xDAB9); inline PROP_ARTIST
+        // strings are overwritten by the device's auto-created "Unknown
+        // Artist" object. Earlier Zunes happily display the inline string
+        // and the Artist-object creation path was never exercised there.
+        let artist_supported = self.product_id == 0x063e;
+        let (album_date_supported, album_cover_supported) = (true, true);
 
         self.log_msg(&format!(
             "Caps: artist={} date={} cover={}",
@@ -851,9 +866,18 @@ impl NativeSession {
                 Ok((_, _, id)) => {
                     // Complete the two-phase MTP operation with empty data.
                     let _ = self.session.send_object(&[]);
+                    self.log_msg(&format!("Created artist object {id} for {name:?}"));
                     id
                 }
-                Err(_) => folder_id, // Fallback to folder ID if artist creation fails.
+                Err(e) => {
+                    // Surface the failure — silently using the folder ID as
+                    // artist_id leaves tracks tied to a non-artist handle and
+                    // the HD will file them under "Unknown Artist".
+                    self.log_msg(&format!(
+                        "Artist object create failed for {name:?}: {e} — tracks may show as Unknown Artist"
+                    ));
+                    folder_id
+                }
             }
         } else {
             folder_id

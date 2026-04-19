@@ -238,7 +238,10 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                     .clone()
                                     .or_else(|| detected.firmware.clone());
                                 if let Ok((total, free)) = s.get_storage_info() {
-                                    let model = zytunes::device::zune_model_from_storage(total);
+                                    let model = zytunes::device::zune_model_from_storage(
+                                        total,
+                                        zune_product_id,
+                                    );
                                     let used = total.saturating_sub(free);
                                     let pct = if total > 0 {
                                         (used * 100 / total) as u8

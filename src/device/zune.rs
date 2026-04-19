@@ -16,6 +16,7 @@ const ZUNE_PRODUCT_IDS: &[(u16, &str)] = &[
     (0x0710, "Zune (media mode)"),
     (0x0711, "Zune (firmware update mode)"),
     (0x0712, "Zune (MTP mode, alternate)"),
+    (0x063e, "Zune HD (media mode)"),
 ];
 
 /// Represents a detected Zune device on the USB bus.
@@ -36,9 +37,20 @@ pub struct ZuneDeviceData {
     pub usb_mode: Option<String>,
 }
 
-/// Identify Zune model from total storage capacity in bytes.
-pub fn zune_model_from_storage(total_bytes: u64) -> &'static str {
+/// Identify Zune model from USB product ID and total storage capacity.
+///
+/// The Zune HD (pid=0x063e) is identified by PID first since it overlaps
+/// storage sizes with the flash Zunes (16/32 GB). Other generations fall
+/// through to capacity-based identification.
+pub fn zune_model_from_storage(total_bytes: u64, product_id: u16) -> &'static str {
     let gb = total_bytes / 1_000_000_000;
+    if product_id == 0x063e {
+        return match gb {
+            0..=20 => "Zune HD 16",
+            21..=40 => "Zune HD 32",
+            _ => "Zune HD 64",
+        };
+    }
     match gb {
         0..=5 => "Zune 4",
         6..=12 => "Zune 8",
@@ -225,13 +237,29 @@ mod tests {
 
     #[test]
     fn zune_model_from_storage_known_sizes() {
-        assert_eq!(zune_model_from_storage(4_000_000_000), "Zune 4");
-        assert_eq!(zune_model_from_storage(8_000_000_000), "Zune 8");
-        assert_eq!(zune_model_from_storage(16_000_000_000), "Zune 16");
-        assert_eq!(zune_model_from_storage(30_000_000_000), "Zune 30");
-        assert_eq!(zune_model_from_storage(80_000_000_000), "Zune 80");
-        assert_eq!(zune_model_from_storage(120_000_000_000), "Zune 120");
-        assert_eq!(zune_model_from_storage(200_000_000_000), "Zune");
+        assert_eq!(zune_model_from_storage(4_000_000_000, 0x0710), "Zune 4");
+        assert_eq!(zune_model_from_storage(8_000_000_000, 0x0710), "Zune 8");
+        assert_eq!(zune_model_from_storage(16_000_000_000, 0x0710), "Zune 16");
+        assert_eq!(zune_model_from_storage(30_000_000_000, 0x0710), "Zune 30");
+        assert_eq!(zune_model_from_storage(80_000_000_000, 0x0710), "Zune 80");
+        assert_eq!(zune_model_from_storage(120_000_000_000, 0x0710), "Zune 120");
+        assert_eq!(zune_model_from_storage(200_000_000_000, 0x0710), "Zune");
+    }
+
+    #[test]
+    fn zune_hd_identified_by_pid() {
+        assert_eq!(
+            zune_model_from_storage(16_000_000_000, 0x063e),
+            "Zune HD 16"
+        );
+        assert_eq!(
+            zune_model_from_storage(32_000_000_000, 0x063e),
+            "Zune HD 32"
+        );
+        assert_eq!(
+            zune_model_from_storage(64_000_000_000, 0x063e),
+            "Zune HD 64"
+        );
     }
 
     #[test]
