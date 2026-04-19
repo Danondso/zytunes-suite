@@ -5,8 +5,21 @@
 //! transfers natively — unlike macOS where IOKit is needed.
 
 use crate::MtpError;
-use rusb::UsbContext;
+use rusb::{Error as RusbError, UsbContext};
 use std::time::Duration;
+
+/// True when a libusb error on a bulk endpoint is worth attempting
+/// `clear_halt` recovery against — pipe stalls (`Pipe`) and transient
+/// I/O or signalling hiccups (`Io`, `Interrupted`, `Overflow`) that
+/// commonly wedge the pipe and are typically clearable. Terminal errors
+/// (`NoDevice`, `Access`) still fail on the retry attempt and surface
+/// both errors in the message.
+fn is_recoverable_libusb_error(err: &RusbError) -> bool {
+    matches!(
+        err,
+        RusbError::Pipe | RusbError::Io | RusbError::Interrupted | RusbError::Overflow
+    )
+}
 
 /// USB transport using libusb (via rusb) for bulk I/O.
 pub struct LibusbTransport {
@@ -172,38 +185,76 @@ impl LibusbTransport {
     pub fn write(&self, data: &[u8]) -> Result<usize, MtpError> {
         let timeout = Duration::from_secs(30);
         super::chunked_write(data, self.max_packet_size as usize, |chunk| {
-            let n = self
-                .handle
-                .write_bulk(self.endpoint_out, chunk, timeout)
-                .map_err(|e| MtpError::Usb(format!("write_bulk failed: {e}")))?;
-            Ok(n)
+            match self.handle.write_bulk(self.endpoint_out, chunk, timeout) {
+                Ok(n) => Ok(n),
+                Err(e) if is_recoverable_libusb_error(&e) => {
+                    // Clear any host-side stall (prior ReadPipe timeouts, cable
+                    // jostles, or Zune firmware hiccups can leave the OUT pipe
+                    // wedged — every subsequent write then fails with the same
+                    // error until the user physically replugs). Retry once.
+                    let _ = self.handle.clear_halt(self.endpoint_out);
+                    self.handle
+                        .write_bulk(self.endpoint_out, chunk, timeout)
+                        .map_err(|e2| {
+                            MtpError::Usb(format!(
+                                "write_bulk failed: {e} (retry after clear_halt: {e2})"
+                            ))
+                        })
+                }
+                Err(e) => Err(MtpError::Usb(format!("write_bulk failed: {e}"))),
+            }
         })
     }
 
     /// Read data from the bulk IN endpoint.
     pub fn read(&self, buf: &mut [u8]) -> Result<usize, MtpError> {
         let timeout = Duration::from_secs(30);
-        let n = self
-            .handle
-            .read_bulk(self.endpoint_in, buf, timeout)
-            .map_err(|e| MtpError::Usb(format!("read_bulk failed: {e}")))?;
-        Ok(n)
+        match self.handle.read_bulk(self.endpoint_in, buf, timeout) {
+            Ok(n) => Ok(n),
+            Err(e) if is_recoverable_libusb_error(&e) => {
+                let _ = self.handle.clear_halt(self.endpoint_in);
+                self.handle
+                    .read_bulk(self.endpoint_in, buf, timeout)
+                    .map_err(|e2| {
+                        MtpError::Usb(format!(
+                            "read_bulk failed: {e} (retry after clear_halt: {e2})"
+                        ))
+                    })
+            }
+            Err(e) => Err(MtpError::Usb(format!("read_bulk failed: {e}"))),
+        }
     }
 
     /// Read with a timeout (in seconds).
     /// libusb supports native timeouts, so no background thread is needed.
     pub fn read_with_timeout(&self, buf: &mut [u8], timeout_secs: u64) -> Result<usize, MtpError> {
         let timeout = Duration::from_secs(timeout_secs);
-        let n = self
-            .handle
-            .read_bulk(self.endpoint_in, buf, timeout)
-            .map_err(|e| match e {
-                rusb::Error::Timeout => {
-                    MtpError::Usb(format!("read_bulk timed out ({timeout_secs}s)"))
-                }
-                other => MtpError::Usb(format!("read_bulk failed: {other}")),
-            })?;
-        Ok(n)
+        match self.handle.read_bulk(self.endpoint_in, buf, timeout) {
+            Ok(n) => Ok(n),
+            Err(RusbError::Timeout) => {
+                // Mirror the IOKit path: on a read timeout, clear stalls on
+                // BOTH bulk endpoints. If we only clear IN, the OUT pipe can
+                // remain out of sync with the device (it's still waiting to
+                // ACK data we gave up on) and every subsequent write fails
+                // until the user physically replugs.
+                let _ = self.handle.clear_halt(self.endpoint_in);
+                let _ = self.handle.clear_halt(self.endpoint_out);
+                Err(MtpError::Usb(format!(
+                    "read_bulk timed out ({timeout_secs}s)"
+                )))
+            }
+            Err(e) if is_recoverable_libusb_error(&e) => {
+                let _ = self.handle.clear_halt(self.endpoint_in);
+                self.handle
+                    .read_bulk(self.endpoint_in, buf, timeout)
+                    .map_err(|e2| {
+                        MtpError::Usb(format!(
+                            "read_bulk failed: {e} (retry after clear_halt: {e2})"
+                        ))
+                    })
+            }
+            Err(e) => Err(MtpError::Usb(format!("read_bulk failed: {e}"))),
+        }
     }
 
     /// Read a full MTP container, reassembling multi-packet responses.
@@ -220,5 +271,33 @@ impl LibusbTransport {
 impl Drop for LibusbTransport {
     fn drop(&mut self) {
         let _ = self.handle.release_interface(self.interface_number);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_recoverable_libusb_error_recognises_stall_and_transients() {
+        // Pipe stall is the primary case we want to clear and retry.
+        assert!(is_recoverable_libusb_error(&RusbError::Pipe));
+        // Transient I/O / signalling hiccups seen during sync cascades.
+        assert!(is_recoverable_libusb_error(&RusbError::Io));
+        assert!(is_recoverable_libusb_error(&RusbError::Interrupted));
+        assert!(is_recoverable_libusb_error(&RusbError::Overflow));
+    }
+
+    #[test]
+    fn is_recoverable_libusb_error_rejects_terminal_conditions() {
+        // Device physically gone — retry is pointless and misleading.
+        assert!(!is_recoverable_libusb_error(&RusbError::NoDevice));
+        // Permission problem — won't improve on retry.
+        assert!(!is_recoverable_libusb_error(&RusbError::Access));
+        // Timeout is handled separately (no retry, just clear both pipes).
+        assert!(!is_recoverable_libusb_error(&RusbError::Timeout));
+        // NotFound / InvalidParam indicate caller error, not a wire glitch.
+        assert!(!is_recoverable_libusb_error(&RusbError::NotFound));
+        assert!(!is_recoverable_libusb_error(&RusbError::InvalidParam));
     }
 }

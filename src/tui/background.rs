@@ -17,6 +17,9 @@ fn is_device_gone(err: &str) -> bool {
         || err.contains("0xe00002ed")
         || err.contains("retry after ClearPipeStall")
         || err.contains("ReadPipe timed out")
+        // libusb/Linux analogues of the IOKit cascade signals.
+        || err.contains("retry after clear_halt")
+        || err.contains("read_bulk timed out")
 }
 
 use zytunes::device::{
@@ -1096,6 +1099,11 @@ mod tests {
         // comes, subsequent writes cascade.
         assert!(is_device_gone("USB error: ReadPipe timed out (30s)"));
         assert!(is_device_gone("USB error: ReadPipe timed out (90s)"));
+        // libusb/Linux variants — same semantics, different wording.
+        assert!(is_device_gone(
+            "USB error: write_bulk failed: Pipe error (retry after clear_halt: No such device)"
+        ));
+        assert!(is_device_gone("USB error: read_bulk timed out (30s)"));
     }
 
     #[test]
