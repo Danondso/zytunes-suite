@@ -207,7 +207,6 @@ fn track_from_lofty(path: &Path, id: u64) -> Option<Track> {
         name,
         artist,
         album,
-        album_artist: None, // lofty doesn't expose album_artist via Accessor
         genre: tag.genre().map(|s| s.to_string()),
         year: tag.year(),
         track_number: tag.track(),
@@ -241,7 +240,6 @@ fn track_from_path(path: &Path, id: u64) -> Track {
         name,
         artist: parent_name(path, 2),
         album: parent_name(path, 1),
-        album_artist: None,
         genre: None,
         year: None,
         track_number: None,
@@ -303,42 +301,51 @@ impl MusicLibrary for DirectoryLibrary {
         albums
     }
 
-    fn artist_tracks(&self, artist: &str) -> Vec<&Track> {
-        self.tracks
-            .values()
-            .filter(|t| t.artist.eq_ignore_ascii_case(artist))
-            .collect()
+    fn artist_tracks<'a>(&'a self, artist: &str) -> Box<dyn Iterator<Item = &'a Track> + 'a> {
+        let artist = artist.to_string();
+        Box::new(
+            self.tracks
+                .values()
+                .filter(move |t| t.artist.eq_ignore_ascii_case(&artist)),
+        )
     }
 
-    fn album_tracks(&self, album: &str) -> Vec<&Track> {
-        self.tracks
-            .values()
-            .filter(|t| t.album.eq_ignore_ascii_case(album))
-            .collect()
+    fn album_tracks<'a>(&'a self, album: &str) -> Box<dyn Iterator<Item = &'a Track> + 'a> {
+        let album = album.to_string();
+        Box::new(
+            self.tracks
+                .values()
+                .filter(move |t| t.album.eq_ignore_ascii_case(&album)),
+        )
     }
 
-    fn album_tracks_by_artist(&self, artist: &str, album: &str) -> Vec<&Track> {
-        self.tracks
-            .values()
-            .filter(|t| {
-                t.album.eq_ignore_ascii_case(album) && t.artist.eq_ignore_ascii_case(artist)
-            })
-            .collect()
+    fn album_tracks_by_artist<'a>(
+        &'a self,
+        artist: &str,
+        album: &str,
+    ) -> Box<dyn Iterator<Item = &'a Track> + 'a> {
+        let artist = artist.to_string();
+        let album = album.to_string();
+        Box::new(self.tracks.values().filter(move |t| {
+            t.album.eq_ignore_ascii_case(&album) && t.artist.eq_ignore_ascii_case(&artist)
+        }))
     }
 
-    fn tracks_by_name(&self, name: &str) -> Vec<&Track> {
-        self.tracks
-            .values()
-            .filter(|t| t.name.eq_ignore_ascii_case(name))
-            .collect()
+    fn tracks_by_name<'a>(&'a self, name: &str) -> Box<dyn Iterator<Item = &'a Track> + 'a> {
+        let name = name.to_string();
+        Box::new(
+            self.tracks
+                .values()
+                .filter(move |t| t.name.eq_ignore_ascii_case(&name)),
+        )
     }
 
     fn track_count(&self) -> usize {
         self.tracks.len()
     }
 
-    fn all_tracks(&self) -> Vec<&Track> {
-        self.tracks.values().collect()
+    fn all_tracks(&self) -> Box<dyn Iterator<Item = &Track> + '_> {
+        Box::new(self.tracks.values())
     }
 
     fn music_folder(&self) -> Option<&str> {

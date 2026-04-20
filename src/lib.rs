@@ -251,13 +251,14 @@ pub fn transcode_and_import(
     local_path: &str,
     temp_dir: &Path,
     caps: &DeviceCapabilities,
+    meta: Option<&mtp::TrackMeta>,
 ) -> Result<u64, String> {
     let upload_path = if needs_transcoding(local_path, caps.supported_formats) {
         transcode_to_mp3(local_path, temp_dir, caps.max_art_dimensions)?
     } else {
         local_path.to_string()
     };
-    session.import_track(&upload_path)
+    session.import_track(&upload_path, meta)
 }
 
 /// Transcode a file to MP3 using pure Rust libraries.
@@ -487,7 +488,7 @@ pub fn find_matching_tracks<'a>(
 ) -> Result<Vec<&'a library::Track>, String> {
     match sync_type {
         SyncType::Artist => {
-            let tracks = lib.artist_tracks(name);
+            let tracks: Vec<&library::Track> = lib.artist_tracks(name).collect();
             if tracks.is_empty() {
                 let mut msg = format!("No tracks found for artist \"{}\"", name);
                 let artists = lib.artists();
@@ -508,7 +509,7 @@ pub fn find_matching_tracks<'a>(
             Ok(tracks)
         }
         SyncType::Album => {
-            let tracks = lib.album_tracks(name);
+            let tracks: Vec<&library::Track> = lib.album_tracks(name).collect();
             if tracks.is_empty() {
                 return Err(format!("No tracks found for album \"{}\"", name));
             }
@@ -516,7 +517,7 @@ pub fn find_matching_tracks<'a>(
             Ok(tracks)
         }
         SyncType::Track => {
-            let tracks = lib.tracks_by_name(name);
+            let tracks: Vec<&library::Track> = lib.tracks_by_name(name).collect();
             if tracks.is_empty() {
                 return Err(format!("No track found matching \"{}\"", name));
             }
@@ -599,7 +600,8 @@ pub fn sync_to_device(
         let display = format!("{} - {} - {}", track.artist, track.album, track.name);
         println!("[{}/{}] {}", i + 1, total, display);
 
-        match transcode_and_import(session, loc, temp_dir, caps) {
+        let meta = mtp::TrackMeta::from_track(track);
+        match transcode_and_import(session, loc, temp_dir, caps, Some(&meta)) {
             Ok(object_id) => {
                 println!("  OK (id: {})", object_id);
                 success += 1;
@@ -790,37 +792,55 @@ mod tests {
             v.sort_unstable();
             v
         }
-        fn artist_tracks(&self, artist: &str) -> Vec<&library::Track> {
-            self.tracks
-                .iter()
-                .filter(|t| t.artist.eq_ignore_ascii_case(artist))
-                .collect()
+        fn artist_tracks<'a>(
+            &'a self,
+            artist: &str,
+        ) -> Box<dyn Iterator<Item = &'a library::Track> + 'a> {
+            let artist = artist.to_string();
+            Box::new(
+                self.tracks
+                    .iter()
+                    .filter(move |t| t.artist.eq_ignore_ascii_case(&artist)),
+            )
         }
-        fn album_tracks(&self, album: &str) -> Vec<&library::Track> {
-            self.tracks
-                .iter()
-                .filter(|t| t.album.eq_ignore_ascii_case(album))
-                .collect()
+        fn album_tracks<'a>(
+            &'a self,
+            album: &str,
+        ) -> Box<dyn Iterator<Item = &'a library::Track> + 'a> {
+            let album = album.to_string();
+            Box::new(
+                self.tracks
+                    .iter()
+                    .filter(move |t| t.album.eq_ignore_ascii_case(&album)),
+            )
         }
-        fn album_tracks_by_artist(&self, artist: &str, album: &str) -> Vec<&library::Track> {
-            self.tracks
-                .iter()
-                .filter(|t| {
-                    t.album.eq_ignore_ascii_case(album) && t.artist.eq_ignore_ascii_case(artist)
-                })
-                .collect()
+        fn album_tracks_by_artist<'a>(
+            &'a self,
+            artist: &str,
+            album: &str,
+        ) -> Box<dyn Iterator<Item = &'a library::Track> + 'a> {
+            let artist = artist.to_string();
+            let album = album.to_string();
+            Box::new(self.tracks.iter().filter(move |t| {
+                t.album.eq_ignore_ascii_case(&album) && t.artist.eq_ignore_ascii_case(&artist)
+            }))
         }
-        fn tracks_by_name(&self, name: &str) -> Vec<&library::Track> {
-            self.tracks
-                .iter()
-                .filter(|t| t.name.eq_ignore_ascii_case(name))
-                .collect()
+        fn tracks_by_name<'a>(
+            &'a self,
+            name: &str,
+        ) -> Box<dyn Iterator<Item = &'a library::Track> + 'a> {
+            let name = name.to_string();
+            Box::new(
+                self.tracks
+                    .iter()
+                    .filter(move |t| t.name.eq_ignore_ascii_case(&name)),
+            )
         }
         fn track_count(&self) -> usize {
             self.tracks.len()
         }
-        fn all_tracks(&self) -> Vec<&library::Track> {
-            self.tracks.iter().collect()
+        fn all_tracks(&self) -> Box<dyn Iterator<Item = &library::Track> + '_> {
+            Box::new(self.tracks.iter())
         }
         fn music_folder(&self) -> Option<&str> {
             None
@@ -869,7 +889,6 @@ mod tests {
                     name: "Creep".into(),
                     artist: "Radiohead".into(),
                     album: "Pablo Honey".into(),
-                    album_artist: None,
                     genre: None,
                     year: None,
                     track_number: None,
@@ -883,7 +902,6 @@ mod tests {
                     name: "Karma Police".into(),
                     artist: "Radiohead".into(),
                     album: "OK Computer".into(),
-                    album_artist: None,
                     genre: None,
                     year: None,
                     track_number: None,
@@ -897,7 +915,6 @@ mod tests {
                     name: "Army of Me".into(),
                     artist: "Bjork".into(),
                     album: "Post".into(),
-                    album_artist: None,
                     genre: None,
                     year: None,
                     track_number: None,
@@ -1177,7 +1194,6 @@ mod tests {
             name: name.into(),
             artist: artist.into(),
             album: album.into(),
-            album_artist: None,
             genre: None,
             year: None,
             track_number: None,
@@ -1219,7 +1235,11 @@ mod tests {
         fn ls(&mut self, _path: &str) -> Result<Vec<mtp::parse::DeviceEntry>, String> {
             Ok(vec![])
         }
-        fn import_track(&mut self, local_path: &str) -> Result<u64, String> {
+        fn import_track(
+            &mut self,
+            local_path: &str,
+            _meta: Option<&mtp::TrackMeta>,
+        ) -> Result<u64, String> {
             self.import_calls.push(local_path.to_string());
             let id = self.next_import_id;
             self.next_import_id += 1;

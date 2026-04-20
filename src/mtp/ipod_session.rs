@@ -110,7 +110,11 @@ impl DeviceSession for IpodSession {
         Ok(result)
     }
 
-    fn import_track(&mut self, local_path: &str) -> Result<u64, String> {
+    fn import_track(
+        &mut self,
+        local_path: &str,
+        _meta: Option<&super::TrackMeta>,
+    ) -> Result<u64, String> {
         let src = PathBuf::from(local_path);
         if !src.exists() {
             return Err(format!("File not found: {}", local_path));

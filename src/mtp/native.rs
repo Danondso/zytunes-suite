@@ -986,7 +986,11 @@ impl DeviceSession for NativeSession {
         Ok(entries)
     }
 
-    fn import_track(&mut self, local_path: &str) -> Result<u64, String> {
+    fn import_track(
+        &mut self,
+        local_path: &str,
+        meta: Option<&super::TrackMeta>,
+    ) -> Result<u64, String> {
         let file_data =
             std::fs::read(local_path).map_err(|e| format!("Cannot read {}: {}", local_path, e))?;
 
@@ -995,8 +999,18 @@ impl DeviceSession for NativeSession {
             .and_then(|f| f.to_str())
             .unwrap_or("track.mp3");
 
-        // Read metadata from ID3 tags.
-        let (artist, album, title, track_num, genre) = read_metadata(local_path, filename);
+        // Prefer caller-supplied metadata (from the library scan); fall back to
+        // a local lofty read for CLI `push` paths that have no Track backing.
+        let (artist, album, title, track_num, genre) = match meta {
+            Some(m) => (
+                m.artist.clone(),
+                m.album.clone(),
+                m.title.clone(),
+                m.track_number.unwrap_or(0).min(u16::MAX as u32) as u16,
+                m.genre.clone().unwrap_or_default(),
+            ),
+            None => read_metadata(local_path, filename),
+        };
 
         // Ensure library is loaded.
         self.ensure_library()?;

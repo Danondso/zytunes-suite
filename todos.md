@@ -48,30 +48,51 @@ formatting at the CLI/TUI edge where user-facing messages are built.
 
 ## Hygiene / smaller wins
 
-### `get_now_playing` clones the whole track list
-`src/tui/app.rs:427-432`. Clones `self.track_list` into `NowPlaying.playlist`
-every time playback starts. Wrap the track list in `Arc<[TrackInfo]>` (or an
-equivalent shared slice) and share instead of cloning.
+### ~~`get_now_playing` clones the whole track list~~ (done)
+`NowPlaying.playlist` is now `Arc<[TrackInfo]>`. `next_track`/`prev_track`
+`Arc::clone` instead of cloning the slice, and `play_from_playlist` takes
+ownership of the `Arc` so skip/prev hops no longer allocate. The first
+`play_selected_track` pays a single `Arc::from(&[TrackInfo])` copy; every
+subsequent playlist hop is a ref-count bump.
 
-### `MusicLibrary::artist_tracks` / `album_tracks` always return `Vec<&Track>`
-`src/library.rs:109-189`. Each sidebar/album selection triggers a `.collect()`.
-Return `impl Iterator<Item = &Track>` and let the caller decide whether to
-materialize.
+### ~~`MusicLibrary::artist_tracks` / `album_tracks` return `Vec<&Track>`~~ (done)
+The trait methods now return `Box<dyn Iterator<Item = &Track> + '_>` so
+streaming callers (sidebar population in `select_sidebar_item`, the library
+stats pass in `rebuild_album_device_status`, and `add_sidebar_item_to_queue`)
+skip the intermediate `Vec`. `find_matching_tracks` still materializes a
+`Vec` since it uses `.len()` / `.is_empty()` for user-facing messages and
+its public return type is `Vec<&Track>`. The trait stays dyn-safe because
+`Box<dyn Iterator>` is object-safe. `tracks_to_info` was generalized to take
+`impl IntoIterator<Item = &Track>` so it accepts either the new iterator
+form or any other shape without forcing a collect at the call site.
 
-### Dead `#[allow(dead_code)]` fields
-- `src/library.rs:16-26`: `Track.album_artist`, `Track.genre`, `Track.year`,
-  etc. Tagged "parsed for future sync" but never read.
-- `src/tui/app.rs:40`: `DeviceTrackInfo.size`.
+### ~~Dead `#[allow(dead_code)]` fields~~ (done)
+`Track.album_artist` was always `None` in practice (lofty doesn't expose it
+via `Accessor` and no writer populated it) and had no readers — deleted.
+`Track.genre` is now read on the sync path via the new `mtp::TrackMeta`
+struct threaded through `DeviceSession::import_track`, eliminating
+`NativeSession`'s redundant lofty read when the caller already parsed the
+library. The stale `#[allow(dead_code)]` markers on `year`,
+`track_number`, `disc_number`, `total_time_ms` were lies — the TUI
+(`album_list`, `TrackInfo`, sort keys) already read all four — so the
+attributes were dropped. `DeviceTrackInfo.size` was write-only and removed.
+`SyncItem` gained `track_number` / `genre` so the TUI sync path carries
+the metadata through to the wire.
 
-Delete or actually use. Each one is parsing + memory cost per track.
-
-### Search sidebar filter still allocates per item
-`src/tui/app.rs:907-908`. `item.to_lowercase().contains(&q)` allocates one
-`String` per sidebar row per keystroke. Consider:
-- Pre-compute lowercase form of each sidebar item once in `refresh_sidebar`
-  and store alongside the display string.
-- Or a custom `contains_ignore_case` that walks without allocating (awkward
-  for non-ASCII, so the pre-compute is likely cleaner).
+### ~~Search sidebar filter still allocates per item~~ (done)
+Refactored the sidebar into a two-tier cache:
+`sidebar_items_full` holds the unfiltered source, `sidebar_lowercase_full`
+stores the pre-lowercased search key for each row (albums join
+`artist\nalbum` so queries match either side without spanning), and
+`sidebar_items` is the filtered view the UI reads. `rebuild_sidebar_source`
+does the expensive library/device scan on library/mode changes only;
+`apply_sidebar_filter` runs on every `/` keystroke and just walks the
+cached lowercase strings — no per-row `to_lowercase()` allocation.
+`main.rs` search keystrokes route through `apply_sidebar_filter` instead
+of `refresh_sidebar`. Regression tests:
+`sidebar_entry_lowercase_key_album_matches_either_side` guards the
+separator semantics and `search_filter_reuses_cached_lowercase` guards
+the two-tier design.
 
 ## Linux transport parity
 

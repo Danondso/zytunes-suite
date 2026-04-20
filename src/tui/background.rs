@@ -60,12 +60,14 @@ pub enum BgCommand {
 }
 
 /// A single item to sync (resolved to a file path).
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct SyncItem {
     pub artist: String,
     pub album: String,
     pub name: String,
     pub location: String,
+    pub track_number: Option<u32>,
+    pub genre: Option<String>,
 }
 
 /// Device info gathered from USB detection and MTP session.
@@ -885,7 +887,14 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                 processed, total, item.name
                             )));
 
-                            match s.import_track(&upload_path) {
+                            let meta = zytunes::mtp::TrackMeta {
+                                artist: item.artist.clone(),
+                                album: item.album.clone(),
+                                title: item.name.clone(),
+                                track_number: item.track_number,
+                                genre: item.genre.clone(),
+                            };
+                            match s.import_track(&upload_path, Some(&meta)) {
                                 Ok(id) => {
                                     success += 1;
                                     let _ = event_tx

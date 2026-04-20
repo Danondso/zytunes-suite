@@ -7,6 +7,31 @@ pub use ipod_session::IpodSession;
 pub use native::NativeSession;
 use parse::DeviceEntry;
 
+/// Pre-parsed metadata for a track being imported, lifted from the library so
+/// the device session doesn't have to re-read the audio file with lofty.
+/// CLI paths without a library backing (e.g. `zytunes push <file>`) pass
+/// `None` and let the session fall back to its own tag read.
+#[derive(Debug, Clone)]
+pub struct TrackMeta {
+    pub artist: String,
+    pub album: String,
+    pub title: String,
+    pub track_number: Option<u32>,
+    pub genre: Option<String>,
+}
+
+impl TrackMeta {
+    pub fn from_track(t: &crate::library::Track) -> Self {
+        Self {
+            artist: t.artist.clone(),
+            album: t.album.clone(),
+            title: t.name.clone(),
+            track_number: t.track_number,
+            genre: t.genre.clone(),
+        }
+    }
+}
+
 /// Trait abstracting device session operations for testability.
 ///
 /// Implemented by [`NativeSession`] for real hardware and by `MockSession` in tests.
@@ -15,7 +40,8 @@ pub trait DeviceSession {
     /// List files and directories at `path` on the device.
     fn ls(&mut self, path: &str) -> Result<Vec<DeviceEntry>, String>;
     /// Import a local audio file to the device. Returns the new MTP object ID.
-    fn import_track(&mut self, local_path: &str) -> Result<u64, String>;
+    /// `meta`, when supplied, short-circuits the session's own tag read.
+    fn import_track(&mut self, local_path: &str, meta: Option<&TrackMeta>) -> Result<u64, String>;
     /// Remove a file or folder by device path (e.g., `/Music/Artist/Album/track.mp3`).
     fn rm(&mut self, device_path: &str) -> Result<(), String>;
     /// Remove an object by its MTP object ID.

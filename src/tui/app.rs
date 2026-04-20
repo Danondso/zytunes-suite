@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use image::DynamicImage;
@@ -63,14 +64,18 @@ impl SidebarEntry {
         }
     }
 
-    /// Case-insensitive substring match for `/` search. Album variant matches
-    /// on either artist or album so users can type either to filter.
-    pub fn matches_query(&self, query_lower: &str) -> bool {
+    /// Pre-lowercased search key cached alongside each sidebar row. Album
+    /// entries join artist and album with `\n` so substring matches hit
+    /// either side but can't span the separator. Built once by
+    /// `rebuild_sidebar_source` so `/` keystrokes never re-lowercase.
+    pub fn lowercase_key(&self) -> String {
         match self {
-            SidebarEntry::Artist(a) => a.to_lowercase().contains(query_lower),
+            SidebarEntry::Artist(a) => a.to_lowercase(),
             SidebarEntry::Album { artist, album } => {
-                artist.to_lowercase().contains(query_lower)
-                    || album.to_lowercase().contains(query_lower)
+                let mut out = artist.to_lowercase();
+                out.push('\n');
+                out.push_str(&album.to_lowercase());
+                out
             }
         }
     }
@@ -163,8 +168,6 @@ fn quick_random() -> usize {
 pub struct DeviceTrackInfo {
     pub name: String,
     pub device_path: String,
-    #[allow(dead_code)]
-    pub size: u64,
     pub object_id: u64,
     pub artist: String,
     pub album: String,
@@ -287,7 +290,10 @@ pub struct NowPlaying {
     pub elapsed_ms: u64,
     pub state: PlaybackState,
     pub track_index: usize,
-    pub playlist: Vec<TrackInfo>,
+    /// Shared immutable snapshot of the playlist at the moment playback
+    /// started. `Arc` so skip/prev/next don't clone the whole track list on
+    /// every hop.
+    pub playlist: Arc<[TrackInfo]>,
     /// Frame at which playback was paused (freezes animation).
     pub paused_frame: Option<usize>,
 }
@@ -379,7 +385,6 @@ impl DeviceState {
             .push(DeviceTrackInfo {
                 name: display_name.clone(),
                 device_path,
-                size: entry.size,
                 object_id: entry.object_id,
                 artist: artist.clone(),
                 album,
@@ -562,7 +567,17 @@ pub struct App {
     pub active_panel: Panel,
     pub library: Option<Box<dyn MusicLibrary>>,
     pub sidebar_mode: SidebarMode,
+    /// Filtered view the UI reads. Derived from `sidebar_items_full` by
+    /// applying the `/` search filter (when active).
     pub sidebar_items: Vec<SidebarEntry>,
+    /// Unfiltered source list rebuilt only when the underlying library,
+    /// device contents, or sidebar mode change. Search keystrokes filter
+    /// this into `sidebar_items` without re-allocating per row.
+    sidebar_items_full: Vec<SidebarEntry>,
+    /// Pre-lowercased form of each `sidebar_items_full` entry, parallel-
+    /// indexed. For `Album` entries this joins artist and album with `\n`
+    /// so queries match either side without spanning the boundary.
+    sidebar_lowercase_full: Vec<String>,
     pub sidebar_selected: usize,
     pub sidebar_scroll: usize,
     /// Per-mode saved selection positions: [Artists, Albums] x [Library, Device]
@@ -646,6 +661,7 @@ pub struct TrackInfo {
     pub location: Option<String>,
     pub track_number: Option<u32>,
     pub disc_number: Option<u32>,
+    pub genre: Option<String>,
     pub on_device: bool,
     /// Pre-normalized (lowercased, trimmed, edge-stripped) artist key.
     /// Computed once at construction so hot paths (`retag_on_device`, per-frame
@@ -668,6 +684,7 @@ impl TrackInfo {
         location: Option<String>,
         track_number: Option<u32>,
         disc_number: Option<u32>,
+        genre: Option<String>,
         on_device: bool,
     ) -> Self {
         let artist_key = normalize_for_match(&artist);
@@ -681,6 +698,7 @@ impl TrackInfo {
             location,
             track_number,
             disc_number,
+            genre,
             on_device,
             artist_key,
             name_key,
@@ -695,6 +713,8 @@ impl App {
             library: None,
             sidebar_mode: SidebarMode::Artists,
             sidebar_items: Vec::new(),
+            sidebar_items_full: Vec::new(),
+            sidebar_lowercase_full: Vec::new(),
             sidebar_selected: 0,
             sidebar_scroll: 0,
             saved_sidebar_pos: HashMap::new(),
@@ -861,7 +881,7 @@ impl App {
             elapsed_ms: 0,
             state: PlaybackState::Playing,
             track_index: index,
-            playlist: self.track_list.clone(),
+            playlist: Arc::from(self.track_list.as_slice()),
             paused_frame: None,
         });
     }
@@ -891,9 +911,9 @@ impl App {
     pub fn next_track(&mut self, audio_tx: &mpsc::Sender<AudioCommand>) {
         if let Some(ref np) = self.now_playing {
             let next_idx = np.track_index + 1;
-            let playlist = np.playlist.clone();
+            let playlist = Arc::clone(&np.playlist);
             if next_idx < playlist.len() {
-                self.play_from_playlist(next_idx, &playlist, audio_tx);
+                self.play_from_playlist(next_idx, playlist, audio_tx);
             } else {
                 // End of playlist
                 let _ = audio_tx.send(AudioCommand::Stop);
@@ -904,13 +924,14 @@ impl App {
 
     pub fn prev_track(&mut self, audio_tx: &mpsc::Sender<AudioCommand>) {
         if let Some(ref np) = self.now_playing {
-            let playlist = np.playlist.clone();
-            if np.elapsed_ms > 3000 || np.track_index == 0 {
+            let playlist = Arc::clone(&np.playlist);
+            let index = if np.elapsed_ms > 3000 || np.track_index == 0 {
                 // Restart current track
-                self.play_from_playlist(np.track_index, &playlist, audio_tx);
+                np.track_index
             } else {
-                self.play_from_playlist(np.track_index - 1, &playlist, audio_tx);
-            }
+                np.track_index - 1
+            };
+            self.play_from_playlist(index, playlist, audio_tx);
         }
     }
 
@@ -922,7 +943,7 @@ impl App {
     fn play_from_playlist(
         &mut self,
         index: usize,
-        playlist: &[TrackInfo],
+        playlist: Arc<[TrackInfo]>,
         audio_tx: &mpsc::Sender<AudioCommand>,
     ) {
         let track = &playlist[index];
@@ -942,7 +963,7 @@ impl App {
             elapsed_ms: 0,
             state: PlaybackState::Playing,
             track_index: index,
-            playlist: playlist.to_vec(),
+            playlist,
             paused_frame: None,
         });
     }
@@ -1176,18 +1197,22 @@ impl App {
         }
     }
 
-    pub fn refresh_sidebar(&mut self) {
-        match self.browse_mode {
+    /// Rebuild the full sidebar source (expensive: scans the library or device
+    /// index). Call when the underlying data changes, not on every keystroke.
+    fn rebuild_sidebar_source(&mut self) {
+        self.sidebar_items_full = match self.browse_mode {
             BrowseMode::Library => {
                 let lib = match &self.library {
                     Some(l) => l,
                     None => {
+                        self.sidebar_items_full.clear();
+                        self.sidebar_lowercase_full.clear();
                         self.sidebar_items.clear();
                         return;
                     }
                 };
 
-                self.sidebar_items = match self.sidebar_mode {
+                match self.sidebar_mode {
                     SidebarMode::Artists => lib
                         .artists()
                         .into_iter()
@@ -1201,55 +1226,76 @@ impl App {
                             album: album.to_string(),
                         })
                         .collect(),
-                };
+                }
             }
-            BrowseMode::Device => {
-                self.sidebar_items = match self.sidebar_mode {
-                    SidebarMode::Artists => self
-                        .device
-                        .artists
-                        .iter()
-                        .map(|a| SidebarEntry::Artist(a.clone()))
-                        .collect(),
-                    SidebarMode::Albums => {
-                        let mut items: Vec<SidebarEntry> = Vec::new();
-                        for (artist, albums) in &self.device.albums {
-                            for album in albums {
-                                items.push(SidebarEntry::Album {
-                                    artist: artist.clone(),
-                                    album: album.clone(),
-                                });
-                            }
+            BrowseMode::Device => match self.sidebar_mode {
+                SidebarMode::Artists => self
+                    .device
+                    .artists
+                    .iter()
+                    .map(|a| SidebarEntry::Artist(a.clone()))
+                    .collect(),
+                SidebarMode::Albums => {
+                    let mut items: Vec<SidebarEntry> = Vec::new();
+                    for (artist, albums) in &self.device.albums {
+                        for album in albums {
+                            items.push(SidebarEntry::Album {
+                                artist: artist.clone(),
+                                album: album.clone(),
+                            });
                         }
-                        // Sort by (artist, album) — matches the previous
-                        // string-sort of "Artist — Album" for pairs that do
-                        // not include an em-dash in the artist name.
-                        items.sort_by(|a, b| match (a, b) {
-                            (
-                                SidebarEntry::Album {
-                                    artist: aa,
-                                    album: ab,
-                                },
-                                SidebarEntry::Album {
-                                    artist: ba,
-                                    album: bb,
-                                },
-                            ) => aa.cmp(ba).then_with(|| ab.cmp(bb)),
-                            _ => std::cmp::Ordering::Equal,
-                        });
-                        items
                     }
-                };
-            }
-        }
+                    // Sort by (artist, album) — matches the previous
+                    // string-sort of "Artist — Album" for pairs that do
+                    // not include an em-dash in the artist name.
+                    items.sort_by(|a, b| match (a, b) {
+                        (
+                            SidebarEntry::Album {
+                                artist: aa,
+                                album: ab,
+                            },
+                            SidebarEntry::Album {
+                                artist: ba,
+                                album: bb,
+                            },
+                        ) => aa.cmp(ba).then_with(|| ab.cmp(bb)),
+                        _ => std::cmp::Ordering::Equal,
+                    });
+                    items
+                }
+            },
+        };
+        self.sidebar_lowercase_full = self
+            .sidebar_items_full
+            .iter()
+            .map(SidebarEntry::lowercase_key)
+            .collect();
+    }
 
+    /// Apply the `/` search filter to the cached source, producing the
+    /// visible `sidebar_items`. Cheap: just walks `sidebar_lowercase_full`
+    /// and clones matching entries — no new `to_lowercase` allocations.
+    pub fn apply_sidebar_filter(&mut self) {
         if self.search_active && !self.search_query.is_empty() {
             let q = self.search_query.to_lowercase();
-            self.sidebar_items.retain(|item| item.matches_query(&q));
+            self.sidebar_items = self
+                .sidebar_items_full
+                .iter()
+                .zip(self.sidebar_lowercase_full.iter())
+                .filter(|(_, lc)| lc.contains(&q))
+                .map(|(entry, _)| entry.clone())
+                .collect();
+        } else {
+            self.sidebar_items = self.sidebar_items_full.clone();
         }
 
         self.restore_sidebar_pos();
         self.sidebar_scroll = 0;
+    }
+
+    pub fn refresh_sidebar(&mut self) {
+        self.rebuild_sidebar_source();
+        self.apply_sidebar_filter();
         self.album_list.clear();
         self.track_list.clear();
         self.track_selected = 0;
@@ -1274,10 +1320,9 @@ impl App {
 
         match &entry {
             SidebarEntry::Artist(artist) => {
-                let tracks = lib.artist_tracks(artist);
                 let mut album_map: std::collections::BTreeMap<String, (Option<u32>, usize)> =
                     std::collections::BTreeMap::new();
-                for t in &tracks {
+                for t in lib.artist_tracks(artist) {
                     let e = album_map.entry(t.album.clone()).or_insert((t.year, 0));
                     e.1 += 1;
                     if e.0.is_none() && t.year.is_some() {
@@ -1367,6 +1412,7 @@ impl App {
                 Some(tracks) => device_tracks_to_info(tracks),
                 None => Vec::new(),
             };
+            sort_album_tracks(&mut self.track_list);
             self.track_selected = 0;
             self.track_scroll = 0;
             return;
@@ -1381,12 +1427,7 @@ impl App {
             lib.album_tracks_by_artist(&album.artist, &album.name),
             &self.device,
         );
-        // Sort by disc number then track number for album views.
-        self.track_list.sort_by(|a, b| {
-            a.disc_number
-                .cmp(&b.disc_number)
-                .then(a.track_number.cmp(&b.track_number))
-        });
+        sort_album_tracks(&mut self.track_list);
         self.track_selected = 0;
         self.track_scroll = 0;
         self.refresh_album_art();
@@ -1550,6 +1591,8 @@ impl App {
                     album: track.album.clone(),
                     name: track.name.clone(),
                     location: loc.clone(),
+                    track_number: track.track_number,
+                    genre: track.genre.clone(),
                 };
                 self.sync.queue.push(QueuedItem {
                     label: format!("{} - {} - {}", track.artist, track.album, track.name),
@@ -1572,6 +1615,8 @@ impl App {
                     album: track.album.clone(),
                     name: track.name.clone(),
                     location: loc.clone(),
+                    track_number: track.track_number,
+                    genre: track.genre.clone(),
                 });
             }
         }
@@ -1607,15 +1652,16 @@ impl App {
                     Some(l) => l,
                     None => return,
                 };
-                let tracks = lib.artist_tracks(artist);
                 let mut items = Vec::new();
-                for t in &tracks {
+                for t in lib.artist_tracks(artist) {
                     if let Some(ref loc) = t.location {
                         items.push(SyncItem {
                             artist: t.artist.clone(),
                             album: t.album.clone(),
                             name: t.name.clone(),
                             location: loc.clone(),
+                            track_number: t.track_number,
+                            genre: t.genre.clone(),
                         });
                     }
                 }
@@ -2237,7 +2283,10 @@ fn first_char_upper(s: &str) -> char {
         .unwrap_or(' ')
 }
 
-fn tracks_to_info(tracks: Vec<&Track>, device: &DeviceState) -> Vec<TrackInfo> {
+fn tracks_to_info<'a, I>(tracks: I, device: &DeviceState) -> Vec<TrackInfo>
+where
+    I: IntoIterator<Item = &'a Track>,
+{
     tracks
         .into_iter()
         .map(|t| {
@@ -2253,6 +2302,7 @@ fn tracks_to_info(tracks: Vec<&Track>, device: &DeviceState) -> Vec<TrackInfo> {
                 location: t.location.clone(),
                 track_number: t.track_number,
                 disc_number: t.disc_number,
+                genre: t.genre.clone(),
                 on_device,
                 artist_key,
                 name_key,
@@ -2284,6 +2334,30 @@ fn is_on_device(artist: &str, name: &str, device: &DeviceState) -> bool {
     device.contains_track(&artist_key, &name_key)
 }
 
+/// Sort a track list for album→track view. Disc number first, then track
+/// number; tracks missing a number fall to the bottom so tagged tracks
+/// stay in their intended album order. Shared between the Library and
+/// Device paths so both views present tracks in the same album order.
+fn sort_album_tracks(tracks: &mut [TrackInfo]) {
+    tracks.sort_by(|a, b| {
+        let disc = match (a.disc_number, b.disc_number) {
+            (Some(da), Some(db)) => da.cmp(&db),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        };
+        if disc != std::cmp::Ordering::Equal {
+            return disc;
+        }
+        match (a.track_number, b.track_number) {
+            (Some(ta), Some(tb)) => ta.cmp(&tb),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.name.cmp(&b.name),
+        }
+    });
+}
+
 fn device_tracks_to_info(tracks: &[DeviceTrackInfo]) -> Vec<TrackInfo> {
     tracks
         .iter()
@@ -2297,6 +2371,7 @@ fn device_tracks_to_info(tracks: &[DeviceTrackInfo]) -> Vec<TrackInfo> {
                 None,
                 dt.track_number,
                 dt.disc_number,
+                None,
                 false,
             )
         })
@@ -2427,6 +2502,7 @@ mod tests {
             Some("/tmp/idioteque.mp3".into()),
             None,
             None,
+            None,
             false,
         ));
         app.track_selected = 0;
@@ -2475,12 +2551,14 @@ mod tests {
                     album: "A Night at the Opera".into(),
                     name: "Bohemian Rhapsody".into(),
                     location: "/music/a.mp3".into(),
+                    ..Default::default()
                 },
                 SyncItem {
                     artist: "Queen".into(),
                     album: "A Night at the Opera".into(),
                     name: "Love of My Life".into(),
                     location: "/music/b.mp3".into(),
+                    ..Default::default()
                 },
             ],
         });
@@ -2529,6 +2607,7 @@ mod tests {
                 album: "A Night at the Opera".into(),
                 name: "Bohemian Rhapsody".into(),
                 location: "/music/a.mp3".into(),
+                ..Default::default()
             }],
         });
 
@@ -2554,6 +2633,7 @@ mod tests {
             None,
             None,
             Some("/tmp/creep.mp3".into()),
+            None,
             None,
             None,
             false,
@@ -2621,12 +2701,14 @@ mod tests {
                     album: "A Night at the Opera".into(),
                     name: "Bohemian Rhapsody".into(),
                     location: "/music/queen/bohemian.mp3".into(),
+                    ..Default::default()
                 },
                 SyncItem {
                     artist: "Queen".into(),
                     album: "A Night at the Opera".into(),
                     name: "Love of My Life".into(),
                     location: "/music/queen/love.mp3".into(),
+                    ..Default::default()
                 },
             ],
         });
@@ -2667,12 +2749,14 @@ mod tests {
                     album: "A Night at the Opera".into(),
                     name: "Bohemian Rhapsody".into(),
                     location: "/music/queen/bohemian.mp3".into(),
+                    ..Default::default()
                 },
                 SyncItem {
                     artist: "Queen".into(),
                     album: "A Night at the Opera".into(),
                     name: "Love of My Life".into(),
                     location: "/music/queen/love.mp3".into(),
+                    ..Default::default()
                 },
             ],
         });
@@ -2705,6 +2789,7 @@ mod tests {
                 album: "A Night at the Opera".into(),
                 name: "Bohemian Rhapsody".into(),
                 location: "/music/queen/bohemian.mp3".into(),
+                ..Default::default()
             }],
         });
 
@@ -2734,23 +2819,27 @@ mod tests {
             fn albums(&self) -> Vec<(&str, &str)> {
                 vec![("Queen", "A Night at the Opera")]
             }
-            fn artist_tracks(&self, _: &str) -> Vec<&Track> {
-                Vec::new()
+            fn artist_tracks<'a>(&'a self, _: &str) -> Box<dyn Iterator<Item = &'a Track> + 'a> {
+                Box::new(std::iter::empty())
             }
-            fn album_tracks(&self, _: &str) -> Vec<&Track> {
-                Vec::new()
+            fn album_tracks<'a>(&'a self, _: &str) -> Box<dyn Iterator<Item = &'a Track> + 'a> {
+                Box::new(std::iter::empty())
             }
-            fn album_tracks_by_artist(&self, _: &str, _: &str) -> Vec<&Track> {
-                Vec::new()
+            fn album_tracks_by_artist<'a>(
+                &'a self,
+                _: &str,
+                _: &str,
+            ) -> Box<dyn Iterator<Item = &'a Track> + 'a> {
+                Box::new(std::iter::empty())
             }
-            fn tracks_by_name(&self, _: &str) -> Vec<&Track> {
-                Vec::new()
+            fn tracks_by_name<'a>(&'a self, _: &str) -> Box<dyn Iterator<Item = &'a Track> + 'a> {
+                Box::new(std::iter::empty())
             }
             fn track_count(&self) -> usize {
                 0
             }
-            fn all_tracks(&self) -> Vec<&Track> {
-                Vec::new()
+            fn all_tracks(&self) -> Box<dyn Iterator<Item = &Track> + '_> {
+                Box::new(std::iter::empty())
             }
             fn music_folder(&self) -> Option<&str> {
                 None
@@ -2769,6 +2858,7 @@ mod tests {
             None,
             None,
             Some("/music/queen/bohemian.mp3".into()),
+            None,
             None,
             None,
             false,
@@ -2802,6 +2892,7 @@ mod tests {
                 album: "A Night at the Opera".into(),
                 name: "Bohemian Rhapsody".into(),
                 location: "/music/queen/bohemian.mp3".into(),
+                ..Default::default()
             }],
         });
 
@@ -3265,23 +3356,36 @@ mod tests {
         fn albums(&self) -> Vec<(&str, &str)> {
             Vec::new()
         }
-        fn artist_tracks(&self, _: &str) -> Vec<&zytunes::library::Track> {
-            Vec::new()
+        fn artist_tracks<'a>(
+            &'a self,
+            _: &str,
+        ) -> Box<dyn Iterator<Item = &'a zytunes::library::Track> + 'a> {
+            Box::new(std::iter::empty())
         }
-        fn album_tracks(&self, _: &str) -> Vec<&zytunes::library::Track> {
-            Vec::new()
+        fn album_tracks<'a>(
+            &'a self,
+            _: &str,
+        ) -> Box<dyn Iterator<Item = &'a zytunes::library::Track> + 'a> {
+            Box::new(std::iter::empty())
         }
-        fn album_tracks_by_artist(&self, _: &str, _: &str) -> Vec<&zytunes::library::Track> {
-            Vec::new()
+        fn album_tracks_by_artist<'a>(
+            &'a self,
+            _: &str,
+            _: &str,
+        ) -> Box<dyn Iterator<Item = &'a zytunes::library::Track> + 'a> {
+            Box::new(std::iter::empty())
         }
-        fn tracks_by_name(&self, _: &str) -> Vec<&zytunes::library::Track> {
-            Vec::new()
+        fn tracks_by_name<'a>(
+            &'a self,
+            _: &str,
+        ) -> Box<dyn Iterator<Item = &'a zytunes::library::Track> + 'a> {
+            Box::new(std::iter::empty())
         }
         fn track_count(&self) -> usize {
             0
         }
-        fn all_tracks(&self) -> Vec<&zytunes::library::Track> {
-            Vec::new()
+        fn all_tracks(&self) -> Box<dyn Iterator<Item = &zytunes::library::Track> + '_> {
+            Box::new(std::iter::empty())
         }
         fn music_folder(&self) -> Option<&str> {
             None
@@ -3713,7 +3817,6 @@ mod tests {
             vec![DeviceTrackInfo {
                 name: "01 Bohemian Rhapsody".into(),
                 device_path: "/Music/Queen/A Night at the Opera/01 Bohemian Rhapsody.mp3".into(),
-                size: 1000,
                 object_id: 1,
                 artist: "Queen".into(),
                 album: "A Night at the Opera".into(),
@@ -3759,14 +3862,91 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_entry_matches_query_album_matches_either_side() {
+    fn sidebar_entry_lowercase_key_album_matches_either_side() {
+        // The cached lowercase key powers the `/` search filter. Album entries
+        // must let a substring query match either artist or album, but not
+        // span the separator — otherwise "he\nok" would match "Radiohead\nOK"
+        // by accident.
         let a = SidebarEntry::Album {
             artist: "Radiohead".into(),
             album: "OK Computer".into(),
         };
-        assert!(a.matches_query("radio"), "matches on artist");
-        assert!(a.matches_query("computer"), "matches on album");
-        assert!(!a.matches_query("idioteque"));
+        let lc = a.lowercase_key();
+        assert!(lc.contains("radio"), "matches on artist");
+        assert!(lc.contains("computer"), "matches on album");
+        assert!(!lc.contains("idioteque"));
+        assert!(
+            !lc.contains("headok"),
+            "match must not span artist/album boundary"
+        );
+    }
+
+    #[test]
+    fn sort_album_tracks_orders_by_disc_then_track_number() {
+        // Album view must render tracks in tagged order (disc, then track
+        // number) regardless of whether they came from the library or the
+        // device index. Missing numbers fall to the bottom so tagged tracks
+        // keep their album order.
+        fn ti(name: &str, disc: Option<u32>, track: Option<u32>) -> TrackInfo {
+            TrackInfo::new(
+                name.into(),
+                "Artist".into(),
+                "Album".into(),
+                None,
+                None,
+                None,
+                track,
+                disc,
+                None,
+                false,
+            )
+        }
+        let mut tracks = vec![
+            ti("Disc2 Track2", Some(2), Some(2)),
+            ti("No Number", None, None),
+            ti("Disc1 Track3", Some(1), Some(3)),
+            ti("Disc1 Track1", Some(1), Some(1)),
+            ti("Disc2 Track1", Some(2), Some(1)),
+        ];
+        sort_album_tracks(&mut tracks);
+        let order: Vec<&str> = tracks.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            order,
+            vec![
+                "Disc1 Track1",
+                "Disc1 Track3",
+                "Disc2 Track1",
+                "Disc2 Track2",
+                "No Number",
+            ]
+        );
+    }
+
+    #[test]
+    fn search_filter_reuses_cached_lowercase() {
+        // Verify the two-tier sidebar design: rebuild_sidebar_source populates
+        // the full list once, apply_sidebar_filter builds the visible view
+        // from the cached lowercase form without re-allocating per row.
+        let mut app = App::new();
+        app.browse_mode = BrowseMode::Device;
+        app.device.artists = vec!["Beatles".into(), "Radiohead".into(), "Zero 7".into()];
+        app.sidebar_mode = SidebarMode::Artists;
+        app.refresh_sidebar();
+        assert_eq!(app.sidebar_items.len(), 3);
+        assert_eq!(app.sidebar_items_full.len(), 3);
+        assert_eq!(app.sidebar_lowercase_full.len(), 3);
+
+        app.search_active = true;
+        app.search_query = "HEAD".into();
+        app.apply_sidebar_filter();
+        assert_eq!(app.sidebar_items.len(), 1);
+        assert!(matches!(&app.sidebar_items[0], SidebarEntry::Artist(a) if a == "Radiohead"));
+        // Full list is untouched — cheap re-filter is possible on next keystroke.
+        assert_eq!(app.sidebar_items_full.len(), 3);
+
+        app.search_query.clear();
+        app.apply_sidebar_filter();
+        assert_eq!(app.sidebar_items.len(), 3);
     }
 
     #[test]
@@ -3793,6 +3973,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
         );
         // Keys should be normalized (lowercased, edge-stripped) so device
@@ -3811,7 +3992,6 @@ mod tests {
             vec![DeviceTrackInfo {
                 name: "01 Bohemian Rhapsody".into(),
                 device_path: "/Music/Queen/A Night at the Opera/01 Bohemian Rhapsody.mp3".into(),
-                size: 1000,
                 object_id: 1,
                 artist: "Queen".into(),
                 album: "A Night at the Opera".into(),
@@ -3832,12 +4012,14 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 false,
             ),
             TrackInfo::new(
                 "Somebody to Love".into(),
                 "Queen".into(),
                 "A Day at the Races".into(),
+                None,
                 None,
                 None,
                 None,
@@ -3867,7 +4049,6 @@ mod tests {
             vec![DeviceTrackInfo {
                 name: "Bye Bye Bye".into(),
                 device_path: "/Music/NSYNC/No Strings Attached/Bye Bye Bye.mp3".into(),
-                size: 5000,
                 object_id: 10,
                 artist: "NSYNC".into(),
                 album: "No Strings Attached".into(),
@@ -3895,23 +4076,36 @@ mod tests {
             fn albums(&self) -> Vec<(&str, &str)> {
                 Vec::new()
             }
-            fn artist_tracks(&self, _: &str) -> Vec<&zytunes::library::Track> {
-                Vec::new()
+            fn artist_tracks<'a>(
+                &'a self,
+                _: &str,
+            ) -> Box<dyn Iterator<Item = &'a zytunes::library::Track> + 'a> {
+                Box::new(std::iter::empty())
             }
-            fn album_tracks(&self, _: &str) -> Vec<&zytunes::library::Track> {
-                Vec::new()
+            fn album_tracks<'a>(
+                &'a self,
+                _: &str,
+            ) -> Box<dyn Iterator<Item = &'a zytunes::library::Track> + 'a> {
+                Box::new(std::iter::empty())
             }
-            fn album_tracks_by_artist(&self, _: &str, _: &str) -> Vec<&zytunes::library::Track> {
-                Vec::new()
+            fn album_tracks_by_artist<'a>(
+                &'a self,
+                _: &str,
+                _: &str,
+            ) -> Box<dyn Iterator<Item = &'a zytunes::library::Track> + 'a> {
+                Box::new(std::iter::empty())
             }
-            fn tracks_by_name(&self, _: &str) -> Vec<&zytunes::library::Track> {
-                Vec::new()
+            fn tracks_by_name<'a>(
+                &'a self,
+                _: &str,
+            ) -> Box<dyn Iterator<Item = &'a zytunes::library::Track> + 'a> {
+                Box::new(std::iter::empty())
             }
             fn track_count(&self) -> usize {
                 self.tracks.len()
             }
-            fn all_tracks(&self) -> Vec<&zytunes::library::Track> {
-                self.tracks.iter().collect()
+            fn all_tracks(&self) -> Box<dyn Iterator<Item = &zytunes::library::Track> + '_> {
+                Box::new(self.tracks.iter())
             }
             fn music_folder(&self) -> Option<&str> {
                 None
@@ -3924,7 +4118,6 @@ mod tests {
                 name: name.into(),
                 artist: artist.into(),
                 album: album.into(),
-                album_artist: None,
                 genre: None,
                 year: None,
                 track_number: None,
@@ -3957,7 +4150,6 @@ mod tests {
                 DeviceTrackInfo {
                     name: "Airbag".into(),
                     device_path: "/Music/Radiohead/OK Computer/Airbag.mp3".into(),
-                    size: 1,
                     object_id: 1,
                     artist: "Radiohead".into(),
                     album: "OK Computer".into(),
@@ -3967,7 +4159,6 @@ mod tests {
                 DeviceTrackInfo {
                     name: "Karma Police".into(),
                     device_path: "/Music/Radiohead/OK Computer/Karma Police.mp3".into(),
-                    size: 1,
                     object_id: 2,
                     artist: "Radiohead".into(),
                     album: "OK Computer".into(),
@@ -3981,7 +4172,6 @@ mod tests {
             vec![DeviceTrackInfo {
                 name: "Idioteque".into(),
                 device_path: "/Music/Radiohead/Kid A/Idioteque.mp3".into(),
-                size: 1,
                 object_id: 3,
                 artist: "Radiohead".into(),
                 album: "Kid A".into(),
@@ -4112,7 +4302,7 @@ mod tests {
             elapsed_ms: 0,
             state: PlaybackState::Playing,
             track_index: 0,
-            playlist: Vec::new(),
+            playlist: Arc::from([] as [TrackInfo; 0]),
             paused_frame: None,
         });
         app.show_player = None;
@@ -4131,7 +4321,7 @@ mod tests {
             elapsed_ms: 0,
             state: PlaybackState::Playing,
             track_index: 0,
-            playlist: Vec::new(),
+            playlist: Arc::from([] as [TrackInfo; 0]),
             paused_frame: None,
         });
         app.show_player = Some(false);
@@ -4151,7 +4341,7 @@ mod tests {
             elapsed_ms: 0,
             state: PlaybackState::Playing,
             track_index: 0,
-            playlist: Vec::new(),
+            playlist: Arc::from([] as [TrackInfo; 0]),
             paused_frame: None,
         });
         app.show_player = Some(true);

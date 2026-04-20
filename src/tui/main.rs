@@ -155,7 +155,7 @@ fn run_loop(
                         KeyCode::Esc => {
                             app.search_active = false;
                             app.search_query.clear();
-                            app.refresh_sidebar();
+                            app.apply_sidebar_filter();
                         }
                         KeyCode::Enter => {
                             app.search_active = false;
@@ -163,11 +163,11 @@ fn run_loop(
                         }
                         KeyCode::Backspace => {
                             app.search_query.pop();
-                            app.refresh_sidebar();
+                            app.apply_sidebar_filter();
                         }
                         KeyCode::Char(c) => {
                             app.search_query.push(c);
-                            app.refresh_sidebar();
+                            app.apply_sidebar_filter();
                         }
                         _ => {}
                     }

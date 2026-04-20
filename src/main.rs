@@ -158,7 +158,7 @@ fn cmd_library(query: Option<&str>) -> Result<(), String> {
             }
         }
         Some(q) => {
-            let tracks = lib.artist_tracks(q);
+            let tracks: Vec<&zytunes::library::Track> = lib.artist_tracks(q).collect();
             if tracks.is_empty() {
                 println!("No artist matching \"{q}\"");
             } else {
@@ -327,7 +327,7 @@ fn cmd_push(paths: &[String]) -> Result<(), String> {
             .to_string_lossy();
         println!("[{}/{}] {}", i + 1, total, filename);
 
-        match transcode_and_import(session.as_mut(), file, &temp_dir, &caps) {
+        match transcode_and_import(session.as_mut(), file, &temp_dir, &caps, None) {
             Ok(_id) => {
                 println!("  OK");
                 success += 1;
