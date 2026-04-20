@@ -40,11 +40,24 @@ call site. Regression tests cover the precompute
 (`track_info_new_precomputes_match_keys`) and the flush path
 (`retag_on_device_uses_precomputed_keys`).
 
-### `MtpResultExt` discards `MtpError` variants at the session boundary
+### ~~`MtpResultExt` discards `MtpError` variants at the session boundary~~ (wontfix)
 `src/mtp/native.rs`. The `DeviceSession` trait returns `Result<T, String>`, so
 callers lose the structured error info that `zune-mtp` goes to the trouble of
-providing. Change the trait to return `Result<T, MtpError>` and do the string
-formatting at the CLI/TUI edge where user-facing messages are built.
+providing. Original suggestion was to return `Result<T, MtpError>`.
+
+**Why wontfix:** `DeviceSession` now has two implementations —
+`NativeSession` (Zune, emits `MtpError` plus incidental `io::Error`) and
+`IpodSession` (iPod, emits `ipod_db::Error` plus `io::Error`). Making
+the trait's error type `MtpError` would force iPod errors into
+ill-fitting variants. The clean fix is a unifying `DeviceError` enum,
+but every call site changes (trait, both impls, `background.rs`,
+`lib.rs::sync_to_device`, `transcode_and_import`, CLI `cmd_push`) for
+modest practical gain — every consumer ultimately formats to `String`
+for display, and `is_device_gone` already matches on stable substring
+markers (`0xe00002c0`, `0xe00002ed`, `ClearPipeStall`, `clear_halt`,
+`ReadPipe timed out`, `read_bulk timed out`) rather than variant
+identity. Revisit if we grow retry logic or a diagnostic UI that
+genuinely needs to branch on structured variants.
 
 ## Hygiene / smaller wins
 
