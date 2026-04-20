@@ -114,15 +114,38 @@ strings.
 
 ## UX follow-ups
 
-### Dedupe-on-sync prompt
-After a sync completes (or on demand from the Device panel), detect duplicate
-tracks already on the device — same `(artist, album, track_name)` appearing
-under more than one `object_id`. Open a modal with a scrollable list of
-duplicate groups (one entry per group, expandable to show all copies with
-their object IDs and sizes) and let the user select which copies to remove.
-Reuse the existing bulk-remove path (`BgCommand::RemoveFromDevice`) so storage
-refresh and index updates fall out for free. Decide up front whether to keep
-the oldest vs. newest object ID by default.
+### ~~Dedupe-on-sync prompt~~ (done — reshaped into overwrite-on-sync + explicit dedupe hotkey)
+Original plan was a post-hoc modal asking the user which copies to keep.
+Reshaped into a simpler two-part design that doesn't need a modal:
+
+1. **Overwrite-on-sync**: `SyncItem` gained an `overwrite_targets: Vec<(String, u64)>`
+   field. `App::execute_sync` (and the mid-sync append path) now calls
+   `find_device_copies(device, artist, name)` for every queued item and
+   stamps the matching `(device_path, object_id)` pairs onto the item.
+   The old "skip if already on device" filter is gone — every queued
+   track is dispatched. The background worker removes each target via
+   `s.rm_by_id` (falling back to `s.rm(path)`) before calling
+   `import_track`, emitting `DeviceTrackRemoved` / `DeviceTrackAdded` so
+   the in-memory index stays current. Fatal USB cascades during the
+   remove phase trigger the same `is_device_gone` abort path as a failed
+   upload. Result: re-queuing a track always refreshes it on the device,
+   and any pre-existing duplicates matching the queued name get swept as
+   a side effect.
+2. **Explicit dedupe hotkey**: `U` in Device panel invokes
+   `App::dedupe_device`, which scans `device.album_tracks` for groups
+   sharing normalized `(artist, album, name)`, keeps the newest
+   `object_id` per group, and dispatches the rest via
+   `BgCommand::RemoveFromDevice`. No modal — a toast reports either "No
+   duplicates found" or "Removing N duplicate copy(ies) from device...".
+   Keep-newest was the default we discussed — MTP assigns object IDs
+   monotonically so the highest ID is the most recent upload (usually
+   the freshest tags/art).
+
+Regression tests cover: `find_device_copies` returning every matching
+copy (including pre-existing duplicates), `execute_sync` populating
+`overwrite_targets` for duplicates, the mid-sync append path doing the
+same, `collect_device_duplicates` keeping-newest-per-group with
+multi-album guarding, and the dedupe dispatch/toast paths.
 
 ### ~~TUI contrast audit~~ (done)
 - ~~Zune Original theme: the brown `main_bg` makes the existing border color

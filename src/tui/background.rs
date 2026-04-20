@@ -68,6 +68,13 @@ pub struct SyncItem {
     pub location: String,
     pub track_number: Option<u32>,
     pub genre: Option<String>,
+    /// On-device copies that must be removed before the new file uploads —
+    /// `(device_path, object_id)` tuples populated by `App::execute_sync`
+    /// when the queued track normalizes to one or more existing entries in
+    /// the device index. Supports overwrite-on-sync semantics: re-queuing
+    /// a track replaces whatever's on the device (and sweeps pre-existing
+    /// duplicates) rather than being silently skipped.
+    pub overwrite_targets: Vec<(String, u64)>,
 }
 
 /// Device info gathered from USB detection and MTP session.
@@ -881,6 +888,66 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                 } else {
                                     item.location.clone()
                                 };
+
+                            // Overwrite: remove any on-device copies the app
+                            // matched for this track before the new file
+                            // lands. Covers both "user re-queued a track
+                            // that's already there" and "sweep pre-existing
+                            // duplicates as a side effect". On a fatal USB
+                            // cascade (is_device_gone), abort the sync
+                            // before we even try to upload.
+                            let mut overwrite_aborted = false;
+                            if !item.overwrite_targets.is_empty() {
+                                let n = item.overwrite_targets.len();
+                                let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                                    "  Overwriting {} existing {}",
+                                    n,
+                                    if n == 1 { "copy" } else { "copies" }
+                                )));
+                                for (path, oid) in &item.overwrite_targets {
+                                    let result = if *oid > 0 {
+                                        s.rm_by_id(*oid as u32)
+                                    } else {
+                                        s.rm(path)
+                                    };
+                                    match result {
+                                        Ok(()) => {
+                                            let _ = event_tx
+                                                .send(BgEvent::DeviceTrackRemoved(path.clone()));
+                                        }
+                                        Err(e) => {
+                                            let gone = is_device_gone(&e);
+                                            let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                                                "  Remove failed for {}: {}",
+                                                path, e
+                                            )));
+                                            if gone {
+                                                session_dead = true;
+                                                overwrite_aborted = true;
+                                                break;
+                                            }
+                                            // Non-fatal remove failures leave the
+                                            // orphan copy on device; we still
+                                            // proceed to upload so the user at
+                                            // least gets the new version.
+                                        }
+                                    }
+                                }
+                            }
+                            if overwrite_aborted {
+                                failed += 1;
+                                let remaining = sync_queue.len();
+                                let _ = event_tx.send(BgEvent::SyncTrackDone {
+                                    track_name: item.name.clone(),
+                                    success: false,
+                                    error: Some("Device disconnected during overwrite".into()),
+                                });
+                                let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                                    "Device disconnected — aborting sync ({} track(s) skipped). Replug and reconnect.",
+                                    remaining
+                                )));
+                                break;
+                            }
 
                             let _ = event_tx.send(BgEvent::SyncMessage(format!(
                                 "[{}/{}] Uploading \"{}\"...",

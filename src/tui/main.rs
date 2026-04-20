@@ -462,6 +462,11 @@ fn run_loop(
                             app.clear_queue();
                         }
                     }
+                    KeyCode::Char('U') => {
+                        if app.browse_mode == BrowseMode::Device {
+                            app.dedupe_device(cmd_tx);
+                        }
+                    }
                     KeyCode::Char('X') => {
                         app.pending_cache_clear = true;
                     }

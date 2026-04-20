@@ -1610,7 +1610,14 @@ fn draw_keys_panel(f: &mut Frame, app: &App, area: Rect) {
                 ("A", add_all_label),
             ],
         ),
-        Panel::Device => (" Device", vec![("r", "Refresh"), ("d", "Disconnect")]),
+        Panel::Device => (
+            " Device",
+            if is_device_mode {
+                vec![("r", "Refresh"), ("d", "Disconnect"), ("U", "Dedupe")]
+            } else {
+                vec![("r", "Refresh"), ("d", "Disconnect")]
+            },
+        ),
         Panel::SyncQueue => (
             " Queue",
             vec![
@@ -2010,6 +2017,7 @@ fn draw_help_overlay(f: &mut Frame, app: &App) {
         "  Device view",
         "  a           Remove track from device",
         "  A           Remove all visible tracks",
+        "  U           Dedupe (remove duplicate copies, keep newest)",
         "",
         "  Device",
         "  c           Connect to Zune",

@@ -164,7 +164,7 @@ fn quick_random() -> usize {
         .unwrap_or(0)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DeviceTrackInfo {
     pub name: String,
     pub device_path: String,
@@ -1593,6 +1593,7 @@ impl App {
                     location: loc.clone(),
                     track_number: track.track_number,
                     genre: track.genre.clone(),
+                    overwrite_targets: Vec::new(),
                 };
                 self.sync.queue.push(QueuedItem {
                     label: format!("{} - {} - {}", track.artist, track.album, track.name),
@@ -1617,6 +1618,7 @@ impl App {
                     location: loc.clone(),
                     track_number: track.track_number,
                     genre: track.genre.clone(),
+                    overwrite_targets: Vec::new(),
                 });
             }
         }
@@ -1662,6 +1664,7 @@ impl App {
                             location: loc.clone(),
                             track_number: t.track_number,
                             genre: t.genre.clone(),
+                            overwrite_targets: Vec::new(),
                         });
                     }
                 }
@@ -1691,9 +1694,9 @@ impl App {
     /// If a sync is currently in flight, forward the tracks of the most
     /// recently pushed queue entry to the background worker so they get
     /// picked up by the running sync instead of being orphaned when the
-    /// queue is cleared on completion. Mirrors the `execute_sync` dedup
-    /// filter so tracks already on the device (including ones the current
-    /// sync just uploaded) are not re-sent.
+    /// queue is cleared on completion. Mirrors `execute_sync`: every track
+    /// is forwarded and any existing on-device copies are attached as
+    /// `overwrite_targets` for the worker to remove before upload.
     fn forward_last_queue_item_if_syncing(&mut self) {
         if !matches!(self.sync.status, SyncStatus::Running { .. }) {
             return;
@@ -1701,29 +1704,34 @@ impl App {
         let Some(item) = self.sync.queue.last() else {
             return;
         };
-        let total = item.tracks.len();
-        let forward: Vec<SyncItem> = item
-            .tracks
-            .iter()
-            .filter(|it| !is_on_device(&it.artist, &it.name, &self.device))
-            .cloned()
-            .collect();
-        let skipped = total - forward.len();
-        if skipped > 0 {
-            self.sync.log.push(format!(
-                "Appended mid-sync: {n} new {trk}; {skipped} already on device",
-                n = forward.len(),
-                trk = if forward.len() == 1 {
-                    "track"
+        let mut forward: Vec<SyncItem> = item.tracks.clone();
+        let mut overwrite_total = 0usize;
+        for it in &mut forward {
+            it.overwrite_targets = find_device_copies(&self.device, &it.artist, &it.name);
+            overwrite_total += it.overwrite_targets.len();
+        }
+        if forward.is_empty() {
+            return;
+        }
+        let n = forward.len();
+        self.sync.log.push(if overwrite_total > 0 {
+            format!(
+                "Appended mid-sync: {n} {trk}; overwriting {overwrite_total} existing {copies}",
+                trk = if n == 1 { "track" } else { "tracks" },
+                copies = if overwrite_total == 1 {
+                    "copy"
                 } else {
-                    "tracks"
+                    "copies"
                 },
-            ));
-        }
-        if !forward.is_empty() {
-            self.pending_bg_commands
-                .push(BgCommand::AppendSyncQueue(forward));
-        }
+            )
+        } else {
+            format!(
+                "Appended mid-sync: {n} {trk}",
+                trk = if n == 1 { "track" } else { "tracks" }
+            )
+        });
+        self.pending_bg_commands
+            .push(BgCommand::AppendSyncQueue(forward));
     }
 
     pub fn remove_queue_item(&mut self) {
@@ -1764,6 +1772,62 @@ impl App {
         self.removal_queue.clear();
     }
 
+    /// Collect (device_path, object_id) pairs for every older copy of a
+    /// duplicate on the device — the "keep newest, remove the rest" set.
+    /// Groups are keyed on normalized (artist, album, name) so case and
+    /// whitespace variants collapse together. Returns empty when the
+    /// device has no duplicates. Pairs sweep across artists/albums so one
+    /// BgCommand::RemoveFromDevice clears the entire backlog.
+    pub fn collect_device_duplicates(&self) -> Vec<(String, u64)> {
+        use std::collections::HashMap;
+        type Key = (String, String, String);
+        let mut groups: HashMap<Key, Vec<(String, u64)>> = HashMap::new();
+        for tracks in self.device.album_tracks.values() {
+            for t in tracks {
+                let key = (
+                    normalize_for_match(&t.artist),
+                    normalize_for_match(&t.album),
+                    normalize_for_match(&t.name),
+                );
+                groups
+                    .entry(key)
+                    .or_default()
+                    .push((t.device_path.clone(), t.object_id));
+            }
+        }
+        let mut out = Vec::new();
+        for (_, mut copies) in groups {
+            if copies.len() < 2 {
+                continue;
+            }
+            // Newest object_id wins — MTP assigns monotonically, so the
+            // highest ID corresponds to the most recent upload (which is
+            // what the user just synced or most recently re-tagged).
+            copies.sort_by_key(|(_, oid)| *oid);
+            copies.pop(); // keep newest
+            out.extend(copies);
+        }
+        out
+    }
+
+    pub fn dedupe_device(&mut self, cmd_tx: &mpsc::Sender<BgCommand>) {
+        if self.device.status != DeviceStatus::Connected {
+            self.set_toast("Connect a device first".into(), true);
+            return;
+        }
+        let targets = self.collect_device_duplicates();
+        if targets.is_empty() {
+            self.set_toast("No duplicates found".into(), false);
+            return;
+        }
+        let count = targets.len();
+        self.set_toast(
+            format!("Removing {} duplicate copy(ies) from device...", count),
+            false,
+        );
+        let _ = cmd_tx.send(BgCommand::RemoveFromDevice(targets));
+    }
+
     pub fn execute_sync(&mut self, cmd_tx: &mpsc::Sender<BgCommand>) {
         if self.sync.queue.is_empty() {
             return;
@@ -1773,31 +1837,31 @@ impl App {
             return;
         }
         self.sync.log.clear();
-        let all_items: Vec<SyncItem> = self
+        // Queue every track — no pre-sync skip. Tracks that match existing
+        // on-device copies get those copies' (device_path, object_id) stamped
+        // into `overwrite_targets`; the worker removes them before uploading
+        // the new file. Picks up pre-existing duplicates as a side effect.
+        let mut items: Vec<SyncItem> = self
             .sync
             .queue
             .iter()
             .flat_map(|q| q.tracks.clone())
             .collect();
-        let total_before = all_items.len();
-        let items: Vec<SyncItem> = all_items
-            .into_iter()
-            .filter(|it| !is_on_device(&it.artist, &it.name, &self.device))
-            .collect();
-        let skipped = total_before - items.len();
-        if items.is_empty() {
-            self.set_toast("All queued tracks already on device".into(), false);
-            return;
+        let mut overwrite_total = 0usize;
+        for it in &mut items {
+            it.overwrite_targets = find_device_copies(&self.device, &it.artist, &it.name);
+            overwrite_total += it.overwrite_targets.len();
         }
-        // Always log a single line summarising the sync plan, with both the
-        // "will sync" count and the "already on device" count visible. The
-        // grammar is matched (1 track vs N tracks) so it reads cleanly in
-        // either singular or plural.
         let n = items.len();
-        let plan = if skipped > 0 {
+        let plan = if overwrite_total > 0 {
             format!(
-                "Syncing {n} new {trk}; {skipped} already on device",
-                trk = if n == 1 { "track" } else { "tracks" }
+                "Syncing {n} {trk}; overwriting {overwrite_total} existing {copies}",
+                trk = if n == 1 { "track" } else { "tracks" },
+                copies = if overwrite_total == 1 {
+                    "copy"
+                } else {
+                    "copies"
+                }
             )
         } else {
             format!(
@@ -2334,6 +2398,44 @@ fn is_on_device(artist: &str, name: &str, device: &DeviceState) -> bool {
     device.contains_track(&artist_key, &name_key)
 }
 
+/// Find every on-device track whose normalized (artist, name) matches the
+/// supplied pair. Returns `(device_path, object_id)` tuples — used by
+/// `execute_sync` to populate `SyncItem::overwrite_targets` so re-queuing a
+/// track wipes its existing on-device copies (including pre-existing
+/// duplicates) before the new upload lands. Returns an empty vec if the
+/// device isn't connected or the track isn't on it.
+pub fn find_device_copies(device: &DeviceState, artist: &str, name: &str) -> Vec<(String, u64)> {
+    if device.status != DeviceStatus::Connected {
+        return Vec::new();
+    }
+    let artist_key = normalize_for_match(artist);
+    let name_key = normalize_for_match(name);
+    let stripped_key = normalize_for_match(zytunes::strip_track_number(name.trim()));
+
+    let mut out = Vec::new();
+    for tracks in device.album_tracks.values() {
+        for t in tracks {
+            if normalize_for_match(&t.artist) != artist_key {
+                continue;
+            }
+            let t_name_key = normalize_for_match(&t.name);
+            let t_stripped_key = normalize_for_match(zytunes::strip_track_number(t.name.trim()));
+            // Bidirectional match — handles filenames with added/stripped
+            // track-number prefixes, matching the same fallback
+            // `DeviceState::contains_track` does for on/off-device tags.
+            let matches = t_name_key == name_key
+                || t_name_key == stripped_key
+                || t_stripped_key == name_key
+                || t_name_key.contains(&name_key)
+                || name_key.contains(&t_name_key);
+            if matches {
+                out.push((t.device_path.clone(), t.object_id));
+            }
+        }
+    }
+    out
+}
+
 /// Sort a track list for album→track view. Disc number first, then track
 /// number; tracks missing a number fall to the bottom so tagged tracks
 /// stay in their intended album order. Shared between the Library and
@@ -2527,22 +2629,31 @@ mod tests {
     }
 
     #[test]
-    fn mid_sync_append_filters_already_on_device() {
-        // When a user queues a track mid-sync that's already on the device
-        // (say, because the current sync just uploaded it), the append path
-        // must not re-send it to the worker — otherwise the Zune stores a
-        // duplicate under a new object ID.
+    fn mid_sync_append_populates_overwrite_targets() {
+        // When a user queues a track mid-sync that's already on the device,
+        // the append path forwards both tracks — the duplicate gets its
+        // on-device copy stamped into overwrite_targets so the worker wipes
+        // it before the new upload lands.
         let mut app = App::new();
         app.sync.status = SyncStatus::Running {
             current: 1,
             total: 5,
         };
         app.device.status = DeviceStatus::Connected;
-        app.device.track_set.insert((
-            normalize_for_match("Queen"),
-            normalize_for_match("Bohemian Rhapsody"),
-        ));
-        // Two tracks queued; only the second is new to the device.
+        app.device.album_tracks.insert(
+            ("Queen".into(), "A Night at the Opera".into()),
+            vec![DeviceTrackInfo {
+                name: "Bohemian Rhapsody".into(),
+                device_path: "/Music/Queen/A Night at the Opera/Bohemian Rhapsody.mp3".into(),
+                object_id: 9,
+                artist: "Queen".into(),
+                album: "A Night at the Opera".into(),
+                track_number: None,
+                disc_number: None,
+            }],
+        );
+        build_match_sets(&mut app.device);
+
         app.sync.queue.push(QueuedItem {
             label: "mix".into(),
             tracks: vec![
@@ -2574,32 +2685,53 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(appended.len(), 1);
-        assert_eq!(appended[0].len(), 1, "duplicate should be filtered out");
-        assert_eq!(appended[0][0].name, "Love of My Life");
+        assert_eq!(appended[0].len(), 2, "both tracks should forward");
+        let bohemian = appended[0]
+            .iter()
+            .find(|i| i.name == "Bohemian Rhapsody")
+            .expect("Bohemian Rhapsody forwarded");
+        assert_eq!(bohemian.overwrite_targets.len(), 1);
+        assert_eq!(bohemian.overwrite_targets[0].1, 9);
+        let love = appended[0]
+            .iter()
+            .find(|i| i.name == "Love of My Life")
+            .expect("Love of My Life forwarded");
+        assert!(love.overwrite_targets.is_empty());
 
-        // The skip should be logged so the user sees what was deduplicated.
         assert!(
             app.sync
                 .log
                 .iter()
-                .any(|m| m.contains("Appended mid-sync") && m.contains("1 already on device")),
-            "expected skip-summary log line, got {:?}",
+                .any(|m| m.contains("Appended mid-sync") && m.contains("overwriting 1")),
+            "expected overwrite-summary log line, got {:?}",
             app.sync.log
         );
     }
 
     #[test]
-    fn mid_sync_append_all_on_device_sends_nothing() {
+    fn mid_sync_append_all_on_device_still_forwards_for_overwrite() {
+        // Every track matching an on-device copy still forwards — the
+        // worker receives the entry with overwrite_targets populated so
+        // the refresh happens instead of a silent skip.
         let mut app = App::new();
         app.sync.status = SyncStatus::Running {
             current: 1,
             total: 5,
         };
         app.device.status = DeviceStatus::Connected;
-        app.device.track_set.insert((
-            normalize_for_match("Queen"),
-            normalize_for_match("Bohemian Rhapsody"),
-        ));
+        app.device.album_tracks.insert(
+            ("Queen".into(), "A Night at the Opera".into()),
+            vec![DeviceTrackInfo {
+                name: "Bohemian Rhapsody".into(),
+                device_path: "/Music/Queen/A Night at the Opera/Bohemian Rhapsody.mp3".into(),
+                object_id: 9,
+                artist: "Queen".into(),
+                album: "A Night at the Opera".into(),
+                track_number: None,
+                disc_number: None,
+            }],
+        );
+        build_match_sets(&mut app.device);
         app.sync.queue.push(QueuedItem {
             label: "dup".into(),
             tracks: vec![SyncItem {
@@ -2613,13 +2745,18 @@ mod tests {
 
         app.forward_last_queue_item_if_syncing();
 
-        // Nothing to forward — no AppendSyncQueue should be emitted.
-        assert!(
-            !app.pending_bg_commands
-                .iter()
-                .any(|cmd| matches!(cmd, BgCommand::AppendSyncQueue(_))),
-            "expected no AppendSyncQueue when every track is already on device",
-        );
+        let appended: Vec<_> = app
+            .pending_bg_commands
+            .iter()
+            .filter_map(|cmd| match cmd {
+                BgCommand::AppendSyncQueue(items) => Some(items.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(appended.len(), 1);
+        assert_eq!(appended[0].len(), 1);
+        assert_eq!(appended[0][0].overwrite_targets.len(), 1);
+        assert_eq!(appended[0][0].overwrite_targets[0].1, 9);
     }
 
     #[test]
@@ -2685,14 +2822,230 @@ mod tests {
     }
 
     #[test]
-    fn execute_sync_filters_tracks_already_on_device() {
+    fn collect_device_duplicates_keeps_newest_per_group() {
+        // Explicit dedupe helper keeps the highest object_id per normalized
+        // (artist, album, name) group and returns the rest for removal.
+        // Groups of 1 produce no output; distinct albums-with-same-name
+        // don't get grouped together.
         let mut app = App::new();
         app.device.status = DeviceStatus::Connected;
-        // Populate device track_set with one track.
-        app.device.track_set.insert((
-            normalize_for_match("Queen"),
-            normalize_for_match("Bohemian Rhapsody"),
-        ));
+        app.device.album_tracks.insert(
+            ("Queen".into(), "A Night at the Opera".into()),
+            vec![
+                DeviceTrackInfo {
+                    name: "Bohemian Rhapsody".into(),
+                    device_path: "/Music/Queen/A Night at the Opera/Bohemian Rhapsody.mp3".into(),
+                    object_id: 10,
+                    artist: "Queen".into(),
+                    album: "A Night at the Opera".into(),
+                    track_number: None,
+                    disc_number: None,
+                },
+                DeviceTrackInfo {
+                    name: "Bohemian Rhapsody".into(),
+                    device_path: "/Music/Queen/A Night at the Opera/Bohemian Rhapsody (1).mp3"
+                        .into(),
+                    object_id: 11,
+                    artist: "Queen".into(),
+                    album: "A Night at the Opera".into(),
+                    track_number: None,
+                    disc_number: None,
+                },
+                DeviceTrackInfo {
+                    name: "Bohemian Rhapsody".into(),
+                    device_path: "/Music/Queen/A Night at the Opera/Bohemian Rhapsody (2).mp3"
+                        .into(),
+                    object_id: 12,
+                    artist: "Queen".into(),
+                    album: "A Night at the Opera".into(),
+                    track_number: None,
+                    disc_number: None,
+                },
+                // Unique within the same album — must NOT appear in the
+                // dedupe set.
+                DeviceTrackInfo {
+                    name: "Love of My Life".into(),
+                    device_path: "/Music/Queen/A Night at the Opera/Love of My Life.mp3".into(),
+                    object_id: 13,
+                    artist: "Queen".into(),
+                    album: "A Night at the Opera".into(),
+                    track_number: None,
+                    disc_number: None,
+                },
+            ],
+        );
+        // Same track name but different album — MUST NOT group with the
+        // Night at the Opera rows.
+        app.device.album_tracks.insert(
+            ("Queen".into(), "Greatest Hits".into()),
+            vec![DeviceTrackInfo {
+                name: "Bohemian Rhapsody".into(),
+                device_path: "/Music/Queen/Greatest Hits/Bohemian Rhapsody.mp3".into(),
+                object_id: 20,
+                artist: "Queen".into(),
+                album: "Greatest Hits".into(),
+                track_number: None,
+                disc_number: None,
+            }],
+        );
+        build_match_sets(&mut app.device);
+
+        let dupes = app.collect_device_duplicates();
+        let mut oids: Vec<u64> = dupes.iter().map(|(_, oid)| *oid).collect();
+        oids.sort();
+        // Of the three Bohemian copies in Night at the Opera (10/11/12),
+        // newest (12) is kept; 10 and 11 are targeted for removal. Nothing
+        // else shows up.
+        assert_eq!(oids, vec![10, 11]);
+    }
+
+    #[test]
+    fn dedupe_device_dispatches_remove_when_duplicates_exist() {
+        let mut app = App::new();
+        app.device.status = DeviceStatus::Connected;
+        app.device.album_tracks.insert(
+            ("Queen".into(), "A Night at the Opera".into()),
+            vec![
+                DeviceTrackInfo {
+                    name: "Bohemian Rhapsody".into(),
+                    device_path: "/Music/Queen/A Night at the Opera/Bohemian Rhapsody.mp3".into(),
+                    object_id: 10,
+                    artist: "Queen".into(),
+                    album: "A Night at the Opera".into(),
+                    track_number: None,
+                    disc_number: None,
+                },
+                DeviceTrackInfo {
+                    name: "Bohemian Rhapsody".into(),
+                    device_path: "/Music/Queen/A Night at the Opera/Bohemian Rhapsody (1).mp3"
+                        .into(),
+                    object_id: 11,
+                    artist: "Queen".into(),
+                    album: "A Night at the Opera".into(),
+                    track_number: None,
+                    disc_number: None,
+                },
+            ],
+        );
+        build_match_sets(&mut app.device);
+
+        let (tx, rx) = mpsc::channel();
+        app.dedupe_device(&tx);
+
+        match rx.try_recv() {
+            Ok(BgCommand::RemoveFromDevice(items)) => {
+                assert_eq!(items.len(), 1, "only the older copy gets removed");
+                assert_eq!(items[0].1, 10);
+            }
+            Ok(other) => panic!(
+                "expected RemoveFromDevice, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+            Err(_) => panic!("no command dispatched"),
+        }
+    }
+
+    #[test]
+    fn dedupe_device_toasts_when_no_duplicates() {
+        let mut app = App::new();
+        app.device.status = DeviceStatus::Connected;
+        app.device.album_tracks.insert(
+            ("Queen".into(), "A Night at the Opera".into()),
+            vec![DeviceTrackInfo {
+                name: "Bohemian Rhapsody".into(),
+                device_path: "/Music/Queen/A Night at the Opera/Bohemian Rhapsody.mp3".into(),
+                object_id: 10,
+                artist: "Queen".into(),
+                album: "A Night at the Opera".into(),
+                track_number: None,
+                disc_number: None,
+            }],
+        );
+        build_match_sets(&mut app.device);
+
+        let (tx, rx) = mpsc::channel();
+        app.dedupe_device(&tx);
+
+        assert!(rx.try_recv().is_err(), "no command should be dispatched");
+        let toast = app.toast_message.as_ref().expect("toast should be set");
+        assert!(toast.0.contains("No duplicates"));
+    }
+
+    #[test]
+    fn find_device_copies_returns_every_matching_copy() {
+        // If the device already has multiple copies of a track (say from
+        // earlier sync mistakes), find_device_copies must return ALL of
+        // them so overwrite-on-sync sweeps the pile instead of leaving
+        // orphan duplicates behind.
+        let mut device = DeviceState::new();
+        device.status = DeviceStatus::Connected;
+        device.album_tracks.insert(
+            ("Queen".into(), "A Night at the Opera".into()),
+            vec![
+                DeviceTrackInfo {
+                    name: "Bohemian Rhapsody".into(),
+                    device_path: "/Music/Queen/A Night at the Opera/Bohemian Rhapsody.mp3".into(),
+                    object_id: 10,
+                    artist: "Queen".into(),
+                    album: "A Night at the Opera".into(),
+                    track_number: None,
+                    disc_number: None,
+                },
+                DeviceTrackInfo {
+                    name: "Bohemian Rhapsody".into(),
+                    device_path: "/Music/Queen/A Night at the Opera/Bohemian Rhapsody (1).mp3"
+                        .into(),
+                    object_id: 11,
+                    artist: "Queen".into(),
+                    album: "A Night at the Opera".into(),
+                    track_number: None,
+                    disc_number: None,
+                },
+                DeviceTrackInfo {
+                    name: "Love of My Life".into(),
+                    device_path: "/Music/Queen/A Night at the Opera/Love of My Life.mp3".into(),
+                    object_id: 12,
+                    artist: "Queen".into(),
+                    album: "A Night at the Opera".into(),
+                    track_number: None,
+                    disc_number: None,
+                },
+            ],
+        );
+        build_match_sets(&mut device);
+
+        let copies = find_device_copies(&device, "Queen", "Bohemian Rhapsody");
+        let mut oids: Vec<u64> = copies.iter().map(|(_, oid)| *oid).collect();
+        oids.sort();
+        assert_eq!(oids, vec![10, 11], "both duplicate copies must be returned");
+
+        // Disconnected device returns no matches even if the index is populated.
+        device.status = DeviceStatus::Disconnected;
+        assert!(find_device_copies(&device, "Queen", "Bohemian Rhapsody").is_empty());
+    }
+
+    #[test]
+    fn execute_sync_populates_overwrite_targets_for_duplicates() {
+        // Tracks matching existing on-device copies must be dispatched with
+        // their (device_path, object_id) stamped into `overwrite_targets`
+        // so the worker removes the old copies before uploading the new —
+        // no more silent "already on device" skip.
+        let mut app = App::new();
+        app.device.status = DeviceStatus::Connected;
+        app.device.album_tracks.insert(
+            ("Queen".into(), "A Night at the Opera".into()),
+            vec![DeviceTrackInfo {
+                name: "Bohemian Rhapsody".into(),
+                device_path: "/Music/Queen/A Night at the Opera/Bohemian Rhapsody.mp3".into(),
+                object_id: 77,
+                artist: "Queen".into(),
+                album: "A Night at the Opera".into(),
+                track_number: None,
+                disc_number: None,
+            }],
+        );
+        build_match_sets(&mut app.device);
+
         app.sync.queue.push(QueuedItem {
             label: "test".into(),
             tracks: vec![
@@ -2716,23 +3069,40 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         app.execute_sync(&tx);
 
-        // Only the non-duplicate should be sent.
+        // Both tracks dispatched; the duplicate carries the overwrite target.
         match rx.try_recv() {
             Ok(BgCommand::ExecuteSyncQueue(items)) => {
-                assert_eq!(items.len(), 1);
-                assert_eq!(items[0].name, "Love of My Life");
+                assert_eq!(items.len(), 2, "both tracks should be dispatched");
+                let bohemian = items
+                    .iter()
+                    .find(|i| i.name == "Bohemian Rhapsody")
+                    .expect("Bohemian Rhapsody in items");
+                assert_eq!(
+                    bohemian.overwrite_targets,
+                    vec![(
+                        "/Music/Queen/A Night at the Opera/Bohemian Rhapsody.mp3".to_string(),
+                        77u64
+                    )]
+                );
+                let love = items
+                    .iter()
+                    .find(|i| i.name == "Love of My Life")
+                    .expect("Love of My Life in items");
+                assert!(
+                    love.overwrite_targets.is_empty(),
+                    "non-duplicate should have empty overwrite_targets"
+                );
             }
             Ok(_) => panic!("expected ExecuteSyncQueue"),
             Err(_) => panic!("no command dispatched"),
         }
-        // Log should summarise both the planned sync count and the skip count
-        // on a single line so the user sees what's actually about to happen.
+        // Plan summary mentions the overwrite count so the user sees what's happening.
         assert!(
             app.sync
                 .log
                 .iter()
-                .any(|m| m.contains("Syncing 1") && m.contains("1 already on device")),
-            "expected combined summary line, got {:?}",
+                .any(|m| m.contains("Syncing 2") && m.contains("overwriting 1")),
+            "expected overwrite summary, got {:?}",
             app.sync.log
         );
     }
@@ -2878,13 +3248,26 @@ mod tests {
     }
 
     #[test]
-    fn execute_sync_all_on_device_shows_toast_and_sends_nothing() {
+    fn execute_sync_all_on_device_dispatches_with_overwrite_targets() {
+        // When every queued track matches an on-device copy, we still
+        // dispatch — each item carries the target so the worker overwrites.
+        // No more "nothing to do" toast; the user gets the refresh they
+        // asked for by re-queuing.
         let mut app = App::new();
         app.device.status = DeviceStatus::Connected;
-        app.device.track_set.insert((
-            normalize_for_match("Queen"),
-            normalize_for_match("Bohemian Rhapsody"),
-        ));
+        app.device.album_tracks.insert(
+            ("Queen".into(), "A Night at the Opera".into()),
+            vec![DeviceTrackInfo {
+                name: "Bohemian Rhapsody".into(),
+                device_path: "/Music/Queen/A Night at the Opera/Bohemian Rhapsody.mp3".into(),
+                object_id: 42,
+                artist: "Queen".into(),
+                album: "A Night at the Opera".into(),
+                track_number: None,
+                disc_number: None,
+            }],
+        );
+        build_match_sets(&mut app.device);
         app.sync.queue.push(QueuedItem {
             label: "test".into(),
             tracks: vec![SyncItem {
@@ -2899,12 +3282,15 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         app.execute_sync(&tx);
 
-        // Nothing dispatched.
-        assert!(rx.try_recv().is_err());
-        // Toast explains why.
-        let toast = app.toast_message.as_ref().expect("toast should be set");
-        assert!(toast.0.contains("already on device"));
-        assert!(!toast.2, "toast should be informational, not error");
+        match rx.try_recv() {
+            Ok(BgCommand::ExecuteSyncQueue(items)) => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].overwrite_targets.len(), 1);
+                assert_eq!(items[0].overwrite_targets[0].1, 42);
+            }
+            Ok(_) => panic!("expected ExecuteSyncQueue"),
+            Err(_) => panic!("no command dispatched — sync should always proceed now"),
+        }
     }
 
     #[test]
