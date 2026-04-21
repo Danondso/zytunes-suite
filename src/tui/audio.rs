@@ -114,13 +114,15 @@ pub fn spawn(event_tx: mpsc::Sender<AudioEvent>) -> mpsc::Sender<AudioCommand> {
     let (cmd_tx, cmd_rx) = mpsc::channel::<AudioCommand>();
 
     thread::spawn(move || {
-        let device_sink = match DeviceSinkBuilder::open_default_sink() {
+        let mut device_sink = match DeviceSinkBuilder::open_default_sink() {
             Ok(s) => s,
             Err(e) => {
                 let _ = event_tx.send(AudioEvent::PlaybackError(format!("Audio output: {}", e)));
                 return;
             }
         };
+        // Suppress rodio's drop-time eprintln which would corrupt the TUI.
+        device_sink.log_on_drop(false);
 
         let mut player: Option<Player> = None;
         let mut playing = false;
