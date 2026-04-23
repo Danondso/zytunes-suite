@@ -8,6 +8,12 @@
 //! Layout under `root/`:
 //!   - `{hash}.jpg`       — the cached JPEG payload
 //!   - `{hash}.meta.json` — fingerprint of the source file the art came from
+//!
+//! The cache is append-only: entries are never evicted, so albums removed
+//! from the library leave their art behind. At ~15 KB per album this is
+//! negligible for a personal library (a few MB for thousands of albums),
+//! but the directory lives under `$HOME/.cache/zytunes/art` so users can
+//! `rm -rf` it freely — the next TUI launch will re-populate on demand.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
