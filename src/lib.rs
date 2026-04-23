@@ -262,6 +262,39 @@ pub fn transcode_and_import(
     session.import_track(&upload_path, meta)
 }
 
+/// Byte index of the end of the last frame in `samples` that contains any
+/// non-zero value. Returns 0 if the entire slice is digital silence.
+fn last_nonzero_frame_end(samples: &[f32], channels: usize) -> usize {
+    if channels == 0 {
+        return 0;
+    }
+    let last_nonzero = samples
+        .iter()
+        .rposition(|&s| s != 0.0)
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    last_nonzero.div_ceil(channels) * channels
+}
+
+fn encode_pcm(
+    encoder: &mut mp3lame_encoder::Encoder,
+    samples: &[f32],
+    channels: usize,
+    output: &mut Vec<u8>,
+) -> Result<(), String> {
+    if samples.is_empty() {
+        return Ok(());
+    }
+    let frames = samples.len() / channels;
+    output.reserve(mp3lame_encoder::max_required_buffer_size(frames));
+    let res = match channels {
+        1 => encoder.encode_to_vec(mp3lame_encoder::MonoPcm(samples), output),
+        2 => encoder.encode_to_vec(mp3lame_encoder::InterleavedPcm(samples), output),
+        n => return Err(format!("Unsupported channel count: {n}")),
+    };
+    res.map(|_| ()).map_err(|e| format!("LAME encode: {e:?}"))
+}
+
 /// Transcode a file to MP3 using pure Rust libraries.
 /// Preserves metadata and resizes album art to the given dimensions (or 200x200 by default).
 pub fn transcode_to_mp3(
@@ -335,8 +368,20 @@ pub fn transcode_to_mp3(
         .build()
         .map_err(|e| format!("LAME build: {e:?}"))?;
 
+    if channels == 0 || channels > 2 {
+        return Err(format!(
+            "Cannot transcode {channels}-channel audio; only mono and stereo are supported"
+        ));
+    }
+
     let mut mp3_data = Vec::new();
     let mut sample_buf: Option<SampleBuffer<f32>> = None;
+    // Trailing run of zero samples. Held rather than encoded so that digital
+    // silence at the tail of the stream is dropped at EOF. symphonia's isomp4
+    // demuxer parses M4A edit-list atoms but does not apply them, so silence
+    // the source's edit list would have trimmed otherwise bleeds into LAME.
+    let mut trailing_zeros: Vec<f32> = Vec::new();
+    let mut encoded_any = false;
 
     loop {
         let packet = match format.next_packet() {
@@ -367,18 +412,36 @@ pub fn transcode_to_mp3(
         sbuf.copy_interleaved_ref(decoded);
 
         let samples = sbuf.samples();
-        let input_pcm = mp3lame_encoder::InterleavedPcm(samples);
-        mp3_data.reserve(mp3lame_encoder::max_required_buffer_size(
-            samples.len() / channels,
-        ));
-        mp3_encoder
-            .encode_to_vec(input_pcm, &mut mp3_data)
-            .map_err(|e| format!("LAME encode: {e:?}"))?;
+        let split_at = last_nonzero_frame_end(samples, channels);
+        let (audio, trailing) = samples.split_at(split_at);
+
+        if !audio.is_empty() {
+            if !trailing_zeros.is_empty() {
+                encode_pcm(&mut mp3_encoder, &trailing_zeros, channels, &mut mp3_data)?;
+                trailing_zeros.clear();
+            }
+            encode_pcm(&mut mp3_encoder, audio, channels, &mut mp3_data)?;
+            encoded_any = true;
+        }
+
+        trailing_zeros.extend_from_slice(trailing);
     }
 
-    // Flush the encoder
+    if encoded_any {
+        // Held trailing zeros were genuinely at the tail — drop them.
+        drop(trailing_zeros);
+    } else {
+        // Entire stream was digital silence. Preserve it so downstream tag
+        // writing and LAME's flush both have valid state to work with.
+        encode_pcm(&mut mp3_encoder, &trailing_zeros, channels, &mut mp3_data)?;
+    }
+
+    // FlushGap is the correct end-of-stream flush for a standalone track
+    // (pads the final frame with zeros, allows id3v1). FlushNoGap is for
+    // gapless concatenation and leaves the final frame padded with ancillary
+    // data, which some decoders (including the Zune) mishandle.
     mp3_encoder
-        .flush_to_vec::<mp3lame_encoder::FlushNoGap>(&mut mp3_data)
+        .flush_to_vec::<mp3lame_encoder::FlushGap>(&mut mp3_data)
         .map_err(|e| format!("LAME flush: {e:?}"))?;
 
     // 4. Write the MP3 file
@@ -1417,6 +1480,229 @@ mod tests {
         // Write silence (zeros)
         let silence = vec![0u8; data_size as usize];
         f.write_all(&silence).unwrap();
+    }
+
+    /// WAV with `audio_frames` of low-amplitude alternating samples followed
+    /// by `silence_frames` of exact zeros (stereo s16le @ 44.1 kHz).
+    fn make_wav_tail(path: &std::path::Path, audio_frames: usize, silence_frames: usize) {
+        use std::io::Write;
+        let channels: u16 = 2;
+        let sample_rate: u32 = 44100;
+        let bits_per_sample: u16 = 16;
+        let byte_rate = sample_rate * u32::from(channels) * u32::from(bits_per_sample) / 8;
+        let block_align = channels * bits_per_sample / 8;
+        let total_frames = audio_frames + silence_frames;
+        let data_size =
+            (total_frames * usize::from(channels) * usize::from(bits_per_sample) / 8) as u32;
+        let file_size = 36 + data_size;
+
+        let mut f = std::fs::File::create(path).unwrap();
+        f.write_all(b"RIFF").unwrap();
+        f.write_all(&file_size.to_le_bytes()).unwrap();
+        f.write_all(b"WAVE").unwrap();
+        f.write_all(b"fmt ").unwrap();
+        f.write_all(&16u32.to_le_bytes()).unwrap();
+        f.write_all(&1u16.to_le_bytes()).unwrap();
+        f.write_all(&channels.to_le_bytes()).unwrap();
+        f.write_all(&sample_rate.to_le_bytes()).unwrap();
+        f.write_all(&byte_rate.to_le_bytes()).unwrap();
+        f.write_all(&block_align.to_le_bytes()).unwrap();
+        f.write_all(&bits_per_sample.to_le_bytes()).unwrap();
+        f.write_all(b"data").unwrap();
+        f.write_all(&data_size.to_le_bytes()).unwrap();
+
+        for i in 0..audio_frames {
+            let v: i16 = if i % 2 == 0 { 2000 } else { -2000 };
+            let bytes = v.to_le_bytes();
+            for _ in 0..channels {
+                f.write_all(&bytes).unwrap();
+            }
+        }
+        let silence = vec![0u8; silence_frames * usize::from(channels) * 2];
+        f.write_all(&silence).unwrap();
+    }
+
+    fn count_mp3_frames(mp3_path: &str) -> u64 {
+        use symphonia::core::codecs::DecoderOptions;
+        use symphonia::core::formats::FormatOptions;
+        use symphonia::core::io::MediaSourceStream;
+        use symphonia::core::meta::MetadataOptions;
+        use symphonia::core::probe::Hint;
+
+        let file = std::fs::File::open(mp3_path).unwrap();
+        let mss = MediaSourceStream::new(Box::new(file), Default::default());
+        let mut hint = Hint::new();
+        hint.with_extension("mp3");
+        let probed = symphonia::default::get_probe()
+            .format(
+                &hint,
+                mss,
+                &FormatOptions::default(),
+                &MetadataOptions::default(),
+            )
+            .unwrap();
+        let mut format = probed.format;
+        let track = format.default_track().unwrap().clone();
+        let mut decoder = symphonia::default::get_codecs()
+            .make(&track.codec_params, &DecoderOptions::default())
+            .unwrap();
+
+        let mut total: u64 = 0;
+        loop {
+            let packet = match format.next_packet() {
+                Ok(p) => p,
+                Err(symphonia::core::errors::Error::IoError(ref e))
+                    if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+                {
+                    break;
+                }
+                Err(_) => break,
+            };
+            if packet.track_id() != track.id {
+                continue;
+            }
+            let decoded = decoder.decode(&packet).unwrap();
+            total += decoded.frames() as u64;
+        }
+        total
+    }
+
+    #[test]
+    fn last_nonzero_frame_end_finds_tail() {
+        // Stereo: [L0 R0 L1 R1 L2 R2]
+        let samples = [0.1f32, 0.2, 0.3, 0.4, 0.0, 0.0];
+        assert_eq!(last_nonzero_frame_end(&samples, 2), 4);
+
+        let all_zero = [0.0f32; 8];
+        assert_eq!(last_nonzero_frame_end(&all_zero, 2), 0);
+
+        // Non-zero only in the right channel of the last frame — still a
+        // frame with content, must round up to include both samples.
+        let right_only = [0.0f32, 0.0, 0.0, 0.5];
+        assert_eq!(last_nonzero_frame_end(&right_only, 2), 4);
+
+        // Non-zero in one sample of the middle frame; trailing frame is zero.
+        let mid_only = [0.0f32, 0.0, 0.1, 0.0, 0.0, 0.0];
+        assert_eq!(last_nonzero_frame_end(&mid_only, 2), 4);
+
+        // Mono
+        let mono = [0.0f32, 0.5, 0.0];
+        assert_eq!(last_nonzero_frame_end(&mono, 1), 2);
+    }
+
+    #[test]
+    fn transcode_trims_trailing_silence() {
+        let dir = std::env::temp_dir().join("zytunes-test-transcode-trim");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let wav_path = dir.join("tail.wav");
+        // 1s of audio + 7s of digital silence (the slowerpace pattern).
+        make_wav_tail(&wav_path, 44_100, 44_100 * 7);
+
+        let out_dir = dir.join("out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        let mp3_path =
+            transcode_to_mp3(wav_path.to_str().unwrap(), &out_dir, Some((200, 200))).unwrap();
+
+        let frames = count_mp3_frames(&mp3_path);
+
+        // Without the trim, output would be ~8s (~352,800 frames). With the
+        // trim it should be ~1s plus a small LAME delay — comfortably under
+        // 2s. Guard against a regression where the 7s tail leaks back in.
+        assert!(
+            frames < 44_100 * 2,
+            "output still contains trailing silence: {} frames (~{:.2}s)",
+            frames,
+            frames as f64 / 44_100.0
+        );
+        // Sanity check: we didn't strip the actual audio.
+        assert!(
+            frames > 22_050,
+            "output suspiciously short: {} frames (~{:.3}s)",
+            frames,
+            frames as f64 / 44_100.0
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transcode_preserves_mid_track_silence() {
+        // A gap of zeros between two regions of audio should survive.
+        let dir = std::env::temp_dir().join("zytunes-test-transcode-gap");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let wav_path = dir.join("gap.wav");
+        // Build: 1s audio, 2s silence, 1s audio. We write it manually so the
+        // trailing audio forces the held-zero buffer to flush.
+        {
+            use std::io::Write;
+            let channels: u16 = 2;
+            let sample_rate: u32 = 44100;
+            let bits_per_sample: u16 = 16;
+            let audio_frames = 44_100usize;
+            let silence_frames = 44_100usize * 2;
+            let total_frames = audio_frames * 2 + silence_frames;
+            let byte_rate = sample_rate * u32::from(channels) * u32::from(bits_per_sample) / 8;
+            let block_align = channels * bits_per_sample / 8;
+            let data_size =
+                (total_frames * usize::from(channels) * usize::from(bits_per_sample) / 8) as u32;
+            let file_size = 36 + data_size;
+
+            let mut f = std::fs::File::create(&wav_path).unwrap();
+            f.write_all(b"RIFF").unwrap();
+            f.write_all(&file_size.to_le_bytes()).unwrap();
+            f.write_all(b"WAVE").unwrap();
+            f.write_all(b"fmt ").unwrap();
+            f.write_all(&16u32.to_le_bytes()).unwrap();
+            f.write_all(&1u16.to_le_bytes()).unwrap();
+            f.write_all(&channels.to_le_bytes()).unwrap();
+            f.write_all(&sample_rate.to_le_bytes()).unwrap();
+            f.write_all(&byte_rate.to_le_bytes()).unwrap();
+            f.write_all(&block_align.to_le_bytes()).unwrap();
+            f.write_all(&bits_per_sample.to_le_bytes()).unwrap();
+            f.write_all(b"data").unwrap();
+            f.write_all(&data_size.to_le_bytes()).unwrap();
+
+            for i in 0..audio_frames {
+                let v: i16 = if i % 2 == 0 { 2000 } else { -2000 };
+                let bytes = v.to_le_bytes();
+                for _ in 0..channels {
+                    f.write_all(&bytes).unwrap();
+                }
+            }
+            let silence = vec![0u8; silence_frames * usize::from(channels) * 2];
+            f.write_all(&silence).unwrap();
+            for i in 0..audio_frames {
+                let v: i16 = if i % 2 == 0 { 2000 } else { -2000 };
+                let bytes = v.to_le_bytes();
+                for _ in 0..channels {
+                    f.write_all(&bytes).unwrap();
+                }
+            }
+        }
+
+        let out_dir = dir.join("out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        let mp3_path =
+            transcode_to_mp3(wav_path.to_str().unwrap(), &out_dir, Some((200, 200))).unwrap();
+
+        let frames = count_mp3_frames(&mp3_path);
+        // Total source = 4s. Output should keep the middle gap (mid-track
+        // silence is not trailing), so frames ~= 4s worth. Allow slack for
+        // LAME delay/padding on either side.
+        assert!(
+            frames > 44_100 * 3,
+            "mid-track silence was incorrectly trimmed: {} frames (~{:.2}s)",
+            frames,
+            frames as f64 / 44_100.0
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Generate a minimal JPEG image of given dimensions.
