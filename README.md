@@ -2,32 +2,37 @@
 
 [![CI](https://github.com/Danondso/zytunes/actions/workflows/ci.yml/badge.svg)](https://github.com/Danondso/zytunes/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.87%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.94%2B-orange.svg)](https://www.rust-lang.org)
 
-A Rust CLI tool for syncing music to a Microsoft Zune 30 from macOS and Linux.
+A Rust tool for syncing music (and photos/videos on Zune) to a Microsoft Zune 30 or classic iPod from macOS and Linux.
 
 ## Status
 
-**Active development.** Core functionality is working: device detection, MTPZ authentication, file listing, music push/remove, library sync (by artist, album, or track), and automatic transcoding of unsupported formats.
+**Active development.** Core functionality is working: device detection for both Zune and iPod Classic, MTPZ authentication (Zune), iTunesDB reads/writes (iPod), file listing, music push/remove, library sync (by artist, album, or track), and automatic transcoding of unsupported formats.
 
 ## What works
 
-- **USB detection** — scans connected USB devices via `rusb` and identifies a Zune 30 by Microsoft vendor ID `0x045e` and known product IDs
-- **MTPZ authentication** — the Zune requires Microsoft's encrypted MTPZ handshake before exposing storage. Handled automatically via the native IOKit backend (`zune-mtp`)
-- **File listing** — `ls [path]` enumerates storage and prints the device's directory tree
-- **Music push** — `push <files...>` uploads music files to the Zune with proper metadata via `zune-import`
+- **Multi-device detection** — scans for both Microsoft Zune 30 (VID `0x045e`) and classic iPod via `rusb` plus mounted-volume probing. CLI and TUI iterate registered backends and open a session against whichever device is connected
+- **MTPZ authentication (Zune)** — the Zune requires Microsoft's encrypted MTPZ handshake before exposing storage. Handled automatically via the native IOKit backend (`zune-mtp`)
+- **iPod Classic sync** — full music sync via a pure-Rust `ipod-db` crate. iTunesDB parser/writer with hash58 signing, ArtworkDB + ITHMB thumbnails, from-scratch libgpod-ported mhit writer for new tracks, and raw blob replay for lossless round-trip of existing tracks
+- **File listing** — `ls [path]` enumerates storage and prints the device's directory tree (device browser in the TUI shows human-readable `Artist/Album/Title.ext` paths on the iPod instead of the hashed F-dir filenames)
+- **Music push** — `push <files...>` uploads music files to the device with proper metadata
 - **Music removal** — `rm <device-paths...>` removes files/folders from the device (leaf-first for directories)
 - **Music library sync** — `sync <type> <name>` syncs tracks by artist, album, or track name by scanning a local music folder. Detects duplicates already on device and skips them. The TUI's queued sync also filters out tracks already on the device before dispatching the sync
-- **Auto-transcoding** — non-native formats (FLAC, OGG, WAV, M4A, OPUS, ALAC, AIFF) are transcoded to MP3 via ffmpeg with album art resized to 200x200 (Zune 30 constraint)
+- **Photo & video sync (Zune)** — `photo-sync [dir]` and `video-sync [dir]` push images and videos to the Zune's Pictures/Video stores. Videos are transcoded to WMV2/WMAv2 via ffmpeg; photos are JPEG-normalised
+- **Auto-transcoding (audio)** — non-native formats (FLAC, OGG, WAV, M4A, OPUS, ALAC, AIFF) are transcoded to MP3 via pure-Rust symphonia + LAME, with album art resized to 200x200 (Zune 30 constraint). The M4A/ALAC path trims trailing silence leaked by symphonia's unapplied `elst` edit-list atoms
 - **MP3 passthrough** — native formats (MP3, WMA, AAC) skip transcoding entirely
 - **Library browsing** — `library [query]` browses/searches your music library
 - **Directory scanning** — point zytunes at a music folder. It reads tags via lofty (FLAC, M4A, OGG, WAV, MP3, etc.) and infers metadata from the directory structure (`Artist/Album/Track.ext`) for untagged files. Set `ZYTUNES_MUSIC_DIR` or add `music_dir` to `~/.config/zytunes/config.toml`
-- **Interactive TUI** — `zytunes-tui` launches a terminal UI (ratatui) for browsing your music library, connecting to the device, managing a sync queue, and monitoring sync progress. Library scanning runs in the background on startup. TUI displays sync status on the Zune ASCII art screen including loading spinner, track count, syncing spinner, and queue count
-- **Device content browsing** — the TUI can browse tracks on the connected Zune organized by artist/album, toggled with `v`. The device library is indexed from the device's Music directory structure (`Artist/Album/Track`)
+- **Interactive TUI** — `zytunes-tui` launches a terminal UI (ratatui) for browsing your music library, connecting to the device, managing a sync queue, and monitoring sync progress. Library scanning runs in the background on startup. TUI shows a device-aware ASCII art panel with loading spinner, track count, syncing spinner, and queue count
+- **Device content browsing** — the TUI can browse tracks on the connected device organised by artist/album, toggled with `v`. The sidebar auto-labels itself `Zune: …` or `iPod: …` based on which device is connected
 - **Device track removal** — in device view mode, `a`/`A` removes selected tracks, albums, or artists from the device. Progress is shown during removal and the device track list auto-refreshes afterward
+- **Album-art rendering** — two renderers: unicode `halfblock` (default) and a 10-char luminance ramp `ascii` renderer. Press `T` to toggle; choice persists to `config.toml`. Per-album renderings are cached at `~/.cache/zytunes/art/` keyed by `(artist, album)` with `(mtime, size)` fingerprint invalidation so re-tagging refreshes automatically
+- **Audio playback** — in-TUI preview of library tracks via rodio (play/pause/skip). Press `P` to cycle the now-playing panel through auto → force-hidden → force-shown. Selected rows marquee-scroll long titles
+- **Log export** — press `L` to dump the live log to `/tmp/zytunes-log.txt` and copy the path to the system clipboard
 - **USB resilience (macOS)** — the native IOKit backend recovers from transient pipe stalls via `ClearPipeStall` with a one-shot retry on both read and write paths. Read timeouts clear stalls on both bulk endpoints so the OUT pipe stays in sync with the device. When a sync/remove cascade indicates the USB session is truly gone (device unplug, `NotResponding`, unrecoverable stall, read timeout) the TUI aborts remaining work, clears the session, and prompts the user to replug
-- **Theming** — the TUI includes 16 built-in color themes (iTunes 2004, Gruvbox Dark/Light, Everforest Dark/Light, Tokyo Night, IBM Mainframe, Amber CRT, Windows 95, System 7, BIOS, Red Sands, Newport Lights, NeXTSTEP, WinAmp Classic, Zune Original). Press `t` to open the theme picker. Selected theme is persisted to `~/.config/zytunes/config.toml`
-- **Native IOKit USB backend** — the `zune-mtp` crate provides direct MTP/MTPZ communication via Apple's IOKit framework, bypassing libusb. This is the sole backend for all device operations, supporting listing, import, removal, and track collection
+- **Theming** — 16 built-in color themes (iTunes 2004, Gruvbox Dark/Light, Everforest Dark/Light, Tokyo Night, IBM Mainframe, Amber CRT, Windows 95, System 7, BIOS, Red Sands, Newport Lights, NeXTSTEP, WinAmp Classic, Zune Original) plus user-defined themes via `[themes."Name"]` tables in `~/.config/zytunes/config.toml`. Press `t` to open the theme picker
+- **Native IOKit USB backend** — the `zune-mtp` crate provides direct MTP/MTPZ communication via Apple's IOKit framework, bypassing libusb. This is the sole transport for Zune device operations on macOS — supporting listing, import, removal, and track collection. A libusb transport is present for Linux but does not yet match the IOKit stall-recovery behaviour
 
 ## Interactive TUI
 
@@ -66,7 +71,7 @@ The TUI reads `music_dir` from `~/.config/zytunes/config.toml`, or falls back to
 ### Browse modes
 
 - **Library mode** (default) — browse your music library by Artists (`1`) or Albums (`2`)
-- **Device mode** — browse tracks on the connected Zune, organized by Artist/Album from the device filesystem. Toggle with `v`
+- **Device mode** — browse tracks on the connected device, organised by Artist/Album from the device filesystem. Toggle with `v`. Sidebar header auto-labels itself "Zune: …" or "iPod: …"
 
 The album detail view shows a ZIP disk ASCII art with album metadata (artist, album, year, track count, duration) alongside the track table.
 
@@ -97,7 +102,7 @@ The album detail view shows a ZIP disk ASCII art with album metadata (artist, al
 
 | Key | Action |
 |-----|--------|
-| `c` | Connect to Zune (USB detect + MTPZ handshake) |
+| `c` | Connect to device (USB detect; MTPZ handshake on Zune, volume mount on iPod) |
 | `r` | Refresh device track list |
 | `d` | Disconnect |
 
@@ -109,6 +114,15 @@ The album detail view shows a ZIP disk ASCII art with album metadata (artist, al
 | `d` (in queue) | Remove selected item |
 | `C` | Clear entire queue |
 | `Esc` | Cancel running sync |
+
+**Playback & display**
+
+| Key | Action |
+|-----|--------|
+| `p` | Play / pause selected track |
+| `P` | Cycle now-playing panel (auto → hidden → always on) |
+| `T` | Toggle album-art style (halfblock / ASCII) |
+| `L` | Dump log to `/tmp/zytunes-log.txt` and copy path to clipboard |
 
 **General**
 
@@ -125,7 +139,19 @@ The album detail view shows a ZIP disk ASCII art with album metadata (artist, al
 
 iTunes 2004, Gruvbox Dark, Gruvbox Light, Everforest Dark, Everforest Light, Tokyo Night, IBM Mainframe, Amber CRT, Windows 95, System 7, BIOS, Red Sands, Newport Lights, NeXTSTEP, WinAmp Classic, Zune Original
 
-Selected theme is persisted to `~/.config/zytunes/config.toml`.
+Selected theme is persisted to `~/.config/zytunes/config.toml`. You can also define your own themes by adding a `[themes."Name"]` table that inherits from a built-in `base` and overrides any colors, modifiers, border type, or accent animation:
+
+```toml
+theme = "My Custom"
+
+[themes."My Custom"]
+base = "Gruvbox Dark"
+selection_bg = "#ff00aa"
+progress_bar = "#00ffaa"
+accent_anim = "pulse"
+```
+
+Custom themes appear in the picker alongside the built-ins. Malformed entries (unknown base, bad color, name collision with a built-in) are skipped with a stderr warning — a bad entry never breaks the picker.
 
 ### Terminal compatibility
 
@@ -136,7 +162,7 @@ The TUI works in any EAW-compliant terminal (Alacritty, kitty, wezterm, Zed's em
 ### Sync workflow
 
 1. Browse your music library and press `a` to add artists, albums, or individual tracks to the sync queue
-2. Press `c` to connect to the Zune (auto-detects via USB, performs MTPZ handshake)
+2. Press `c` to connect to the device (auto-detects via USB, performs MTPZ handshake on Zune / mounts the iPod volume)
 3. Press `S` or switch to the queue and press `Enter` to start syncing
 4. Non-native formats are auto-transcoded to MP3, album art resized to 200x200
 5. Progress and results appear in the log panel; device track list auto-refreshes on completion. Tracks already on the device are skipped automatically and noted in the log
@@ -155,17 +181,19 @@ Both skills run `cargo fmt` and `cargo clippy -- -D warnings` as part of their f
 
 ## What's planned
 
-- **Dump command** — `dump` to pull all music off a Zune to a local directory
+- **Dump command** — `dump` to pull all music off a device to a local directory
+- **Linux transport parity** — port IOKit's `ClearPipeStall` recovery behaviour to the libusb transport so Linux hosts survive transient pipe errors without a replug
 
 ## Setup
 
 ### Prerequisites
 
 ```
-brew install libusb
+brew install libusb            # required
+brew install ffmpeg            # optional: only needed for `video-sync` and TUI playback of WMA files
 ```
 
-### MTPZ keys
+### MTPZ keys (Zune only)
 
 The Zune requires MTPZ authentication. Place the keys file in your home directory:
 
@@ -173,7 +201,7 @@ The Zune requires MTPZ authentication. Place the keys file in your home director
 cp mtpz-data.example ~/.mtpz-data
 ```
 
-These keys originate from the [libmtp-zune](https://github.com/kbhomes/libmtp-zune) project.
+These keys originate from the [libmtp-zune](https://github.com/kbhomes/libmtp-zune) project. The iPod backend does not use them.
 
 ### Music library
 
@@ -288,43 +316,55 @@ Error codes encountered during development and what they mean in the Zune contex
 ## Project structure
 
 ```
-zune-mtp/            — native IOKit MTP/MTPZ library (workspace crate)
+zune-mtp/            — native MTP/MTPZ library (workspace crate)
   src/
-    lib.rs           — crate root, public API
+    lib.rs           — crate root, public API, MtpError
     transport.rs     — IOKit USB transport (device open, bulk read/write, ClearPipeStall recovery)
+    transport/
+      libusb.rs      — libusb fallback transport (Linux)
+      tcp.rs         — MTP/IP (PTP over IP) transport
     container.rs     — MTP/PTP container format (build/parse commands, data, responses)
     session.rs       — MTP session (open, object operations, property lists, object references)
     mtpz.rs          — MTPZ authentication (RSA, AES-CBC, CMAC, certificate exchange)
     proplist.rs      — MTP ObjectPropList builder (SendObjectPropList payloads)
     iokit_ffi.rs     — raw FFI declarations for IOKit and CoreFoundation
-  examples/
-    test_connect.rs  — end-to-end connection test
-    test_cmac.rs     — AES-CMAC verification against RFC 4493
-    test_sign.rs     — CMAC signature verification against aft-mtp-cli trace output
-    test_rsa.rs      — RSA key roundtrip verification
-    test_ls.rs       — device directory listing test
-    test_tracks.rs   — full Music tree walk and track enumeration
-    test_import.rs   — file upload via SendObjectPropList
+  examples/          — standalone integration tests (connect, ls, tracks, import, MTPZ primitives)
+ipod-db/             — pure-Rust iTunesDB parser/writer (workspace crate)
+  src/
+    lib.rs           — crate root
+    itunesdb.rs      — iTunesDB reader
+    itunesdb_write.rs— mhit/mhbd writer (libgpod-port), hash58 signing
+    artwork/         — ArtworkDB + ITHMB thumbnail writer
+    detect.rs        — iPod volume/mount detection
+    fs.rs            — iPod_Control path helpers
+    hash.rs          — hash58 signing
+    encoding.rs      — UTF-16 helpers
 src/
   main.rs            — CLI entry point, commands (ls, push, rm, sync, library, photo-sync, video-sync)
-  lib.rs             — public API, sync engine, SyncType enum, transcoding
-  device.rs          — USB scanning and Zune identification (rusb)
+  lib.rs             — public API, sync engine, SyncType enum, audio transcoding (symphonia + LAME), video transcoding (ffmpeg shell-out)
+  device/
+    mod.rs           — DeviceBackend trait, DeviceCapabilities, DeviceFamily
+    zune.rs          — ZuneBackend: rusb-based scan, opens NativeSession
+    ipod.rs          — IpodBackend: mounted-volume scan, opens IpodSession
   mtp/
-    mod.rs           — module root, DeviceSession trait
-    native.rs        — native IOKit backend (NativeSession implementing DeviceSession)
+    mod.rs           — DeviceSession trait, TrackMeta
+    native.rs        — Zune session (NativeSession on zune-mtp)
+    ipod_session.rs  — iPod session (IpodSession on ipod-db)
     parse.rs         — DeviceEntry struct and parsing utilities
+    zmdb.rs          — Zune Metadata Database parser (vendor op 0x9217)
   library.rs         — MusicLibrary trait and shared Track type
   dirlib.rs          — DirectoryLibrary: recursive folder scanner (lofty tags + path fallback)
   cache.rs           — on-disk cache for the directory scanner
+  paths.rs           — device-scoped cache paths (ZYTUNES_CACHE_DIR aware)
   tui/
     main.rs          — TUI entry point (zytunes-tui binary)
     app.rs           — application state, panel navigation, event handling
-    ui.rs            — ratatui widget rendering (layout, panels, overlays)
-    background.rs    — background worker thread (device I/O, sync, removal, library loading)
+    ui.rs            — ratatui widget rendering (layout, panels, overlays, album-art cache)
+    background.rs    — background worker thread (device I/O, sync, removal, library loading, album-art load)
     anim.rs          — theme-aware animations
-    audio.rs         — local audio playback
-    theme.rs         — theme struct and built-in theme presets
-    config.rs        — TOML config file loading/saving (~/.config/zytunes/config.toml)
+    audio.rs         — local audio playback (rodio)
+    theme.rs         — Theme struct, built-in presets, user-theme merge
+    config.rs        — TOML config file (~/.config/zytunes/config.toml)
 ```
 
 ## Reference libraries
