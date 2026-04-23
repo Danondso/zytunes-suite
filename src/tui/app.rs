@@ -623,7 +623,8 @@ pub struct App {
     pub artist_device_status: BTreeMap<String, DevicePresence>,
     /// Per-(artist, album) device presence for album-list indicators.
     pub album_device_status: BTreeMap<(String, String), DevicePresence>,
-    /// Cached album art extracted from ID3 tags.
+    /// Cached album art extracted from embedded tags (any lofty-supported
+    /// format — MP3 / FLAC / ALAC / OGG / WMA).
     pub album_art: Option<DynamicImage>,
     /// Key used to avoid re-extracting art (e.g. "artist/album").
     album_art_key: String,

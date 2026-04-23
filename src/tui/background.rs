@@ -149,7 +149,9 @@ pub enum BgEvent {
     AcquiredItemsCount(u32),
     /// Parsed sync progress status from MTP vendor op 0x922f.
     DeviceSyncStatus(Option<String>),
-    /// Album art loaded from ID3 tags in the background.
+    /// Album art loaded from embedded tags (any lofty-supported format) in
+    /// the background. `image` is `None` when no candidate track yielded a
+    /// decodable picture.
     AlbumArtLoaded {
         key: String,
         image: Option<image::DynamicImage>,
