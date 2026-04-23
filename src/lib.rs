@@ -1,3 +1,4 @@
+pub mod art_cache;
 pub mod cache;
 pub mod device;
 pub mod dirlib;
