@@ -1439,9 +1439,15 @@ impl App {
 
     /// Request album art extraction in the background thread.
     pub fn refresh_album_art(&mut self) {
-        // Build a cache key from the current track list context.
-        let key = if let Some(t) = self.track_list.first() {
-            format!("{}/{}", t.artist, t.album)
+        // Build a cache key from the current track list context. Artist and
+        // album are passed separately so the persistent art cache can key on
+        // structured fields rather than parsing the delimited form.
+        let (key, artist, album) = if let Some(t) = self.track_list.first() {
+            (
+                format!("{}/{}", t.artist, t.album),
+                t.artist.clone(),
+                t.album.clone(),
+            )
         } else {
             self.album_art = None;
             self.album_art_key.clear();
@@ -1464,8 +1470,12 @@ impl App {
             .iter()
             .filter_map(|t| t.location.clone())
             .collect();
-        self.pending_bg_commands
-            .push(BgCommand::LoadAlbumArt { key, paths });
+        self.pending_bg_commands.push(BgCommand::LoadAlbumArt {
+            key,
+            artist,
+            album,
+            paths,
+        });
     }
 
     /// Rebuild the album-art cache sized to fit within the given terminal area,
