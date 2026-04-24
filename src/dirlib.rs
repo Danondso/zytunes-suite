@@ -78,9 +78,16 @@ impl DirectoryLibrary {
         });
 
         // For each file: stat → fingerprint → reuse cached Track if the
-        // fingerprint matches, otherwise run lofty to parse tags + duration.
-        // Stats are cheap; lofty is the expensive step, so the cache makes
-        // repeat launches nearly instant even with `read_properties` on.
+        // (mtime,size) fingerprint matches, otherwise run lofty to parse tags
+        // + duration. Stats are cheap; lofty is the expensive step, so the
+        // cache makes repeat launches nearly instant even with
+        // `read_properties` on.
+        //
+        // Acoustic fingerprint is computed if (a) the file is fresh, or (b)
+        // the cached track predates the acoustic-fingerprint field and so
+        // carries `None` — computing one from an unchanged file is safe
+        // because chromaprint is content-derived. Cached tracks that already
+        // have an `acoustic_id` are reused verbatim.
         let completed = AtomicU64::new(0);
         let entries: Vec<(String, crate::cache::CachedFile)> = paths
             .par_iter()
@@ -88,10 +95,14 @@ impl DirectoryLibrary {
                 let key = p.to_string_lossy().to_string();
                 let fingerprint = crate::cache::FileFingerprint::from_path(p)?;
 
-                let track = match cached.get(&key) {
+                let mut track = match cached.get(&key) {
                     Some(entry) if entry.fingerprint == fingerprint => entry.track.clone(),
                     _ => build_track(p, hash_path(p)),
                 };
+
+                if track.acoustic_id.is_none() {
+                    track.acoustic_id = crate::fingerprint::fingerprint_for(p);
+                }
 
                 let n = completed.fetch_add(1, Ordering::Relaxed) + 1;
                 on_progress(ScanProgress {
@@ -202,6 +213,12 @@ fn track_from_lofty(path: &Path, id: u64) -> Option<Track> {
         .map(|s| s.to_string())
         .unwrap_or_else(|| parent_name(path, 1));
 
+    // Prefer an already-embedded ACOUSTID_FINGERPRINT tag (written by Picard
+    // / fpcalc) over computing one — we've already parsed the tagged file,
+    // so reading the tag is effectively free; computing means a full decode.
+    // The scan loop backfills via `fingerprint_for` when this returns None.
+    let acoustic_id = crate::fingerprint::read_embedded_fingerprint(path);
+
     Some(Track {
         id,
         name,
@@ -227,6 +244,7 @@ fn track_from_lofty(path: &Path, id: u64) -> Option<Track> {
                 .unwrap_or("unknown")
                 .to_uppercase()
         )),
+        acoustic_id,
     })
 }
 
@@ -253,6 +271,7 @@ fn track_from_path(path: &Path, id: u64) -> Track {
                 .unwrap_or("unknown")
                 .to_uppercase()
         )),
+        acoustic_id: None,
     }
 }
 
@@ -578,6 +597,122 @@ mod tests {
         assert_eq!(track.album, "Post");
         assert_eq!(track.name, "Army of Me");
         assert_eq!(track.track_number, Some(1));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Write a short 440 Hz sine-wave WAV — decodable by symphonia, so the
+    /// fingerprint step can produce a real `acoustic_id`.
+    fn write_sine_wav(path: &Path, seconds: u32) {
+        use std::io::Write;
+        let sample_rate: u32 = 44_100;
+        let channels: u16 = 1;
+        let bits: u16 = 16;
+        let frames = sample_rate * seconds;
+        let data_size = frames * u32::from(channels) * u32::from(bits) / 8;
+        let byte_rate = sample_rate * u32::from(channels) * u32::from(bits) / 8;
+        let block_align = channels * bits / 8;
+        let riff_size = 36 + data_size;
+
+        let mut f = fs::File::create(path).unwrap();
+        f.write_all(b"RIFF").unwrap();
+        f.write_all(&riff_size.to_le_bytes()).unwrap();
+        f.write_all(b"WAVE").unwrap();
+        f.write_all(b"fmt ").unwrap();
+        f.write_all(&16u32.to_le_bytes()).unwrap();
+        f.write_all(&1u16.to_le_bytes()).unwrap();
+        f.write_all(&channels.to_le_bytes()).unwrap();
+        f.write_all(&sample_rate.to_le_bytes()).unwrap();
+        f.write_all(&byte_rate.to_le_bytes()).unwrap();
+        f.write_all(&block_align.to_le_bytes()).unwrap();
+        f.write_all(&bits.to_le_bytes()).unwrap();
+        f.write_all(b"data").unwrap();
+        f.write_all(&data_size.to_le_bytes()).unwrap();
+        let mut pcm = Vec::with_capacity(data_size as usize);
+        for i in 0..frames {
+            let t = i as f32 / sample_rate as f32;
+            let v = ((t * 440.0 * std::f32::consts::TAU).sin() * 30_000.0) as i16;
+            pcm.extend_from_slice(&v.to_le_bytes());
+        }
+        f.write_all(&pcm).unwrap();
+    }
+
+    #[test]
+    fn scan_populates_acoustic_id_for_real_audio() {
+        // Uses a real sine WAV so the symphonia decode → chromaprint path
+        // actually runs end-to-end via the scan pipeline.
+        let dir = std::env::temp_dir().join("zytunes-dirlib-acousticid");
+        let _ = fs::remove_dir_all(&dir);
+        let album = dir.join("FpArtist").join("FpAlbum");
+        fs::create_dir_all(&album).unwrap();
+        write_sine_wav(&album.join("01 FpSong.wav"), 10);
+
+        let lib = DirectoryLibrary::scan(dir.to_str().unwrap()).unwrap();
+        assert_eq!(lib.track_count(), 1);
+        let track = lib.all_tracks().next().unwrap();
+        assert!(
+            track.acoustic_id.is_some(),
+            "scan must populate acoustic_id for decodable files; got None"
+        );
+
+        // Second scan hits the cache but keeps the stored fingerprint.
+        let original_fp = track.acoustic_id.clone();
+        let lib2 = DirectoryLibrary::scan(dir.to_str().unwrap()).unwrap();
+        let track2 = lib2.all_tracks().next().unwrap();
+        assert_eq!(
+            track2.acoustic_id, original_fp,
+            "cached scan must preserve the acoustic_id"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_backfills_acoustic_id_on_cached_track_with_none() {
+        // Simulates an older cache from before acoustic_id existed: we
+        // manually seed the cache with acoustic_id=None, then scan. The new
+        // scan should reuse the cached metadata (mtime/size still matches)
+        // but compute a fresh fingerprint, demonstrating the backfill path.
+        let dir = std::env::temp_dir().join("zytunes-dirlib-fp-backfill");
+        let _ = fs::remove_dir_all(&dir);
+        let album = dir.join("BackArtist").join("BackAlbum");
+        fs::create_dir_all(&album).unwrap();
+        let file = album.join("01 BackSong.wav");
+        write_sine_wav(&file, 10);
+
+        let path_key = file.to_string_lossy().to_string();
+        let fp = crate::cache::FileFingerprint::from_path(&file).unwrap();
+        let seed = crate::cache::CachedFile {
+            fingerprint: fp,
+            track: Track {
+                id: 42,
+                name: "Back Song".into(),
+                artist: "Back Artist".into(),
+                album: "Back Album".into(),
+                genre: None,
+                year: None,
+                track_number: None,
+                disc_number: None,
+                total_time_ms: None,
+                location: Some(path_key.clone()),
+                kind: None,
+                acoustic_id: None, // simulated pre-feature cache
+            },
+        };
+        let mut seeded = HashMap::new();
+        seeded.insert(path_key, seed);
+        crate::cache::save_dirlib_cache(dir.to_str().unwrap(), seeded);
+
+        let lib = DirectoryLibrary::scan(dir.to_str().unwrap()).unwrap();
+        let track = lib.all_tracks().next().unwrap();
+        assert!(
+            track.acoustic_id.is_some(),
+            "scan must backfill acoustic_id for cached tracks that lack it"
+        );
+        // Metadata from the seeded cache must survive — proof we took the
+        // cache-hit path rather than re-parsing tags from the file.
+        assert_eq!(track.name, "Back Song");
+        assert_eq!(track.id, 42);
 
         let _ = fs::remove_dir_all(&dir);
     }
