@@ -702,7 +702,14 @@ pub fn sync_to_device(
 
 /// Expand paths into a list of music files.
 /// If a path is a directory, recursively find music files in it.
+///
+/// Diagnostic messages (skipped files, missing paths) go to stderr.
 pub fn collect_music_files(paths: &[&str]) -> Vec<String> {
+    collect_music_files_with_logger(paths, &cache::default_logger())
+}
+
+/// Like [`collect_music_files`] but routes diagnostics through `log`.
+pub fn collect_music_files_with_logger(paths: &[&str], log: &cache::Logger) -> Vec<String> {
     let music_extensions = [
         "mp3", "wma", "aac", "m4a", "ogg", "flac", "wav", "opus", "alac", "aiff",
     ];
@@ -715,13 +722,13 @@ pub fn collect_music_files(paths: &[&str]) -> Vec<String> {
                 if music_extensions.contains(&ext.to_lowercase().as_str()) {
                     files.push(path.to_string());
                 } else {
-                    eprintln!("Skipping non-music file: {}", path);
+                    log(&format!("Skipping non-music file: {path}"));
                 }
             }
         } else if p.is_dir() {
-            collect_music_files_recursive(p, &music_extensions, &mut files);
+            collect_files_recursive_with_logger(p, &music_extensions, &mut files, log);
         } else {
-            eprintln!("Not found: {}", path);
+            log(&format!("Not found: {path}"));
         }
     }
 
@@ -730,12 +737,19 @@ pub fn collect_music_files(paths: &[&str]) -> Vec<String> {
 }
 
 pub fn collect_music_files_recursive(dir: &Path, extensions: &[&str], files: &mut Vec<String>) {
-    collect_files_recursive(dir, extensions, files);
+    collect_files_recursive_with_logger(dir, extensions, files, &cache::default_logger())
 }
 
 /// Expand paths into a list of photo files.
 /// If a path is a directory, recursively find photo files in it.
+///
+/// Diagnostic messages (skipped files, missing paths) go to stderr.
 pub fn collect_photo_files(paths: &[&str]) -> Vec<String> {
+    collect_photo_files_with_logger(paths, &cache::default_logger())
+}
+
+/// Like [`collect_photo_files`] but routes diagnostics through `log`.
+pub fn collect_photo_files_with_logger(paths: &[&str], log: &cache::Logger) -> Vec<String> {
     let photo_extensions = ["jpg", "jpeg", "png", "bmp", "gif", "tiff", "webp"];
     let mut files = Vec::new();
 
@@ -746,13 +760,13 @@ pub fn collect_photo_files(paths: &[&str]) -> Vec<String> {
                 if photo_extensions.contains(&ext.to_lowercase().as_str()) {
                     files.push(path.to_string());
                 } else {
-                    eprintln!("Skipping non-photo file: {}", path);
+                    log(&format!("Skipping non-photo file: {path}"));
                 }
             }
         } else if p.is_dir() {
-            collect_files_recursive(p, &photo_extensions, &mut files);
+            collect_files_recursive_with_logger(p, &photo_extensions, &mut files, log);
         } else {
-            eprintln!("Not found: {}", path);
+            log(&format!("Not found: {path}"));
         }
     }
 
@@ -762,7 +776,14 @@ pub fn collect_photo_files(paths: &[&str]) -> Vec<String> {
 
 /// Expand paths into a list of video files.
 /// If a path is a directory, recursively find video files in it.
+///
+/// Diagnostic messages (skipped files, missing paths) go to stderr.
 pub fn collect_video_files(paths: &[&str]) -> Vec<String> {
+    collect_video_files_with_logger(paths, &cache::default_logger())
+}
+
+/// Like [`collect_video_files`] but routes diagnostics through `log`.
+pub fn collect_video_files_with_logger(paths: &[&str], log: &cache::Logger) -> Vec<String> {
     let video_extensions = ["wmv", "mp4", "avi", "mpeg", "mpg"];
     let mut files = Vec::new();
 
@@ -773,13 +794,13 @@ pub fn collect_video_files(paths: &[&str]) -> Vec<String> {
                 if video_extensions.contains(&ext.to_lowercase().as_str()) {
                     files.push(path.to_string());
                 } else {
-                    eprintln!("Skipping non-video file: {}", path);
+                    log(&format!("Skipping non-video file: {path}"));
                 }
             }
         } else if p.is_dir() {
-            collect_files_recursive(p, &video_extensions, &mut files);
+            collect_files_recursive_with_logger(p, &video_extensions, &mut files, log);
         } else {
-            eprintln!("Not found: {}", path);
+            log(&format!("Not found: {path}"));
         }
     }
 
@@ -788,11 +809,16 @@ pub fn collect_video_files(paths: &[&str]) -> Vec<String> {
 }
 
 /// Generic recursive file collection by extension list.
-fn collect_files_recursive(dir: &Path, extensions: &[&str], files: &mut Vec<String>) {
+fn collect_files_recursive_with_logger(
+    dir: &Path,
+    extensions: &[&str],
+    files: &mut Vec<String>,
+    log: &cache::Logger,
+) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("Cannot read directory {}: {}", dir.display(), e);
+            log(&format!("Cannot read directory {}: {}", dir.display(), e));
             return;
         }
     };
@@ -800,7 +826,7 @@ fn collect_files_recursive(dir: &Path, extensions: &[&str], files: &mut Vec<Stri
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            collect_files_recursive(&path, extensions, files);
+            collect_files_recursive_with_logger(&path, extensions, files, log);
         } else if path.is_file() {
             if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                 if extensions.contains(&ext.to_lowercase().as_str()) {
@@ -1895,5 +1921,103 @@ mod tests {
         assert!(result.is_err());
 
         let _ = std::fs::remove_dir_all(&out_dir);
+    }
+
+    // -- _with_logger seam tests --
+
+    #[test]
+    fn collect_photo_files_with_logger_captures_missing_path() {
+        // Call collect_photo_files_with_logger against a nonexistent path and
+        // verify the "Not found" message routes through the logger rather than
+        // going to stderr (which would corrupt a ratatui frame buffer).
+        use std::sync::{Arc, Mutex};
+
+        let missing = "/tmp/zytunes-no-such-dir-for-logger-test-photos";
+        let _ = std::fs::remove_dir_all(missing);
+
+        let msgs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let msgs_clone = msgs.clone();
+        let log: cache::Logger =
+            Arc::new(move |msg: &str| msgs_clone.lock().unwrap().push(msg.to_string()));
+
+        let files = collect_photo_files_with_logger(&[missing], &log);
+        assert!(files.is_empty());
+
+        // "Not found" is emitted when a path is neither a file nor a directory.
+        let captured = msgs.lock().unwrap();
+        assert!(
+            captured.iter().any(|m| m.contains("Not found")),
+            "expected 'Not found' in logger output; got: {captured:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn collect_photo_files_with_logger_captures_unreadable_subdir() {
+        // Verify that collect_files_recursive_with_logger routes a read_dir
+        // error through the logger rather than stderr.
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::{Arc, Mutex};
+
+        let dir = std::env::temp_dir().join("zytunes-test-logger-unreadable-subdir");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("photo.jpg"), b"fake").unwrap();
+        let subdir = dir.join("subdir");
+        std::fs::create_dir_all(&subdir).unwrap();
+        std::fs::set_permissions(&subdir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let msgs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let msgs_clone = msgs.clone();
+        let log: cache::Logger =
+            Arc::new(move |msg: &str| msgs_clone.lock().unwrap().push(msg.to_string()));
+
+        let files = collect_photo_files_with_logger(&[dir.to_str().unwrap()], &log);
+
+        // Restore permissions so cleanup works.
+        std::fs::set_permissions(&subdir, std::fs::Permissions::from_mode(0o755)).ok();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // The photo in the parent dir should still be found.
+        assert!(
+            files.iter().any(|f| f.ends_with("photo.jpg")),
+            "expected photo.jpg to be found; got: {files:?}"
+        );
+
+        // "Cannot read directory" must come through the logger, not stderr.
+        let captured = msgs.lock().unwrap();
+        assert!(
+            captured.iter().any(|m| m.contains("Cannot read directory")),
+            "expected 'Cannot read directory' in logger output; got: {captured:?}"
+        );
+    }
+
+    #[test]
+    fn collect_video_files_with_logger_captures_skip_message() {
+        // Pass a non-video file to collect_video_files_with_logger and verify
+        // the "Skipping non-video file" message routes through the logger.
+        use std::sync::{Arc, Mutex};
+
+        let dir = std::env::temp_dir().join("zytunes-test-logger-skip-video");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("photo.jpg");
+        std::fs::write(&f, b"fake").unwrap();
+
+        let msgs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let msgs_clone = msgs.clone();
+        let log: cache::Logger =
+            Arc::new(move |msg: &str| msgs_clone.lock().unwrap().push(msg.to_string()));
+
+        let files = collect_video_files_with_logger(&[f.to_str().unwrap()], &log);
+        assert!(files.is_empty());
+
+        let captured = msgs.lock().unwrap();
+        assert!(
+            captured.iter().any(|m| m.contains("Skipping non-video")),
+            "expected 'Skipping non-video' in logger output; got: {captured:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

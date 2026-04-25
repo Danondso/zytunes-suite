@@ -24,17 +24,35 @@ const SAVE_CHUNK_SIZE: usize = 2_000;
 const SAVE_DIRTY_THRESHOLD: u64 = 500;
 
 /// Knobs for `scan_with_options`.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone)]
 pub struct ScanOptions {
     /// Compute acoustic fingerprints for files that lack one. Disabling
     /// makes the scan much faster but skips the foundation for cross-device
     /// playcount merging (Phase 2+ of the playcount work).
     pub fingerprint: bool,
+
+    /// Receives diagnostic log messages (cache miss/hit summaries, save
+    /// errors, etc.).  Defaults to writing to stderr; the TUI background
+    /// worker replaces this with a channel-routing closure so messages appear
+    /// in the sync log panel instead of corrupting the ratatui frame buffer.
+    pub log: crate::cache::Logger,
 }
 
 impl Default for ScanOptions {
     fn default() -> Self {
-        Self { fingerprint: true }
+        Self {
+            fingerprint: true,
+            log: crate::cache::default_logger(),
+        }
+    }
+}
+
+// Manual Debug impl because function pointers aren't Debug.
+impl std::fmt::Debug for ScanOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScanOptions")
+            .field("fingerprint", &self.fingerprint)
+            .finish_non_exhaustive()
     }
 }
 
@@ -109,7 +127,7 @@ impl DirectoryLibrary {
 
         // Load the previous per-file cache. Missing / unreadable = empty map,
         // so first launches just fall through to a full parse.
-        let cached = crate::cache::load_dirlib_cache(path);
+        let cached = crate::cache::load_dirlib_cache(path, &options.log);
 
         // Parallel directory walk.
         let paths = collect_audio_paths(root);
@@ -256,7 +274,7 @@ impl DirectoryLibrary {
                 }
             };
             if let Some(snap) = snapshot {
-                crate::cache::save_dirlib_cache(path, snap);
+                crate::cache::save_dirlib_cache(path, snap, &options.log);
                 pending_changes.store(0, Ordering::Relaxed);
             }
         }
@@ -287,12 +305,12 @@ impl DirectoryLibrary {
         let total_dirty = total_changes.load(Ordering::Relaxed);
         let needs_save = pending > 0 || pruned > 0;
         if needs_save {
-            crate::cache::save_dirlib_cache(path, final_cache);
+            crate::cache::save_dirlib_cache(path, final_cache, &options.log);
         }
 
         // One-line summary only when work happened. Pure reloads stay silent.
         if total_dirty > 0 || pruned > 0 {
-            eprintln!(
+            (options.log)(&format!(
                 "zytunes: scan: {:.1}s | new/changed: {total_dirty} | pruned: {pruned} | \
                  cache hits: {hit_fp} with-fp + {hit_no_fp} backfilled | misses: {miss} | \
                  fingerprints: {comp} computed, {fail} failed",
@@ -302,7 +320,7 @@ impl DirectoryLibrary {
                 miss = cache_miss.load(Ordering::Relaxed),
                 comp = fp_computed.load(Ordering::Relaxed),
                 fail = fp_failed.load(Ordering::Relaxed),
-            );
+            ));
         }
 
         Ok(DirectoryLibrary {
@@ -664,7 +682,8 @@ mod tests {
         assert_eq!(lib1.track_count(), 2);
 
         // Peek at the cache: both files should be recorded.
-        let cached = crate::cache::load_dirlib_cache(dir.to_str().unwrap());
+        let log = crate::cache::default_logger();
+        let cached = crate::cache::load_dirlib_cache(dir.to_str().unwrap(), &log);
         assert_eq!(cached.len(), 2);
         let original_fp = cached
             .get(album.join("01 Original.mp3").to_str().unwrap())
@@ -677,7 +696,7 @@ mod tests {
         let lib2 = DirectoryLibrary::scan(dir.to_str().unwrap()).unwrap();
         assert_eq!(lib2.track_count(), 3);
 
-        let cached2 = crate::cache::load_dirlib_cache(dir.to_str().unwrap());
+        let cached2 = crate::cache::load_dirlib_cache(dir.to_str().unwrap(), &log);
         assert_eq!(cached2.len(), 3);
         // Unchanged file's fingerprint must survive across scans.
         assert_eq!(
@@ -691,7 +710,7 @@ mod tests {
         fs::remove_file(album.join("01 Original.mp3")).unwrap();
         let lib3 = DirectoryLibrary::scan(dir.to_str().unwrap()).unwrap();
         assert_eq!(lib3.track_count(), 2);
-        let cached3 = crate::cache::load_dirlib_cache(dir.to_str().unwrap());
+        let cached3 = crate::cache::load_dirlib_cache(dir.to_str().unwrap(), &log);
         assert_eq!(cached3.len(), 2);
         assert!(!cached3.contains_key(album.join("01 Original.mp3").to_str().unwrap()));
 
@@ -710,7 +729,10 @@ mod tests {
         fs::create_dir_all(&album).unwrap();
         write_sine_wav(&album.join("01 OffSong.wav"), 10);
 
-        let opts = ScanOptions { fingerprint: false };
+        let opts = ScanOptions {
+            fingerprint: false,
+            ..ScanOptions::default()
+        };
         let lib = DirectoryLibrary::scan_with_options(dir.to_str().unwrap(), opts, |_| {}).unwrap();
         let track = lib.all_tracks().next().unwrap();
         assert!(
@@ -736,8 +758,11 @@ mod tests {
         write_sine_wav(&album.join("02 R.wav"), 5);
 
         // First scan: populates cache.
-        let opts = ScanOptions { fingerprint: false };
-        DirectoryLibrary::scan_with_options(dir.to_str().unwrap(), opts, |_| {}).unwrap();
+        let opts = ScanOptions {
+            fingerprint: false,
+            ..ScanOptions::default()
+        };
+        DirectoryLibrary::scan_with_options(dir.to_str().unwrap(), opts.clone(), |_| {}).unwrap();
 
         // Capture cache file mtime.
         let cache_path = std::path::Path::new(&std::env::var("HOME").unwrap())
@@ -913,7 +938,8 @@ mod tests {
         };
         let mut seeded = HashMap::new();
         seeded.insert(path_key, seed);
-        crate::cache::save_dirlib_cache(dir.to_str().unwrap(), seeded);
+        let log = crate::cache::default_logger();
+        crate::cache::save_dirlib_cache(dir.to_str().unwrap(), seeded, &log);
 
         let lib = DirectoryLibrary::scan(dir.to_str().unwrap()).unwrap();
         let track = lib.all_tracks().next().unwrap();

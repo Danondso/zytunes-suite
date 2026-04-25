@@ -29,8 +29,9 @@ use zytunes::mtp::native::NativeSession;
 use zytunes::mtp::parse::DeviceEntry;
 use zytunes::mtp::DeviceSession;
 use zytunes::{
-    collect_photo_files, collect_video_files, make_transcode_temp_dir, needs_transcoding,
-    needs_video_transcoding, resize_photo_for_zune, transcode_and_import_video, transcode_to_mp3,
+    collect_photo_files_with_logger, collect_video_files_with_logger, make_transcode_temp_dir,
+    needs_transcoding, needs_video_transcoding, resize_photo_for_zune, transcode_and_import_video,
+    transcode_to_mp3,
 };
 
 /// Commands sent from the main TUI thread to the background worker.
@@ -181,7 +182,14 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                     music_dir,
                     fingerprint,
                 } => {
-                    let opts = zytunes::dirlib::ScanOptions { fingerprint };
+                    let log_tx = event_tx.clone();
+                    let scan_log: zytunes::cache::Logger = std::sync::Arc::new(move |msg: &str| {
+                        let _ = log_tx.send(BgEvent::SyncMessage(msg.to_string()));
+                    });
+                    let opts = zytunes::dirlib::ScanOptions {
+                        fingerprint,
+                        log: scan_log,
+                    };
                     let result = zytunes::resolve_music_dir(music_dir.as_deref()).and_then(|dir| {
                         let progress_tx = event_tx.clone();
                         zytunes::dirlib::DirectoryLibrary::scan_with_options(&dir, opts, |p| {
@@ -581,7 +589,12 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                 }
                 BgCommand::SyncPhotos { dir } => {
                     if let Some(ref mut s) = session {
-                        let files = collect_photo_files(&[dir.as_str()]);
+                        let photo_log_tx = event_tx.clone();
+                        let photo_log: zytunes::cache::Logger =
+                            std::sync::Arc::new(move |msg: &str| {
+                                let _ = photo_log_tx.send(BgEvent::SyncMessage(msg.to_string()));
+                            });
+                        let files = collect_photo_files_with_logger(&[dir.as_str()], &photo_log);
                         if files.is_empty() {
                             let _ = event_tx
                                 .send(BgEvent::SyncMessage("No photos found to sync".into()));
@@ -687,7 +700,12 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                 }
                 BgCommand::SyncVideos { dir } => {
                     if let Some(ref mut s) = session {
-                        let files = collect_video_files(&[dir.as_str()]);
+                        let video_log_tx = event_tx.clone();
+                        let video_log: zytunes::cache::Logger =
+                            std::sync::Arc::new(move |msg: &str| {
+                                let _ = video_log_tx.send(BgEvent::SyncMessage(msg.to_string()));
+                            });
+                        let files = collect_video_files_with_logger(&[dir.as_str()], &video_log);
                         if files.is_empty() {
                             let _ = event_tx
                                 .send(BgEvent::SyncMessage("No videos found to sync".into()));

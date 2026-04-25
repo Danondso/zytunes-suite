@@ -159,6 +159,7 @@ fn cmd_library(query: Option<&str>) -> Result<(), String> {
     let start = std::time::Instant::now();
     let opts = zytunes::dirlib::ScanOptions {
         fingerprint: load_config_bool("fingerprinting").unwrap_or(true),
+        ..zytunes::dirlib::ScanOptions::default()
     };
     let lib = zytunes::load_library_with_options(load_config_field("music_dir").as_deref(), opts)?;
     println!(

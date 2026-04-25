@@ -15,6 +15,22 @@ use serde::{Deserialize, Serialize};
 
 use crate::library::Track;
 
+/// A callable that receives diagnostic messages from cache operations.
+///
+/// Using `Arc<dyn Fn>` lets callers forward messages to a channel (TUI) or
+/// write to stderr (CLI) without lifetime constraints on the closure.
+pub type Logger = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
+/// A logger that writes to stderr — the default for CLI code paths.
+pub fn stderr_logger(msg: &str) {
+    eprintln!("{msg}");
+}
+
+/// Convenience: wrap `stderr_logger` in an `Arc` for use as the default.
+pub fn default_logger() -> Logger {
+    std::sync::Arc::new(stderr_logger)
+}
+
 /// `(mtime, size)` fingerprint for one audio file.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileFingerprint {
@@ -74,7 +90,7 @@ fn dirlib_cache_name(dir_path: &str) -> String {
     format!("dirlib-library-{:016x}.json", hasher.finish())
 }
 
-fn load_raw(dir_path: &str) -> Option<CachedLibrary> {
+fn load_raw(dir_path: &str, log: &Logger) -> Option<CachedLibrary> {
     let path = cache_path(&dirlib_cache_name(dir_path))?;
     let data = match std::fs::read(&path) {
         Ok(d) => d,
@@ -82,12 +98,15 @@ fn load_raw(dir_path: &str) -> Option<CachedLibrary> {
             // ENOENT on first launch is normal; only log if it's something
             // else (permission denied, bad symlink, etc.).
             if e.kind() != std::io::ErrorKind::NotFound {
-                eprintln!("zytunes: cache: read {} failed: {e}", path.display());
+                log(&format!(
+                    "zytunes: cache: read {} failed: {e}",
+                    path.display()
+                ));
             } else {
-                eprintln!(
+                log(&format!(
                     "zytunes: cache: no cache file at {} (first scan or previous run failed to save)",
                     path.display()
-                );
+                ));
             }
             return None;
         }
@@ -95,34 +114,37 @@ fn load_raw(dir_path: &str) -> Option<CachedLibrary> {
     match serde_json::from_slice::<CachedLibrary>(&data) {
         Ok(c) => Some(c),
         Err(e) => {
-            eprintln!(
+            log(&format!(
                 "zytunes: cache: parse {} ({} bytes) failed: {e} — treating as empty",
                 path.display(),
                 data.len()
-            );
+            ));
             None
         }
     }
 }
 
-fn save_raw(dir_path: &str, cached: &CachedLibrary) {
+fn save_raw(dir_path: &str, cached: &CachedLibrary, log: &Logger) {
     let Some(path) = cache_path(&dirlib_cache_name(dir_path)) else {
-        eprintln!("zytunes: cache: HOME unset, cannot persist library cache");
+        log("zytunes: cache: HOME unset, cannot persist library cache");
         return;
     };
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
-            eprintln!("zytunes: cache: mkdir {} failed: {e}", parent.display());
+            log(&format!(
+                "zytunes: cache: mkdir {} failed: {e}",
+                parent.display()
+            ));
             return;
         }
     }
     let data = match serde_json::to_vec(cached) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!(
+            log(&format!(
                 "zytunes: cache: serialize {} files failed: {e}",
                 cached.files.len()
-            );
+            ));
             return;
         }
     };
@@ -134,19 +156,19 @@ fn save_raw(dir_path: &str, cached: &CachedLibrary) {
     // half-written mix.
     let tmp = path.with_extension("json.tmp");
     if let Err(e) = std::fs::write(&tmp, &data) {
-        eprintln!(
+        log(&format!(
             "zytunes: cache: write {} ({} bytes) failed: {e}",
             tmp.display(),
             data.len()
-        );
+        ));
         return;
     }
     if let Err(e) = std::fs::rename(&tmp, &path) {
-        eprintln!(
+        log(&format!(
             "zytunes: cache: rename {} -> {} failed: {e}",
             tmp.display(),
             path.display()
-        );
+        ));
         // Best-effort cleanup of the orphan; nothing we can do if this fails.
         let _ = std::fs::remove_file(&tmp);
     }
@@ -154,19 +176,22 @@ fn save_raw(dir_path: &str, cached: &CachedLibrary) {
 
 /// Load the per-file cache for `dir_path`. Returns an empty map if the cache
 /// is missing, unreadable, or for a different root.
-pub fn load_dirlib_cache(dir_path: &str) -> HashMap<String, CachedFile> {
-    match load_raw(dir_path) {
+///
+/// `log` receives any diagnostic messages (cache miss, parse error, etc.).
+/// Pass [`default_logger`] for the CLI, or a channel-routing closure for the TUI.
+pub fn load_dirlib_cache(dir_path: &str, log: &Logger) -> HashMap<String, CachedFile> {
+    match load_raw(dir_path, log) {
         Some(c) if c.root == dir_path => c.files,
         Some(c) => {
             // Path normalisation skew is the silent killer here — a single
             // trailing slash difference between launches (e.g. `~/Music`
             // vs `~/Music/`) silently invalidates the entire cache.
-            eprintln!(
+            log(&format!(
                 "zytunes: cache: stored root {:?} != requested root {:?} — discarding {} cached entries",
                 c.root,
                 dir_path,
                 c.files.len()
-            );
+            ));
             HashMap::new()
         }
         None => HashMap::new(),
@@ -174,19 +199,32 @@ pub fn load_dirlib_cache(dir_path: &str) -> HashMap<String, CachedFile> {
 }
 
 /// Save the per-file cache for `dir_path`.
-pub fn save_dirlib_cache(dir_path: &str, files: HashMap<String, CachedFile>) {
+///
+/// `log` receives any diagnostic messages (write errors, serialisation failures, etc.).
+pub fn save_dirlib_cache(dir_path: &str, files: HashMap<String, CachedFile>, log: &Logger) {
     save_raw(
         dir_path,
         &CachedLibrary {
             root: dir_path.to_string(),
             files,
         },
+        log,
     );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Capturing logger for tests — collects all messages into a `Vec<String>`.
+    fn capturing_logger() -> (Logger, std::sync::Arc<Mutex<Vec<String>>>) {
+        let msgs: std::sync::Arc<Mutex<Vec<String>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let msgs_clone = msgs.clone();
+        let log: Logger =
+            std::sync::Arc::new(move |msg: &str| msgs_clone.lock().unwrap().push(msg.to_string()));
+        (log, msgs)
+    }
 
     #[test]
     fn cache_dir_ignores_zytunes_cache_dir_override() {
@@ -227,5 +265,40 @@ mod tests {
         );
         assert!(a.starts_with("dirlib-library-"));
         assert!(a.ends_with(".json"));
+    }
+
+    #[test]
+    fn load_dirlib_cache_emits_parse_error_via_logger() {
+        // Write a corrupted JSON file directly into the cache location, then
+        // call `load_dirlib_cache` and assert the logger captured the parse
+        // error message rather than writing to stderr.
+        let dir_path = "/tmp/zytunes-cache-test-parse-error-seam";
+
+        // Put garbage bytes at the expected cache path.
+        let cache_name = dirlib_cache_name(dir_path);
+        let Some(path) = cache_path(&cache_name) else {
+            return; // HOME not set — skip
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        std::fs::write(&path, b"{ this is not valid json !!!").unwrap();
+
+        let (log, captured) = capturing_logger();
+        let result = load_dirlib_cache(dir_path, &log);
+
+        // Should fall back to an empty map, not panic.
+        assert!(result.is_empty(), "corrupted cache should yield empty map");
+
+        // Logger must have received the parse-error message.
+        let msgs = captured.lock().unwrap();
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("parse") && m.contains("treating as empty")),
+            "expected a parse-error log message; got: {msgs:?}"
+        );
+
+        // Clean up.
+        let _ = std::fs::remove_file(&path);
     }
 }
