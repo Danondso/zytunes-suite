@@ -83,7 +83,33 @@ pub fn read_embedded_fingerprint(path: &Path) -> Option<String> {
 /// to the AcoustID-default (Test2) fingerprinter, and returns the URL-safe
 /// base64 form. Returns `None` on any decode or fingerprint failure —
 /// fingerprinting is best-effort; a missing fingerprint is not a scan error.
+///
+/// Internally panic-isolated: symphonia's AAC decoder and rusty-chromaprint's
+/// audio processor each have known panic paths on edge-case audio (malformed
+/// frames, channel-count mismatches, internal invariant violations). Without
+/// isolation a single bad file kills the rayon scan via panic propagation
+/// through `.collect()`, leaving the cache unsaved and forcing every launch
+/// to start over. Panics are caught, logged, and converted to `None`.
 pub fn compute_fingerprint(path: &Path) -> Option<String> {
+    let path_buf = path.to_path_buf();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        compute_fingerprint_inner(&path_buf)
+    }));
+    match result {
+        Ok(r) => r,
+        Err(panic) => {
+            let msg = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap_or("<non-string panic>");
+            eprintln!("zytunes: fingerprint: panic on {}: {msg}", path.display());
+            None
+        }
+    }
+}
+
+fn compute_fingerprint_inner(path: &Path) -> Option<String> {
     let config = Configuration::preset_test2();
 
     let file = std::fs::File::open(path).ok()?;
@@ -109,22 +135,19 @@ pub fn compute_fingerprint(path: &Path) -> Option<String> {
         .iter()
         .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)?
         .clone();
-    let sample_rate = track.codec_params.sample_rate?;
-    let channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(2) as u32;
-    if channels == 0 {
-        return None;
-    }
     let track_id = track.id;
 
     let mut decoder = symphonia::default::get_codecs()
         .make(&track.codec_params, &DecoderOptions::default())
         .ok()?;
 
-    let mut fp = Fingerprinter::new(&config);
-    fp.start(sample_rate, channels).ok()?;
-
-    // Cap on interleaved sample count (frames × channels).
-    let max_samples = u64::from(sample_rate) * u64::from(channels) * FINGERPRINT_SECONDS;
+    // Initialise chromaprint lazily from the first decoded packet's spec, not
+    // from `codec_params`. AAC tracks sometimes advertise stereo in container
+    // metadata but decode mono frames (or vice versa); using `codec_params`
+    // for `Fingerprinter::start` trips chromaprint's internal channel-count
+    // assertion when a mismatch fires. The decoded spec is authoritative.
+    let mut fp: Option<Fingerprinter> = None;
+    let mut max_samples: u64 = 0;
     let mut samples_seen: u64 = 0;
     let mut sbuf: Option<SampleBuffer<i16>> = None;
 
@@ -146,6 +169,18 @@ pub fn compute_fingerprint(path: &Path) -> Option<String> {
             Err(_) => continue,
         };
 
+        if fp.is_none() {
+            let spec = *decoded.spec();
+            let channels = spec.channels.count() as u32;
+            if channels == 0 {
+                return None;
+            }
+            let mut new_fp = Fingerprinter::new(&config);
+            new_fp.start(spec.rate, channels).ok()?;
+            fp = Some(new_fp);
+            max_samples = u64::from(spec.rate) * u64::from(channels) * FINGERPRINT_SECONDS;
+        }
+
         // SampleBuffer must be at least as large as the largest packet's
         // capacity, otherwise `copy_interleaved_ref` writes past the end.
         // M4A and other variable-frame containers can produce packets larger
@@ -162,13 +197,16 @@ pub fn compute_fingerprint(path: &Path) -> Option<String> {
         if samples.is_empty() {
             continue;
         }
-        fp.consume(samples);
+        fp.as_mut()
+            .expect("fingerprinter initialised above")
+            .consume(samples);
         samples_seen += samples.len() as u64;
         if samples_seen >= max_samples {
             break;
         }
     }
 
+    let mut fp = fp?;
     fp.finish();
     let raw = fp.fingerprint();
     if raw.is_empty() {
@@ -180,6 +218,7 @@ pub fn compute_fingerprint(path: &Path) -> Option<String> {
 }
 
 /// Read an embedded fingerprint if present, else compute one from the audio.
+/// Inherits `compute_fingerprint`'s panic isolation on the compute fallback.
 pub fn fingerprint_for(path: &Path) -> Option<String> {
     read_embedded_fingerprint(path).or_else(|| compute_fingerprint(path))
 }
