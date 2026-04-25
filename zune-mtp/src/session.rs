@@ -748,7 +748,14 @@ pub fn parse_object_prop_list(data: &[u8]) -> Vec<PropListElement> {
         return Vec::new();
     }
     let count = le_u32(data, 0) as usize;
-    let mut out = Vec::with_capacity(count);
+    // `count` is attacker-controlled (especially via `probe vendor-op`,
+    // which interprets arbitrary opcode responses through this parser).
+    // Each element occupies at least 9 bytes (8-byte header + ≥1-byte
+    // value), so cap the initial allocation at what the buffer could
+    // possibly hold. Without this clamp, `count = 0xFFFFFFFF` would
+    // attempt a multi-GB up-front allocation.
+    let cap = count.min(data.len().saturating_sub(4) / 9);
+    let mut out = Vec::with_capacity(cap);
     let mut offset = 4;
     for _ in 0..count {
         // Header: handle (4) + prop_code (2) + datatype (2) = 8 bytes.
@@ -808,7 +815,11 @@ fn read_typed_value(data: &[u8], datatype: u16) -> Option<(Vec<u8>, usize)> {
             return None;
         }
         let count = le_u32(data, 0) as usize;
-        let total = 4 + count * elem_len;
+        // Checked arithmetic — `count` is read off the wire and unbounded;
+        // on 32-bit targets `count * elem_len` (up to 16) can wrap to a
+        // small value, which would let the subsequent length check pass
+        // and slice past end of buffer.
+        let total = count.checked_mul(elem_len)?.checked_add(4)?;
         if data.len() < total {
             return None;
         }
@@ -1142,5 +1153,46 @@ mod tests {
     fn parse_object_prop_list_returns_empty_for_short_input() {
         assert!(parse_object_prop_list(&[]).is_empty());
         assert!(parse_object_prop_list(&[0, 0, 0]).is_empty());
+    }
+
+    /// A malformed payload claiming `0xFFFFFFFF` elements in a tiny buffer
+    /// must not attempt a multi-GB allocation. The capacity clamp keeps the
+    /// up-front allocation proportional to the input size; the per-element
+    /// loop then bails on the first short read.
+    #[test]
+    fn parse_object_prop_list_clamps_capacity_on_giant_count() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&0xFFFFFFFFu32.to_le_bytes()); // claimed count
+                                                              // First element header but no value bytes — read_typed_value
+                                                              // returns None, the loop breaks out.
+        data.extend_from_slice(&0x100u32.to_le_bytes());
+        data.extend_from_slice(&0xDC91u16.to_le_bytes());
+        data.extend_from_slice(&0x0006u16.to_le_bytes());
+
+        let elements = parse_object_prop_list(&data);
+        assert!(
+            elements.is_empty(),
+            "must not surface bogus elements from malformed count"
+        );
+    }
+
+    /// An array-typed value (`AUINT32`) claiming `0xFFFFFFFF` elements in a
+    /// tiny buffer must reject via checked arithmetic instead of wrapping
+    /// to a small `total` that would let the subsequent bounds check pass.
+    #[test]
+    fn parse_object_prop_list_rejects_giant_array_length() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u32.to_le_bytes()); // one prop element
+        data.extend_from_slice(&0x100u32.to_le_bytes()); // handle
+        data.extend_from_slice(&0xDC91u16.to_le_bytes()); // prop
+        data.extend_from_slice(&0x4006u16.to_le_bytes()); // datatype AUINT32
+        data.extend_from_slice(&0xFFFFFFFFu32.to_le_bytes()); // claimed array count
+                                                              // No actual array bytes follow.
+
+        let elements = parse_object_prop_list(&data);
+        assert!(
+            elements.is_empty(),
+            "must not slice past end of buffer when array length is bogus"
+        );
     }
 }

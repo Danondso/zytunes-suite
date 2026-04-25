@@ -1262,12 +1262,21 @@ impl DeviceSession for NativeSession {
                 self.clear_library_cache();
                 self.library = None;
             } else {
-                let with_pc = cached.iter().filter(|t| t.play_count.is_some()).count();
+                // Cache holds the last-known playcount/rating snapshot, but
+                // those change without storage changing — re-run the bulk
+                // enrichment so device-only plays surface in the TUI without
+                // waiting for the next sync. Single round-trip per prop;
+                // gracefully no-ops on firmware that rejects the bulk path.
+                // Persist the refreshed values so a fast reconnect keeps them.
+                let mut tracks = cached.clone();
+                self.enrich_with_playcounts(&mut tracks);
+                self.cache.save(&tracks, current_free);
+                let with_pc = tracks.iter().filter(|t| t.play_count.is_some()).count();
                 self.log_msg(&format!(
                     "Loaded {} tracks from cache ({with_pc} with playcount)",
-                    cached.len()
+                    tracks.len()
                 ));
-                return Ok(cached.clone());
+                return Ok(tracks);
             }
         }
         self.log_msg("No cache, querying device...");
@@ -1745,7 +1754,6 @@ impl NativeSession {
     }
 }
 
-/// Convert an MTP ObjectInfo to a DeviceEntry.
 /// Serialize one `DeviceEntry` to its on-disk track-cache line. Tabs in the
 /// name are flattened to spaces so the splitn(7, '\t') loader stays in sync.
 /// `play_count` and `rating` are emitted as digits or empty for `None`.
@@ -1812,6 +1820,7 @@ fn apply_ratings(tracks: &mut [DeviceEntry], elements: &[PropListElement]) {
     }
 }
 
+/// Convert an MTP ObjectInfo to a DeviceEntry.
 fn object_info_to_entry(handle: u32, info: &ObjectInfo) -> DeviceEntry {
     DeviceEntry {
         object_id: handle as u64,
