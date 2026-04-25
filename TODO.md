@@ -24,6 +24,42 @@
   - Suggest improvements / redundant / confusing
 - **One Offs**
   - perf: batch transcoding — transcoding is sequential; `rayon` is already a dependency but unused in the sync loop.
+- **Unify cache implementations** — four device-scoped caches plus the album-art cache are hand-rolled with no shared abstraction. The dirlib library scan cache stays out of this work: it lives at `$HOME/.cache/zytunes` precisely so sibling worktrees pointed at the same `~/Music` reuse one scan, which is the entire reason `ZYTUNES_CACHE_DIR` exists (it isolates device caches per-worktree without dragging the library scan along). Goal: one cache layer for everything else, with on-disk formats designed for **export** (a user can bundle their cache, ship it to another machine or back it up, and reimport it).
+  - **In scope:**
+    - `src/art_cache.rs` — album art, raw JPEG + `.meta.json` sidecar, `$HOME/.cache/zytunes/art/{hash(artist,album)}.jpg`, source-file `(mtime,size)` fingerprint. Worth exporting (regenerating across a large library is expensive).
+    - `src/mtp/native.rs::TrackCache` (lines 168–330) — custom tab-separated text with `#free_bytes:` header, `{device_cache_base()}/.zytunes-track-cache-{serial}`, **fast-path header rewrite** in `update_free_bytes` (258–277) is load-bearing.
+    - `src/mtp/native.rs::DeviceLibrary` (lines 71–150) — custom tab-separated text (`HDR`/`ART`/`ALB`), `{device_cache_base()}/.zytunes-library-cache-{serial}`, targeted invalidation via `invalidate_library_for_path` (1615–1642).
+    - `src/mtp/native.rs::sync_progress` (lines 1349–1367, 1669–1714) — raw 530-byte binary blob from vendor op `0x9217`, `{device_cache_base()}/.zytunes-sync-progress-{serial}`.
+  - **Out of scope (do not touch):**
+    - `src/cache.rs` (dirlib library scan) — keep as-is. Its deliberate `ZYTUNES_CACHE_DIR` opt-out is the load-bearing behaviour. Test in `cache.rs:192-207` must continue to pass; the unification work must not import or replace this module.
+  - **Export constraint shapes the design:**
+    - Every cache file in scope must be self-describing: a fixed magic header, a `u32` schema version, and a typed payload. No more "what does the second field on this `ART` line mean?" — the format itself answers.
+    - One canonical on-disk layout per cache so `zytunes cache export <path>` can `tar.zst` the relevant files (album art bundle for `Scope::Shared`, per-device bundle for `Scope::Device`) and `zytunes cache import <path>` can validate magic + version and place files back. Per-device bundles key on the device serial baked into the file header, not the filename, so importing onto a different host still works.
+    - Pick **bincode + serde** for the typed caches (track list, device library, art metadata sidecar). It is compact, self-versioning when paired with an outer envelope, and serde-derive lets us evolve schemas without hand-writing parsers. Track-cache and library-cache custom text formats get retired as part of the port — easier than retrofitting export into them.
+    - Sync progress stays a raw blob (it is opaque vendor data) but gets wrapped in the same magic+version envelope so the export tool can identify it.
+    - Album art JPEGs stay as-is on disk (the file IS the cached artifact); only the `.meta.json` sidecar gets the envelope treatment, switching to bincode at the same time.
+  - **Design sketch:**
+    - New `src/cache/mod.rs`:
+      - `CacheEnvelope<T>` — magic bytes (`b"ZYTC"`), `schema_version: u32`, `created_unix: u64`, `payload: T`. Single `read`/`write` pair handles framing + atomic write (`.tmp` + rename).
+      - `Scope::Shared` → `$HOME/.cache/zytunes/...` (album art only, in this work).
+      - `Scope::Device { serial }` → `paths::device_cache_base()/...{serial}` honouring `ZYTUNES_CACHE_DIR`.
+      - `PartialUpdate` trait — opt-in for caches that need surgical rewrites without rehydrating the full payload. `TrackCache::update_free_bytes` becomes an `impl PartialUpdate` that knows where in the bincode stream the free-bytes field sits (or moves the field into a separate small file in the same envelope so we don't have to seek into a serialized blob).
+      - `Fingerprint { mtime: u64, size: u64 }` — shared helper, currently duplicated between `cache.rs` and `art_cache.rs`. Lift it out so the art cache can use it; dirlib keeps its own copy unchanged.
+    - New `src/cache/export.rs` — `pack(scope) -> tar.zst` and `unpack(path) -> ()`. Validates envelope magic + version on each entry. Refuses to import device-scope bundles whose serial does not match the connected device unless `--force` is passed.
+    - New CLI subcommands (`src/main.rs`): `zytunes cache export <path>` and `zytunes cache import <path>`. Per-device export defaults to "currently connected device"; shared export grabs the art bundle.
+  - **Migration order:**
+    1. Land `cache::CacheEnvelope` + `Scope` + atomic-write helper + `PartialUpdate` trait. No callers yet.
+    2. Port `art_cache.rs` — simplest case, exercises `Scope::Shared` and the `Fingerprint` helper. Keep JPEGs raw, switch sidecar to enveloped bincode.
+    3. Port `sync_progress` — trivial raw-bytes case wrapped in the envelope, exercises `Scope::Device`.
+    4. Port `DeviceLibrary` — bincode payload, exercises targeted invalidation through the new API. Migration code reads the old text format once if present, rewrites as bincode, deletes the legacy file.
+    5. Port `TrackCache` last — has the fast-path constraint. Decide between (a) `PartialUpdate` seeking into bincode or (b) splitting free-bytes into a sibling file under the same envelope; pick whichever benchmarks cleanly. Same legacy-format migration step as `DeviceLibrary`.
+    6. Wire up `zytunes cache export` / `import` and document the bundle format.
+  - **Test gates:**
+    - `cache.rs:192-207` (worktree-shared dirlib) keeps passing untouched.
+    - New: `ZYTUNES_CACHE_DIR=/tmp/foo` redirects all four in-scope caches but leaves dirlib + art untouched (art is `Scope::Shared` by design).
+    - New: round-trip export → wipe → import reproduces the cache byte-for-byte (excluding timestamps in the envelope).
+    - New: importing a bundle written with `schema_version - 1` fails cleanly with a "run an older zytunes to read this" error rather than a bincode panic.
+    - New: `TrackCache::update_free_bytes` benchmark stays within ~2x of the current line-rewrite cost; if the seek-into-bincode approach loses, fall back to the split-file design.
 - **Code Audit**
   - Rule of threes should be observed, what code is duplicated > 3 times or two even if the code block is large
   - Rust best practices
