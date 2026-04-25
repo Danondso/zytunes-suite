@@ -8,6 +8,21 @@ use std::collections::HashMap;
 use std::path::Path;
 
 fn main() {
+    // Suppress panic prints from rayon worker threads. The library scan calls
+    // symphonia + rusty-chromaprint per file in parallel, both of which have
+    // known panic paths on edge-case audio (see `compute_fingerprint`).
+    // `catch_unwind` already absorbs the panic and turns it into `None`, but
+    // without this hook the default handler still prints the three-line
+    // `thread '<unnamed>' panicked at ...` block per panicking file —
+    // hundreds of lines for a modest library, all noise. Main-thread panics
+    // still print so genuine bugs surface.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if std::thread::current().name() == Some("main") {
+            default_hook(info);
+        }
+    }));
+
     let args: Vec<String> = std::env::args().collect();
     if let Err(e) = run(&args) {
         eprintln!("{e}");

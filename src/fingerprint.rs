@@ -92,21 +92,16 @@ pub fn read_embedded_fingerprint(path: &Path) -> Option<String> {
 /// to start over. Panics are caught, logged, and converted to `None`.
 pub fn compute_fingerprint(path: &Path) -> Option<String> {
     let path_buf = path.to_path_buf();
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+    // Per-file panics get absorbed silently — the scan-end summary reports
+    // the total `fp_failed` count, which is the only number that matters
+    // for "is the cache making progress." Listing each panicking file every
+    // launch was just noise once we confirmed the panics are upstream
+    // (symphonia AAC + rusty-chromaprint internal asserts).
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
         compute_fingerprint_inner(&path_buf)
-    }));
-    match result {
-        Ok(r) => r,
-        Err(panic) => {
-            let msg = panic
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .or_else(|| panic.downcast_ref::<&str>().copied())
-                .unwrap_or("<non-string panic>");
-            eprintln!("zytunes: fingerprint: panic on {}: {msg}", path.display());
-            None
-        }
-    }
+    }))
+    .ok()
+    .flatten()
 }
 
 fn compute_fingerprint_inner(path: &Path) -> Option<String> {
