@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use rayon::prelude::*;
 
@@ -64,9 +65,20 @@ impl DirectoryLibrary {
             return Err(format!("Not a directory: {path}"));
         }
 
+        let scan_start = Instant::now();
+
         // Load the previous per-file cache. Missing / unreadable = empty map,
         // so first launches just fall through to a full parse.
         let cached = crate::cache::load_dirlib_cache(path);
+        let cache_with_fp = cached
+            .values()
+            .filter(|c| c.track.acoustic_id.is_some())
+            .count();
+        eprintln!(
+            "zytunes: scan: loaded {} cached entries ({} with fingerprints) for {path}",
+            cached.len(),
+            cache_with_fp,
+        );
 
         // Parallel directory walk.
         let paths = collect_audio_paths(root);
@@ -100,6 +112,14 @@ impl DirectoryLibrary {
         //
         // Cached tracks that already have an `acoustic_id` are reused as-is.
         let completed = AtomicU64::new(0);
+        // Counters for the post-scan summary. Plain atomics — no lock
+        // contention because they're only read once at the end.
+        let cache_hit_with_fp = AtomicU64::new(0);
+        let cache_hit_no_fp = AtomicU64::new(0);
+        let cache_miss = AtomicU64::new(0);
+        let fp_computed = AtomicU64::new(0);
+        let fp_failed = AtomicU64::new(0);
+
         let entries: Vec<(String, crate::cache::CachedFile)> = paths
             .par_iter()
             .filter_map(|p| {
@@ -108,8 +128,19 @@ impl DirectoryLibrary {
 
                 let (mut track, came_from_cache) = match cached.get(&key) {
                     Some(entry) if entry.fingerprint == fingerprint => (entry.track.clone(), true),
-                    _ => (build_track(p, hash_path(p)), false),
+                    _ => {
+                        cache_miss.fetch_add(1, Ordering::Relaxed);
+                        (build_track(p, hash_path(p)), false)
+                    }
                 };
+
+                if came_from_cache {
+                    if track.acoustic_id.is_some() {
+                        cache_hit_with_fp.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        cache_hit_no_fp.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
 
                 if track.acoustic_id.is_none() {
                     // Fresh-parse already tried `read_embedded_fingerprint`
@@ -126,6 +157,11 @@ impl DirectoryLibrary {
                     } else {
                         crate::fingerprint::compute_fingerprint(p)
                     };
+                    if track.acoustic_id.is_some() {
+                        fp_computed.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        fp_failed.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
 
                 let n = completed.fetch_add(1, Ordering::Relaxed) + 1;
@@ -151,7 +187,24 @@ impl DirectoryLibrary {
         // Persist the fresh cache — implicitly drops entries for files that
         // disappeared from the tree since the last scan.
         let new_cache: HashMap<String, crate::cache::CachedFile> = entries.into_iter().collect();
+        let saved_with_fp = new_cache
+            .values()
+            .filter(|c| c.track.acoustic_id.is_some())
+            .count();
+        let saved_total = new_cache.len();
         crate::cache::save_dirlib_cache(path, new_cache);
+
+        eprintln!(
+            "zytunes: scan: completed in {:.1}s — {saved_total} tracks ({saved_with_fp} with fingerprints) | \
+             cache hits: {hit_fp} with-fp + {hit_no_fp} backfilled | misses: {miss} | \
+             new fingerprints: {comp} computed, {fail} failed",
+            scan_start.elapsed().as_secs_f64(),
+            hit_fp = cache_hit_with_fp.load(Ordering::Relaxed),
+            hit_no_fp = cache_hit_no_fp.load(Ordering::Relaxed),
+            miss = cache_miss.load(Ordering::Relaxed),
+            comp = fp_computed.load(Ordering::Relaxed),
+            fail = fp_failed.load(Ordering::Relaxed),
+        );
 
         Ok(DirectoryLibrary {
             tracks,

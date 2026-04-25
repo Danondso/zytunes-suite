@@ -144,6 +144,19 @@ fn cmd_library(query: Option<&str>) -> Result<(), String> {
             println!("  {} artists", artists.len());
             println!("  {} albums", albums.len());
 
+            // Acoustic-fingerprint coverage. Useful for diagnosing whether
+            // the cache is being persisted between scans — if this stays
+            // low after a successful run, the cache write probably failed
+            // (look for "zytunes: cache: write … failed" on stderr).
+            let total = lib.track_count();
+            let with_fp = lib.all_tracks().filter(|t| t.acoustic_id.is_some()).count();
+            let pct = if total == 0 {
+                0.0
+            } else {
+                100.0 * with_fp as f64 / total as f64
+            };
+            println!("\nFingerprints: {with_fp}/{total} ({pct:.1}%)");
+
             // Format breakdown.
             let mut formats: HashMap<String, usize> = HashMap::new();
             for t in lib.all_tracks() {
