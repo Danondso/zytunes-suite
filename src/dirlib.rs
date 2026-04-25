@@ -4,12 +4,39 @@
 //! tags (MP3) or infers it from the directory structure (other formats).
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::time::Instant;
 
 use rayon::prelude::*;
+
+/// How many files the scan processes between cache snapshot decisions.
+const SAVE_CHUNK_SIZE: usize = 2_000;
+
+/// Minimum number of *changed* entries since the last save to trigger an
+/// in-progress snapshot. A pure reload (every file is a cache hit with
+/// matching `acoustic_id`) accumulates zero changes and never saves —
+/// previously we re-serialised the entire ~36 MB cache after every chunk
+/// even when nothing had changed, which dominated reload time.
+const SAVE_DIRTY_THRESHOLD: u64 = 500;
+
+/// Knobs for `scan_with_options`.
+#[derive(Clone, Copy, Debug)]
+pub struct ScanOptions {
+    /// Compute acoustic fingerprints for files that lack one. Disabling
+    /// makes the scan much faster but skips the foundation for cross-device
+    /// playcount merging (Phase 2+ of the playcount work).
+    pub fingerprint: bool,
+}
+
+impl Default for ScanOptions {
+    fn default() -> Self {
+        Self { fingerprint: true }
+    }
+}
 
 use crate::library::{MusicLibrary, Track};
 
@@ -47,7 +74,7 @@ impl DirectoryLibrary {
     /// files have been added or modified since the last run. When the cache is
     /// stale, metadata reads are parallelized with rayon.
     pub fn scan(path: &str) -> Result<Self, String> {
-        Self::scan_with_progress(path, |_| {})
+        Self::scan_with_options(path, ScanOptions::default(), |_| {})
     }
 
     /// Same as `scan`, but invokes `on_progress` for each track built.
@@ -59,10 +86,26 @@ impl DirectoryLibrary {
     where
         F: Fn(ScanProgress) + Sync,
     {
+        Self::scan_with_options(path, ScanOptions::default(), on_progress)
+    }
+
+    /// Full scan API: caller supplies options (e.g. to disable fingerprinting)
+    /// alongside a progress callback. The simpler `scan` and
+    /// `scan_with_progress` entry points wrap this with `ScanOptions::default()`.
+    pub fn scan_with_options<F>(
+        path: &str,
+        options: ScanOptions,
+        on_progress: F,
+    ) -> Result<Self, String>
+    where
+        F: Fn(ScanProgress) + Sync,
+    {
         let root = Path::new(path);
         if !root.is_dir() {
             return Err(format!("Not a directory: {path}"));
         }
+
+        let scan_start = Instant::now();
 
         // Load the previous per-file cache. Missing / unreadable = empty map,
         // so first launches just fall through to a full parse.
@@ -100,45 +143,167 @@ impl DirectoryLibrary {
         //
         // Cached tracks that already have an `acoustic_id` are reused as-is.
         let completed = AtomicU64::new(0);
-        let entries: Vec<(String, crate::cache::CachedFile)> = paths
-            .par_iter()
-            .filter_map(|p| {
-                let key = p.to_string_lossy().to_string();
-                let fingerprint = crate::cache::FileFingerprint::from_path(p)?;
+        // Counters for the post-scan summary. Plain atomics — no lock
+        // contention because they're only read once at the end.
+        let cache_hit_with_fp = AtomicU64::new(0);
+        let cache_hit_no_fp = AtomicU64::new(0);
+        let cache_miss = AtomicU64::new(0);
+        let fp_computed = AtomicU64::new(0);
+        let fp_failed = AtomicU64::new(0);
 
-                let mut track = match cached.get(&key) {
-                    Some(entry) if entry.fingerprint == fingerprint => entry.track.clone(),
-                    _ => build_track(p, hash_path(p)),
-                };
-
-                if track.acoustic_id.is_none() {
-                    track.acoustic_id = crate::fingerprint::fingerprint_for(p);
-                }
-
-                let n = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                on_progress(ScanProgress {
-                    completed: n,
-                    total,
-                    sample: Some(TrackSample {
-                        artist: track.artist.clone(),
-                        album: track.album.clone(),
-                        name: track.name.clone(),
-                    }),
-                });
-
-                Some((key, crate::cache::CachedFile { fingerprint, track }))
-            })
-            .collect();
-
-        let tracks: HashMap<u64, Track> = entries
+        // Process in chunks of `SAVE_CHUNK_SIZE` and snapshot the cache after
+        // each one. The working map starts as a clone of the previous cache,
+        // gets per-file entries inserted as chunks complete, and is what we
+        // serialise on every snapshot. Files we haven't visited yet survive
+        // in the working map (still pointing at the previous-scan entry), so
+        // a Ctrl+C mid-scan only loses the current chunk's work — never the
+        // previous run's entries for files we just haven't reached yet.
+        let extant_paths: HashSet<String> = paths
             .iter()
-            .map(|(_, cf)| (cf.track.id, cf.track.clone()))
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let working: Mutex<HashMap<String, crate::cache::CachedFile>> = Mutex::new(cached.clone());
+
+        // Tracks how many entries genuinely changed since the last on-disk
+        // save. Increments only when (a) the file wasn't in the cache, or
+        // (b) the file was cached but its `acoustic_id` is now different.
+        // A pure reload (every file is a cache hit with the same fingerprint)
+        // accumulates zero — and skips both per-chunk and final save.
+        let pending_changes = AtomicU64::new(0);
+        let total_changes = AtomicU64::new(0);
+
+        for chunk in paths.chunks(SAVE_CHUNK_SIZE) {
+            let chunk_entries: Vec<(String, crate::cache::CachedFile)> = chunk
+                .par_iter()
+                .filter_map(|p| {
+                    let key = p.to_string_lossy().to_string();
+                    let fingerprint = crate::cache::FileFingerprint::from_path(p)?;
+
+                    let (mut track, came_from_cache, prev_acoustic) = match cached.get(&key) {
+                        Some(entry) if entry.fingerprint == fingerprint => {
+                            (entry.track.clone(), true, entry.track.acoustic_id.clone())
+                        }
+                        _ => {
+                            cache_miss.fetch_add(1, Ordering::Relaxed);
+                            (build_track(p, hash_path(p)), false, None)
+                        }
+                    };
+
+                    if came_from_cache {
+                        if track.acoustic_id.is_some() {
+                            cache_hit_with_fp.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            cache_hit_no_fp.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+
+                    if options.fingerprint && track.acoustic_id.is_none() {
+                        // Fresh-parse already tried `read_embedded_fingerprint`
+                        // inside `track_from_lofty`; if that turned up nothing,
+                        // re-trying it would just re-open + re-parse the tag
+                        // for a guaranteed second `None`. Skip straight to
+                        // compute.
+                        //
+                        // Cache-hit paths take the full pipeline: a pre-existing
+                        // cache from before the field was added has acoustic_id
+                        // = None despite the file possibly carrying a tag, so
+                        // the embedded read is worth attempting once.
+                        track.acoustic_id = if came_from_cache {
+                            crate::fingerprint::fingerprint_for(p)
+                        } else {
+                            crate::fingerprint::compute_fingerprint(p)
+                        };
+                        if track.acoustic_id.is_some() {
+                            fp_computed.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            fp_failed.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+
+                    if !came_from_cache || track.acoustic_id != prev_acoustic {
+                        pending_changes.fetch_add(1, Ordering::Relaxed);
+                        total_changes.fetch_add(1, Ordering::Relaxed);
+                    }
+
+                    let n = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                    on_progress(ScanProgress {
+                        completed: n,
+                        total,
+                        sample: Some(TrackSample {
+                            artist: track.artist.clone(),
+                            album: track.album.clone(),
+                            name: track.name.clone(),
+                        }),
+                    });
+
+                    Some((key, crate::cache::CachedFile { fingerprint, track }))
+                })
+                .collect();
+
+            // Merge chunk results into the working cache. Snapshot only if
+            // enough genuine changes have accumulated since the last save —
+            // a reload with no new fingerprints accumulates zero and never
+            // hits the `>= threshold` branch, making reloads near-instant.
+            let snapshot = {
+                let mut w = working.lock().expect("working cache lock");
+                for (k, v) in chunk_entries {
+                    w.insert(k, v);
+                }
+                if pending_changes.load(Ordering::Relaxed) >= SAVE_DIRTY_THRESHOLD {
+                    Some(w.clone())
+                } else {
+                    None
+                }
+            };
+            if let Some(snap) = snapshot {
+                crate::cache::save_dirlib_cache(path, snap);
+                pending_changes.store(0, Ordering::Relaxed);
+            }
+        }
+
+        // Final pass: drop entries whose files disappeared since the previous
+        // scan. Only at the end — partial saves can't prune, because
+        // unprocessed paths aren't yet known to be missing-vs-pending.
+        let mut final_cache = working.into_inner().expect("working cache lock");
+        let pruned = {
+            let before = final_cache.len();
+            final_cache.retain(|k, _| extant_paths.contains(k));
+            before - final_cache.len()
+        };
+
+        let tracks: HashMap<u64, Track> = final_cache
+            .values()
+            .map(|cf| (cf.track.id, cf.track.clone()))
             .collect();
 
-        // Persist the fresh cache — implicitly drops entries for files that
-        // disappeared from the tree since the last scan.
-        let new_cache: HashMap<String, crate::cache::CachedFile> = entries.into_iter().collect();
-        crate::cache::save_dirlib_cache(path, new_cache);
+        // Save only when there's actually new state to persist:
+        //   - entries changed since last save (`pending_changes > 0`), or
+        //   - files were pruned, or
+        //   - in the unusual case where total_changes is 0 but the cache
+        //     file doesn't exist yet (caught implicitly via pending_changes
+        //     after first chunk if any insertion happened — pure-empty
+        //     library handled via `saved_total == 0` skip).
+        let pending = pending_changes.load(Ordering::Relaxed);
+        let total_dirty = total_changes.load(Ordering::Relaxed);
+        let needs_save = pending > 0 || pruned > 0;
+        if needs_save {
+            crate::cache::save_dirlib_cache(path, final_cache);
+        }
+
+        // One-line summary only when work happened. Pure reloads stay silent.
+        if total_dirty > 0 || pruned > 0 {
+            eprintln!(
+                "zytunes: scan: {:.1}s | new/changed: {total_dirty} | pruned: {pruned} | \
+                 cache hits: {hit_fp} with-fp + {hit_no_fp} backfilled | misses: {miss} | \
+                 fingerprints: {comp} computed, {fail} failed",
+                scan_start.elapsed().as_secs_f64(),
+                hit_fp = cache_hit_with_fp.load(Ordering::Relaxed),
+                hit_no_fp = cache_hit_no_fp.load(Ordering::Relaxed),
+                miss = cache_miss.load(Ordering::Relaxed),
+                comp = fp_computed.load(Ordering::Relaxed),
+                fail = fp_failed.load(Ordering::Relaxed),
+            );
+        }
 
         Ok(DirectoryLibrary {
             tracks,
@@ -529,6 +694,76 @@ mod tests {
         let cached3 = crate::cache::load_dirlib_cache(dir.to_str().unwrap());
         assert_eq!(cached3.len(), 2);
         assert!(!cached3.contains_key(album.join("01 Original.mp3").to_str().unwrap()));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_with_options_disabled_skips_fingerprinting() {
+        // When fingerprinting is disabled, the scan must NOT compute or
+        // backfill an `acoustic_id`. Used by the `fingerprinting = false`
+        // config option to keep reloads fast at the cost of cross-device
+        // playcount merging.
+        let dir = std::env::temp_dir().join("zytunes-dirlib-fp-disabled");
+        let _ = fs::remove_dir_all(&dir);
+        let album = dir.join("OffArtist").join("OffAlbum");
+        fs::create_dir_all(&album).unwrap();
+        write_sine_wav(&album.join("01 OffSong.wav"), 10);
+
+        let opts = ScanOptions { fingerprint: false };
+        let lib = DirectoryLibrary::scan_with_options(dir.to_str().unwrap(), opts, |_| {}).unwrap();
+        let track = lib.all_tracks().next().unwrap();
+        assert!(
+            track.acoustic_id.is_none(),
+            "fingerprint:false must leave acoustic_id None even for decodable files; got Some"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pure_reload_does_not_rewrite_cache() {
+        // After a first scan populates the cache, a second scan with no
+        // file changes must NOT touch the cache file. Previously every
+        // chunked save re-serialised the entire (potentially 36 MB) cache
+        // even when nothing had changed, which made reloads scale with
+        // library size instead of staying constant.
+        let dir = std::env::temp_dir().join("zytunes-dirlib-pure-reload");
+        let _ = fs::remove_dir_all(&dir);
+        let album = dir.join("ReloadArtist").join("ReloadAlbum");
+        fs::create_dir_all(&album).unwrap();
+        write_sine_wav(&album.join("01 R.wav"), 5);
+        write_sine_wav(&album.join("02 R.wav"), 5);
+
+        // First scan: populates cache.
+        let opts = ScanOptions { fingerprint: false };
+        DirectoryLibrary::scan_with_options(dir.to_str().unwrap(), opts, |_| {}).unwrap();
+
+        // Capture cache file mtime.
+        let cache_path = std::path::Path::new(&std::env::var("HOME").unwrap())
+            .join(".cache")
+            .join("zytunes")
+            .join(format!("dirlib-library-{:016x}.json", {
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                let mut h = DefaultHasher::new();
+                dir.to_str().unwrap().hash(&mut h);
+                h.finish()
+            }));
+        let mtime_before = std::fs::metadata(&cache_path).unwrap().modified().unwrap();
+
+        // Sleep just enough for filesystem mtime granularity to advance had
+        // we written. 1.1s covers ext4 (1s granularity) and HFS+ (1s).
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        // Second scan with no file changes — must not rewrite the cache.
+        DirectoryLibrary::scan_with_options(dir.to_str().unwrap(), opts, |_| {}).unwrap();
+        let mtime_after = std::fs::metadata(&cache_path).unwrap().modified().unwrap();
+
+        assert_eq!(
+            mtime_before, mtime_after,
+            "pure reload must not rewrite the cache file"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

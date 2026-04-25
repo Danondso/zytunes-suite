@@ -61,9 +61,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (audio_event_tx, audio_event_rx) = mpsc::channel();
     let audio_cmd_tx = audio::spawn(audio_event_tx);
 
-    // Kick off async library load.
+    // Kick off async library load. `fingerprinting` defaults to true when
+    // unset; setting `fingerprinting = false` in config.toml skips the
+    // expensive symphonia + chromaprint pass.
     let _ = cmd_tx.send(BgCommand::LoadLibrary {
         music_dir: cfg.music_dir.clone(),
+        fingerprint: cfg.fingerprinting.unwrap_or(true),
     });
 
     // Main event loop.

@@ -81,9 +81,21 @@ pub fn resolve_music_dir(music_dir: Option<&str>) -> Result<String, String> {
 ///
 /// Tries `ZYTUNES_MUSIC_DIR`, then the `music_dir` argument (typically from
 /// config.toml). Returns a boxed trait object so callers are backend-agnostic.
+/// Always uses default scan options (fingerprinting enabled). Callers that
+/// want to disable fingerprinting should construct `ScanOptions` and call
+/// `dirlib::DirectoryLibrary::scan_with_options` directly.
 pub fn load_library(music_dir: Option<&str>) -> Result<Box<dyn MusicLibrary + Send>, String> {
+    load_library_with_options(music_dir, dirlib::ScanOptions::default())
+}
+
+/// Like `load_library`, but lets the caller override scan options.
+pub fn load_library_with_options(
+    music_dir: Option<&str>,
+    options: dirlib::ScanOptions,
+) -> Result<Box<dyn MusicLibrary + Send>, String> {
     let dir = resolve_music_dir(music_dir)?;
-    dirlib::DirectoryLibrary::scan(&dir).map(|l| Box::new(l) as Box<dyn MusicLibrary + Send>)
+    dirlib::DirectoryLibrary::scan_with_options(&dir, options, |_| {})
+        .map(|l| Box::new(l) as Box<dyn MusicLibrary + Send>)
 }
 
 /// Formats the Zune 30 natively supports (no transcoding needed).

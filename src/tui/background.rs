@@ -37,6 +37,10 @@ use zytunes::{
 pub enum BgCommand {
     LoadLibrary {
         music_dir: Option<String>,
+        /// Whether to compute acoustic fingerprints during the scan.
+        /// `false` skips the symphonia + chromaprint pass — faster scan, no
+        /// `acoustic_id` for cross-device playcount merging.
+        fingerprint: bool,
     },
     Connect,
     LoadDeviceTracks,
@@ -173,10 +177,14 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
 
         while let Ok(cmd) = cmd_rx.recv() {
             match cmd {
-                BgCommand::LoadLibrary { music_dir } => {
+                BgCommand::LoadLibrary {
+                    music_dir,
+                    fingerprint,
+                } => {
+                    let opts = zytunes::dirlib::ScanOptions { fingerprint };
                     let result = zytunes::resolve_music_dir(music_dir.as_deref()).and_then(|dir| {
                         let progress_tx = event_tx.clone();
-                        zytunes::dirlib::DirectoryLibrary::scan_with_progress(&dir, |p| {
+                        zytunes::dirlib::DirectoryLibrary::scan_with_options(&dir, opts, |p| {
                             let _ = progress_tx.send(BgEvent::LibraryScanProgress(p));
                         })
                         .map(|l| Box::new(l) as Box<dyn zytunes::library::MusicLibrary + Send>)

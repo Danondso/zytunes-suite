@@ -8,6 +8,21 @@ use std::collections::HashMap;
 use std::path::Path;
 
 fn main() {
+    // Suppress panic prints from rayon worker threads. The library scan calls
+    // symphonia + rusty-chromaprint per file in parallel, both of which have
+    // known panic paths on edge-case audio (see `compute_fingerprint`).
+    // `catch_unwind` already absorbs the panic and turns it into `None`, but
+    // without this hook the default handler still prints the three-line
+    // `thread '<unnamed>' panicked at ...` block per panicking file —
+    // hundreds of lines for a modest library, all noise. Main-thread panics
+    // still print so genuine bugs surface.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if std::thread::current().name() == Some("main") {
+            default_hook(info);
+        }
+    }));
+
     let args: Vec<String> = std::env::args().collect();
     if let Err(e) = run(&args) {
         eprintln!("{e}");
@@ -15,8 +30,19 @@ fn main() {
     }
 }
 
-/// Load a field from the TOML config file at ~/.config/zytunes/config.toml.
+/// Load a string field from the TOML config file at
+/// ~/.config/zytunes/config.toml.
 fn load_config_field(field: &str) -> Option<String> {
+    load_config_value(field).and_then(|v| v.as_str().map(|s| s.to_string()))
+}
+
+/// Load a boolean field from the same config. Returns `None` for absent or
+/// non-bool values; callers apply their own default.
+fn load_config_bool(field: &str) -> Option<bool> {
+    load_config_value(field).and_then(|v| v.as_bool())
+}
+
+fn load_config_value(field: &str) -> Option<toml::Value> {
     let home = std::env::var("HOME").ok()?;
     let path = Path::new(&home)
         .join(".config")
@@ -24,7 +50,7 @@ fn load_config_field(field: &str) -> Option<String> {
         .join("config.toml");
     let contents = std::fs::read_to_string(path).ok()?;
     let table: toml::Table = contents.parse().ok()?;
-    table.get(field)?.as_str().map(|s| s.to_string())
+    table.get(field).cloned()
 }
 
 fn run(args: &[String]) -> Result<(), String> {
@@ -117,7 +143,10 @@ fn run(args: &[String]) -> Result<(), String> {
 fn cmd_library(query: Option<&str>) -> Result<(), String> {
     println!("Loading music library...");
     let start = std::time::Instant::now();
-    let lib = zytunes::load_library(load_config_field("music_dir").as_deref())?;
+    let opts = zytunes::dirlib::ScanOptions {
+        fingerprint: load_config_bool("fingerprinting").unwrap_or(true),
+    };
+    let lib = zytunes::load_library_with_options(load_config_field("music_dir").as_deref(), opts)?;
     println!(
         "Loaded {} tracks in {:.1}s\n",
         lib.track_count(),
@@ -143,6 +172,19 @@ fn cmd_library(query: Option<&str>) -> Result<(), String> {
             println!("  {} tracks", lib.track_count());
             println!("  {} artists", artists.len());
             println!("  {} albums", albums.len());
+
+            // Acoustic-fingerprint coverage. Useful for diagnosing whether
+            // the cache is being persisted between scans — if this stays
+            // low after a successful run, the cache write probably failed
+            // (look for "zytunes: cache: write … failed" on stderr).
+            let total = lib.track_count();
+            let with_fp = lib.all_tracks().filter(|t| t.acoustic_id.is_some()).count();
+            let pct = if total == 0 {
+                0.0
+            } else {
+                100.0 * with_fp as f64 / total as f64
+            };
+            println!("\nFingerprints: {with_fp}/{total} ({pct:.1}%)");
 
             // Format breakdown.
             let mut formats: HashMap<String, usize> = HashMap::new();

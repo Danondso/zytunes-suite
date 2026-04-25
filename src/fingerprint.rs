@@ -13,7 +13,9 @@
 use std::path::Path;
 
 use base64::engine::{general_purpose::URL_SAFE_NO_PAD, Engine};
+use lofty::config::ParseOptions;
 use lofty::file::TaggedFileExt;
+use lofty::probe::Probe;
 use lofty::tag::{ItemKey, ItemValue};
 use rusty_chromaprint::{Configuration, FingerprintCompressor, Fingerprinter};
 use symphonia::core::audio::SampleBuffer;
@@ -43,7 +45,17 @@ const FINGERPRINT_SECONDS: u64 = 120;
 ///
 /// Returns the stored string verbatim — it's opaque to callers.
 pub fn read_embedded_fingerprint(path: &Path) -> Option<String> {
-    let tagged = lofty::probe::read_from_path(path).ok()?;
+    // Skip the properties parse — we only need the tag. For VBR MP3, the
+    // properties pass scans frames across the whole file for duration, which
+    // costs ~100x more than the tag read alone. Hot path on every cached
+    // track that lacks a stored fingerprint.
+    let tagged = Probe::open(path)
+        .ok()?
+        .options(ParseOptions::new().read_properties(false))
+        .guess_file_type()
+        .ok()?
+        .read()
+        .ok()?;
     let tag = tagged.primary_tag().or_else(|| tagged.first_tag())?;
 
     for item in tag.items() {
@@ -71,7 +83,28 @@ pub fn read_embedded_fingerprint(path: &Path) -> Option<String> {
 /// to the AcoustID-default (Test2) fingerprinter, and returns the URL-safe
 /// base64 form. Returns `None` on any decode or fingerprint failure —
 /// fingerprinting is best-effort; a missing fingerprint is not a scan error.
+///
+/// Internally panic-isolated: symphonia's AAC decoder and rusty-chromaprint's
+/// audio processor each have known panic paths on edge-case audio (malformed
+/// frames, channel-count mismatches, internal invariant violations). Without
+/// isolation a single bad file kills the rayon scan via panic propagation
+/// through `.collect()`, leaving the cache unsaved and forcing every launch
+/// to start over. Panics are caught, logged, and converted to `None`.
 pub fn compute_fingerprint(path: &Path) -> Option<String> {
+    let path_buf = path.to_path_buf();
+    // Per-file panics get absorbed silently — the scan-end summary reports
+    // the total `fp_failed` count, which is the only number that matters
+    // for "is the cache making progress." Listing each panicking file every
+    // launch was just noise once we confirmed the panics are upstream
+    // (symphonia AAC + rusty-chromaprint internal asserts).
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        compute_fingerprint_inner(&path_buf)
+    }))
+    .ok()
+    .flatten()
+}
+
+fn compute_fingerprint_inner(path: &Path) -> Option<String> {
     let config = Configuration::preset_test2();
 
     let file = std::fs::File::open(path).ok()?;
@@ -97,22 +130,19 @@ pub fn compute_fingerprint(path: &Path) -> Option<String> {
         .iter()
         .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)?
         .clone();
-    let sample_rate = track.codec_params.sample_rate?;
-    let channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(2) as u32;
-    if channels == 0 {
-        return None;
-    }
     let track_id = track.id;
 
     let mut decoder = symphonia::default::get_codecs()
         .make(&track.codec_params, &DecoderOptions::default())
         .ok()?;
 
-    let mut fp = Fingerprinter::new(&config);
-    fp.start(sample_rate, channels).ok()?;
-
-    // Cap on interleaved sample count (frames × channels).
-    let max_samples = u64::from(sample_rate) * u64::from(channels) * FINGERPRINT_SECONDS;
+    // Initialise chromaprint lazily from the first decoded packet's spec, not
+    // from `codec_params`. AAC tracks sometimes advertise stereo in container
+    // metadata but decode mono frames (or vice versa); using `codec_params`
+    // for `Fingerprinter::start` trips chromaprint's internal channel-count
+    // assertion when a mismatch fires. The decoded spec is authoritative.
+    let mut fp: Option<Fingerprinter> = None;
+    let mut max_samples: u64 = 0;
     let mut samples_seen: u64 = 0;
     let mut sbuf: Option<SampleBuffer<i16>> = None;
 
@@ -134,11 +164,27 @@ pub fn compute_fingerprint(path: &Path) -> Option<String> {
             Err(_) => continue,
         };
 
-        if sbuf.is_none() {
-            sbuf = Some(SampleBuffer::new(
-                decoded.capacity() as u64,
-                *decoded.spec(),
-            ));
+        if fp.is_none() {
+            let spec = *decoded.spec();
+            let channels = spec.channels.count() as u32;
+            if channels == 0 {
+                return None;
+            }
+            let mut new_fp = Fingerprinter::new(&config);
+            new_fp.start(spec.rate, channels).ok()?;
+            fp = Some(new_fp);
+            max_samples = u64::from(spec.rate) * u64::from(channels) * FINGERPRINT_SECONDS;
+        }
+
+        // SampleBuffer must be at least as large as the largest packet's
+        // capacity, otherwise `copy_interleaved_ref` writes past the end.
+        // M4A and other variable-frame containers can produce packets larger
+        // than the first one, so grow the buffer on demand instead of
+        // sizing-once-from-first-packet.
+        let needed = decoded.capacity() as u64;
+        let needs_alloc = sbuf.as_ref().is_none_or(|b| (b.capacity() as u64) < needed);
+        if needs_alloc {
+            sbuf = Some(SampleBuffer::new(needed, *decoded.spec()));
         }
         let buf = sbuf.as_mut().expect("sample buffer initialised above");
         buf.copy_interleaved_ref(decoded);
@@ -146,13 +192,16 @@ pub fn compute_fingerprint(path: &Path) -> Option<String> {
         if samples.is_empty() {
             continue;
         }
-        fp.consume(samples);
+        fp.as_mut()
+            .expect("fingerprinter initialised above")
+            .consume(samples);
         samples_seen += samples.len() as u64;
         if samples_seen >= max_samples {
             break;
         }
     }
 
+    let mut fp = fp?;
     fp.finish();
     let raw = fp.fingerprint();
     if raw.is_empty() {
@@ -164,6 +213,7 @@ pub fn compute_fingerprint(path: &Path) -> Option<String> {
 }
 
 /// Read an embedded fingerprint if present, else compute one from the audio.
+/// Inherits `compute_fingerprint`'s panic isolation on the compute fallback.
 pub fn fingerprint_for(path: &Path) -> Option<String> {
     read_embedded_fingerprint(path).or_else(|| compute_fingerprint(path))
 }
@@ -237,6 +287,20 @@ mod tests {
         let path = dir.join("not-audio.wav");
         fs::write(&path, b"this is not audio, it's just bytes").unwrap();
         assert!(compute_fingerprint(&path).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compute_fingerprint_handles_multi_packet_audio() {
+        // A 60-second WAV decodes across many packets. The earlier bug sized
+        // SampleBuffer once from the first packet's capacity and wrote past
+        // the end if a later packet was larger; this test makes sure long
+        // files complete cleanly.
+        let dir = fresh_dir("multi-packet");
+        let path = dir.join("long.wav");
+        write_sine_wav(&path, 60);
+        let fp = compute_fingerprint(&path).expect("60s WAV must fingerprint");
+        assert!(!fp.is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 

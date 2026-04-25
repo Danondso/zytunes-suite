@@ -76,19 +76,79 @@ fn dirlib_cache_name(dir_path: &str) -> String {
 
 fn load_raw(dir_path: &str) -> Option<CachedLibrary> {
     let path = cache_path(&dirlib_cache_name(dir_path))?;
-    let data = std::fs::read(&path).ok()?;
-    serde_json::from_slice(&data).ok()
+    let data = match std::fs::read(&path) {
+        Ok(d) => d,
+        Err(e) => {
+            // ENOENT on first launch is normal; only log if it's something
+            // else (permission denied, bad symlink, etc.).
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("zytunes: cache: read {} failed: {e}", path.display());
+            } else {
+                eprintln!(
+                    "zytunes: cache: no cache file at {} (first scan or previous run failed to save)",
+                    path.display()
+                );
+            }
+            return None;
+        }
+    };
+    match serde_json::from_slice::<CachedLibrary>(&data) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            eprintln!(
+                "zytunes: cache: parse {} ({} bytes) failed: {e} — treating as empty",
+                path.display(),
+                data.len()
+            );
+            None
+        }
+    }
 }
 
 fn save_raw(dir_path: &str, cached: &CachedLibrary) {
     let Some(path) = cache_path(&dirlib_cache_name(dir_path)) else {
+        eprintln!("zytunes: cache: HOME unset, cannot persist library cache");
         return;
     };
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!("zytunes: cache: mkdir {} failed: {e}", parent.display());
+            return;
+        }
     }
-    if let Ok(data) = serde_json::to_vec(cached) {
-        let _ = std::fs::write(&path, data);
+    let data = match serde_json::to_vec(cached) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!(
+                "zytunes: cache: serialize {} files failed: {e}",
+                cached.files.len()
+            );
+            return;
+        }
+    };
+    // Atomic write: stage to a sibling .tmp, then rename. Without this, a
+    // kill mid-write (Ctrl+C, OOM, kernel panic) leaves a truncated JSON on
+    // disk; next launch fails to parse it and re-does the entire scan. The
+    // rename is atomic on every POSIX filesystem we care about, so the cache
+    // file is either the previous valid one or the new valid one — never a
+    // half-written mix.
+    let tmp = path.with_extension("json.tmp");
+    if let Err(e) = std::fs::write(&tmp, &data) {
+        eprintln!(
+            "zytunes: cache: write {} ({} bytes) failed: {e}",
+            tmp.display(),
+            data.len()
+        );
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        eprintln!(
+            "zytunes: cache: rename {} -> {} failed: {e}",
+            tmp.display(),
+            path.display()
+        );
+        // Best-effort cleanup of the orphan; nothing we can do if this fails.
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
@@ -97,7 +157,19 @@ fn save_raw(dir_path: &str, cached: &CachedLibrary) {
 pub fn load_dirlib_cache(dir_path: &str) -> HashMap<String, CachedFile> {
     match load_raw(dir_path) {
         Some(c) if c.root == dir_path => c.files,
-        _ => HashMap::new(),
+        Some(c) => {
+            // Path normalisation skew is the silent killer here — a single
+            // trailing slash difference between launches (e.g. `~/Music`
+            // vs `~/Music/`) silently invalidates the entire cache.
+            eprintln!(
+                "zytunes: cache: stored root {:?} != requested root {:?} — discarding {} cached entries",
+                c.root,
+                dir_path,
+                c.files.len()
+            );
+            HashMap::new()
+        }
+        None => HashMap::new(),
     }
 }
 
