@@ -13,6 +13,12 @@ pub struct Config {
     /// when there's a track and the terminal is tall enough). `Some(false)`
     /// force-hides the panel even when playback is active.
     pub show_player: Option<bool>,
+    /// Compute Chromaprint acoustic fingerprints during the library scan.
+    /// `None` (default) and `Some(true)` enable; `Some(false)` skips the
+    /// expensive symphonia + chromaprint pass entirely. When disabled the
+    /// scan is fast (lofty tag read only) but Phase 2+ playcount-merge
+    /// features that key on `acoustic_id` won't have anything to match on.
+    pub fingerprinting: Option<bool>,
     /// User-defined custom themes keyed by theme name. Each entry inherits
     /// missing fields from its `base` (or `iTunes 2004` when unset) and merges
     /// into the theme picker alongside the built-ins.
@@ -140,6 +146,7 @@ music_dir = "/home/user/Music"
             video_dir: Some("/videos".into()),
             album_art_style: Some("ascii".into()),
             show_player: Some(true),
+            fingerprinting: Some(false),
             themes: BTreeMap::new(),
         };
         let serialized = toml::to_string_pretty(&config).unwrap();
@@ -148,6 +155,7 @@ music_dir = "/home/user/Music"
         assert_eq!(deserialized.video_dir.as_deref(), Some("/videos"));
         assert_eq!(deserialized.album_art_style.as_deref(), Some("ascii"));
         assert_eq!(deserialized.show_player, Some(true));
+        assert_eq!(deserialized.fingerprinting, Some(false));
     }
 
     #[test]
@@ -159,7 +167,21 @@ music_dir = "/home/user/Music"
         assert!(config.video_dir.is_none());
         assert!(config.album_art_style.is_none());
         assert!(config.show_player.is_none());
+        assert!(config.fingerprinting.is_none());
         assert!(config.themes.is_empty());
+    }
+
+    #[test]
+    fn config_round_trip_fingerprinting() {
+        for pref in [Some(true), Some(false), None] {
+            let config = Config {
+                fingerprinting: pref,
+                ..Config::default()
+            };
+            let serialized = toml::to_string_pretty(&config).unwrap();
+            let deserialized: Config = toml::from_str(&serialized).unwrap();
+            assert_eq!(deserialized.fingerprinting, pref);
+        }
     }
 
     #[test]

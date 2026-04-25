@@ -30,8 +30,19 @@ fn main() {
     }
 }
 
-/// Load a field from the TOML config file at ~/.config/zytunes/config.toml.
+/// Load a string field from the TOML config file at
+/// ~/.config/zytunes/config.toml.
 fn load_config_field(field: &str) -> Option<String> {
+    load_config_value(field).and_then(|v| v.as_str().map(|s| s.to_string()))
+}
+
+/// Load a boolean field from the same config. Returns `None` for absent or
+/// non-bool values; callers apply their own default.
+fn load_config_bool(field: &str) -> Option<bool> {
+    load_config_value(field).and_then(|v| v.as_bool())
+}
+
+fn load_config_value(field: &str) -> Option<toml::Value> {
     let home = std::env::var("HOME").ok()?;
     let path = Path::new(&home)
         .join(".config")
@@ -39,7 +50,7 @@ fn load_config_field(field: &str) -> Option<String> {
         .join("config.toml");
     let contents = std::fs::read_to_string(path).ok()?;
     let table: toml::Table = contents.parse().ok()?;
-    table.get(field)?.as_str().map(|s| s.to_string())
+    table.get(field).cloned()
 }
 
 fn run(args: &[String]) -> Result<(), String> {
@@ -132,7 +143,10 @@ fn run(args: &[String]) -> Result<(), String> {
 fn cmd_library(query: Option<&str>) -> Result<(), String> {
     println!("Loading music library...");
     let start = std::time::Instant::now();
-    let lib = zytunes::load_library(load_config_field("music_dir").as_deref())?;
+    let opts = zytunes::dirlib::ScanOptions {
+        fingerprint: load_config_bool("fingerprinting").unwrap_or(true),
+    };
+    let lib = zytunes::load_library_with_options(load_config_field("music_dir").as_deref(), opts)?;
     println!(
         "Loaded {} tracks in {:.1}s\n",
         lib.track_count(),
