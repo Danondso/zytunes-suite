@@ -423,6 +423,10 @@ mod tests {
             ipod_path: ":iPod_Control:Music:F00:ABCD.mp3".into(),
             filetype: 0x4d503320,
             filetype_string: None,
+            play_count: 0,
+            last_played: 0,
+            skip_count: 0,
+            last_skipped: 0,
             raw_mhit_header: None,
         });
 
@@ -492,6 +496,10 @@ mod tests {
             ipod_path: ":iPod_Control:Music:F00:AAAA.mp3".into(),
             filetype: 0x4d503320,
             filetype_string: None,
+            play_count: 0,
+            last_played: 0,
+            skip_count: 0,
+            last_skipped: 0,
             raw_mhit_header: None,
         });
 
@@ -542,6 +550,10 @@ mod tests {
             ipod_path: ":iPod_Control:Music:F00:AAAA.mp3".into(),
             filetype: 0x4d503320,
             filetype_string: None,
+            play_count: 0,
+            last_played: 0,
+            skip_count: 0,
+            last_skipped: 0,
             raw_mhit_header: None,
         });
 
@@ -595,6 +607,10 @@ mod tests {
             ipod_path: ":iPod_Control:Music:F00:AAAA.mp3".into(),
             filetype: 0x4d503320,
             filetype_string: None,
+            play_count: 0,
+            last_played: 0,
+            skip_count: 0,
+            last_skipped: 0,
             raw_mhit_header: None,
         });
         // No artwork initialized.

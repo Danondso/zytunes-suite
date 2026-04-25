@@ -77,8 +77,20 @@ impl MtpSession {
         code: OperationCode,
         params: &[u32],
     ) -> Result<Vec<u8>, MtpError> {
+        self.execute_data_in_raw(code as u16, params)
+    }
+
+    /// Variant of `execute_data_in` that takes a raw u16 operation code.
+    /// Used by probe tooling to call vendor operations not in the
+    /// `OperationCode` enum (avoids the UB of transmuting an arbitrary u16
+    /// to an enum). Same data-in semantics; same error handling.
+    pub fn execute_data_in_raw(
+        &mut self,
+        op_code: u16,
+        params: &[u32],
+    ) -> Result<Vec<u8>, MtpError> {
         let tid = self.next_transaction();
-        let cmd = build_command(code, tid, params);
+        let cmd = crate::container::build_command_raw(op_code, tid, params);
         self.transport.write(&cmd)?;
 
         let data = self.transport.read_container()?;
@@ -406,6 +418,15 @@ impl MtpSession {
 
     /// Get object property list (0x9805) — efficient bulk property query.
     /// Returns raw property list data.
+    ///
+    /// Common parameter forms:
+    ///   - One object, all properties: `(handle, 0, 0xFFFFFFFF, 0, 0)`
+    ///   - All objects of a format, one property: `(0xFFFFFFFF, format, prop, 0, 0)`
+    ///   - One object, one property: `(handle, 0, prop, 0, 0)`
+    ///
+    /// Devices commonly serve properties via this op even when they don't
+    /// advertise them through `GetObjectPropsSupported` — useful on Zune
+    /// v1.4 where standard MTP-AAS props aren't all listed.
     pub fn get_object_prop_list(
         &mut self,
         object_id: u32,
@@ -678,6 +699,139 @@ fn le_u64(data: &[u8], offset: usize) -> u64 {
     ])
 }
 
+/// One element of a parsed `GetObjectPropList` response: which object,
+/// which property, the property's MTP data type, and the raw value bytes.
+/// Callers decode `value` per `datatype` (see MTP-AAS spec table 9.5.6.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PropListElement {
+    pub object_handle: u32,
+    pub prop_code: u16,
+    pub datatype: u16,
+    pub value: Vec<u8>,
+}
+
+impl PropListElement {
+    /// Decode the value as a u32 if the datatype is UINT32 (`0x0006`).
+    pub fn as_u32(&self) -> Option<u32> {
+        if self.datatype == 0x0006 && self.value.len() >= 4 {
+            Some(le_u32(&self.value, 0))
+        } else {
+            None
+        }
+    }
+
+    /// Decode the value as a u16 if the datatype is UINT16 (`0x0004`).
+    pub fn as_u16(&self) -> Option<u16> {
+        if self.datatype == 0x0004 && self.value.len() >= 2 {
+            Some(le_u16(&self.value, 0))
+        } else {
+            None
+        }
+    }
+
+    /// Decode the value as a string if the datatype is STR (`0xFFFF`).
+    pub fn as_string(&self) -> Option<String> {
+        if self.datatype != 0xFFFF {
+            return None;
+        }
+        let mut offset = 0;
+        Some(read_mtp_string(&self.value, &mut offset))
+    }
+}
+
+/// Parse a GetObjectPropList (`0x9805`) response payload into individual
+/// property elements. Best-effort: stops at the first element it can't
+/// decode (e.g. an unknown variable-length type) instead of erroring, so
+/// partial responses are still useful for diagnostics.
+pub fn parse_object_prop_list(data: &[u8]) -> Vec<PropListElement> {
+    if data.len() < 4 {
+        return Vec::new();
+    }
+    let count = le_u32(data, 0) as usize;
+    let mut out = Vec::with_capacity(count);
+    let mut offset = 4;
+    for _ in 0..count {
+        // Header: handle (4) + prop_code (2) + datatype (2) = 8 bytes.
+        if offset + 8 > data.len() {
+            break;
+        }
+        let object_handle = le_u32(data, offset);
+        let prop_code = le_u16(data, offset + 4);
+        let datatype = le_u16(data, offset + 6);
+        offset += 8;
+        let Some((value, consumed)) = read_typed_value(&data[offset..], datatype) else {
+            break;
+        };
+        offset += consumed;
+        out.push(PropListElement {
+            object_handle,
+            prop_code,
+            datatype,
+            value,
+        });
+    }
+    out
+}
+
+/// Read a fixed/variable-length MTP value of `datatype` from the head of
+/// `data`. Returns the raw value bytes and how many input bytes were
+/// consumed, or `None` if the datatype is unknown or the buffer is short.
+fn read_typed_value(data: &[u8], datatype: u16) -> Option<(Vec<u8>, usize)> {
+    // Fixed-width scalar types — table from MTP-AAS spec §9.5.6.1.
+    let scalar_len = match datatype {
+        0x0001 | 0x0002 => Some(1),  // INT8 / UINT8
+        0x0003 | 0x0004 => Some(2),  // INT16 / UINT16
+        0x0005 | 0x0006 => Some(4),  // INT32 / UINT32
+        0x0007 | 0x0008 => Some(8),  // INT64 / UINT64
+        0x0009 | 0x000A => Some(16), // INT128 / UINT128
+        _ => None,
+    };
+    if let Some(n) = scalar_len {
+        if data.len() < n {
+            return None;
+        }
+        return Some((data[..n].to_vec(), n));
+    }
+
+    // Array types: [u32 count] followed by `count` elements of the
+    // matching scalar size. 0x4000 base + scalar code's low nibble.
+    if (0x4001..=0x400A).contains(&datatype) {
+        let elem_len = match datatype {
+            0x4001 | 0x4002 => 1,
+            0x4003 | 0x4004 => 2,
+            0x4005 | 0x4006 => 4,
+            0x4007 | 0x4008 => 8,
+            0x4009 | 0x400A => 16,
+            _ => return None,
+        };
+        if data.len() < 4 {
+            return None;
+        }
+        let count = le_u32(data, 0) as usize;
+        let total = 4 + count * elem_len;
+        if data.len() < total {
+            return None;
+        }
+        return Some((data[..total].to_vec(), total));
+    }
+
+    // STR: [u8 num_chars] [u16 chars...]. Always UCS-2LE, including the
+    // null terminator in the count when present.
+    if datatype == 0xFFFF {
+        if data.is_empty() {
+            return None;
+        }
+        let num_chars = data[0] as usize;
+        let total = 1 + num_chars * 2;
+        if data.len() < total {
+            return None;
+        }
+        return Some((data[..total].to_vec(), total));
+    }
+
+    None
+}
+
 /// Parse MTP u32 array: [u32 count] [u32 values...]
 fn parse_u32_array(data: &[u8]) -> Vec<u32> {
     if data.len() < 4 {
@@ -891,5 +1045,102 @@ mod tests {
     #[test]
     fn get_object_prop_value_op_code_matches_mtp_spec() {
         assert_eq!(OperationCode::GetObjectPropValue as u16, 0x9803);
+    }
+
+    /// Build a minimal `GetObjectPropList` payload with one UINT32 element
+    /// (handle=0x100, prop=0xDC91 UseCount, value=42) and confirm the
+    /// parser surfaces it.
+    #[test]
+    fn parse_object_prop_list_decodes_uint32() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u32.to_le_bytes()); // count
+        data.extend_from_slice(&0x100u32.to_le_bytes()); // handle
+        data.extend_from_slice(&0xDC91u16.to_le_bytes()); // prop
+        data.extend_from_slice(&0x0006u16.to_le_bytes()); // datatype UINT32
+        data.extend_from_slice(&42u32.to_le_bytes()); // value
+        let elements = parse_object_prop_list(&data);
+        assert_eq!(elements.len(), 1);
+        let e = &elements[0];
+        assert_eq!(e.object_handle, 0x100);
+        assert_eq!(e.prop_code, 0xDC91);
+        assert_eq!(e.datatype, 0x0006);
+        assert_eq!(e.as_u32(), Some(42));
+        assert_eq!(e.as_u16(), None);
+        assert_eq!(e.as_string(), None);
+    }
+
+    #[test]
+    fn parse_object_prop_list_decodes_string() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u32.to_le_bytes()); // count
+        data.extend_from_slice(&0x200u32.to_le_bytes()); // handle
+        data.extend_from_slice(&0xDC44u16.to_le_bytes()); // prop Name
+        data.extend_from_slice(&0xFFFFu16.to_le_bytes()); // datatype STR
+                                                          // String: "Hi" + null terminator = 3 chars.
+        data.push(3);
+        data.extend_from_slice(&0x0048u16.to_le_bytes()); // 'H'
+        data.extend_from_slice(&0x0069u16.to_le_bytes()); // 'i'
+        data.extend_from_slice(&0x0000u16.to_le_bytes()); // null
+        let elements = parse_object_prop_list(&data);
+        assert_eq!(elements.len(), 1);
+        assert_eq!(elements[0].as_string().as_deref(), Some("Hi"));
+    }
+
+    #[test]
+    fn parse_object_prop_list_decodes_multiple_elements() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&3u32.to_le_bytes()); // count
+                                                     // (handle=10, prop=0xDC91 UseCount UINT32, value=7)
+        data.extend_from_slice(&10u32.to_le_bytes());
+        data.extend_from_slice(&0xDC91u16.to_le_bytes());
+        data.extend_from_slice(&0x0006u16.to_le_bytes());
+        data.extend_from_slice(&7u32.to_le_bytes());
+        // (handle=10, prop=0xDC8B Track UINT16, value=3)
+        data.extend_from_slice(&10u32.to_le_bytes());
+        data.extend_from_slice(&0xDC8Bu16.to_le_bytes());
+        data.extend_from_slice(&0x0004u16.to_le_bytes());
+        data.extend_from_slice(&3u16.to_le_bytes());
+        // (handle=10, prop=0xDC93 LastAccessed UINT64, value=1234567890)
+        data.extend_from_slice(&10u32.to_le_bytes());
+        data.extend_from_slice(&0xDC93u16.to_le_bytes());
+        data.extend_from_slice(&0x0008u16.to_le_bytes());
+        data.extend_from_slice(&1234567890u64.to_le_bytes());
+
+        let elements = parse_object_prop_list(&data);
+        assert_eq!(elements.len(), 3);
+        assert_eq!(elements[0].as_u32(), Some(7));
+        assert_eq!(elements[1].as_u16(), Some(3));
+        // u64 value not in our convenience accessors; check raw bytes.
+        assert_eq!(elements[2].value.len(), 8);
+        assert_eq!(
+            u64::from_le_bytes(elements[2].value.as_slice().try_into().unwrap()),
+            1234567890
+        );
+    }
+
+    #[test]
+    fn parse_object_prop_list_stops_on_truncation() {
+        // Header claims 2 elements but the second is truncated mid-value.
+        let mut data = Vec::new();
+        data.extend_from_slice(&2u32.to_le_bytes()); // count
+        data.extend_from_slice(&0x100u32.to_le_bytes());
+        data.extend_from_slice(&0xDC91u16.to_le_bytes());
+        data.extend_from_slice(&0x0006u16.to_le_bytes());
+        data.extend_from_slice(&42u32.to_le_bytes());
+        // Second element header but only 1 byte of the 4-byte UINT32 value.
+        data.extend_from_slice(&0x100u32.to_le_bytes());
+        data.extend_from_slice(&0xDC92u16.to_le_bytes());
+        data.extend_from_slice(&0x0006u16.to_le_bytes());
+        data.push(0xFF);
+
+        let elements = parse_object_prop_list(&data);
+        assert_eq!(elements.len(), 1, "must return only the complete element");
+        assert_eq!(elements[0].as_u32(), Some(42));
+    }
+
+    #[test]
+    fn parse_object_prop_list_returns_empty_for_short_input() {
+        assert!(parse_object_prop_list(&[]).is_empty());
+        assert!(parse_object_prop_list(&[0, 0, 0]).is_empty());
     }
 }

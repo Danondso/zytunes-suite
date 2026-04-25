@@ -275,6 +275,16 @@ impl Zmdb {
                     } else {
                         None
                     },
+                    // ZMDB doesn't surface playcount / skip / last-played /
+                    // rating fields; the MTP `GetObjectPropList` path picks
+                    // up UseCount and Rating after this layer assigns them
+                    // an `object_id` (via the cache merge in
+                    // `collect_all_tracks`). The other counters aren't
+                    // exposed by Zune v1.4 firmware on either MTP path.
+                    play_count: None,
+                    last_played: None,
+                    skip_count: None,
+                    rating: None,
                 }
             })
             .collect()

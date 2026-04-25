@@ -140,6 +140,11 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("  probe playcount [obj]  Read playcount-related props for an audio object");
             println!("                         (uses first audio object if obj-id omitted)");
             println!("  probe zmdb-dump <out>  Dump raw ZMDB binary for diff-based analysis");
+            println!("                         (firmware 3.0+ only)");
+            println!("  probe all-props [obj]  Ask the device for ALL props (bypasses the");
+            println!("                         supported-list — best v1.4 path)");
+            println!("  probe vendor-op <code> [params...]  Invoke a raw vendor op for survey");
+            println!("                         (read-only ops only; allowlist excludes 0x9180)");
             Ok(())
         }
         other => Err(format!(
@@ -607,7 +612,7 @@ fn cmd_probe(args: &[String]) -> Result<(), String> {
     let sub = args
         .first()
         .map(|s| s.as_str())
-        .ok_or("Usage: zytunes probe <props|playcount|zmdb-dump> [args...]")?;
+        .ok_or("Usage: zytunes probe <props|playcount|zmdb-dump|all-props|vendor-op> [args...]")?;
 
     // Detect + open a Zune session. We bypass the generic connect() because
     // it returns Box<dyn DeviceSession>; the probe methods live on the
@@ -681,15 +686,184 @@ fn cmd_probe(args: &[String]) -> Result<(), String> {
             println!("     Bytes that changed identify where the playcount lives.");
             Ok(())
         }
+        "all-props" => {
+            let target = match args.get(1) {
+                Some(s) => parse_u32_maybe_hex(s)?,
+                None => match session.probe_first_audio_handle()? {
+                    Some((h, fmt)) => {
+                        println!(
+                            "Auto-selected first audio object: handle=0x{h:08X} format=0x{fmt:04X}"
+                        );
+                        h
+                    }
+                    None => {
+                        return Err(
+                            "No audio objects found on device — sync a track first.".into()
+                        )
+                    }
+                },
+            };
+            println!();
+            probe_all_props(&mut session, target)
+        }
+        "vendor-op" => {
+            let code_str = args
+                .get(1)
+                .ok_or("Usage: zytunes probe vendor-op <hex-code> [param1 param2 ...]")?;
+            let code = parse_u16_maybe_hex(code_str)?;
+            let params: Result<Vec<u32>, String> =
+                args.iter().skip(2).map(|s| parse_u32_maybe_hex(s)).collect();
+            let params = params?;
+            println!(
+                "Calling op 0x{code:04X} with {} param(s): {:?}",
+                params.len(),
+                params
+            );
+            match session.probe_vendor_op(code, &params) {
+                Ok(bytes) => {
+                    println!(
+                        "OK — {} byte(s) returned: {}",
+                        bytes.len(),
+                        preview_bytes(&bytes)
+                    );
+                    if bytes.len() > 16 {
+                        // Dump first 256 bytes hex+ascii for inspection.
+                        let n = bytes.len().min(256);
+                        println!("\nFirst {n} bytes:");
+                        for chunk in bytes[..n].chunks(16) {
+                            let hex: String = chunk
+                                .iter()
+                                .map(|b| format!("{b:02x} "))
+                                .collect();
+                            let ascii: String = chunk
+                                .iter()
+                                .map(|&b| {
+                                    if (0x20..=0x7E).contains(&b) {
+                                        b as char
+                                    } else {
+                                        '.'
+                                    }
+                                })
+                                .collect();
+                            println!("  {hex:<48} {ascii}");
+                        }
+                    }
+                    Ok(())
+                }
+                Err(e) => Err(format!("op 0x{code:04X} failed: {e}")),
+            }
+        }
         other => Err(format!(
-            "Unknown probe subcommand: {other}\nUsage: zytunes probe <props|playcount|zmdb-dump> [args...]"
+            "Unknown probe subcommand: {other}\nUsage: zytunes probe <props|playcount|zmdb-dump|all-props|vendor-op> [args...]"
         )),
     }
 }
 
-/// Query each known playcount-adjacent property on `object_id` and report
-/// what the device returns. Labels unsupported props clearly so missing
-/// entries are obvious.
+/// Bypass `GetObjectPropsSupported` and ask the device directly for every
+/// property it has on `object_id`. Devices commonly serve unadvertised
+/// properties — particularly Microsoft-specific MTP-AAS extensions on the
+/// Zune — so this is the highest-yield probe on v1.4 hardware where the
+/// supported-list is conservative.
+fn probe_all_props(
+    session: &mut zytunes::mtp::NativeSession,
+    object_id: u32,
+) -> Result<(), String> {
+    use zune_mtp::proplist::{
+        PROP_DATE_ADDED, PROP_LAST_ACCESSED, PROP_RATING, PROP_SKIP_COUNT, PROP_USE_COUNT,
+    };
+    let elements = session.probe_all_props(object_id)?;
+    if elements.is_empty() {
+        println!("Device returned no properties for handle 0x{object_id:08X}.");
+        println!("(Either the object id is wrong or this op isn't supported.)");
+        return Ok(());
+    }
+    println!(
+        "GetObjectPropList returned {} properties for object 0x{object_id:08X}:",
+        elements.len()
+    );
+    println!();
+    println!("  {:<6}  {:<32}  {:<8}  VALUE", "PROP", "LABEL", "TYPE");
+    for e in &elements {
+        let label = prop_label(e.prop_code);
+        let type_name = mtp_datatype_name(e.datatype);
+        let mut value_str = preview_bytes(&e.value);
+        // For STR-typed values, render the decoded UCS-2LE string instead
+        // of the raw byte preview — much more useful for diagnostics.
+        if let Some(s) = e.as_string() {
+            value_str = format!("\"{s}\"");
+        }
+        println!(
+            "  0x{:04X}  {:<32}  {:<8}  {}",
+            e.prop_code, label, type_name, value_str
+        );
+    }
+    println!();
+
+    // Highlight playcount-related findings explicitly so the user doesn't
+    // have to scan the whole list.
+    let playcount_props = [
+        (PROP_USE_COUNT, "UseCount"),
+        (PROP_SKIP_COUNT, "SkipCount"),
+        (PROP_LAST_ACCESSED, "LastAccessed"),
+        (PROP_RATING, "Rating"),
+        (PROP_DATE_ADDED, "DateAdded"),
+    ];
+    let found: Vec<_> = playcount_props
+        .iter()
+        .filter_map(|(code, label)| {
+            elements
+                .iter()
+                .find(|e| e.prop_code == *code)
+                .map(|e| (*code, *label, e))
+        })
+        .collect();
+    if found.is_empty() {
+        println!("No playcount-adjacent props in the response.");
+        println!("If GetObjectPropsSupported also didn't list them, this Zune doesn't expose");
+        println!("playcount via standard MTP-AAS. Try `probe vendor-op` to survey the");
+        println!("Microsoft 0x91xx range (carefully — see findings.md for known-bad codes).");
+    } else {
+        println!("Playcount-adjacent props found:");
+        for (code, label, e) in found {
+            let value = e
+                .as_u32()
+                .map(|v| format!("u32={v}"))
+                .or_else(|| e.as_u16().map(|v| format!("u16={v}")))
+                .unwrap_or_else(|| preview_bytes(&e.value));
+            println!("  0x{code:04X}  {label}  →  {value}");
+        }
+    }
+    Ok(())
+}
+
+fn mtp_datatype_name(t: u16) -> &'static str {
+    match t {
+        0x0000 => "UNDEF",
+        0x0001 => "INT8",
+        0x0002 => "UINT8",
+        0x0003 => "INT16",
+        0x0004 => "UINT16",
+        0x0005 => "INT32",
+        0x0006 => "UINT32",
+        0x0007 => "INT64",
+        0x0008 => "UINT64",
+        0x0009 => "INT128",
+        0x000A => "UINT128",
+        0x4002 => "AUINT8",
+        0x4004 => "AUINT16",
+        0x4006 => "AUINT32",
+        0x4008 => "AUINT64",
+        0xFFFF => "STR",
+        _ => "?",
+    }
+}
+
+/// Query playcount-adjacent properties on `object_id` and report what the
+/// device returns. Uses `GetObjectPropList(handle, 0, 0xFFFFFFFF, 0, 0)` —
+/// the bulk path — since v1.4 firmware rejects the per-property
+/// `GetObjectPropValue` op for many of these codes (`0xa801
+/// InvalidObjectPropCode`) even when the prop *is* served via the bulk op.
+/// The bulk path is the truth.
 fn probe_playcount_props(
     session: &mut zytunes::mtp::NativeSession,
     object_id: u32,
@@ -706,30 +880,41 @@ fn probe_playcount_props(
         (PROP_DATE_ADDED, "DateAdded"),
     ];
 
+    let elements = session.probe_all_props(object_id)?;
+
     println!("Querying playcount-adjacent properties on object 0x{object_id:08X}:");
+    println!("(via GetObjectPropList; absent props are not exposed by firmware)");
     println!();
+
+    let mut any_present = false;
     for (code, label) in targets {
-        match session.probe_prop_value(object_id, code) {
-            Ok(bytes) => {
-                let preview = preview_bytes(&bytes);
-                println!(
-                    "  0x{code:04X}  {label:<22}  OK  {} bytes  {preview}",
-                    bytes.len()
-                );
+        match elements.iter().find(|e| e.prop_code == code) {
+            Some(e) => {
+                any_present = true;
+                let value = e
+                    .as_u32()
+                    .map(|v| format!("u32={v}"))
+                    .or_else(|| e.as_u16().map(|v| format!("u16={v}")))
+                    .unwrap_or_else(|| preview_bytes(&e.value));
+                println!("  0x{code:04X}  {label:<22}  exposed   {value}");
             }
-            Err(e) => {
-                // Most likely "0x200A InvalidObjectPropCode" meaning the
-                // device doesn't advertise this prop for this object.
-                println!("  0x{code:04X}  {label:<22}  ERR  {e}");
+            None => {
+                println!("  0x{code:04X}  {label:<22}  not exposed by firmware");
             }
         }
     }
     println!();
     println!("Interpretation:");
-    println!("  - OK + non-zero bytes on UseCount → MTP prop path is viable; Phase 4b can read");
-    println!("    playcounts via `session.get_object_prop_u32(handle, PROP_USE_COUNT)`.");
-    println!("  - All ERR → Zune doesn't expose playcount via MTP props; use the ZMDB diff");
-    println!("    approach instead (`zytunes probe zmdb-dump`).");
+    if any_present {
+        println!("  - 'exposed' props can be populated via `session.get_object_prop_list(...)`.");
+        println!("  - 'not exposed' props are absent from the device's response and cannot be");
+        println!("    read on this firmware. Zune v1.4 does not surface SkipCount, LastAccessed,");
+        println!("    or DateAdded on either MTP path — confirmed via the full-prop dump");
+        println!("    (`zytunes probe all-props {object_id:#X}`).");
+    } else {
+        println!("  - The device returned no playcount-adjacent props at all. Use");
+        println!("    `zytunes probe all-props {object_id:#X}` to inspect what it does serve.");
+    }
     Ok(())
 }
 

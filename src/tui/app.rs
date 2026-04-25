@@ -173,6 +173,14 @@ pub struct DeviceTrackInfo {
     pub album: String,
     pub track_number: Option<u32>,
     pub disc_number: Option<u32>,
+    /// How many times the device has played this track. `None` when the
+    /// device family doesn't surface a playcount or the source is still
+    /// pending implementation (Zune ZMDB extension awaits Phase 4b probe
+    /// results). UI renders `—` for `None`, the digit for `Some`.
+    pub play_count: Option<u32>,
+    /// User-set rating from the device (MTP `0xDC8A`, range 0–100).
+    /// `None` if the device doesn't surface ratings.
+    pub rating: Option<u16>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -195,6 +203,10 @@ pub enum SyncStatus {
     Idle,
     Running { current: usize, total: usize },
 }
+
+/// Per-track on-device metadata cached for fast Library-side lookup.
+/// Mirrors the equivalent fields on `DeviceTrackInfo` and `DeviceEntry`.
+pub type DeviceTrackMeta = (Option<u32>, Option<u16>);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SortColumn {
@@ -322,6 +334,11 @@ pub struct DeviceState {
     pub album_tracks: BTreeMap<(String, String), Vec<DeviceTrackInfo>>,
     /// Precomputed set of (normalized_artist, normalized_name) for on-device matching.
     pub track_set: HashSet<(String, String)>,
+    /// Per-track metadata keyed identically to `track_set` so library-side
+    /// rows can inherit on-device `play_count` and `rating` without walking
+    /// `album_tracks`. Populated alongside `track_set` in
+    /// `add_indexed_track`.
+    pub track_metadata: HashMap<(String, String), DeviceTrackMeta>,
     /// Per-artist list of normalized device track names for substring fallback.
     pub artist_track_names: BTreeMap<String, Vec<String>>,
     /// Number of items the device acquired on its own (podcasts, Zune-to-Zune shares).
@@ -349,6 +366,7 @@ impl DeviceState {
             albums: BTreeMap::new(),
             album_tracks: BTreeMap::new(),
             track_set: HashSet::new(),
+            track_metadata: HashMap::new(),
             artist_track_names: BTreeMap::new(),
             acquired_items: 0,
             sync_status: None,
@@ -390,14 +408,22 @@ impl DeviceState {
                 album,
                 track_number: entry.track_number,
                 disc_number: entry.disc_number,
+                play_count: entry.play_count,
+                rating: entry.rating,
             });
 
         let artist_key = normalize_for_match(&artist);
         let raw = normalize_for_match(&display_name);
         let stripped = normalize_for_match(zytunes::strip_track_number(display_name.trim()));
         self.track_set.insert((artist_key.clone(), raw.clone()));
+        let meta = (entry.play_count, entry.rating);
+        self.track_metadata
+            .insert((artist_key.clone(), raw.clone()), meta);
         if stripped != raw {
-            self.track_set.insert((artist_key.clone(), stripped));
+            self.track_set
+                .insert((artist_key.clone(), stripped.clone()));
+            self.track_metadata
+                .insert((artist_key.clone(), stripped), meta);
         }
         self.artist_track_names
             .entry(artist_key)
@@ -465,15 +491,20 @@ impl DeviceState {
         false
     }
 
-    /// Rebuild `track_set` and `artist_track_names` entries for a single artist.
-    /// Cheap because it only walks that artist's tracks, not the whole device.
+    /// Rebuild `track_set`, `track_metadata`, and `artist_track_names`
+    /// entries for a single artist. Cheap because it only walks that
+    /// artist's tracks, not the whole device.
     fn rebuild_lookup_for_artist(&mut self, artist: &str) {
         let artist_key = normalize_for_match(artist);
         self.track_set.retain(|(a, _)| a != &artist_key);
+        self.track_metadata.retain(|(a, _), _| a != &artist_key);
         self.artist_track_names.remove(&artist_key);
 
         let mut names = Vec::new();
-        let mut extra_keys = Vec::new();
+        // Collected as (key, metadata) so the post-walk insert phase can
+        // populate both `track_set` and `track_metadata` consistently.
+        let mut extra_entries: Vec<(String, DeviceTrackMeta)> = Vec::new();
+        let mut raw_entries: Vec<(String, DeviceTrackMeta)> = Vec::new();
         for ((a, _), tracks) in &self.album_tracks {
             if normalize_for_match(a) != artist_key {
                 continue;
@@ -481,17 +512,23 @@ impl DeviceState {
             for dt in tracks {
                 let raw = normalize_for_match(&dt.name);
                 let stripped = normalize_for_match(zytunes::strip_track_number(dt.name.trim()));
+                let meta = (dt.play_count, dt.rating);
                 if stripped != raw {
-                    extra_keys.push(stripped);
+                    extra_entries.push((stripped, meta));
                 }
-                names.push(raw);
+                names.push(raw.clone());
+                raw_entries.push((raw, meta));
             }
         }
-        for raw in &names {
+        for (raw, meta) in raw_entries {
             self.track_set.insert((artist_key.clone(), raw.clone()));
+            self.track_metadata.insert((artist_key.clone(), raw), meta);
         }
-        for stripped in extra_keys {
-            self.track_set.insert((artist_key.clone(), stripped));
+        for (stripped, meta) in extra_entries {
+            self.track_set
+                .insert((artist_key.clone(), stripped.clone()));
+            self.track_metadata
+                .insert((artist_key.clone(), stripped), meta);
         }
         if !names.is_empty() {
             self.artist_track_names.insert(artist_key, names);
@@ -664,6 +701,13 @@ pub struct TrackInfo {
     pub disc_number: Option<u32>,
     pub genre: Option<String>,
     pub on_device: bool,
+    /// Number of plays on the device. Populated when this row was built
+    /// from a `DeviceTrackInfo`; `None` for library-side rows (we don't
+    /// track local TUI plays yet — that's Phase 3 of the playcount work).
+    pub play_count: Option<u32>,
+    /// User-set rating from the device (MTP `0xDC8A`, range 0–100, displayed
+    /// as 0–5 stars by dividing by 20). Populated from `DeviceTrackInfo`.
+    pub rating: Option<u16>,
     /// Pre-normalized (lowercased, trimmed, edge-stripped) artist key.
     /// Computed once at construction so hot paths (`retag_on_device`, per-frame
     /// filter passes) do not re-allocate on every render.
@@ -675,6 +719,10 @@ pub struct TrackInfo {
 impl TrackInfo {
     /// Construct a `TrackInfo`, precomputing match keys so on-device lookups
     /// avoid re-normalizing per render.
+    ///
+    /// `play_count` is left at `None` here; callers building from a
+    /// `DeviceTrackInfo` set it after construction. Library tracks never
+    /// have a playcount (until Phase 3 wires local-play tracking).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         name: String,
@@ -701,6 +749,8 @@ impl TrackInfo {
             disc_number,
             genre,
             on_device,
+            play_count: None,
+            rating: None,
             artist_key,
             name_key,
         }
@@ -1006,6 +1056,7 @@ impl App {
         self.device.albums.clear();
         self.device.album_tracks.clear();
         self.device.track_set.clear();
+        self.device.track_metadata.clear();
         self.device.artist_track_names.clear();
 
         let tracks = std::mem::take(&mut self.device.tracks);
@@ -1069,6 +1120,7 @@ impl App {
         self.device.albums.clear();
         self.device.album_tracks.clear();
         self.device.track_set.clear();
+        self.device.track_metadata.clear();
         self.device.artist_track_names.clear();
         self.device.acquired_items = 0;
         self.artist_device_status.clear();
@@ -2368,6 +2420,19 @@ where
             let artist_key = normalize_for_match(&t.artist);
             let name_key = normalize_for_match(&t.name);
             let on_device = device.contains_track(&artist_key, &name_key);
+            // Library rows have no plays/rating of their own (we don't track
+            // local TUI plays yet). When the same track exists on the device,
+            // surface its on-device counters so the user sees the same data
+            // in either browse mode without having to flip via `v`.
+            let (play_count, rating) = if on_device {
+                device
+                    .track_metadata
+                    .get(&(artist_key.clone(), name_key.clone()))
+                    .copied()
+                    .unwrap_or((None, None))
+            } else {
+                (None, None)
+            };
             TrackInfo {
                 name: t.name.clone(),
                 artist: t.artist.clone(),
@@ -2379,6 +2444,8 @@ where
                 disc_number: t.disc_number,
                 genre: t.genre.clone(),
                 on_device,
+                play_count,
+                rating,
                 artist_key,
                 name_key,
             }
@@ -2475,7 +2542,7 @@ fn device_tracks_to_info(tracks: &[DeviceTrackInfo]) -> Vec<TrackInfo> {
     tracks
         .iter()
         .map(|dt| {
-            TrackInfo::new(
+            let mut info = TrackInfo::new(
                 dt.name.clone(),
                 dt.artist.clone(),
                 dt.album.clone(),
@@ -2486,7 +2553,10 @@ fn device_tracks_to_info(tracks: &[DeviceTrackInfo]) -> Vec<TrackInfo> {
                 dt.disc_number,
                 None,
                 false,
-            )
+            );
+            info.play_count = dt.play_count;
+            info.rating = dt.rating;
+            info
         })
         .collect()
 }
@@ -2661,6 +2731,8 @@ mod tests {
                 album: "A Night at the Opera".into(),
                 track_number: None,
                 disc_number: None,
+                play_count: None,
+                rating: None,
             }],
         );
         build_match_sets(&mut app.device);
@@ -2740,6 +2812,8 @@ mod tests {
                 album: "A Night at the Opera".into(),
                 track_number: None,
                 disc_number: None,
+                play_count: None,
+                rating: None,
             }],
         );
         build_match_sets(&mut app.device);
@@ -2851,6 +2925,8 @@ mod tests {
                     album: "A Night at the Opera".into(),
                     track_number: None,
                     disc_number: None,
+                    play_count: None,
+                    rating: None,
                 },
                 DeviceTrackInfo {
                     name: "Bohemian Rhapsody".into(),
@@ -2861,6 +2937,8 @@ mod tests {
                     album: "A Night at the Opera".into(),
                     track_number: None,
                     disc_number: None,
+                    play_count: None,
+                    rating: None,
                 },
                 DeviceTrackInfo {
                     name: "Bohemian Rhapsody".into(),
@@ -2871,6 +2949,8 @@ mod tests {
                     album: "A Night at the Opera".into(),
                     track_number: None,
                     disc_number: None,
+                    play_count: None,
+                    rating: None,
                 },
                 // Unique within the same album — must NOT appear in the
                 // dedupe set.
@@ -2882,6 +2962,8 @@ mod tests {
                     album: "A Night at the Opera".into(),
                     track_number: None,
                     disc_number: None,
+                    play_count: None,
+                    rating: None,
                 },
             ],
         );
@@ -2897,6 +2979,8 @@ mod tests {
                 album: "Greatest Hits".into(),
                 track_number: None,
                 disc_number: None,
+                play_count: None,
+                rating: None,
             }],
         );
         build_match_sets(&mut app.device);
@@ -2925,6 +3009,8 @@ mod tests {
                     album: "A Night at the Opera".into(),
                     track_number: None,
                     disc_number: None,
+                    play_count: None,
+                    rating: None,
                 },
                 DeviceTrackInfo {
                     name: "Bohemian Rhapsody".into(),
@@ -2935,6 +3021,8 @@ mod tests {
                     album: "A Night at the Opera".into(),
                     track_number: None,
                     disc_number: None,
+                    play_count: None,
+                    rating: None,
                 },
             ],
         );
@@ -2970,6 +3058,8 @@ mod tests {
                 album: "A Night at the Opera".into(),
                 track_number: None,
                 disc_number: None,
+                play_count: None,
+                rating: None,
             }],
         );
         build_match_sets(&mut app.device);
@@ -3001,6 +3091,8 @@ mod tests {
                     album: "A Night at the Opera".into(),
                     track_number: None,
                     disc_number: None,
+                    play_count: None,
+                    rating: None,
                 },
                 DeviceTrackInfo {
                     name: "Bohemian Rhapsody".into(),
@@ -3011,6 +3103,8 @@ mod tests {
                     album: "A Night at the Opera".into(),
                     track_number: None,
                     disc_number: None,
+                    play_count: None,
+                    rating: None,
                 },
                 DeviceTrackInfo {
                     name: "Love of My Life".into(),
@@ -3020,6 +3114,8 @@ mod tests {
                     album: "A Night at the Opera".into(),
                     track_number: None,
                     disc_number: None,
+                    play_count: None,
+                    rating: None,
                 },
             ],
         );
@@ -3053,6 +3149,8 @@ mod tests {
                 album: "A Night at the Opera".into(),
                 track_number: None,
                 disc_number: None,
+                play_count: None,
+                rating: None,
             }],
         );
         build_match_sets(&mut app.device);
@@ -3276,6 +3374,8 @@ mod tests {
                 album: "A Night at the Opera".into(),
                 track_number: None,
                 disc_number: None,
+                play_count: None,
+                rating: None,
             }],
         );
         build_match_sets(&mut app.device);
@@ -3348,6 +3448,82 @@ mod tests {
             name: name.to_string(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn device_tracks_to_info_propagates_play_count() {
+        // End-to-end: a DeviceEntry with a non-zero play_count must reach
+        // the rendered TrackInfo.play_count via the index → DeviceTrackInfo
+        // → TrackInfo path. Regression for v1.4 enrichment plumbing.
+        let mut app = App::new();
+        app.device.tracks = vec![
+            DeviceEntry {
+                play_count: Some(7),
+                ..make_device_entry("Artist/Album/played.mp3", 1000)
+            },
+            DeviceEntry {
+                play_count: None,
+                ..make_device_entry("Artist/Album/never.mp3", 2000)
+            },
+        ];
+        app.build_device_index();
+
+        let dt = app
+            .device
+            .album_tracks
+            .get(&("Artist".into(), "Album".into()))
+            .unwrap();
+        let played = dt.iter().find(|t| t.name == "played").unwrap();
+        assert_eq!(played.play_count, Some(7));
+
+        let infos = device_tracks_to_info(dt);
+        let played = infos.iter().find(|t| t.name == "played").unwrap();
+        let never = infos.iter().find(|t| t.name == "never").unwrap();
+        assert_eq!(played.play_count, Some(7));
+        assert_eq!(never.play_count, None);
+    }
+
+    #[test]
+    fn track_metadata_index_carries_play_count_and_rating() {
+        // After build_device_index, a Library-side lookup keyed on
+        // (artist_key, name_key) must surface the device's play_count and
+        // rating. This is what `tracks_to_info` reads from to render
+        // playcounts in Library mode without flipping into Device mode.
+        let mut app = App::new();
+        app.device.status = DeviceStatus::Connected;
+        app.device.tracks = vec![
+            DeviceEntry {
+                play_count: Some(5),
+                rating: Some(80),
+                ..make_device_entry("Radiohead/OK Computer/Karma Police.mp3", 4_000_000)
+            },
+            DeviceEntry {
+                play_count: None,
+                rating: None,
+                ..make_device_entry("Radiohead/OK Computer/Airbag.mp3", 5_000_000)
+            },
+        ];
+        app.build_device_index();
+
+        let karma = app
+            .device
+            .track_metadata
+            .get(&(
+                normalize_for_match("Radiohead"),
+                normalize_for_match("Karma Police"),
+            ))
+            .copied();
+        assert_eq!(karma, Some((Some(5), Some(80))));
+
+        let airbag = app
+            .device
+            .track_metadata
+            .get(&(
+                normalize_for_match("Radiohead"),
+                normalize_for_match("Airbag"),
+            ))
+            .copied();
+        assert_eq!(airbag, Some((None, None)));
     }
 
     #[test]
@@ -3665,6 +3841,7 @@ mod tests {
             albums: device.albums.clone(),
             album_tracks: device.album_tracks.clone(),
             track_set: device.track_set.clone(),
+            track_metadata: device.track_metadata.clone(),
             artist_track_names: device.artist_track_names.clone(),
             acquired_items: 0,
             sync_status: None,
@@ -4219,6 +4396,8 @@ mod tests {
                 album: "A Night at the Opera".into(),
                 track_number: None,
                 disc_number: None,
+                play_count: None,
+                rating: None,
             }],
         );
         build_match_sets(&mut device);
@@ -4394,6 +4573,8 @@ mod tests {
                 album: "A Night at the Opera".into(),
                 track_number: None,
                 disc_number: None,
+                play_count: None,
+                rating: None,
             }],
         );
         build_match_sets(&mut app.device);
@@ -4451,6 +4632,8 @@ mod tests {
                 album: "No Strings Attached".into(),
                 track_number: None,
                 disc_number: None,
+                play_count: None,
+                rating: None,
             }],
         );
         build_match_sets(&mut device);
@@ -4553,6 +4736,8 @@ mod tests {
                     album: "OK Computer".into(),
                     track_number: None,
                     disc_number: None,
+                    play_count: None,
+                    rating: None,
                 },
                 DeviceTrackInfo {
                     name: "Karma Police".into(),
@@ -4562,6 +4747,8 @@ mod tests {
                     album: "OK Computer".into(),
                     track_number: None,
                     disc_number: None,
+                    play_count: None,
+                    rating: None,
                 },
             ],
         );
@@ -4575,6 +4762,8 @@ mod tests {
                 album: "Kid A".into(),
                 track_number: None,
                 disc_number: None,
+                play_count: None,
+                rating: None,
             }],
         );
         build_match_sets(&mut app.device);

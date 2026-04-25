@@ -177,6 +177,19 @@ pub struct IpodTrack {
     /// "AAC audio file", "Apple Lossless audio file"). The iPod firmware uses
     /// this to select the audio decoder. When `None`, derived from `filetype`.
     pub filetype_string: Option<String>,
+    /// Number of times this track has been played (mhit `+80`). The iPod
+    /// firmware increments this on track completion; iTunes' Play Counts
+    /// sidecar file is folded back into mhit on the next sync.
+    pub play_count: u32,
+    /// Last-played timestamp (mhit `+84`). Mac HFS epoch — seconds since
+    /// 1904-01-01 UTC. `0` when the track has never played.
+    pub last_played: u32,
+    /// Number of times the user has skipped this track (mhit `+148`).
+    /// Only present in `header_size >= 212` mhits; older iPods leave it `0`.
+    pub skip_count: u32,
+    /// Last-skipped timestamp (mhit `+152`). Same Mac HFS epoch as
+    /// `last_played`. `0` when the track has never been skipped.
+    pub last_skipped: u32,
     /// Raw mhit header bytes (full 624-byte header from parsed database).
     /// When present, the serializer replays this and patches only the fields
     /// it actively manages (artwork_count, has_artwork, total_size, num_mhods).

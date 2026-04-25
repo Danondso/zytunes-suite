@@ -7,7 +7,7 @@ use crate::mtp::DeviceSession;
 
 use zune_mtp::container::MTP_ROOT;
 use zune_mtp::proplist::*;
-use zune_mtp::session::ObjectInfo;
+use zune_mtp::session::{parse_object_prop_list, ObjectInfo, PropListElement};
 use zune_mtp::{MtpError, MtpSession, MtpzKeys};
 
 use std::collections::HashMap;
@@ -199,16 +199,27 @@ impl TrackCache {
             if line.starts_with('#') {
                 continue;
             }
-            let parts: Vec<&str> = line.splitn(5, '\t').collect();
+            // Format evolution: original cache had 5 fields; play_count
+            // (column 5) was added in Phase 4b alongside rating (column 6).
+            // Old caches still parse — missing fields stay `None`.
+            let parts: Vec<&str> = line.splitn(7, '\t').collect();
             if parts.len() < 5 {
                 continue;
             }
+            let play_count = parts
+                .get(5)
+                .and_then(|s| s.trim_end_matches('\n').parse::<u32>().ok());
+            let rating = parts
+                .get(6)
+                .and_then(|s| s.trim_end_matches('\n').parse::<u16>().ok());
             entries.push(DeviceEntry {
                 object_id: parts[0].parse().unwrap_or(0),
                 storage_id: parts[1].parse().unwrap_or(0),
                 format: parts[2].to_string(),
                 size: parts[3].parse().unwrap_or(0),
                 name: parts[4].to_string(),
+                play_count,
+                rating,
                 ..Default::default()
             });
         }
@@ -226,11 +237,7 @@ impl TrackCache {
         };
         let mut content = format!("#free_bytes:{free_bytes}\n");
         for t in tracks {
-            let safe_name = t.name.replace('\t', " ");
-            content.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{}\n",
-                t.object_id, t.storage_id, t.format, t.size, safe_name
-            ));
+            content.push_str(&serialize_entry(t));
         }
         let _ = std::fs::write(path, content);
     }
@@ -275,25 +282,23 @@ impl TrackCache {
             None => return,
         };
         use std::io::Write;
-        let safe_name = entry.name.replace('\t', " ");
-        let line = format!(
-            "{}\t{}\t{}\t{}\t{}\n",
-            entry.object_id, entry.storage_id, entry.format, entry.size, safe_name
-        );
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .append(true)
             .create(true)
             .open(path)
         {
-            let _ = file.write_all(line.as_bytes());
+            let _ = file.write_all(serialize_entry(entry).as_bytes());
         }
     }
 
     fn remove(&self, device_path: &str) {
         let path_suffix = device_path.trim_start_matches("/Music/");
         let prefix = format!("{path_suffix}/");
+        // Name is field #5 (index 4) in the cache line; field #6 is the
+        // optional play_count added in Phase 4b. Using `split` over `splitn`
+        // because we only inspect one field by index.
         self.filter_cache(|line| {
-            line.splitn(5, '\t')
+            line.split('\t')
                 .nth(4)
                 .map(|name| name != path_suffix && !name.starts_with(&prefix))
                 .unwrap_or(true)
@@ -622,6 +627,71 @@ impl NativeSession {
             }
         }
         Ok(current)
+    }
+
+    /// Enrich `tracks` with `play_count` (from `0xDC91 UseCount`) and
+    /// `rating` (from `0xDC8A Rating`) using bulk `GetObjectPropList`
+    /// queries — one round-trip per property for the whole library, not
+    /// one per track. Tracks whose `object_id` is `0` (ZMDB entries before
+    /// any cache merge has restored the handle) are skipped silently.
+    ///
+    /// Both queries are best-effort and independent: if the device rejects
+    /// one, we log it and proceed with the other. Confirmed to work on Zune
+    /// v1.4 firmware `01.04.00485.00-00425` even though these props are not
+    /// listed in `GetObjectPropsSupported(0x3009)`.
+    fn enrich_with_playcounts(&mut self, tracks: &mut [DeviceEntry]) {
+        // Avoid needless round-trips when nothing in the list could be
+        // matched — e.g. ZMDB on a fresh connect with no prior cache.
+        if !tracks.iter().any(|t| t.object_id != 0) {
+            return;
+        }
+        self.enrich_one_prop(tracks, PROP_USE_COUNT, "playcounts", apply_playcounts);
+        self.enrich_one_prop(tracks, PROP_RATING, "ratings", apply_ratings);
+    }
+
+    /// Issue a single bulk `GetObjectPropList` for `prop` across all MP3
+    /// objects, parse the response, and apply the results onto `tracks`
+    /// using `apply`. Logs how many entries were populated, or a one-liner
+    /// if the device rejected the op. Generic over the apply function so
+    /// the playcount and rating paths share the wire/log machinery.
+    fn enrich_one_prop<F>(&mut self, tracks: &mut [DeviceEntry], prop: u16, label: &str, apply: F)
+    where
+        F: FnOnce(&mut [DeviceEntry], &[PropListElement]),
+    {
+        let raw = match self.session.get_object_prop_list(
+            0xFFFFFFFF,
+            FORMAT_MP3 as u32,
+            prop as u32,
+            0,
+            0,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                self.log_msg(&format!("{label} enrichment unavailable: {e}"));
+                return;
+            }
+        };
+        let elements = parse_object_prop_list(&raw);
+        if elements.is_empty() {
+            return;
+        }
+        // Counter callback handles the "before/after diff" so we don't need
+        // to know which field on DeviceEntry the apply touched.
+        let count_set = |ts: &[DeviceEntry], p: u16| -> usize {
+            ts.iter()
+                .filter(|t| match p {
+                    PROP_USE_COUNT => t.play_count.is_some(),
+                    PROP_RATING => t.rating.is_some(),
+                    _ => false,
+                })
+                .count()
+        };
+        let before = count_set(tracks, prop);
+        apply(tracks, &elements);
+        let added = count_set(tracks, prop) - before;
+        if added > 0 {
+            self.log_msg(&format!("Loaded {label} for {added} tracks"));
+        }
     }
 
     /// Try to load the device library via the ZMDB vendor operation.
@@ -1192,7 +1262,11 @@ impl DeviceSession for NativeSession {
                 self.clear_library_cache();
                 self.library = None;
             } else {
-                self.log_msg(&format!("Loaded {} tracks from cache", cached.len()));
+                let with_pc = cached.iter().filter(|t| t.play_count.is_some()).count();
+                self.log_msg(&format!(
+                    "Loaded {} tracks from cache ({with_pc} with playcount)",
+                    cached.len()
+                ));
                 return Ok(cached.clone());
             }
         }
@@ -1233,6 +1307,7 @@ impl DeviceSession for NativeSession {
                         ));
                     }
                 }
+                self.enrich_with_playcounts(&mut tracks);
                 self.cache.save(&tracks, current_free);
                 return Ok(tracks);
             }
@@ -1250,8 +1325,9 @@ impl DeviceSession for NativeSession {
         self.log_msg("Scanning device (first time may take a minute)...");
         let mut entries = Vec::new();
         self.list_recursive(parent, "", &mut entries)?;
-        let tracks: Vec<DeviceEntry> = entries.into_iter().filter(|e| !e.is_dir()).collect();
+        let mut tracks: Vec<DeviceEntry> = entries.into_iter().filter(|e| !e.is_dir()).collect();
 
+        self.enrich_with_playcounts(&mut tracks);
         self.cache.save(&tracks, current_free);
         self.log_msg(&format!("Cached {} tracks", tracks.len()));
 
@@ -1381,6 +1457,49 @@ impl NativeSession {
     pub fn probe_prop_u32(&mut self, object_id: u32, prop: u16) -> Result<Option<u32>, String> {
         self.session
             .get_object_prop_u32(object_id, prop)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Phase 4a probe: ask the device for ALL properties on `object_id`,
+    /// regardless of what `GetObjectPropsSupported` advertises. Devices
+    /// frequently serve unadvertised properties — particularly Microsoft-
+    /// specific MTP-AAS extensions — and on Zune v1.4 this is the most
+    /// likely path to surface a playcount the firmware doesn't list.
+    ///
+    /// Wraps `GetObjectPropList(handle, format=0, prop=0xFFFFFFFF, group=0,
+    /// depth=0)` and decodes the response into typed elements.
+    pub fn probe_all_props(
+        &mut self,
+        object_id: u32,
+    ) -> Result<Vec<zune_mtp::session::PropListElement>, String> {
+        let raw = self
+            .session
+            .get_object_prop_list(object_id, 0, 0xFFFF_FFFF, 0, 0)
+            .map_err(|e| e.to_string())?;
+        Ok(zune_mtp::session::parse_object_prop_list(&raw))
+    }
+
+    /// Phase 4a probe: invoke an arbitrary MTP operation by code with up to
+    /// five u32 params, returning the response code, response params, and
+    /// any data-in payload. Hard 10 s timeout so a hung device doesn't
+    /// stall the whole session. Refuses to fire on the small allowlist of
+    /// operation codes that have empirically wedged the device.
+    ///
+    /// Use ONLY for read-only data-in operations (op code in the 0x90xx /
+    /// 0x91xx Microsoft vendor ranges, or unknown 0x9xxx). Calling a
+    /// data-out operation with this will fail or wedge the session.
+    pub fn probe_vendor_op(&mut self, op_code: u16, params: &[u32]) -> Result<Vec<u8>, String> {
+        // Empirical hard-block list. 0x9180 is documented in the v1.4
+        // vendor-ops survey as causing a USB-resetting hang. Adding more
+        // here as we learn them is cheap insurance.
+        const BLOCKED: &[u16] = &[0x9180];
+        if BLOCKED.contains(&op_code) {
+            return Err(format!(
+                "op 0x{op_code:04X} is on the probe blocklist (known to wedge the device)"
+            ));
+        }
+        self.session
+            .execute_data_in_raw(op_code, params)
             .map_err(|e| e.to_string())
     }
 
@@ -1627,6 +1746,72 @@ impl NativeSession {
 }
 
 /// Convert an MTP ObjectInfo to a DeviceEntry.
+/// Serialize one `DeviceEntry` to its on-disk track-cache line. Tabs in the
+/// name are flattened to spaces so the splitn(7, '\t') loader stays in sync.
+/// `play_count` and `rating` are emitted as digits or empty for `None`.
+fn serialize_entry(entry: &DeviceEntry) -> String {
+    let safe_name = entry.name.replace('\t', " ");
+    let pc = entry.play_count.map(|v| v.to_string()).unwrap_or_default();
+    let rt = entry.rating.map(|v| v.to_string()).unwrap_or_default();
+    format!(
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        entry.object_id, entry.storage_id, entry.format, entry.size, safe_name, pc, rt
+    )
+}
+
+/// Project parsed `GetObjectPropList` elements onto tracks, populating
+/// `play_count` for entries whose `object_id` matches a returned handle.
+/// Tracks without an `object_id` (ZMDB entries on a fresh connect) keep
+/// `play_count = None`. Pure helper so the join logic is unit-testable
+/// without a live MTP session.
+fn apply_playcounts(tracks: &mut [DeviceEntry], elements: &[PropListElement]) {
+    let mut counts: HashMap<u32, u32> = HashMap::new();
+    for e in elements {
+        if e.prop_code == PROP_USE_COUNT {
+            if let Some(v) = e.as_u32() {
+                counts.insert(e.object_handle, v);
+            }
+        }
+    }
+    if counts.is_empty() {
+        return;
+    }
+    for t in tracks.iter_mut() {
+        if t.object_id == 0 {
+            continue;
+        }
+        if let Some(&n) = counts.get(&(t.object_id as u32)) {
+            t.play_count = Some(n);
+        }
+    }
+}
+
+/// Project parsed `GetObjectPropList` elements onto tracks, populating
+/// `rating` for entries whose `object_id` matches a returned handle. Same
+/// shape as `apply_playcounts` but for `0xDC8A Rating` (UINT16). Tracks
+/// without `object_id` are skipped silently.
+fn apply_ratings(tracks: &mut [DeviceEntry], elements: &[PropListElement]) {
+    let mut ratings: HashMap<u32, u16> = HashMap::new();
+    for e in elements {
+        if e.prop_code == PROP_RATING {
+            if let Some(v) = e.as_u16() {
+                ratings.insert(e.object_handle, v);
+            }
+        }
+    }
+    if ratings.is_empty() {
+        return;
+    }
+    for t in tracks.iter_mut() {
+        if t.object_id == 0 {
+            continue;
+        }
+        if let Some(&r) = ratings.get(&(t.object_id as u32)) {
+            t.rating = Some(r);
+        }
+    }
+}
+
 fn object_info_to_entry(handle: u32, info: &ObjectInfo) -> DeviceEntry {
     DeviceEntry {
         object_id: handle as u64,
@@ -2473,5 +2658,180 @@ mod tests {
         assert_eq!(genre, "Alternative");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn use_count_element(handle: u32, count: u32) -> PropListElement {
+        PropListElement {
+            object_handle: handle,
+            prop_code: PROP_USE_COUNT,
+            datatype: 0x0006,
+            value: count.to_le_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn apply_playcounts_populates_matched_handles() {
+        let mut tracks = vec![sample_entry("a.mp3", 100), sample_entry("b.mp3", 101)];
+        let elements = vec![use_count_element(100, 7), use_count_element(101, 0)];
+        apply_playcounts(&mut tracks, &elements);
+        assert_eq!(tracks[0].play_count, Some(7));
+        assert_eq!(tracks[1].play_count, Some(0));
+    }
+
+    #[test]
+    fn apply_playcounts_leaves_unmatched_handles_alone() {
+        // Track 102 has no element in the prop-list response; it should
+        // stay None, not be cleared, even if play_count was already set.
+        let mut tracks = vec![
+            sample_entry("a.mp3", 100),
+            DeviceEntry {
+                play_count: Some(99),
+                ..sample_entry("b.mp3", 102)
+            },
+        ];
+        let elements = vec![use_count_element(100, 5)];
+        apply_playcounts(&mut tracks, &elements);
+        assert_eq!(tracks[0].play_count, Some(5));
+        assert_eq!(tracks[1].play_count, Some(99));
+    }
+
+    #[test]
+    fn apply_playcounts_skips_zero_object_ids() {
+        // ZMDB tracks before any cache merge have object_id == 0; they must
+        // not match an element whose handle was reported as 0 by the device.
+        let mut tracks = vec![sample_entry("zmdb-only.mp3", 0)];
+        let elements = vec![use_count_element(0, 12)];
+        apply_playcounts(&mut tracks, &elements);
+        assert_eq!(tracks[0].play_count, None);
+    }
+
+    #[test]
+    fn apply_playcounts_ignores_non_use_count_props() {
+        let mut tracks = vec![sample_entry("a.mp3", 200)];
+        let rating = PropListElement {
+            object_handle: 200,
+            prop_code: PROP_RATING,
+            datatype: 0x0004,
+            value: 4u16.to_le_bytes().to_vec(),
+        };
+        apply_playcounts(&mut tracks, &[rating]);
+        assert_eq!(tracks[0].play_count, None);
+    }
+
+    #[test]
+    fn apply_ratings_populates_matched_handles() {
+        let mut tracks = vec![sample_entry("a.mp3", 300), sample_entry("b.mp3", 301)];
+        let elements = vec![
+            PropListElement {
+                object_handle: 300,
+                prop_code: PROP_RATING,
+                datatype: 0x0004,
+                value: 80u16.to_le_bytes().to_vec(),
+            },
+            PropListElement {
+                object_handle: 301,
+                prop_code: PROP_RATING,
+                datatype: 0x0004,
+                value: 0u16.to_le_bytes().to_vec(),
+            },
+        ];
+        apply_ratings(&mut tracks, &elements);
+        assert_eq!(tracks[0].rating, Some(80));
+        assert_eq!(tracks[1].rating, Some(0));
+    }
+
+    #[test]
+    fn apply_ratings_ignores_use_count_props() {
+        // A UseCount element must not be misinterpreted as a rating.
+        let mut tracks = vec![sample_entry("a.mp3", 400)];
+        let use_count = PropListElement {
+            object_handle: 400,
+            prop_code: PROP_USE_COUNT,
+            datatype: 0x0006,
+            value: 5u32.to_le_bytes().to_vec(),
+        };
+        apply_ratings(&mut tracks, &[use_count]);
+        assert_eq!(tracks[0].rating, None);
+    }
+
+    #[test]
+    fn track_cache_round_trips_play_count() {
+        let cache = make_cache(Some("playcount-rt"));
+        let entries = vec![
+            DeviceEntry {
+                play_count: Some(7),
+                ..sample_entry("Artist/Album/played.mp3", 100)
+            },
+            sample_entry("Artist/Album/never.mp3", 101),
+        ];
+        cache.save(&entries, 1_000);
+
+        let (_, loaded) = cache.load().unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].play_count, Some(7));
+        assert_eq!(loaded[1].play_count, None);
+
+        if let Some(p) = cache.cache_path() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn track_cache_loads_legacy_5_field_format() {
+        // Old cache files predate the play_count and rating columns; they
+        // have only 5 tab-separated fields. The loader must accept them
+        // and leave both Option fields as None rather than dropping the
+        // entry.
+        let cache = make_cache(Some("legacy-5col"));
+        let path = cache.cache_path().unwrap();
+        let legacy = "#free_bytes:0\n100\t65537\tMP3\t1024\tArtist/Album/old.mp3\n";
+        std::fs::write(&path, legacy).unwrap();
+
+        let (_, loaded) = cache.load().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "Artist/Album/old.mp3");
+        assert_eq!(loaded[0].play_count, None);
+        assert_eq!(loaded[0].rating, None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn track_cache_loads_six_field_format_without_rating() {
+        // Intermediate cache shape: play_count column added but rating
+        // column not yet. Loader must keep play_count and leave rating None.
+        let cache = make_cache(Some("legacy-6col"));
+        let path = cache.cache_path().unwrap();
+        let legacy = "#free_bytes:0\n100\t65537\tMP3\t1024\tArtist/Album/mid.mp3\t7\n";
+        std::fs::write(&path, legacy).unwrap();
+
+        let (_, loaded) = cache.load().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].play_count, Some(7));
+        assert_eq!(loaded[0].rating, None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn track_cache_round_trips_rating() {
+        let cache = make_cache(Some("rating-rt"));
+        let entries = vec![
+            DeviceEntry {
+                rating: Some(80),
+                ..sample_entry("Artist/Album/rated.mp3", 200)
+            },
+            sample_entry("Artist/Album/unrated.mp3", 201),
+        ];
+        cache.save(&entries, 1_000);
+
+        let (_, loaded) = cache.load().unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].rating, Some(80));
+        assert_eq!(loaded[1].rating, None);
+
+        if let Some(p) = cache.cache_path() {
+            let _ = std::fs::remove_file(p);
+        }
     }
 }

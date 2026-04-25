@@ -78,13 +78,22 @@ pub const MTP_ROOT: u32 = 0xFFFFFFFF;
 
 /// Build a command container with up to 5 u32 parameters.
 pub fn build_command(code: OperationCode, transaction_id: u32, params: &[u32]) -> Vec<u8> {
+    build_command_raw(code as u16, transaction_id, params)
+}
+
+/// Variant of `build_command` that takes a raw u16 op code. Used by probe
+/// tooling to invoke vendor operations whose codes aren't in the
+/// `OperationCode` enum — adding every undocumented vendor op as an enum
+/// variant would pollute the production enum, and transmuting a u16 to an
+/// arbitrary `OperationCode` is undefined behavior.
+pub fn build_command_raw(op_code: u16, transaction_id: u32, params: &[u32]) -> Vec<u8> {
     let payload_size = params.len() * 4;
     let total_size = CONTAINER_HEADER_SIZE + payload_size;
     let mut buf = Vec::with_capacity(total_size);
 
     buf.extend_from_slice(&(total_size as u32).to_le_bytes());
     buf.extend_from_slice(&(ContainerType::Command as u16).to_le_bytes());
-    buf.extend_from_slice(&(code as u16).to_le_bytes());
+    buf.extend_from_slice(&op_code.to_le_bytes());
     buf.extend_from_slice(&transaction_id.to_le_bytes());
     for p in params {
         buf.extend_from_slice(&p.to_le_bytes());

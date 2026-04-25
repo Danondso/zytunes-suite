@@ -185,8 +185,8 @@ fn parse_mhit(cur: &mut Cursor<&[u8]>, start: u64) -> crate::Result<IpodTrack> {
     let _start_time = cur.read_u32::<LittleEndian>()?; // +68
     let _stop_time = cur.read_u32::<LittleEndian>()?; // +72
     let _sound_check = cur.read_u32::<LittleEndian>()?; // +76
-    let _play_count = cur.read_u32::<LittleEndian>()?; // +80
-    let _last_played = cur.read_u32::<LittleEndian>()?; // +84   Mac timestamp
+    let play_count = cur.read_u32::<LittleEndian>()?; // +80
+    let last_played = cur.read_u32::<LittleEndian>()?; // +84   Mac timestamp
     let _date_added_to_device = cur.read_u32::<LittleEndian>()?; // +88   Mac timestamp
     let disc_number = cur.read_u32::<LittleEndian>()?; // +92
     let total_discs = cur.read_u32::<LittleEndian>()?; // +96
@@ -203,6 +203,8 @@ fn parse_mhit(cur: &mut Cursor<&[u8]>, start: u64) -> crate::Result<IpodTrack> {
         0
     };
 
+    let mut skip_count: u32 = 0;
+    let mut last_skipped: u32 = 0;
     if header_size >= 212 {
         let _checked = cur.read_u32::<LittleEndian>()?; // +120
         let _app_rating = cur.read_u32::<LittleEndian>()?; // +124
@@ -211,8 +213,8 @@ fn parse_mhit(cur: &mut Cursor<&[u8]>, start: u64) -> crate::Result<IpodTrack> {
         let _sample_rate_dup = cur.read_u32::<LittleEndian>()?; // +136  fixed-point dup
         let _date_released2 = cur.read_u32::<LittleEndian>()?; // +140
         let _explicit_flag = cur.read_u32::<LittleEndian>()?; // +144
-        let _skip_count = cur.read_u32::<LittleEndian>()?; // +148
-        let _last_skipped = cur.read_u32::<LittleEndian>()?; // +152  Mac timestamp
+        skip_count = cur.read_u32::<LittleEndian>()?; // +148
+        last_skipped = cur.read_u32::<LittleEndian>()?; // +152  Mac timestamp
         let _has_artwork = cur.read_u32::<LittleEndian>()?; // +156
         let _skip_shuffling = cur.read_u32::<LittleEndian>()?; // +160
         let _remember_pos = cur.read_u32::<LittleEndian>()?; // +164
@@ -325,6 +327,10 @@ fn parse_mhit(cur: &mut Cursor<&[u8]>, start: u64) -> crate::Result<IpodTrack> {
         ipod_path,
         filetype,
         filetype_string,
+        play_count,
+        last_played,
+        skip_count,
+        last_skipped,
         raw_mhit_header,
     })
 }
@@ -543,6 +549,10 @@ mod tests {
             ipod_path: ":iPod_Control:Music:F00:abcdef.mp3".into(),
             filetype: 0x4d503320, // "MP3 "
             filetype_string: None,
+            play_count: 0,
+            last_played: 0,
+            skip_count: 0,
+            last_skipped: 0,
             raw_mhit_header: None,
         });
 
@@ -594,6 +604,10 @@ mod tests {
             ipod_path: ":iPod_Control:Music:F00:a.mp3".into(),
             filetype: 0x4d503320,
             filetype_string: None,
+            play_count: 0,
+            last_played: 0,
+            skip_count: 0,
+            last_skipped: 0,
             raw_mhit_header: None,
         });
         let dbid2 = db.add_track(IpodTrack {
@@ -616,6 +630,10 @@ mod tests {
             ipod_path: ":iPod_Control:Music:F01:b.mp3".into(),
             filetype: 0x4d503320,
             filetype_string: None,
+            play_count: 0,
+            last_played: 0,
+            skip_count: 0,
+            last_skipped: 0,
             raw_mhit_header: None,
         });
 
@@ -662,6 +680,10 @@ mod tests {
             ipod_path: ":iPod_Control:Music:F05:XYZW.mp3".into(),
             filetype: 0x4d503320,
             filetype_string: None,
+            play_count: 0,
+            last_played: 0,
+            skip_count: 0,
+            last_skipped: 0,
             raw_mhit_header: None,
         });
 
@@ -685,6 +707,72 @@ mod tests {
         assert_eq!(t.filetype, 0x4d503320);
         assert_eq!(t.dbid, db.tracks[0].dbid);
         assert_eq!(t.track_id, db.tracks[0].track_id);
+        // Playcount fields are plumbed through the parser even when the
+        // serialized value is zero. The writer still zeros these on
+        // export — fixing that round-trip is Phase 2 of the playcount work.
+        assert_eq!(t.play_count, 0);
+        assert_eq!(t.last_played, 0);
+        assert_eq!(t.skip_count, 0);
+        assert_eq!(t.last_skipped, 0);
+    }
+
+    /// Direct parser test: hand-craft a minimal valid mhit chunk with
+    /// non-zero `play_count` at offset `+80` and confirm the parser surfaces
+    /// it. Bypasses the writer (which still zeros these fields — Phase 2)
+    /// so we can verify the read path independently.
+    #[test]
+    fn parse_mhit_reads_nonzero_play_count() {
+        use byteorder::WriteBytesExt;
+        // Serialize an arbitrary track first to get a known-valid mhit, then
+        // patch the play_count bytes in place. Cheaper than reconstructing
+        // every mhit field by hand.
+        let mut db = IpodDatabase::new(PathBuf::from("/mnt/IPOD"));
+        db.add_track(IpodTrack {
+            dbid: 0,
+            track_id: 0,
+            title: "Patched Song".into(),
+            artist: "PA".into(),
+            album: "PB".into(),
+            album_artist: None,
+            genre: None,
+            track_number: None,
+            total_tracks: None,
+            disc_number: None,
+            total_discs: None,
+            total_time_ms: None,
+            year: None,
+            file_size: 100,
+            bitrate: None,
+            sample_rate: None,
+            ipod_path: ":iPod_Control:Music:F00:p.mp3".into(),
+            filetype: 0x4d503320,
+            filetype_string: None,
+            play_count: 0,
+            last_played: 0,
+            skip_count: 0,
+            last_skipped: 0,
+            raw_mhit_header: None,
+        });
+        let mut bytes = itunesdb_write::serialize(&db);
+        // Locate the mhit chunk and patch the play_count field at offset +80
+        // (relative to the mhit start). The serialized stream contains the
+        // 4-byte `mhit` magic; we add 80 to the offset of that byte.
+        let mhit_start = bytes
+            .windows(4)
+            .position(|w| w == b"mhit")
+            .expect("mhit chunk should be present in serialized output");
+        let pc_offset = mhit_start + 80;
+        let mut cur = std::io::Cursor::new(&mut bytes[pc_offset..pc_offset + 4]);
+        cur.write_u32::<LittleEndian>(42).unwrap();
+        // Patch +84 too so we cover last_played; +148 is in extended header
+        // and may not be present on all sized headers, so leave it alone.
+        let lp_offset = mhit_start + 84;
+        let mut cur = std::io::Cursor::new(&mut bytes[lp_offset..lp_offset + 4]);
+        cur.write_u32::<LittleEndian>(0xDEAD_BEEF).unwrap();
+
+        let parsed = parse(&bytes, PathBuf::from("/mnt/IPOD")).unwrap();
+        assert_eq!(parsed.tracks[0].play_count, 42);
+        assert_eq!(parsed.tracks[0].last_played, 0xDEAD_BEEF);
     }
 
     #[test]
@@ -711,6 +799,10 @@ mod tests {
             ipod_path: ":iPod_Control:Music:F00:a.mp3".into(),
             filetype: 0x4d503320,
             filetype_string: None,
+            play_count: 0,
+            last_played: 0,
+            skip_count: 0,
+            last_skipped: 0,
             raw_mhit_header: None,
         });
 
@@ -761,6 +853,10 @@ mod tests {
             ipod_path: ":iPod_Control:Music:F00:b.mp3".into(),
             filetype: 0x4d503320,
             filetype_string: None,
+            play_count: 0,
+            last_played: 0,
+            skip_count: 0,
+            last_skipped: 0,
             raw_mhit_header: None,
         });
 
@@ -870,6 +966,10 @@ mod tests {
             ipod_path: ":iPod_Control:Music:F00:a.mp3".into(),
             filetype: 0x4d503320,
             filetype_string: None,
+            play_count: 0,
+            last_played: 0,
+            skip_count: 0,
+            last_skipped: 0,
             raw_mhit_header: None,
         });
         db.add_track(IpodTrack {
@@ -892,6 +992,10 @@ mod tests {
             ipod_path: ":iPod_Control:Music:F01:b.mp3".into(),
             filetype: 0x4d503320,
             filetype_string: None,
+            play_count: 0,
+            last_played: 0,
+            skip_count: 0,
+            last_skipped: 0,
             raw_mhit_header: None,
         });
 
@@ -960,6 +1064,10 @@ mod tests {
             ipod_path: ":iPod_Control:Music:F00:a.mp3".into(),
             filetype: 0x4d503320,
             filetype_string: None,
+            play_count: 0,
+            last_played: 0,
+            skip_count: 0,
+            last_skipped: 0,
             raw_mhit_header: None,
         });
         db.add_track(IpodTrack {
@@ -982,6 +1090,10 @@ mod tests {
             ipod_path: ":iPod_Control:Music:F01:b.mp3".into(),
             filetype: 0x4d503320,
             filetype_string: None,
+            play_count: 0,
+            last_played: 0,
+            skip_count: 0,
+            last_skipped: 0,
             raw_mhit_header: None,
         });
 
@@ -1047,6 +1159,10 @@ mod tests {
                 ipod_path: format!(":iPod_Control:Music:F0{i}:x.mp3"),
                 filetype: 0x4d503320,
                 filetype_string: None,
+                play_count: 0,
+                last_played: 0,
+                skip_count: 0,
+                last_skipped: 0,
                 raw_mhit_header: None,
             });
         }

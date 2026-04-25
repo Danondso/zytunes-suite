@@ -875,8 +875,13 @@ fn draw_album_track_list(f: &mut Frame, app: &App, area: Rect) {
             };
             flat_rows.push((
                 None,
-                Row::new(vec![Cell::from(""), Cell::from(disc_label), Cell::from("")])
-                    .style(t.dim()),
+                Row::new(vec![
+                    Cell::from(""),
+                    Cell::from(disc_label),
+                    Cell::from(""),
+                    Cell::from(""),
+                ])
+                .style(t.dim()),
             ));
             last_disc = Some(track.disc_number);
         }
@@ -902,14 +907,20 @@ fn draw_album_track_list(f: &mut Frame, app: &App, area: Rect) {
             .map(|n| format!("{}.", n))
             .unwrap_or_default();
         let dur = track.duration_ms.map(format_duration).unwrap_or_default();
+        // Em-dash for tracks without a device-side playcount (library rows,
+        // never-played tracks, or formats the device didn't report).
+        let plays = track
+            .play_count
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "—".to_string());
 
         let name_raw = if track.on_device {
             format!("✓ {}", track.name)
         } else {
             track.name.clone()
         };
-        // Name column width = total - 4 (num) - 6 (duration) - 2 (column gutters).
-        let name_w = (area.width as usize).saturating_sub(12);
+        // Name column width = total - 4 (num) - 6 (dur) - 6 (plays) - 3 gutters.
+        let name_w = (area.width as usize).saturating_sub(19);
         let display_name = if is_selected && disp_width(&name_raw) > name_w && name_w > 0 {
             marquee(&name_raw, name_w, app.anim_frame)
         } else {
@@ -922,17 +933,31 @@ fn draw_album_track_list(f: &mut Frame, app: &App, area: Rect) {
                 Cell::from(num),
                 Cell::from(display_name),
                 Cell::from(dur),
+                Cell::from(plays),
             ])
             .style(Style::default().bg(bg).fg(fg)),
         ));
     }
+
+    // Header row labels each column. Without this users can't tell what
+    // the rightmost number columns mean — particularly Plays, which is
+    // new and not self-evident.
+    let header = Row::new(vec![
+        Cell::from("#"),
+        Cell::from("Title"),
+        Cell::from("Dur"),
+        Cell::from("Plays"),
+    ])
+    .style(t.header())
+    .height(1);
 
     // Scroll based on the selected track's position in the flat list.
     let selected_flat = flat_rows
         .iter()
         .position(|(idx, _)| *idx == Some(app.track_selected))
         .unwrap_or(0);
-    let visible_height = area.height as usize;
+    // -1 row reserved for the header.
+    let visible_height = (area.height as usize).saturating_sub(1);
     let scroll = compute_scroll(selected_flat, visible_height, flat_rows.len());
 
     let visible_rows: Vec<Row> = flat_rows
@@ -946,9 +971,10 @@ fn draw_album_track_list(f: &mut Frame, app: &App, area: Rect) {
         Constraint::Length(4),
         Constraint::Min(12),
         Constraint::Length(6),
+        Constraint::Length(6),
     ];
 
-    let table = Table::new(visible_rows, widths);
+    let table = Table::new(visible_rows, widths).header(header);
     f.render_widget(table, area);
 }
 
@@ -1001,6 +1027,10 @@ fn draw_track_table(f: &mut Frame, app: &App, area: Rect) {
         Cell::from(format!("Album{}", sort_indicator(SortColumn::Album))),
         Cell::from(format!("Dur{}", sort_indicator(SortColumn::Duration))),
         Cell::from(format!("Fmt{}", sort_indicator(SortColumn::Format))),
+        // Plays column shows the device-side playcount when present.
+        // `—` means "not surfaced for this device family" (Zune until
+        // Phase 4b lands the read path) or "never played".
+        Cell::from("Plays"),
     ];
     let header = Row::new(header_cells).style(t.header()).height(1);
 
@@ -1045,9 +1075,10 @@ fn draw_track_table(f: &mut Frame, app: &App, area: Rect) {
                 track.name.clone()
             };
             // Table name column is ~30% of the flex area (widths below sum to
-            // 75% + 16 fixed cols). Estimate the rendered width so the selected
-            // row's marquee matches what ratatui will actually show.
-            let flex = (inner.width as usize).saturating_sub(16);
+            // 75% + 22 fixed cols: 4 num + 6 dur + 6 fmt + 6 plays). Estimate
+            // the rendered width so the selected row's marquee matches what
+            // ratatui will actually show.
+            let flex = (inner.width as usize).saturating_sub(22);
             let name_w = flex * 30 / 100;
             let is_row_selected = i == app.track_selected;
             let display_name = if is_row_selected && disp_width(&name_raw) > name_w && name_w > 0 {
@@ -1056,6 +1087,13 @@ fn draw_track_table(f: &mut Frame, app: &App, area: Rect) {
                 name_raw
             };
 
+            // Em-dash (`—`) renders 1 cell wide and reads as "no value"
+            // without being mistaken for the numeric `0`.
+            let plays = track
+                .play_count
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "—".to_string());
+
             Row::new(vec![
                 Cell::from(num),
                 Cell::from(display_name),
@@ -1063,6 +1101,7 @@ fn draw_track_table(f: &mut Frame, app: &App, area: Rect) {
                 Cell::from(track.album.clone()),
                 Cell::from(dur),
                 Cell::from(kind),
+                Cell::from(plays),
             ])
             .style(Style::default().bg(bg).fg(fg))
         })
@@ -1073,6 +1112,7 @@ fn draw_track_table(f: &mut Frame, app: &App, area: Rect) {
         Constraint::Percentage(30),
         Constraint::Percentage(20),
         Constraint::Percentage(25),
+        Constraint::Length(6),
         Constraint::Length(6),
         Constraint::Length(6),
     ];

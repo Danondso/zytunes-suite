@@ -387,6 +387,29 @@ impl DeviceSession for IpodSession {
                     name: display_path,
                     track_number: t.track_number.map(|n| n as u32),
                     disc_number: t.disc_number.map(|n| n as u32),
+                    // The iPod stores these as plain `u32` and uses `0` as the
+                    // sentinel for "never played" / "never skipped"; lift `0`
+                    // to `None` so the UI can render an em-dash instead of a
+                    // misleading-looking literal zero.
+                    play_count: if t.play_count > 0 {
+                        Some(t.play_count)
+                    } else {
+                        None
+                    },
+                    last_played: if t.last_played > 0 {
+                        Some(u64::from(t.last_played))
+                    } else {
+                        None
+                    },
+                    skip_count: if t.skip_count > 0 {
+                        Some(t.skip_count)
+                    } else {
+                        None
+                    },
+                    // iTunesDB has a `rating` byte at mhit +30 but the
+                    // parser currently discards it; wiring that up is
+                    // tracked separately. Zune is the rating-enabled path.
+                    rating: None,
                 }
             })
             .collect();

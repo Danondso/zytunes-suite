@@ -11,6 +11,23 @@ pub struct DeviceEntry {
     pub track_number: Option<u32>,
     /// Disc number (1-based), if known from ZMDB.
     pub disc_number: Option<u32>,
+    /// Number of times the device has played this track. `None` when the
+    /// device family doesn't surface a playcount or the source data path
+    /// hasn't been wired yet (e.g. Zune ZMDB extension still pending Phase
+    /// 4b probe results). Sourced from mhit `+80` on iPod Classic.
+    pub play_count: Option<u32>,
+    /// Last-played timestamp from the device's clock. Format is device-
+    /// specific: iPod Classic stores Mac HFS seconds-since-1904 in mhit
+    /// `+84`. `None` when unset or the device doesn't surface it.
+    pub last_played: Option<u64>,
+    /// Number of times the user has skipped this track on the device.
+    /// `None` if the device doesn't track or hasn't surfaced it.
+    pub skip_count: Option<u32>,
+    /// User-set rating from the device. Sourced from MTP property
+    /// `0xDC8A Rating` (UINT16, range 0–100 per MTP-AAS spec, conventionally
+    /// shown as 0–5 stars by dividing by 20). `None` when the device doesn't
+    /// surface ratings or hasn't been queried for them yet.
+    pub rating: Option<u16>,
 }
 
 impl DeviceEntry {
