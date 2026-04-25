@@ -201,17 +201,15 @@ impl TrackCache {
             }
             // Format evolution: original cache had 5 fields; play_count
             // (column 5) was added in Phase 4b alongside rating (column 6).
-            // Old caches still parse — missing fields stay `None`.
+            // Old caches still parse — missing fields stay `None`. `lines()`
+            // already strips `\n` and `\r\n`, so per-field newline trimming
+            // would be redundant.
             let parts: Vec<&str> = line.splitn(7, '\t').collect();
             if parts.len() < 5 {
                 continue;
             }
-            let play_count = parts
-                .get(5)
-                .and_then(|s| s.trim_end_matches('\n').parse::<u32>().ok());
-            let rating = parts
-                .get(6)
-                .and_then(|s| s.trim_end_matches('\n').parse::<u16>().ok());
+            let play_count = parts.get(5).and_then(|s| s.parse::<u32>().ok());
+            let rating = parts.get(6).and_then(|s| s.parse::<u16>().ok());
             entries.push(DeviceEntry {
                 object_id: parts[0].parse().unwrap_or(0),
                 storage_id: parts[1].parse().unwrap_or(0),
@@ -230,16 +228,20 @@ impl TrackCache {
         }
     }
 
-    fn save(&self, tracks: &[DeviceEntry], free_bytes: u64) {
-        let path = match self.cache_path() {
-            Some(p) => p,
-            None => return,
+    /// Persist the track cache. Returns `Err` with a human-readable message
+    /// when the write fails so callers can surface it through their log
+    /// channel — silently dropping ENOSPC or a flipped permission would
+    /// cost the next reconnect a full track scan with no diagnostic.
+    fn save(&self, tracks: &[DeviceEntry], free_bytes: u64) -> Result<(), String> {
+        let Some(path) = self.cache_path() else {
+            return Ok(());
         };
         let mut content = format!("#free_bytes:{free_bytes}\n");
         for t in tracks {
             content.push_str(&serialize_entry(t));
         }
-        let _ = std::fs::write(path, content);
+        std::fs::write(&path, content)
+            .map_err(|e| format!("track cache: write {} failed: {e}", path.display()))
     }
 
     /// Clear the track cache entirely.
@@ -1270,7 +1272,9 @@ impl DeviceSession for NativeSession {
                 // Persist the refreshed values so a fast reconnect keeps them.
                 let mut tracks = cached.clone();
                 self.enrich_with_playcounts(&mut tracks);
-                self.cache.save(&tracks, current_free);
+                if let Err(e) = self.cache.save(&tracks, current_free) {
+                    self.log_msg(&e);
+                }
                 let with_pc = tracks.iter().filter(|t| t.play_count.is_some()).count();
                 self.log_msg(&format!(
                     "Loaded {} tracks from cache ({with_pc} with playcount)",
@@ -1317,7 +1321,9 @@ impl DeviceSession for NativeSession {
                     }
                 }
                 self.enrich_with_playcounts(&mut tracks);
-                self.cache.save(&tracks, current_free);
+                if let Err(e) = self.cache.save(&tracks, current_free) {
+                    self.log_msg(&e);
+                }
                 return Ok(tracks);
             }
             Err(e) => {
@@ -1337,7 +1343,9 @@ impl DeviceSession for NativeSession {
         let mut tracks: Vec<DeviceEntry> = entries.into_iter().filter(|e| !e.is_dir()).collect();
 
         self.enrich_with_playcounts(&mut tracks);
-        self.cache.save(&tracks, current_free);
+        if let Err(e) = self.cache.save(&tracks, current_free) {
+            self.log_msg(&e);
+        }
         self.log_msg(&format!("Cached {} tracks", tracks.len()));
 
         Ok(tracks)
@@ -2277,7 +2285,7 @@ mod tests {
             sample_entry("Artist/Album/track1.mp3", 100),
             sample_entry("Artist/Album/track2.mp3", 101),
         ];
-        cache.save(&entries, 5_000_000);
+        cache.save(&entries, 5_000_000).expect("save");
 
         let (free_bytes, loaded) = cache.load().unwrap();
         assert_eq!(free_bytes, 5_000_000);
@@ -2296,7 +2304,7 @@ mod tests {
     fn track_cache_append() {
         let cache = make_cache(Some("append"));
         let entries = vec![sample_entry("first.mp3", 1)];
-        cache.save(&entries, 0);
+        cache.save(&entries, 0).expect("save");
 
         cache.append(&sample_entry("second.mp3", 2));
 
@@ -2316,7 +2324,7 @@ mod tests {
             sample_entry("Artist/Album/keep.mp3", 1),
             sample_entry("Artist/Album/delete.mp3", 2),
         ];
-        cache.save(&entries, 0);
+        cache.save(&entries, 0).expect("save");
 
         cache.remove("/Music/Artist/Album/delete.mp3");
 
@@ -2342,7 +2350,7 @@ mod tests {
             sample_entry("Artist/AlbumB/song3.mp3", 3),
             sample_entry("OtherArtist/AlbumA/song4.mp3", 4),
         ];
-        cache.save(&entries, 0);
+        cache.save(&entries, 0).expect("save");
 
         cache.remove("/Music/Artist/AlbumA");
 
@@ -2367,7 +2375,7 @@ mod tests {
             sample_entry("Album/song.mp3", 1),
             sample_entry("Album-Live/song.mp3", 2),
         ];
-        cache.save(&entries, 0);
+        cache.save(&entries, 0).expect("save");
 
         cache.remove("/Music/Album");
 
@@ -2383,7 +2391,7 @@ mod tests {
     #[test]
     fn track_cache_clear() {
         let cache = make_cache(Some("clear"));
-        cache.save(&[sample_entry("x.mp3", 1)], 0);
+        cache.save(&[sample_entry("x.mp3", 1)], 0).expect("save");
         assert!(cache.cache_path().unwrap().exists());
 
         cache.clear();
@@ -2400,7 +2408,7 @@ mod tests {
     fn track_cache_free_bytes_round_trips() {
         let cache = make_cache(Some("free-bytes"));
         let entries = vec![sample_entry("track.mp3", 1)];
-        cache.save(&entries, 28_000_000_000);
+        cache.save(&entries, 28_000_000_000).expect("save");
 
         let (free, loaded) = cache.load().unwrap();
         assert_eq!(free, 28_000_000_000);
@@ -2429,7 +2437,7 @@ mod tests {
             sample_entry("Artist/Album/a.mp3", 1),
             sample_entry("Artist/Album/b.mp3", 2),
         ];
-        cache.save(&entries, 1_000_000);
+        cache.save(&entries, 1_000_000).expect("save");
 
         cache.update_free_bytes(2_500_000);
 
@@ -2476,7 +2484,7 @@ mod tests {
             sample_entry("Artist/Album/a.mp3", 1),
             sample_entry("Artist/Album/b.mp3", 2),
         ];
-        cache.save(&entries, 1_000_000);
+        cache.save(&entries, 1_000_000).expect("save");
 
         let path = cache.cache_path().unwrap();
         let before = std::fs::read_to_string(&path).unwrap();
@@ -2509,7 +2517,7 @@ mod tests {
     fn track_cache_tabs_in_name_handled() {
         let cache = make_cache(Some("tabs"));
         let entries = vec![sample_entry("Art\tist/Album/track.mp3", 1)];
-        cache.save(&entries, 0);
+        cache.save(&entries, 0).expect("save");
 
         let (_, loaded) = cache.load().unwrap();
         // Tab should be replaced with space in saved format.
@@ -2518,6 +2526,46 @@ mod tests {
         if let Some(p) = cache.cache_path() {
             let _ = std::fs::remove_file(p);
         }
+    }
+
+    /// Locks down the schema-evolution claim in `TrackCache::load`'s comment:
+    /// the parser must accept 5-field rows (pre-Phase-4b), 7-field rows with
+    /// playcount/rating populated, mixed-format files, CRLF line endings, and
+    /// 6-field rows where rating is missing but playcount is present.
+    #[test]
+    fn track_cache_load_handles_mixed_schema_rows() {
+        let cache = make_cache(Some("mixed-schema"));
+        let path = cache.cache_path().unwrap();
+
+        // 5-field row (legacy), 6-field row (playcount only), 7-field row
+        // (playcount + rating), and a CRLF-terminated 7-field row.
+        let content = "#free_bytes:1000\n\
+            1\t1\tmp3\t100\tA/B/legacy.mp3\n\
+            2\t1\tmp3\t200\tA/B/playcount-only.mp3\t7\n\
+            3\t1\tmp3\t300\tA/B/full.mp3\t12\t80\n\
+            4\t1\tmp3\t400\tA/B/crlf.mp3\t3\t60\r\n";
+        std::fs::write(&path, content).unwrap();
+
+        let (free, loaded) = cache.load().expect("load");
+        assert_eq!(free, 1000);
+        assert_eq!(loaded.len(), 4);
+
+        assert_eq!(loaded[0].name, "A/B/legacy.mp3");
+        assert_eq!(loaded[0].play_count, None);
+        assert_eq!(loaded[0].rating, None);
+
+        assert_eq!(loaded[1].play_count, Some(7));
+        assert_eq!(loaded[1].rating, None);
+
+        assert_eq!(loaded[2].play_count, Some(12));
+        assert_eq!(loaded[2].rating, Some(80));
+
+        // CRLF row: lines() strips \r\n, so the rating parses cleanly.
+        assert_eq!(loaded[3].name, "A/B/crlf.mp3");
+        assert_eq!(loaded[3].play_count, Some(3));
+        assert_eq!(loaded[3].rating, Some(60));
+
+        let _ = std::fs::remove_file(path);
     }
 
     // -- extract_album_art tests --
@@ -2773,7 +2821,7 @@ mod tests {
             },
             sample_entry("Artist/Album/never.mp3", 101),
         ];
-        cache.save(&entries, 1_000);
+        cache.save(&entries, 1_000).expect("save");
 
         let (_, loaded) = cache.load().unwrap();
         assert_eq!(loaded.len(), 2);
@@ -2832,7 +2880,7 @@ mod tests {
             },
             sample_entry("Artist/Album/unrated.mp3", 201),
         ];
-        cache.save(&entries, 1_000);
+        cache.save(&entries, 1_000).expect("save");
 
         let (_, loaded) = cache.load().unwrap();
         assert_eq!(loaded.len(), 2);

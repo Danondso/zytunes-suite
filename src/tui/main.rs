@@ -322,14 +322,12 @@ fn run_loop(
                         app.toggle_album_art_style();
                     }
                     KeyCode::Char('I') => {
-                        // Library-only: device-side TrackInfo lacks the
-                        // extended metadata that makes the popup useful.
-                        if app.active_panel == Panel::TrackList
-                            && app.browse_mode == BrowseMode::Library
-                        {
+                        // Works in both browse modes: in Library mode the
+                        // popup pulls extended lofty fields from the library
+                        // Track; in Device mode it shows the device-side
+                        // playcount/rating with library fields collapsed.
+                        if app.active_panel == Panel::TrackList {
                             app.open_track_info();
-                        } else if app.active_panel == Panel::TrackList {
-                            app.set_toast("Track info available in Library view".into(), false);
                         }
                     }
                     KeyCode::Char('P') => {
