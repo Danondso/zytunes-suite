@@ -82,13 +82,34 @@ fn load_raw(dir_path: &str) -> Option<CachedLibrary> {
 
 fn save_raw(dir_path: &str, cached: &CachedLibrary) {
     let Some(path) = cache_path(&dirlib_cache_name(dir_path)) else {
+        eprintln!("zytunes: cache: HOME unset, cannot persist library cache");
         return;
     };
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!("zytunes: cache: mkdir {} failed: {e}", parent.display());
+            return;
+        }
     }
-    if let Ok(data) = serde_json::to_vec(cached) {
-        let _ = std::fs::write(&path, data);
+    let data = match serde_json::to_vec(cached) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!(
+                "zytunes: cache: serialize {} files failed: {e}",
+                cached.files.len()
+            );
+            return;
+        }
+    };
+    if let Err(e) = std::fs::write(&path, &data) {
+        // Silent failure here is the worst-case UX: every launch re-runs the
+        // full lofty + chromaprint pass because the previous run's work
+        // never landed on disk. Surface it loudly.
+        eprintln!(
+            "zytunes: cache: write {} ({} bytes) failed: {e}",
+            path.display(),
+            data.len()
+        );
     }
 }
 

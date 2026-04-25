@@ -13,7 +13,9 @@
 use std::path::Path;
 
 use base64::engine::{general_purpose::URL_SAFE_NO_PAD, Engine};
+use lofty::config::ParseOptions;
 use lofty::file::TaggedFileExt;
+use lofty::probe::Probe;
 use lofty::tag::{ItemKey, ItemValue};
 use rusty_chromaprint::{Configuration, FingerprintCompressor, Fingerprinter};
 use symphonia::core::audio::SampleBuffer;
@@ -43,7 +45,17 @@ const FINGERPRINT_SECONDS: u64 = 120;
 ///
 /// Returns the stored string verbatim — it's opaque to callers.
 pub fn read_embedded_fingerprint(path: &Path) -> Option<String> {
-    let tagged = lofty::probe::read_from_path(path).ok()?;
+    // Skip the properties parse — we only need the tag. For VBR MP3, the
+    // properties pass scans frames across the whole file for duration, which
+    // costs ~100x more than the tag read alone. Hot path on every cached
+    // track that lacks a stored fingerprint.
+    let tagged = Probe::open(path)
+        .ok()?
+        .options(ParseOptions::new().read_properties(false))
+        .guess_file_type()
+        .ok()?
+        .read()
+        .ok()?;
     let tag = tagged.primary_tag().or_else(|| tagged.first_tag())?;
 
     for item in tag.items() {
@@ -134,11 +146,15 @@ pub fn compute_fingerprint(path: &Path) -> Option<String> {
             Err(_) => continue,
         };
 
-        if sbuf.is_none() {
-            sbuf = Some(SampleBuffer::new(
-                decoded.capacity() as u64,
-                *decoded.spec(),
-            ));
+        // SampleBuffer must be at least as large as the largest packet's
+        // capacity, otherwise `copy_interleaved_ref` writes past the end.
+        // M4A and other variable-frame containers can produce packets larger
+        // than the first one, so grow the buffer on demand instead of
+        // sizing-once-from-first-packet.
+        let needed = decoded.capacity() as u64;
+        let needs_alloc = sbuf.as_ref().is_none_or(|b| (b.capacity() as u64) < needed);
+        if needs_alloc {
+            sbuf = Some(SampleBuffer::new(needed, *decoded.spec()));
         }
         let buf = sbuf.as_mut().expect("sample buffer initialised above");
         buf.copy_interleaved_ref(decoded);
@@ -237,6 +253,20 @@ mod tests {
         let path = dir.join("not-audio.wav");
         fs::write(&path, b"this is not audio, it's just bytes").unwrap();
         assert!(compute_fingerprint(&path).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compute_fingerprint_handles_multi_packet_audio() {
+        // A 60-second WAV decodes across many packets. The earlier bug sized
+        // SampleBuffer once from the first packet's capacity and wrote past
+        // the end if a later packet was larger; this test makes sure long
+        // files complete cleanly.
+        let dir = fresh_dir("multi-packet");
+        let path = dir.join("long.wav");
+        write_sine_wav(&path, 60);
+        let fp = compute_fingerprint(&path).expect("60s WAV must fingerprint");
+        assert!(!fp.is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 

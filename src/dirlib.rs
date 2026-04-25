@@ -106,13 +106,26 @@ impl DirectoryLibrary {
                 let key = p.to_string_lossy().to_string();
                 let fingerprint = crate::cache::FileFingerprint::from_path(p)?;
 
-                let mut track = match cached.get(&key) {
-                    Some(entry) if entry.fingerprint == fingerprint => entry.track.clone(),
-                    _ => build_track(p, hash_path(p)),
+                let (mut track, came_from_cache) = match cached.get(&key) {
+                    Some(entry) if entry.fingerprint == fingerprint => (entry.track.clone(), true),
+                    _ => (build_track(p, hash_path(p)), false),
                 };
 
                 if track.acoustic_id.is_none() {
-                    track.acoustic_id = crate::fingerprint::fingerprint_for(p);
+                    // Fresh-parse already tried `read_embedded_fingerprint`
+                    // inside `track_from_lofty`; if that turned up nothing,
+                    // re-trying it would just re-open + re-parse the tag for
+                    // a guaranteed second `None`. Skip straight to compute.
+                    //
+                    // Cache-hit paths take the full pipeline: a pre-existing
+                    // cache from before the field was added has acoustic_id
+                    // = None despite the file possibly carrying a tag, so
+                    // the embedded read is worth attempting once.
+                    track.acoustic_id = if came_from_cache {
+                        crate::fingerprint::fingerprint_for(p)
+                    } else {
+                        crate::fingerprint::compute_fingerprint(p)
+                    };
                 }
 
                 let n = completed.fetch_add(1, Ordering::Relaxed) + 1;
