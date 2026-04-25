@@ -84,10 +84,21 @@ impl DirectoryLibrary {
         // `read_properties` on.
         //
         // Acoustic fingerprint is computed if (a) the file is fresh, or (b)
-        // the cached track predates the acoustic-fingerprint field and so
-        // carries `None` — computing one from an unchanged file is safe
-        // because chromaprint is content-derived. Cached tracks that already
-        // have an `acoustic_id` are reused verbatim.
+        // the cached track has `acoustic_id == None`. Case (b) covers two
+        // distinct situations:
+        //   - cache predates the field (post-upgrade backfill), and
+        //   - earlier scan tried to fingerprint and got `None` (corrupt /
+        //     unsupported codec / too-short clip).
+        //
+        // The retry on case-2 is INTENTIONAL: not caching negative results
+        // means a file that becomes fingerprintable later (codec support
+        // improves, broken file is repaired or re-downloaded) automatically
+        // picks up its fingerprint without a cache wipe. The cost is one
+        // extra decode per launch per pathological file — bounded by the
+        // (mtime,size) outer cache to actually-pathological files only,
+        // and small relative to the value of self-healing on case 2.
+        //
+        // Cached tracks that already have an `acoustic_id` are reused as-is.
         let completed = AtomicU64::new(0);
         let entries: Vec<(String, crate::cache::CachedFile)> = paths
             .par_iter()
@@ -601,41 +612,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// Write a short 440 Hz sine-wave WAV — decodable by symphonia, so the
-    /// fingerprint step can produce a real `acoustic_id`.
-    fn write_sine_wav(path: &Path, seconds: u32) {
-        use std::io::Write;
-        let sample_rate: u32 = 44_100;
-        let channels: u16 = 1;
-        let bits: u16 = 16;
-        let frames = sample_rate * seconds;
-        let data_size = frames * u32::from(channels) * u32::from(bits) / 8;
-        let byte_rate = sample_rate * u32::from(channels) * u32::from(bits) / 8;
-        let block_align = channels * bits / 8;
-        let riff_size = 36 + data_size;
-
-        let mut f = fs::File::create(path).unwrap();
-        f.write_all(b"RIFF").unwrap();
-        f.write_all(&riff_size.to_le_bytes()).unwrap();
-        f.write_all(b"WAVE").unwrap();
-        f.write_all(b"fmt ").unwrap();
-        f.write_all(&16u32.to_le_bytes()).unwrap();
-        f.write_all(&1u16.to_le_bytes()).unwrap();
-        f.write_all(&channels.to_le_bytes()).unwrap();
-        f.write_all(&sample_rate.to_le_bytes()).unwrap();
-        f.write_all(&byte_rate.to_le_bytes()).unwrap();
-        f.write_all(&block_align.to_le_bytes()).unwrap();
-        f.write_all(&bits.to_le_bytes()).unwrap();
-        f.write_all(b"data").unwrap();
-        f.write_all(&data_size.to_le_bytes()).unwrap();
-        let mut pcm = Vec::with_capacity(data_size as usize);
-        for i in 0..frames {
-            let t = i as f32 / sample_rate as f32;
-            let v = ((t * 440.0 * std::f32::consts::TAU).sin() * 30_000.0) as i16;
-            pcm.extend_from_slice(&v.to_le_bytes());
-        }
-        f.write_all(&pcm).unwrap();
-    }
+    use crate::test_audio::write_sine_wav;
 
     #[test]
     fn scan_populates_acoustic_id_for_real_audio() {

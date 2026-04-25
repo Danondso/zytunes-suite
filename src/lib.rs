@@ -7,6 +7,9 @@ pub mod library;
 pub mod mtp;
 pub mod paths;
 
+#[cfg(test)]
+mod test_audio;
+
 use device::{
     DetectedDevice, DeviceBackend, DeviceCapabilities, DeviceFamily, IpodBackend, ZuneBackend,
 };

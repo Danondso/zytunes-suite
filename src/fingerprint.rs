@@ -171,128 +171,17 @@ pub fn fingerprint_for(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_audio::{write_silence_wav, write_sine_wav};
     use std::fs;
-    use std::io::Write;
 
-    fn temp_file(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join("zytunes-fp-tests");
-        let _ = fs::create_dir_all(&dir);
-        dir.join(name)
-    }
-
-    fn write_silence_wav(path: &Path, seconds: u32) {
-        // Minimal PCM WAV: 44.1 kHz, stereo, 16-bit, all-zero samples.
-        let sample_rate: u32 = 44_100;
-        let channels: u16 = 2;
-        let bits: u16 = 16;
-        let frames = sample_rate * seconds;
-        let data_size = frames * u32::from(channels) * u32::from(bits) / 8;
-        let byte_rate = sample_rate * u32::from(channels) * u32::from(bits) / 8;
-        let block_align = channels * bits / 8;
-        let riff_size = 36 + data_size;
-
-        let mut f = fs::File::create(path).unwrap();
-        f.write_all(b"RIFF").unwrap();
-        f.write_all(&riff_size.to_le_bytes()).unwrap();
-        f.write_all(b"WAVE").unwrap();
-        f.write_all(b"fmt ").unwrap();
-        f.write_all(&16u32.to_le_bytes()).unwrap();
-        f.write_all(&1u16.to_le_bytes()).unwrap();
-        f.write_all(&channels.to_le_bytes()).unwrap();
-        f.write_all(&sample_rate.to_le_bytes()).unwrap();
-        f.write_all(&byte_rate.to_le_bytes()).unwrap();
-        f.write_all(&block_align.to_le_bytes()).unwrap();
-        f.write_all(&bits.to_le_bytes()).unwrap();
-        f.write_all(b"data").unwrap();
-        f.write_all(&data_size.to_le_bytes()).unwrap();
-        // All-zero PCM — writing a big zero buffer.
-        let zeros = vec![0u8; data_size as usize];
-        f.write_all(&zeros).unwrap();
-    }
-
-    fn write_sine_wav(path: &Path, seconds: u32) {
-        let sample_rate: u32 = 44_100;
-        let channels: u16 = 1;
-        let bits: u16 = 16;
-        let frames = sample_rate * seconds;
-        let data_size = frames * u32::from(channels) * u32::from(bits) / 8;
-        let byte_rate = sample_rate * u32::from(channels) * u32::from(bits) / 8;
-        let block_align = channels * bits / 8;
-        let riff_size = 36 + data_size;
-
-        let mut f = fs::File::create(path).unwrap();
-        f.write_all(b"RIFF").unwrap();
-        f.write_all(&riff_size.to_le_bytes()).unwrap();
-        f.write_all(b"WAVE").unwrap();
-        f.write_all(b"fmt ").unwrap();
-        f.write_all(&16u32.to_le_bytes()).unwrap();
-        f.write_all(&1u16.to_le_bytes()).unwrap();
-        f.write_all(&channels.to_le_bytes()).unwrap();
-        f.write_all(&sample_rate.to_le_bytes()).unwrap();
-        f.write_all(&byte_rate.to_le_bytes()).unwrap();
-        f.write_all(&block_align.to_le_bytes()).unwrap();
-        f.write_all(&bits.to_le_bytes()).unwrap();
-        f.write_all(b"data").unwrap();
-        f.write_all(&data_size.to_le_bytes()).unwrap();
-
-        // 440 Hz sine so chromaprint actually has signal to latch onto.
-        let mut pcm = Vec::with_capacity(data_size as usize);
-        for i in 0..frames {
-            let t = i as f32 / sample_rate as f32;
-            let s = (t * 440.0 * std::f32::consts::TAU).sin();
-            let v = (s * 30_000.0) as i16;
-            pcm.extend_from_slice(&v.to_le_bytes());
-        }
-        f.write_all(&pcm).unwrap();
-    }
-
-    #[test]
-    fn compute_fingerprint_emits_something_for_real_audio() {
-        let path = temp_file("sine.wav");
-        write_sine_wav(&path, 10);
-        let fp = compute_fingerprint(&path);
-        let fp = fp.expect("should produce a fingerprint for 10s of audio");
-        // URL-safe base64, no padding; Chromaprint compressed form is always
-        // > 0 bytes for any non-empty signal.
-        assert!(!fp.is_empty());
-        assert!(!fp.contains('='), "URL-safe-no-pad encoding drops '='");
-        assert!(
-            !fp.contains('+') && !fp.contains('/'),
-            "URL-safe encoding uses '-' and '_' not '+/'"
-        );
-    }
-
-    #[test]
-    fn compute_fingerprint_is_deterministic() {
-        let path = temp_file("sine-det.wav");
-        write_sine_wav(&path, 10);
-        let a = compute_fingerprint(&path).unwrap();
-        let b = compute_fingerprint(&path).unwrap();
-        assert_eq!(a, b, "same file must produce identical fingerprints");
-    }
-
-    #[test]
-    fn compute_fingerprint_returns_none_for_non_audio() {
-        let path = temp_file("not-audio.wav");
-        fs::write(&path, b"this is not audio, it's just bytes").unwrap();
-        assert!(compute_fingerprint(&path).is_none());
-    }
-
-    #[test]
-    fn compute_fingerprint_handles_short_silence() {
-        // Chromaprint needs enough signal to emit hashes; silence may produce
-        // a degenerate fingerprint. The contract is only "no panic, no error"
-        // — an empty result maps to None, which is acceptable.
-        let path = temp_file("silence.wav");
-        write_silence_wav(&path, 2);
-        let _ = compute_fingerprint(&path); // must not panic
-    }
-
-    #[test]
-    fn read_embedded_fingerprint_absent_returns_none() {
-        let path = temp_file("no-tag.wav");
-        write_sine_wav(&path, 1);
-        assert!(read_embedded_fingerprint(&path).is_none());
+    /// Per-test scratch dir under one shared `zytunes-fp-tests/` parent so
+    /// `cargo test` cleanup removes it all in one shot. Each test owns its
+    /// subdir and tears it down on exit, mirroring the dirlib test pattern.
+    fn fresh_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join("zytunes-fp-tests").join(name);
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     /// Write an ID3v2 tag with the given `ACOUSTID_FINGERPRINT`-style
@@ -314,8 +203,68 @@ mod tests {
     }
 
     #[test]
+    fn compute_fingerprint_emits_something_for_real_audio() {
+        let dir = fresh_dir("emits-real-audio");
+        let path = dir.join("sine.wav");
+        write_sine_wav(&path, 10);
+        let fp = compute_fingerprint(&path);
+        let fp = fp.expect("should produce a fingerprint for 10s of audio");
+        // URL-safe base64, no padding; Chromaprint compressed form is always
+        // > 0 bytes for any non-empty signal.
+        assert!(!fp.is_empty());
+        assert!(!fp.contains('='), "URL-safe-no-pad encoding drops '='");
+        assert!(
+            !fp.contains('+') && !fp.contains('/'),
+            "URL-safe encoding uses '-' and '_' not '+/'"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compute_fingerprint_is_deterministic() {
+        let dir = fresh_dir("deterministic");
+        let path = dir.join("sine.wav");
+        write_sine_wav(&path, 10);
+        let a = compute_fingerprint(&path).unwrap();
+        let b = compute_fingerprint(&path).unwrap();
+        assert_eq!(a, b, "same file must produce identical fingerprints");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compute_fingerprint_returns_none_for_non_audio() {
+        let dir = fresh_dir("non-audio");
+        let path = dir.join("not-audio.wav");
+        fs::write(&path, b"this is not audio, it's just bytes").unwrap();
+        assert!(compute_fingerprint(&path).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compute_fingerprint_handles_short_silence() {
+        // Chromaprint needs enough signal to emit hashes; silence may produce
+        // a degenerate fingerprint. The contract is only "no panic, no error"
+        // — an empty result maps to None, which is acceptable.
+        let dir = fresh_dir("short-silence");
+        let path = dir.join("silence.wav");
+        write_silence_wav(&path, 2);
+        let _ = compute_fingerprint(&path); // must not panic
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_embedded_fingerprint_absent_returns_none() {
+        let dir = fresh_dir("absent-tag");
+        let path = dir.join("no-tag.wav");
+        write_sine_wav(&path, 1);
+        assert!(read_embedded_fingerprint(&path).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn read_embedded_fingerprint_returns_tag_value() {
-        let path = temp_file("tagged.wav");
+        let dir = fresh_dir("tagged");
+        let path = dir.join("tagged.wav");
         write_sine_wav(&path, 1);
         write_acoustid_id3_tag(
             &path,
@@ -326,13 +275,15 @@ mod tests {
 
         let got = read_embedded_fingerprint(&path);
         assert_eq!(got.as_deref(), Some("AQADtEmUaEmS5Ac"));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn read_embedded_fingerprint_matches_uppercase_key() {
         // Some taggers write `ACOUSTID_FINGERPRINT` as the ID3 TXXX
         // description; match it case-insensitively.
-        let path = temp_file("tagged-upper.wav");
+        let dir = fresh_dir("tagged-upper");
+        let path = dir.join("tagged.wav");
         write_sine_wav(&path, 1);
         write_acoustid_id3_tag(
             &path,
@@ -343,11 +294,13 @@ mod tests {
 
         let got = read_embedded_fingerprint(&path);
         assert_eq!(got.as_deref(), Some("AQADtEmUaEmS5Ac"));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn fingerprint_for_prefers_embedded_tag_over_compute() {
-        let path = temp_file("prefers-tag.wav");
+        let dir = fresh_dir("prefers-tag");
+        let path = dir.join("prefers.wav");
         write_sine_wav(&path, 5);
         // An obviously fake value that could never come out of compute().
         write_acoustid_id3_tag(
@@ -362,5 +315,6 @@ mod tests {
             got, "SENTINEL-NOT-A-REAL-FP",
             "fingerprint_for must short-circuit on the embedded tag"
         );
+        let _ = fs::remove_dir_all(&dir);
     }
 }
