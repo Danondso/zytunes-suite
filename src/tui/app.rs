@@ -656,6 +656,19 @@ pub struct App {
     pub show_theme_picker: bool,
     pub theme_picker_index: usize,
     pub theme_before_picker: &'static Theme,
+    /// Track-info inspector popup. Shown only when the focused panel is
+    /// `Panel::TrackList`; closed on any navigation that changes the
+    /// selection (`move_up`/`move_down`, panel cycle, sidebar/album select).
+    pub show_track_info: bool,
+    /// Vertical scroll offset for the track-info popup body. Optimistic
+    /// (incremented on key down without knowing visible height); render
+    /// clamps to the actual `total - visible` upper bound.
+    pub track_info_scroll: usize,
+    /// Library `Track` resolved at popup-open time. Cached here so the
+    /// renderer reads it directly each frame instead of re-running an O(N)
+    /// `tracks_by_name` linear scan on every ~50 ms tick while the popup is
+    /// visible. `None` when the popup is closed or no library row matched.
+    pub track_info_lib: Option<Track>,
     /// Per-artist device presence for sidebar indicators (Library browse mode).
     pub artist_device_status: BTreeMap<String, DevicePresence>,
     /// Per-(artist, album) device presence for album-list indicators.
@@ -801,6 +814,9 @@ impl App {
             theme: all_themes()[0],
             show_theme_picker: false,
             theme_picker_index: 0,
+            show_track_info: false,
+            track_info_scroll: 0,
+            track_info_lib: None,
             theme_before_picker: all_themes()[0],
             artist_device_status: BTreeMap::new(),
             album_device_status: BTreeMap::new(),
@@ -906,6 +922,61 @@ impl App {
     pub fn theme_picker_cancel(&mut self) {
         self.theme = self.theme_before_picker;
         self.show_theme_picker = false;
+    }
+
+    // -- Track-info popup --
+
+    /// Open the metadata-inspector popup for the currently selected track.
+    /// No-op (and silently keeps the popup closed) when the track list is
+    /// empty — there is no row to describe.
+    ///
+    /// Resolves the matching library `Track` once and stashes it in
+    /// `track_info_lib` so the per-frame renderer does not re-walk the
+    /// library on every ~50 ms tick while the popup is open.
+    pub fn open_track_info(&mut self) {
+        let Some(track) = self.track_list.get(self.track_selected) else {
+            return;
+        };
+        let resolved = self.library.as_ref().and_then(|lib| {
+            lib.tracks_by_name(&track.name)
+                .find(|t| {
+                    t.artist.eq_ignore_ascii_case(&track.artist)
+                        && t.album.eq_ignore_ascii_case(&track.album)
+                })
+                .cloned()
+        });
+        self.track_info_lib = resolved;
+        self.track_info_scroll = 0;
+        self.show_track_info = true;
+    }
+
+    pub fn close_track_info(&mut self) {
+        self.show_track_info = false;
+        self.track_info_scroll = 0;
+        self.track_info_lib = None;
+    }
+
+    /// Move the popup scroll cursor by `delta` rows. Negative values clamp
+    /// at zero; positive values are clamped against the actual content
+    /// height in the renderer (the App layer doesn't know the popup's
+    /// rendered visible height — same trick `compute_scroll` uses for the
+    /// main track table).
+    pub fn track_info_move(&mut self, delta: isize) {
+        let next = self.track_info_scroll as isize + delta;
+        self.track_info_scroll = next.max(0) as usize;
+    }
+
+    /// Page-sized jump (matches the log-pane page step).
+    pub fn track_info_page(&mut self, delta: isize) {
+        self.track_info_move(delta * 10);
+    }
+
+    pub fn track_info_home(&mut self) {
+        self.track_info_scroll = 0;
+    }
+
+    pub fn track_info_end(&mut self) {
+        self.track_info_scroll = usize::MAX;
     }
 
     // -- Playback controls --
@@ -2207,6 +2278,7 @@ impl App {
             Panel::TrackList => {
                 if self.track_selected > 0 {
                     self.track_selected -= 1;
+                    self.close_track_info();
                 }
             }
             Panel::Device => {
@@ -2242,6 +2314,7 @@ impl App {
             Panel::TrackList => {
                 if self.track_selected + 1 < self.track_list.len() {
                     self.track_selected += 1;
+                    self.close_track_info();
                 }
             }
             Panel::Device => {
@@ -2369,6 +2442,7 @@ impl App {
     }
 
     pub fn cycle_panel(&mut self) {
+        self.close_track_info();
         self.active_panel = match self.active_panel {
             Panel::Library => {
                 if self.has_album_browser() {
@@ -2385,6 +2459,7 @@ impl App {
     }
 
     pub fn cycle_panel_back(&mut self) {
+        self.close_track_info();
         self.active_panel = match self.active_panel {
             Panel::Library => Panel::SyncQueue,
             Panel::Albums => Panel::Library,
@@ -4200,6 +4275,233 @@ mod tests {
         assert!(!app.show_theme_picker);
     }
 
+    // -- Track-info popup tests --
+
+    fn populate_track_list(app: &mut App, names: &[&str]) {
+        for n in names {
+            app.track_list.push(TrackInfo::new(
+                (*n).to_string(),
+                "Artist".into(),
+                "Album".into(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+            ));
+        }
+    }
+
+    #[test]
+    fn track_info_open_noop_on_empty_list() {
+        let mut app = App::new();
+        app.active_panel = Panel::TrackList;
+        app.open_track_info();
+        assert!(
+            !app.show_track_info,
+            "open_track_info on an empty list must stay closed"
+        );
+    }
+
+    #[test]
+    fn track_info_open_sets_visible() {
+        let mut app = App::new();
+        app.active_panel = Panel::TrackList;
+        populate_track_list(&mut app, &["Idioteque"]);
+        app.open_track_info();
+        assert!(app.show_track_info);
+        assert_eq!(app.track_info_scroll, 0);
+    }
+
+    #[test]
+    fn track_info_close_resets_scroll() {
+        let mut app = App::new();
+        app.active_panel = Panel::TrackList;
+        populate_track_list(&mut app, &["Idioteque"]);
+        app.open_track_info();
+        app.track_info_move(5);
+        app.close_track_info();
+        assert!(!app.show_track_info);
+        assert_eq!(app.track_info_scroll, 0);
+    }
+
+    #[test]
+    fn track_info_scroll_does_not_underflow() {
+        let mut app = App::new();
+        app.active_panel = Panel::TrackList;
+        populate_track_list(&mut app, &["Idioteque"]);
+        app.open_track_info();
+        app.track_info_move(-1);
+        app.track_info_move(-5);
+        assert_eq!(app.track_info_scroll, 0);
+    }
+
+    #[test]
+    fn track_info_home_resets_to_top() {
+        let mut app = App::new();
+        app.active_panel = Panel::TrackList;
+        populate_track_list(&mut app, &["Idioteque"]);
+        app.open_track_info();
+        app.track_info_move(8);
+        app.track_info_home();
+        assert_eq!(app.track_info_scroll, 0);
+    }
+
+    #[test]
+    fn track_info_closes_on_panel_cycle() {
+        let mut app = App::new();
+        app.active_panel = Panel::TrackList;
+        populate_track_list(&mut app, &["Idioteque"]);
+        app.open_track_info();
+        app.cycle_panel();
+        assert!(
+            !app.show_track_info,
+            "cycle_panel should dismiss the popup since selection context is changing"
+        );
+    }
+
+    #[test]
+    fn track_info_closes_on_track_selection_change() {
+        let mut app = App::new();
+        app.active_panel = Panel::TrackList;
+        populate_track_list(&mut app, &["Idioteque", "Optimistic"]);
+        app.track_selected = 0;
+        app.open_track_info();
+        app.move_down();
+        assert!(
+            !app.show_track_info,
+            "moving the track-list selection should dismiss the popup"
+        );
+    }
+
+    /// Bare-bones in-memory `MusicLibrary` for tests that need to exercise
+    /// the popup's library-lookup cache. Mirrors the shape of `TestLibrary`
+    /// in `src/lib.rs`, kept tiny — only the methods the tests touch.
+    struct PopupTestLib {
+        tracks: Vec<zytunes::library::Track>,
+    }
+
+    impl zytunes::library::MusicLibrary for PopupTestLib {
+        fn artists(&self) -> Vec<&str> {
+            Vec::new()
+        }
+        fn albums(&self) -> Vec<(&str, &str)> {
+            Vec::new()
+        }
+        fn artist_tracks<'a>(
+            &'a self,
+            _artist: &str,
+        ) -> Box<dyn Iterator<Item = &'a zytunes::library::Track> + 'a> {
+            Box::new(std::iter::empty())
+        }
+        fn album_tracks<'a>(
+            &'a self,
+            _album: &str,
+        ) -> Box<dyn Iterator<Item = &'a zytunes::library::Track> + 'a> {
+            Box::new(std::iter::empty())
+        }
+        fn album_tracks_by_artist<'a>(
+            &'a self,
+            _artist: &str,
+            _album: &str,
+        ) -> Box<dyn Iterator<Item = &'a zytunes::library::Track> + 'a> {
+            Box::new(std::iter::empty())
+        }
+        fn tracks_by_name<'a>(
+            &'a self,
+            name: &str,
+        ) -> Box<dyn Iterator<Item = &'a zytunes::library::Track> + 'a> {
+            let name = name.to_string();
+            Box::new(
+                self.tracks
+                    .iter()
+                    .filter(move |t| t.name.eq_ignore_ascii_case(&name)),
+            )
+        }
+        fn track_count(&self) -> usize {
+            self.tracks.len()
+        }
+        fn all_tracks(&self) -> Box<dyn Iterator<Item = &zytunes::library::Track> + '_> {
+            Box::new(self.tracks.iter())
+        }
+        fn music_folder(&self) -> Option<&str> {
+            None
+        }
+    }
+
+    #[test]
+    fn track_info_open_caches_library_track() {
+        // The popup renderer reads `app.track_info_lib` rather than walking
+        // the library on every frame. Verify the cached lookup is populated
+        // on open (matching by case-insensitive artist+album+name) and
+        // cleared on close.
+        let mut app = App::new();
+        app.active_panel = Panel::TrackList;
+        let lib = PopupTestLib {
+            tracks: vec![
+                zytunes::library::Track {
+                    id: 1,
+                    name: "Idioteque".into(),
+                    artist: "Radiohead".into(),
+                    album: "Kid A".into(),
+                    composer: Some("Thom Yorke".into()),
+                    ..Default::default()
+                },
+                zytunes::library::Track {
+                    id: 2,
+                    name: "Decoy".into(),
+                    artist: "Other".into(),
+                    album: "Other".into(),
+                    ..Default::default()
+                },
+            ],
+        };
+        app.library = Some(Box::new(lib));
+        app.track_list.push(TrackInfo::new(
+            "Idioteque".into(),
+            "RADIOHEAD".into(), // case mismatch on purpose
+            "Kid A".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        ));
+        app.track_selected = 0;
+
+        app.open_track_info();
+        let cached = app
+            .track_info_lib
+            .as_ref()
+            .expect("library lookup should resolve to a Track on open");
+        assert_eq!(cached.id, 1);
+        assert_eq!(cached.composer.as_deref(), Some("Thom Yorke"));
+
+        app.close_track_info();
+        assert!(
+            app.track_info_lib.is_none(),
+            "close_track_info must drop the cached library reference"
+        );
+    }
+
+    #[test]
+    fn track_info_open_caches_none_when_no_match() {
+        // Track is in the TUI list but does not exist in the library — the
+        // cache should be `None`, not panic, and the popup still opens with
+        // just the TrackInfo identity fields.
+        let mut app = App::new();
+        app.active_panel = Panel::TrackList;
+        app.library = Some(Box::new(PopupTestLib { tracks: Vec::new() }));
+        populate_track_list(&mut app, &["Orphan"]);
+        app.open_track_info();
+        assert!(app.show_track_info);
+        assert!(app.track_info_lib.is_none());
+    }
+
     // -- Playback tests --
 
     #[test]
@@ -4698,14 +5000,7 @@ mod tests {
                 name: name.into(),
                 artist: artist.into(),
                 album: album.into(),
-                genre: None,
-                year: None,
-                track_number: None,
-                disc_number: None,
-                total_time_ms: None,
-                location: None,
-                kind: None,
-                acoustic_id: None,
+                ..Default::default()
             }
         }
 

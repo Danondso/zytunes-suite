@@ -995,42 +995,21 @@ mod tests {
                     name: "Creep".into(),
                     artist: "Radiohead".into(),
                     album: "Pablo Honey".into(),
-                    genre: None,
-                    year: None,
-                    track_number: None,
-                    disc_number: None,
-                    total_time_ms: None,
-                    location: None,
-                    kind: None,
-                    acoustic_id: None,
+                    ..Default::default()
                 },
                 library::Track {
                     id: 2,
                     name: "Karma Police".into(),
                     artist: "Radiohead".into(),
                     album: "OK Computer".into(),
-                    genre: None,
-                    year: None,
-                    track_number: None,
-                    disc_number: None,
-                    total_time_ms: None,
-                    location: None,
-                    kind: None,
-                    acoustic_id: None,
+                    ..Default::default()
                 },
                 library::Track {
                     id: 3,
                     name: "Army of Me".into(),
                     artist: "Bjork".into(),
                     album: "Post".into(),
-                    genre: None,
-                    year: None,
-                    track_number: None,
-                    disc_number: None,
-                    total_time_ms: None,
-                    location: None,
-                    kind: None,
-                    acoustic_id: None,
+                    ..Default::default()
                 },
             ],
         }
@@ -1303,14 +1282,8 @@ mod tests {
             name: name.into(),
             artist: artist.into(),
             album: album.into(),
-            genre: None,
-            year: None,
-            track_number: None,
-            disc_number: None,
-            total_time_ms: None,
             location: Some(path.into()),
-            kind: None,
-            acoustic_id: None,
+            ..Default::default()
         }
     }
 

@@ -29,6 +29,7 @@ A Rust tool for syncing music (and photos/videos on Zune) to a Microsoft Zune 30
 - **Device track removal** — in device view mode, `a`/`A` removes selected tracks, albums, or artists from the device. Progress is shown during removal and the device track list auto-refreshes afterward
 - **Album-art rendering** — two renderers: unicode `halfblock` (default) and a 10-char luminance ramp `ascii` renderer. Press `T` to toggle; choice persists to `config.toml`. Per-album renderings are cached at `~/.cache/zytunes/art/` keyed by `(artist, album)` with `(mtime, size)` fingerprint invalidation so re-tagging refreshes automatically
 - **Audio playback** — in-TUI preview of library tracks via rodio (play/pause/skip). Press `P` to cycle the now-playing panel through auto → force-hidden → force-shown. Selected rows marquee-scroll long titles
+- **Track-info inspector** — press `I` on any library track to open a centered, scrollable popup with all parsed metadata: title/artist/album, composer / conductor / lyricist, ISRC / barcode / catalog number, all seven MusicBrainz IDs, ReplayGain values, audio properties (sample rate, bit depth, bitrate, channels), file size, encoder, and a lyrics preview. Sections are suppressed when empty so lightly-tagged tracks stay terse. Long values (file paths, MB UUIDs) marquee-scroll inside the value column
 - **Log export** — press `L` to dump the live log to `/tmp/zytunes-log.txt` and copy the path to the system clipboard
 - **USB resilience (macOS)** — the native IOKit backend recovers from transient pipe stalls via `ClearPipeStall` with a one-shot retry on both read and write paths. Read timeouts clear stalls on both bulk endpoints so the OUT pipe stays in sync with the device. When a sync/remove cascade indicates the USB session is truly gone (device unplug, `NotResponding`, unrecoverable stall, read timeout) the TUI aborts remaining work, clears the session, and prompts the user to replug
 - **Theming** — 16 built-in color themes (iTunes 2004, Gruvbox Dark/Light, Everforest Dark/Light, Tokyo Night, IBM Mainframe, Amber CRT, Windows 95, System 7, BIOS, Red Sands, Newport Lights, NeXTSTEP, WinAmp Classic, Zune Original) plus user-defined themes via `[themes."Name"]` tables in `~/.config/zytunes/config.toml`. Press `t` to open the theme picker
@@ -94,6 +95,7 @@ The album detail view shows a ZIP disk ASCII art with album metadata (artist, al
 |-----|--------|
 | `/` | Search sidebar (live filter, `Esc` to cancel) |
 | `s` | Cycle sort column (track list) |
+| `I` | Open track-info popup (Library mode, TrackList panel) — `j`/`k` or `↑`/`↓` to scroll, `g`/`G` for top/end, `Esc` to close |
 | `a` | Add selection to sync queue (library) / remove from device (device mode) |
 | `A` | Add all visible tracks / remove all visible |
 | `v` | Toggle Library / Device browse mode |

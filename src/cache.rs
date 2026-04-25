@@ -61,9 +61,23 @@ pub struct CachedFile {
     pub track: Track,
 }
 
+/// Bumped whenever the on-disk shape of a cached `Track` changes such that
+/// stale cache entries would silently carry `None` for new fields. On
+/// mismatch we discard the cache and force a re-scan so the new fields get
+/// populated rather than sitting empty until each file is re-tagged.
+///
+/// Bump history:
+///   1 → 2 (2026-04): added extended lofty metadata + audio properties
+///   (composer, isrc, mb_*, replaygain_*, sample_rate, channels, …).
+const CACHE_SCHEMA_VERSION: u32 = 2;
+
 #[derive(Serialize, Deserialize, Default)]
 struct CachedLibrary {
     root: String,
+    /// Default of `0` for caches written before the field existed — treated
+    /// as a stale schema and discarded by `load_dirlib_cache`.
+    #[serde(default)]
+    schema_version: u32,
     /// Keyed by absolute file path.
     files: HashMap<String, CachedFile>,
 }
@@ -175,14 +189,13 @@ fn save_raw(dir_path: &str, cached: &CachedLibrary, log: &Logger) {
 }
 
 /// Load the per-file cache for `dir_path`. Returns an empty map if the cache
-/// is missing, unreadable, or for a different root.
+/// is missing, unreadable, for a different root, or for an older schema.
 ///
 /// `log` receives any diagnostic messages (cache miss, parse error, etc.).
 /// Pass [`default_logger`] for the CLI, or a channel-routing closure for the TUI.
 pub fn load_dirlib_cache(dir_path: &str, log: &Logger) -> HashMap<String, CachedFile> {
     match load_raw(dir_path, log) {
-        Some(c) if c.root == dir_path => c.files,
-        Some(c) => {
+        Some(c) if c.root != dir_path => {
             // Path normalisation skew is the silent killer here — a single
             // trailing slash difference between launches (e.g. `~/Music`
             // vs `~/Music/`) silently invalidates the entire cache.
@@ -194,6 +207,19 @@ pub fn load_dirlib_cache(dir_path: &str, log: &Logger) -> HashMap<String, Cached
             ));
             HashMap::new()
         }
+        Some(c) if c.schema_version != CACHE_SCHEMA_VERSION => {
+            // A stale schema means newer `Track` fields would silently sit
+            // at `None` for every cached entry until each file's mtime
+            // changed. One forced re-scan is the smaller wart.
+            log(&format!(
+                "zytunes: cache: stored schema {} != current {} — discarding {} cached entries to force re-scan",
+                c.schema_version,
+                CACHE_SCHEMA_VERSION,
+                c.files.len()
+            ));
+            HashMap::new()
+        }
+        Some(c) => c.files,
         None => HashMap::new(),
     }
 }
@@ -206,6 +232,7 @@ pub fn save_dirlib_cache(dir_path: &str, files: HashMap<String, CachedFile>, log
         dir_path,
         &CachedLibrary {
             root: dir_path.to_string(),
+            schema_version: CACHE_SCHEMA_VERSION,
             files,
         },
         log,
@@ -248,6 +275,59 @@ mod tests {
             Some(v) => std::env::set_var("ZYTUNES_CACHE_DIR", v),
             None => std::env::remove_var("ZYTUNES_CACHE_DIR"),
         }
+    }
+
+    #[test]
+    fn cached_library_with_old_schema_is_discarded() {
+        // A cache file from before `CACHE_SCHEMA_VERSION` existed — or from
+        // any older schema — must be discarded so the next scan repopulates
+        // newly-added `Track` fields instead of leaving them all None.
+        //
+        // Uses a unique scan-root key so this test's cache file is distinct
+        // from any other test's, then writes/reads against the real `HOME`.
+        // Mutating `HOME` mid-test would race with parallel tests that read
+        // `cache_dir()` (the test runner does not serialize HOME accesses).
+        let dir_path = "/tmp/zytunes-cache-schema-test-unique-root";
+        let cache_name = dirlib_cache_name(dir_path);
+        let Some(path) = cache_path(&cache_name) else {
+            return; // HOME not set — skip (CI environments can be funny).
+        };
+
+        let stale = CachedLibrary {
+            root: dir_path.to_string(),
+            schema_version: 1,
+            files: HashMap::from([(
+                format!("{dir_path}/song.mp3"),
+                CachedFile {
+                    fingerprint: FileFingerprint {
+                        mtime_secs: 0,
+                        size: 0,
+                    },
+                    track: crate::library::Track {
+                        id: 1,
+                        name: "Stale".into(),
+                        artist: "Stale".into(),
+                        album: "Stale".into(),
+                        ..Default::default()
+                    },
+                },
+            )]),
+        };
+        let log = default_logger();
+        save_raw(dir_path, &stale, &log);
+
+        let loaded = load_dirlib_cache(dir_path, &log);
+        assert!(
+            loaded.is_empty(),
+            "load_dirlib_cache must discard caches with a stale schema_version"
+        );
+
+        // Sanity check: a fresh save round-trips with the current schema.
+        save_dirlib_cache(dir_path, HashMap::new(), &log);
+        let raw = load_raw(dir_path, &log).expect("just wrote a cache");
+        assert_eq!(raw.schema_version, CACHE_SCHEMA_VERSION);
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

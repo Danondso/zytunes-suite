@@ -247,6 +247,37 @@ fn run_loop(
                     continue;
                 }
 
+                // Track-info popup. While visible, the popup grabs scroll
+                // and dismiss keys so the underlying track list does not
+                // also navigate.
+                if app.show_track_info {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('I') => {
+                            app.close_track_info();
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            app.track_info_move(-1);
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            app.track_info_move(1);
+                        }
+                        KeyCode::PageUp => {
+                            app.track_info_page(-1);
+                        }
+                        KeyCode::PageDown => {
+                            app.track_info_page(1);
+                        }
+                        KeyCode::Char('g') => {
+                            app.track_info_home();
+                        }
+                        KeyCode::Char('G') => {
+                            app.track_info_end();
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
                 // Global keys.
                 match key.code {
                     KeyCode::Char('q') => {
@@ -289,6 +320,17 @@ fn run_loop(
                     }
                     KeyCode::Char('T') => {
                         app.toggle_album_art_style();
+                    }
+                    KeyCode::Char('I') => {
+                        // Library-only: device-side TrackInfo lacks the
+                        // extended metadata that makes the popup useful.
+                        if app.active_panel == Panel::TrackList
+                            && app.browse_mode == BrowseMode::Library
+                        {
+                            app.open_track_info();
+                        } else if app.active_panel == Panel::TrackList {
+                            app.set_toast("Track info available in Library view".into(), false);
+                        }
                     }
                     KeyCode::Char('P') => {
                         let label = app.cycle_show_player();

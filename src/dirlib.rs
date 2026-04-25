@@ -383,6 +383,7 @@ fn build_track(path: &Path, id: u64) -> Track {
 /// makes sure we only pay that cost once per file per change.
 fn track_from_lofty(path: &Path, id: u64) -> Option<Track> {
     use lofty::file::{AudioFile, TaggedFileExt};
+    use lofty::prelude::ItemKey;
     use lofty::tag::Accessor;
 
     let tagged = lofty::probe::read_from_path(path).ok()?;
@@ -413,6 +414,12 @@ fn track_from_lofty(path: &Path, id: u64) -> Option<Track> {
     // The scan loop backfills via `fingerprint_for` when this returns None.
     let acoustic_id = crate::fingerprint::read_embedded_fingerprint(path);
 
+    let s = |key: ItemKey| tag.get_string(&key).map(|v| v.to_string());
+    let parsed = |key: ItemKey| s(key).and_then(|v| v.parse().ok());
+
+    let props = tagged.properties();
+    let file_size_bytes = std::fs::metadata(path).ok().map(|m| m.len());
+
     Some(Track {
         id,
         name,
@@ -423,7 +430,7 @@ fn track_from_lofty(path: &Path, id: u64) -> Option<Track> {
         track_number: tag.track(),
         disc_number: tag.disk(),
         total_time_ms: {
-            let dur = tagged.properties().duration();
+            let dur = props.duration();
             if dur.is_zero() {
                 None
             } else {
@@ -439,6 +446,58 @@ fn track_from_lofty(path: &Path, id: u64) -> Option<Track> {
                 .to_uppercase()
         )),
         acoustic_id,
+
+        album_artist: s(ItemKey::AlbumArtist),
+        composer: s(ItemKey::Composer),
+        conductor: s(ItemKey::Conductor),
+        lyricist: s(ItemKey::Lyricist),
+        comment: s(ItemKey::Comment),
+        description: s(ItemKey::Description),
+        // ID3v2 stores BPM as `IntegerBpm` (TBPM frame); VorbisComment/MP4
+        // use the decimal `Bpm`. Try the decimal form first, then fall back.
+        bpm: s(ItemKey::Bpm)
+            .or_else(|| s(ItemKey::IntegerBpm))
+            .and_then(|v| v.parse::<f64>().ok().map(|f| f.round() as u32)),
+        initial_key: s(ItemKey::InitialKey),
+        mood: s(ItemKey::Mood),
+        language: s(ItemKey::Language),
+        isrc: s(ItemKey::Isrc),
+        barcode: s(ItemKey::Barcode),
+        catalog_number: s(ItemKey::CatalogNumber),
+        // ID3v2 stores TPUB as `Label` internally even though it represents
+        // the publisher; VorbisComment uses both keys distinctly. Try the
+        // canonical key first, then fall through to the alias.
+        publisher: s(ItemKey::Publisher).or_else(|| s(ItemKey::Label)),
+        copyright: s(ItemKey::CopyrightMessage),
+        encoder: s(ItemKey::EncoderSoftware),
+        encoder_settings: s(ItemKey::EncoderSettings),
+        original_artist: s(ItemKey::OriginalArtist),
+        original_album: s(ItemKey::OriginalAlbumTitle),
+        original_release_date: s(ItemKey::OriginalReleaseDate),
+        track_total: parsed(ItemKey::TrackTotal),
+        disc_total: parsed(ItemKey::DiscTotal),
+        lyrics: s(ItemKey::Lyrics),
+        rating: s(ItemKey::Popularimeter).and_then(|v| v.parse::<u8>().ok()),
+
+        mb_track_id: s(ItemKey::MusicBrainzTrackId),
+        mb_recording_id: s(ItemKey::MusicBrainzRecordingId),
+        mb_release_id: s(ItemKey::MusicBrainzReleaseId),
+        mb_release_group_id: s(ItemKey::MusicBrainzReleaseGroupId),
+        mb_artist_id: s(ItemKey::MusicBrainzArtistId),
+        mb_release_artist_id: s(ItemKey::MusicBrainzReleaseArtistId),
+        mb_work_id: s(ItemKey::MusicBrainzWorkId),
+
+        replaygain_track_gain: s(ItemKey::ReplayGainTrackGain),
+        replaygain_track_peak: s(ItemKey::ReplayGainTrackPeak),
+        replaygain_album_gain: s(ItemKey::ReplayGainAlbumGain),
+        replaygain_album_peak: s(ItemKey::ReplayGainAlbumPeak),
+
+        sample_rate: props.sample_rate(),
+        channels: props.channels(),
+        bit_depth: props.bit_depth(),
+        audio_bitrate_kbps: props.audio_bitrate(),
+        overall_bitrate_kbps: props.overall_bitrate(),
+        file_size_bytes,
     })
 }
 
@@ -452,11 +511,6 @@ fn track_from_path(path: &Path, id: u64) -> Track {
         name,
         artist: parent_name(path, 2),
         album: parent_name(path, 1),
-        genre: None,
-        year: None,
-        track_number: None,
-        disc_number: None,
-        total_time_ms: None,
         location: Some(path.to_string_lossy().to_string()),
         kind: Some(format!(
             "{} audio file",
@@ -465,7 +519,7 @@ fn track_from_path(path: &Path, id: u64) -> Track {
                 .unwrap_or("unknown")
                 .to_uppercase()
         )),
-        acoustic_id: None,
+        ..Default::default()
     }
 }
 
@@ -872,6 +926,128 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn build_track_reads_extended_lofty_metadata() {
+        // Tag a WAV with the full kitchen sink of metadata that
+        // `track_from_lofty` is now expected to surface — keys that previously
+        // got dropped on the floor (composer, ISRC, BPM, MusicBrainz IDs,
+        // ReplayGain values, comment) plus the audio-properties fields read
+        // from `tagged.properties()` (sample rate, channels, bit depth,
+        // bitrate, file size).
+        let dir = std::env::temp_dir().join("zytunes-dirlib-lofty-extended");
+        let _ = fs::remove_dir_all(&dir);
+        let album_dir = dir.join("Artist").join("Album");
+        fs::create_dir_all(&album_dir).unwrap();
+
+        let wav_path = album_dir.join("track.wav");
+        make_test_wav(&wav_path);
+
+        {
+            // Use ID3v2 explicitly — RIFF INFO (the WAV default) supports
+            // only a tiny subset of the keys we want to round-trip, and lofty
+            // silently drops unsupported keys when writing.
+            use lofty::file::TaggedFileExt;
+            use lofty::prelude::ItemKey;
+            use lofty::tag::{Accessor, Tag, TagExt, TagType};
+            let mut tagged = lofty::probe::read_from_path(&wav_path).unwrap();
+            tagged.insert_tag(Tag::new(TagType::Id3v2));
+            let tag = tagged
+                .tag_mut(TagType::Id3v2)
+                .expect("Id3v2 tag was just inserted");
+            tag.set_artist("Test Artist".to_string());
+            tag.set_album("Test Album".to_string());
+            tag.set_title("Test Title".to_string());
+            tag.insert_text(ItemKey::AlbumArtist, "Test Album Artist".to_string());
+            tag.insert_text(ItemKey::Composer, "Test Composer".to_string());
+            tag.insert_text(ItemKey::Conductor, "Test Conductor".to_string());
+            tag.insert_text(ItemKey::Lyricist, "Test Lyricist".to_string());
+            tag.insert_text(ItemKey::Comment, "Test comment line".to_string());
+            tag.insert_text(ItemKey::IntegerBpm, "128".to_string());
+            tag.insert_text(ItemKey::InitialKey, "Cmaj".to_string());
+            tag.insert_text(ItemKey::Mood, "Pensive".to_string());
+            tag.insert_text(ItemKey::Language, "eng".to_string());
+            tag.insert_text(ItemKey::Isrc, "USRC17607839".to_string());
+            tag.insert_text(ItemKey::Barcode, "012345678905".to_string());
+            tag.insert_text(ItemKey::CatalogNumber, "CAT-001".to_string());
+            tag.insert_text(ItemKey::Publisher, "Test Records".to_string());
+            tag.insert_text(ItemKey::CopyrightMessage, "© 2026".to_string());
+            tag.insert_text(ItemKey::TrackTotal, "12".to_string());
+            tag.insert_text(ItemKey::DiscTotal, "2".to_string());
+            // ID3v2's UFID frame requires a registered owner identifier;
+            // round-tripping `MusicBrainzRecordingId` through ID3v2 in this
+            // generic-tag form is not reliable, so we exercise
+            // `MusicBrainzReleaseId` (TXXX-based) for the MB code path.
+            tag.insert_text(
+                ItemKey::MusicBrainzReleaseId,
+                "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string(),
+            );
+            tag.insert_text(ItemKey::ReplayGainTrackGain, "-7.20 dB".to_string());
+            tag.insert_text(ItemKey::ReplayGainAlbumGain, "-6.50 dB".to_string());
+            tag.save_to_path(&wav_path, lofty::config::WriteOptions::default())
+                .unwrap();
+        }
+
+        let track = build_track(&wav_path, 7);
+
+        // Tag-derived fields.
+        assert_eq!(track.album_artist.as_deref(), Some("Test Album Artist"));
+        assert_eq!(track.composer.as_deref(), Some("Test Composer"));
+        assert_eq!(track.conductor.as_deref(), Some("Test Conductor"));
+        assert_eq!(track.lyricist.as_deref(), Some("Test Lyricist"));
+        assert_eq!(track.comment.as_deref(), Some("Test comment line"));
+        assert_eq!(track.bpm, Some(128));
+        assert_eq!(track.initial_key.as_deref(), Some("Cmaj"));
+        assert_eq!(track.mood.as_deref(), Some("Pensive"));
+        assert_eq!(track.language.as_deref(), Some("eng"));
+        assert_eq!(track.isrc.as_deref(), Some("USRC17607839"));
+        assert_eq!(track.barcode.as_deref(), Some("012345678905"));
+        assert_eq!(track.catalog_number.as_deref(), Some("CAT-001"));
+        assert_eq!(track.publisher.as_deref(), Some("Test Records"));
+        assert_eq!(track.copyright.as_deref(), Some("© 2026"));
+        assert_eq!(track.track_total, Some(12));
+        assert_eq!(track.disc_total, Some(2));
+        assert_eq!(
+            track.mb_release_id.as_deref(),
+            Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        );
+        assert_eq!(track.replaygain_track_gain.as_deref(), Some("-7.20 dB"));
+        assert_eq!(track.replaygain_album_gain.as_deref(), Some("-6.50 dB"));
+
+        // Audio properties — should always populate on a real WAV.
+        assert_eq!(track.sample_rate, Some(44_100));
+        assert_eq!(track.channels, Some(2));
+        assert_eq!(track.bit_depth, Some(16));
+        assert!(
+            track.file_size_bytes.is_some_and(|n| n > 0),
+            "file_size_bytes should be populated from the on-disk file"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn track_from_path_leaves_extended_fields_none() {
+        // The fallback path (no readable tags) should not invent metadata for
+        // the new fields — they all default to None.
+        let dir = std::env::temp_dir().join("zytunes-dirlib-pathfallback");
+        let _ = fs::remove_dir_all(&dir);
+        let album_dir = dir.join("Artist").join("Album");
+        fs::create_dir_all(&album_dir).unwrap();
+        let path = album_dir.join("01 Untagged.mp3");
+        fs::write(&path, b"not a real mp3").unwrap();
+
+        let track = track_from_path(&path, 1);
+        assert!(track.composer.is_none());
+        assert!(track.isrc.is_none());
+        assert!(track.bpm.is_none());
+        assert!(track.mb_recording_id.is_none());
+        assert!(track.replaygain_track_gain.is_none());
+        assert!(track.sample_rate.is_none());
+        assert!(track.channels.is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     use crate::test_audio::write_sine_wav;
 
     #[test]
@@ -926,14 +1102,9 @@ mod tests {
                 name: "Back Song".into(),
                 artist: "Back Artist".into(),
                 album: "Back Album".into(),
-                genre: None,
-                year: None,
-                track_number: None,
-                disc_number: None,
-                total_time_ms: None,
                 location: Some(path_key.clone()),
-                kind: None,
                 acoustic_id: None, // simulated pre-feature cache
+                ..Default::default()
             },
         };
         let mut seeded = HashMap::new();

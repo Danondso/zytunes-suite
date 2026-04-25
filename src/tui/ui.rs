@@ -27,9 +27,10 @@ use crate::anim;
 use crate::app::{
     format_duration, format_with_commas, AlbumArtCache, App, BrowseMode, DevicePresence,
     DeviceStatus, NowPlaying, Panel, PlaybackState, SidebarEntry, SidebarMode, SortColumn,
-    SyncStatus,
+    SyncStatus, TrackInfo,
 };
 use crate::theme;
+use zytunes::library::Track;
 
 /// Responsive layout dimensions computed from terminal size.
 ///
@@ -233,6 +234,12 @@ pub fn draw(f: &mut Frame, app: &App) {
     // Theme picker overlay.
     if app.show_theme_picker {
         draw_theme_picker(f, app);
+    }
+
+    // Track-info popup. Drawn before search so an active search input still
+    // sits on top, matching the precedence in the input dispatcher.
+    if app.show_track_info {
+        draw_track_info_overlay(f, app);
     }
 
     // Search overlay.
@@ -2045,6 +2052,7 @@ fn draw_help_overlay(f: &mut Frame, app: &App) {
         "  Library",
         "  /           Search sidebar",
         "  s           Cycle sort column",
+        "  I           Show track info (TrackList panel)",
         "",
         "  Sync",
         "  a           Add track to queue",
@@ -2116,6 +2124,449 @@ fn draw_theme_picker(f: &mut Frame, app: &App) {
 
     let list = List::new(items);
     f.render_widget(list, inner);
+}
+
+/// One row inside the track-info popup body. `Section` renders as a dim
+/// divider header; `Field` renders as a key/value pair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetadataRow {
+    Section(&'static str),
+    Field { key: &'static str, value: String },
+}
+
+/// Build the displayable rows for the track-info popup. The TUI's
+/// `TrackInfo` carries the always-present identity fields plus the bits the
+/// device cares about (duration, kind, on_device); when a matching library
+/// `Track` is supplied (Library browse mode), the richer extended-metadata
+/// fields (composer, ISRC, MusicBrainz IDs, audio properties, …) are
+/// surfaced too.
+///
+/// Sections are emitted **only** if at least one field inside them is
+/// non-empty — keeps the popup terse on lightly-tagged tracks.
+pub fn format_metadata_pairs(track: &TrackInfo, lib: Option<&Track>) -> Vec<MetadataRow> {
+    let mut out: Vec<MetadataRow> = Vec::new();
+
+    // -- Identity (always shown) --
+    out.push(MetadataRow::Section("Identity"));
+    out.push(MetadataRow::Field {
+        key: "Title",
+        value: track.name.clone(),
+    });
+    out.push(MetadataRow::Field {
+        key: "Artist",
+        value: track.artist.clone(),
+    });
+    if let Some(aa) = lib.and_then(|t| t.album_artist.as_ref()) {
+        out.push(MetadataRow::Field {
+            key: "Album Artist",
+            value: aa.clone(),
+        });
+    }
+    out.push(MetadataRow::Field {
+        key: "Album",
+        value: track.album.clone(),
+    });
+    let track_total = lib.and_then(|t| t.track_total);
+    if let Some(n) = track.track_number {
+        let v = match track_total {
+            Some(total) => format!("{n} / {total}"),
+            None => format!("{n}"),
+        };
+        out.push(MetadataRow::Field {
+            key: "Track #",
+            value: v,
+        });
+    }
+    let disc_total = lib.and_then(|t| t.disc_total);
+    if let Some(n) = track.disc_number {
+        let v = match disc_total {
+            Some(total) => format!("{n} / {total}"),
+            None => format!("{n}"),
+        };
+        out.push(MetadataRow::Field {
+            key: "Disc #",
+            value: v,
+        });
+    }
+
+    // -- Classification --
+    let mut class_rows: Vec<MetadataRow> = Vec::new();
+    if let Some(g) = track.genre.as_ref() {
+        class_rows.push(MetadataRow::Field {
+            key: "Genre",
+            value: g.clone(),
+        });
+    } else if let Some(g) = lib.and_then(|t| t.genre.as_ref()) {
+        class_rows.push(MetadataRow::Field {
+            key: "Genre",
+            value: g.clone(),
+        });
+    }
+    if let Some(y) = lib.and_then(|t| t.year) {
+        class_rows.push(MetadataRow::Field {
+            key: "Year",
+            value: y.to_string(),
+        });
+    }
+    if let Some(b) = lib.and_then(|t| t.bpm) {
+        class_rows.push(MetadataRow::Field {
+            key: "BPM",
+            value: b.to_string(),
+        });
+    }
+    push_lib_string(&mut class_rows, "Initial Key", lib, |t| {
+        t.initial_key.as_deref()
+    });
+    push_lib_string(&mut class_rows, "Mood", lib, |t| t.mood.as_deref());
+    push_lib_string(&mut class_rows, "Language", lib, |t| t.language.as_deref());
+    if let Some(r) = lib.and_then(|t| t.rating) {
+        class_rows.push(MetadataRow::Field {
+            key: "Rating",
+            value: format!("{r}/255"),
+        });
+    }
+    if !class_rows.is_empty() {
+        out.push(MetadataRow::Section("Classification"));
+        out.append(&mut class_rows);
+    }
+
+    // -- Credits --
+    let mut cred_rows: Vec<MetadataRow> = Vec::new();
+    push_lib_string(&mut cred_rows, "Composer", lib, |t| t.composer.as_deref());
+    push_lib_string(&mut cred_rows, "Conductor", lib, |t| t.conductor.as_deref());
+    push_lib_string(&mut cred_rows, "Lyricist", lib, |t| t.lyricist.as_deref());
+    push_lib_string(&mut cred_rows, "Original Artist", lib, |t| {
+        t.original_artist.as_deref()
+    });
+    push_lib_string(&mut cred_rows, "Original Album", lib, |t| {
+        t.original_album.as_deref()
+    });
+    push_lib_string(&mut cred_rows, "Original Release Date", lib, |t| {
+        t.original_release_date.as_deref()
+    });
+    if !cred_rows.is_empty() {
+        out.push(MetadataRow::Section("Credits"));
+        out.append(&mut cred_rows);
+    }
+
+    // -- Identifiers --
+    let mut id_rows: Vec<MetadataRow> = Vec::new();
+    if let Some(id) = lib.map(|t| t.id) {
+        id_rows.push(MetadataRow::Field {
+            key: "Library ID",
+            value: id.to_string(),
+        });
+    }
+    push_lib_string(&mut id_rows, "ISRC", lib, |t| t.isrc.as_deref());
+    push_lib_string(&mut id_rows, "Barcode", lib, |t| t.barcode.as_deref());
+    push_lib_string(&mut id_rows, "Catalog #", lib, |t| {
+        t.catalog_number.as_deref()
+    });
+    push_lib_string(&mut id_rows, "Publisher", lib, |t| t.publisher.as_deref());
+    push_lib_string(&mut id_rows, "Copyright", lib, |t| t.copyright.as_deref());
+    if !id_rows.is_empty() {
+        out.push(MetadataRow::Section("Identifiers"));
+        out.append(&mut id_rows);
+    }
+
+    // -- MusicBrainz --
+    let mut mb_rows: Vec<MetadataRow> = Vec::new();
+    push_lib_string(&mut mb_rows, "Recording ID", lib, |t| {
+        t.mb_recording_id.as_deref()
+    });
+    push_lib_string(&mut mb_rows, "Track ID", lib, |t| t.mb_track_id.as_deref());
+    push_lib_string(&mut mb_rows, "Release ID", lib, |t| {
+        t.mb_release_id.as_deref()
+    });
+    push_lib_string(&mut mb_rows, "Release Group ID", lib, |t| {
+        t.mb_release_group_id.as_deref()
+    });
+    push_lib_string(&mut mb_rows, "Work ID", lib, |t| t.mb_work_id.as_deref());
+    push_lib_string(&mut mb_rows, "Artist ID", lib, |t| {
+        t.mb_artist_id.as_deref()
+    });
+    push_lib_string(&mut mb_rows, "Release Artist ID", lib, |t| {
+        t.mb_release_artist_id.as_deref()
+    });
+    if !mb_rows.is_empty() {
+        out.push(MetadataRow::Section("MusicBrainz"));
+        out.append(&mut mb_rows);
+    }
+
+    // -- ReplayGain --
+    let mut rg_rows: Vec<MetadataRow> = Vec::new();
+    push_lib_string(&mut rg_rows, "Track Gain", lib, |t| {
+        t.replaygain_track_gain.as_deref()
+    });
+    push_lib_string(&mut rg_rows, "Track Peak", lib, |t| {
+        t.replaygain_track_peak.as_deref()
+    });
+    push_lib_string(&mut rg_rows, "Album Gain", lib, |t| {
+        t.replaygain_album_gain.as_deref()
+    });
+    push_lib_string(&mut rg_rows, "Album Peak", lib, |t| {
+        t.replaygain_album_peak.as_deref()
+    });
+    if !rg_rows.is_empty() {
+        out.push(MetadataRow::Section("ReplayGain"));
+        out.append(&mut rg_rows);
+    }
+
+    // -- Audio properties --
+    let mut audio_rows: Vec<MetadataRow> = Vec::new();
+    if let Some(k) = track.kind.as_ref() {
+        audio_rows.push(MetadataRow::Field {
+            key: "Format",
+            value: k.clone(),
+        });
+    }
+    if let Some(rate) = lib.and_then(|t| t.sample_rate) {
+        audio_rows.push(MetadataRow::Field {
+            key: "Sample Rate",
+            value: format!("{:.1} kHz", rate as f64 / 1000.0),
+        });
+    }
+    if let Some(c) = lib.and_then(|t| t.channels) {
+        audio_rows.push(MetadataRow::Field {
+            key: "Channels",
+            value: c.to_string(),
+        });
+    }
+    if let Some(bd) = lib.and_then(|t| t.bit_depth) {
+        audio_rows.push(MetadataRow::Field {
+            key: "Bit Depth",
+            value: format!("{bd} bit"),
+        });
+    }
+    if let Some(br) = lib.and_then(|t| t.audio_bitrate_kbps) {
+        audio_rows.push(MetadataRow::Field {
+            key: "Bitrate",
+            value: format!("{br} kbps"),
+        });
+    }
+    if let Some(d) = track.duration_ms {
+        audio_rows.push(MetadataRow::Field {
+            key: "Duration",
+            value: format_duration(d),
+        });
+    }
+    if !audio_rows.is_empty() {
+        out.push(MetadataRow::Section("Audio"));
+        out.append(&mut audio_rows);
+    }
+
+    // -- File --
+    let mut file_rows: Vec<MetadataRow> = Vec::new();
+    if let Some(loc) = track.location.as_ref() {
+        file_rows.push(MetadataRow::Field {
+            key: "Path",
+            value: loc.clone(),
+        });
+    }
+    if let Some(sz) = lib.and_then(|t| t.file_size_bytes) {
+        file_rows.push(MetadataRow::Field {
+            key: "File Size",
+            value: format_bytes(sz),
+        });
+    }
+    push_lib_string(&mut file_rows, "Encoder", lib, |t| t.encoder.as_deref());
+    push_lib_string(&mut file_rows, "Encoder Settings", lib, |t| {
+        t.encoder_settings.as_deref()
+    });
+    push_lib_string(&mut file_rows, "AcoustID", lib, |t| {
+        t.acoustic_id.as_deref()
+    });
+    if !file_rows.is_empty() {
+        out.push(MetadataRow::Section("File"));
+        out.append(&mut file_rows);
+    }
+
+    // -- Notes --
+    let mut note_rows: Vec<MetadataRow> = Vec::new();
+    push_lib_string(&mut note_rows, "Comment", lib, |t| t.comment.as_deref());
+    push_lib_string(&mut note_rows, "Description", lib, |t| {
+        t.description.as_deref()
+    });
+    if let Some(lyr) = lib.and_then(|t| t.lyrics.as_ref()) {
+        // Lyrics can be many KB; show only the first line + a count, the
+        // rest would dominate the popup.
+        let line_count = lyr.lines().count().max(1);
+        let preview = lyr.lines().next().unwrap_or("").to_string();
+        let value = if line_count > 1 {
+            format!("{preview}  … ({line_count} lines)")
+        } else {
+            preview
+        };
+        if !value.is_empty() {
+            note_rows.push(MetadataRow::Field {
+                key: "Lyrics",
+                value,
+            });
+        }
+    }
+    if !note_rows.is_empty() {
+        out.push(MetadataRow::Section("Notes"));
+        out.append(&mut note_rows);
+    }
+
+    // -- Device-side bits (only when on-device) --
+    if track.on_device {
+        let mut dev_rows: Vec<MetadataRow> = Vec::new();
+        if let Some(p) = track.play_count {
+            dev_rows.push(MetadataRow::Field {
+                key: "Plays",
+                value: p.to_string(),
+            });
+        }
+        if let Some(r) = track.rating {
+            dev_rows.push(MetadataRow::Field {
+                key: "Device Rating",
+                value: format!("{}/100", r),
+            });
+        }
+        if !dev_rows.is_empty() {
+            out.push(MetadataRow::Section("Device"));
+            out.append(&mut dev_rows);
+        }
+    }
+
+    out
+}
+
+/// Helper: append a `Field` row from a library getter, only when the value
+/// is non-empty after trimming.
+fn push_lib_string(
+    rows: &mut Vec<MetadataRow>,
+    key: &'static str,
+    lib: Option<&Track>,
+    pick: impl Fn(&Track) -> Option<&str>,
+) {
+    if let Some(v) = lib.and_then(pick) {
+        if !v.trim().is_empty() {
+            rows.push(MetadataRow::Field {
+                key,
+                value: v.to_string(),
+            });
+        }
+    }
+}
+
+/// Render byte counts in a compact human-readable form (KB / MB / GB).
+fn format_bytes(n: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+    if n >= GB {
+        format!("{:.2} GB", n as f64 / GB as f64)
+    } else if n >= MB {
+        format!("{:.2} MB", n as f64 / MB as f64)
+    } else if n >= KB {
+        format!("{:.1} KB", n as f64 / KB as f64)
+    } else {
+        format!("{n} B")
+    }
+}
+
+fn draw_track_info_overlay(f: &mut Frame, app: &App) {
+    let t = app.theme();
+    let area = f.area();
+
+    // Responsive popup: percentage-based with a sane min/max so it stays
+    // legible from 80x24 up to ultrawide terminals.
+    let width = (area.width * 70 / 100)
+        .clamp(40, 90)
+        .min(area.width.saturating_sub(4));
+    let height = (area.height * 70 / 100)
+        .clamp(8, 30)
+        .min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(width)) / 2;
+    let y = (area.height.saturating_sub(height)) / 2;
+    let rect = Rect::new(x, y, width, height);
+
+    f.render_widget(Clear, rect);
+
+    // Resolve the current track. If somehow the popup is visible with no
+    // selection, draw an empty block and bail — keeps render side defensive.
+    let Some(track) = app.track_list.get(app.track_selected) else {
+        let block = t
+            .block()
+            .border_style(Style::default().fg(t.selection_bg))
+            .title(" Track info — Esc to close ")
+            .style(Style::default().bg(t.main_bg));
+        f.render_widget(block, rect);
+        return;
+    };
+
+    // Resolved at popup-open time (`App::open_track_info`); reading the
+    // cached value here keeps the render path O(1) instead of re-running
+    // `tracks_by_name` on every ~50 ms tick while the popup is open.
+    let lib_track = app.track_info_lib.as_ref();
+
+    let title = format!(" Track info — {} (Esc to close) ", track.name);
+    let block = t
+        .block()
+        .border_style(Style::default().fg(t.selection_bg))
+        .title(title)
+        .style(Style::default().bg(t.main_bg));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    // Column constraints below sum to `Length(20) + Min(10) = 30` cells, so
+    // anything narrower will clip the value column to ~zero. Falling back to
+    // the title-only block (the bare frame already drawn above) is a cleaner
+    // failure mode than a half-rendered table.
+    if inner.height < 2 || inner.width < 30 {
+        return;
+    }
+
+    let pairs = format_metadata_pairs(track, lib_track);
+    let total = pairs.len();
+    let visible = inner.height.saturating_sub(1) as usize; // minus header
+    let max_scroll = total.saturating_sub(visible);
+    let scroll = app.track_info_scroll.min(max_scroll);
+
+    let header = Row::new([Cell::from("Field"), Cell::from("Value")])
+        .style(t.header())
+        .height(1);
+
+    // Display width available for the value column. Must match the column
+    // widths below (Length(20) field + 1 cell column gap + Min(10) value),
+    // otherwise the marqueed string and the rendered cell disagree on size
+    // and the popup background bleeds through under truncated text.
+    let widths = [Constraint::Length(20), Constraint::Min(10)];
+    let value_col_w = (inner.width as usize).saturating_sub(21);
+
+    let rows: Vec<Row> = pairs
+        .iter()
+        .enumerate()
+        .skip(scroll)
+        .take(visible)
+        .map(|(i, row)| match row {
+            MetadataRow::Section(name) => {
+                Row::new(vec![Cell::from(format!("── {} ──", name)), Cell::from("")])
+                    .style(Style::default().fg(t.dim_text).bg(t.main_bg))
+            }
+            MetadataRow::Field { key, value } => {
+                let bg = if i.is_multiple_of(2) {
+                    t.main_bg
+                } else {
+                    t.alt_row_bg
+                };
+                // `marquee` is a no-op (returns the source / pad-truncated
+                // form) when the value already fits, so short fields stay
+                // perfectly stable; only overflowing values animate.
+                let displayed = marquee(value, value_col_w, app.anim_frame);
+                Row::new(vec![
+                    Cell::from(*key).style(Style::default().fg(t.header_text)),
+                    Cell::from(displayed).style(Style::default().fg(t.sidebar_text)),
+                ])
+                .style(Style::default().bg(bg))
+            }
+        })
+        .collect();
+
+    let table = Table::new(rows, widths).header(header);
+    f.render_widget(table, inner);
 }
 
 fn draw_search_overlay(f: &mut Frame, app: &App) {
@@ -2444,6 +2895,175 @@ fn build_zune_art(screen_line1: &str, screen_line2: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::TrackInfo;
+    use zytunes::library::Track;
+
+    fn empty_track_info() -> TrackInfo {
+        TrackInfo::new(
+            "Some Title".into(),
+            "Some Artist".into(),
+            "Some Album".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+    }
+
+    #[test]
+    fn format_metadata_pairs_skips_empty_fields() {
+        // A track with only the always-present identity fields should not
+        // emit em-dash rows for every optional metadata key — those just
+        // pad the popup with noise.
+        let ti = empty_track_info();
+        let rows = format_metadata_pairs(&ti, None);
+        let field_keys: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| match r {
+                MetadataRow::Field { key, .. } => Some(*key),
+                _ => None,
+            })
+            .collect();
+        // The always-present fields are Title/Artist/Album.
+        assert!(field_keys.contains(&"Title"));
+        assert!(field_keys.contains(&"Artist"));
+        assert!(field_keys.contains(&"Album"));
+        // No bonus rows for fields we never set.
+        assert!(!field_keys.contains(&"Composer"));
+        assert!(!field_keys.contains(&"ISRC"));
+        assert!(!field_keys.contains(&"Sample Rate"));
+        assert!(!field_keys.contains(&"BPM"));
+    }
+
+    #[test]
+    fn format_metadata_pairs_groups_into_sections() {
+        // Section dividers should appear as `MetadataRow::Section` between
+        // groups of related fields.
+        let mut ti = empty_track_info();
+        ti.duration_ms = Some(120_000);
+        let lib = Track {
+            id: 1,
+            name: "Some Title".into(),
+            artist: "Some Artist".into(),
+            album: "Some Album".into(),
+            isrc: Some("USRC17607839".into()),
+            sample_rate: Some(44_100),
+            channels: Some(2),
+            ..Default::default()
+        };
+        let rows = format_metadata_pairs(&ti, Some(&lib));
+        let sections: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| match r {
+                MetadataRow::Section(name) => Some(*name),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            sections.contains(&"Identifiers"),
+            "Identifiers section should appear when ISRC is present, got {:?}",
+            sections
+        );
+        assert!(
+            sections.contains(&"Audio"),
+            "Audio section should appear when sample_rate is present, got {:?}",
+            sections
+        );
+    }
+
+    #[test]
+    fn format_metadata_pairs_formats_audio_properties() {
+        // Sample rate should render in kHz (e.g. "44.1 kHz") and channels
+        // should be human-readable.
+        let ti = empty_track_info();
+        let lib = Track {
+            id: 1,
+            name: "Some Title".into(),
+            artist: "Some Artist".into(),
+            album: "Some Album".into(),
+            sample_rate: Some(44_100),
+            channels: Some(2),
+            audio_bitrate_kbps: Some(320),
+            file_size_bytes: Some(5_242_880), // 5 MiB
+            ..Default::default()
+        };
+        let rows = format_metadata_pairs(&ti, Some(&lib));
+        let mut found_rate = false;
+        let mut found_channels = false;
+        let mut found_bitrate = false;
+        let mut found_size = false;
+        for row in &rows {
+            if let MetadataRow::Field { key, value } = row {
+                match *key {
+                    "Sample Rate" => {
+                        assert!(
+                            value.contains("44.1") && value.contains("kHz"),
+                            "expected '44.1 kHz', got {:?}",
+                            value
+                        );
+                        found_rate = true;
+                    }
+                    "Channels" => {
+                        assert_eq!(value, "2");
+                        found_channels = true;
+                    }
+                    "Bitrate" => {
+                        assert!(
+                            value.contains("320") && value.contains("kbps"),
+                            "expected '320 kbps', got {:?}",
+                            value
+                        );
+                        found_bitrate = true;
+                    }
+                    "File Size" => {
+                        assert!(
+                            value.contains("MB") || value.contains("MiB"),
+                            "expected human-readable bytes with MB suffix, got {:?}",
+                            value
+                        );
+                        found_size = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(found_rate, "Sample Rate row missing");
+        assert!(found_channels, "Channels row missing");
+        assert!(found_bitrate, "Bitrate row missing");
+        assert!(found_size, "File Size row missing");
+    }
+
+    #[test]
+    fn format_metadata_pairs_enriches_with_library_track() {
+        // Fields only available on the library `Track` (composer, mb_*,
+        // replaygain) should appear in the popup when a library lookup
+        // matched.
+        let ti = empty_track_info();
+        let lib = Track {
+            id: 1,
+            name: "Some Title".into(),
+            artist: "Some Artist".into(),
+            album: "Some Album".into(),
+            composer: Some("Hans Zimmer".into()),
+            mb_release_id: Some("aaaa-bbbb".into()),
+            replaygain_track_gain: Some("-7.20 dB".into()),
+            ..Default::default()
+        };
+        let rows = format_metadata_pairs(&ti, Some(&lib));
+        let by_key: std::collections::HashMap<&str, &str> = rows
+            .iter()
+            .filter_map(|r| match r {
+                MetadataRow::Field { key, value } => Some((*key, value.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(by_key.get("Composer"), Some(&"Hans Zimmer"));
+        assert_eq!(by_key.get("Release ID"), Some(&"aaaa-bbbb"));
+        assert_eq!(by_key.get("Track Gain"), Some(&"-7.20 dB"));
+    }
 
     #[test]
     fn sidebar_icon_accent_is_visible_on_selected_row() {
