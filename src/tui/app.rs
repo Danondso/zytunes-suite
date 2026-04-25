@@ -4522,6 +4522,7 @@ mod tests {
                 total_time_ms: None,
                 location: None,
                 kind: None,
+                acoustic_id: None,
             }
         }
 

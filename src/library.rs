@@ -14,6 +14,12 @@ pub struct Track {
     pub total_time_ms: Option<u64>,
     pub location: Option<String>,
     pub kind: Option<String>,
+    /// Chromaprint fingerprint, URL-safe base64 of the compressed form — same
+    /// wire format as MusicBrainz Picard's `ACOUSTID_FINGERPRINT` tag, so
+    /// computed and embedded fingerprints compare byte-for-byte. `None` until
+    /// the background scan produces one.
+    #[serde(default)]
+    pub acoustic_id: Option<String>,
 }
 
 /// Trait abstracting a music library backend.

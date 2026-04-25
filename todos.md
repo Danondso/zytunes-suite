@@ -182,3 +182,26 @@ must carry BOLD + `selection_bg`) and `zune_original_border_contrasts_main_bg`
 sidebar_bg, alt_row on main_bg) reviewed and left as-is — alt rows are
 intentionally subtle, and sidebar text is already high-contrast on every
 built-in.
+
+## Future features
+
+### MusicBrainz / AcoustID online lookup
+Now that every library track carries a Chromaprint `acoustic_id` (see
+`src/fingerprint.rs`), we have half of what's needed to identify
+poorly-tagged or untagged files against the AcoustID web service and
+pull canonical MusicBrainz metadata. Scope:
+
+1. Add a `musicbrainz` (or `acoustid`) module that POSTs `(duration,
+   acoustic_id)` to `https://api.acoustid.org/v2/lookup` and parses the
+   MBID + recording/release metadata in the response.
+2. Rate-limit to 3 req/sec (AcoustID's published ceiling) and cache
+   lookup results locally — fingerprints are stable, so the response
+   doesn't need to be re-fetched on every launch.
+3. Expose a TUI action ("identify track" / "identify album") that
+   writes the discovered tags back via lofty, updates the library
+   cache, and surfaces a diff for the user to accept/reject.
+4. User-supplied AcoustID application key in
+   `~/.config/zytunes/config.toml` — required by the API ToS; the
+   feature stays dark until configured.
+
+Out of scope for the playcount work that introduced fingerprinting.

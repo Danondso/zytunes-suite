@@ -2,9 +2,13 @@ pub mod art_cache;
 pub mod cache;
 pub mod device;
 pub mod dirlib;
+pub mod fingerprint;
 pub mod library;
 pub mod mtp;
 pub mod paths;
+
+#[cfg(test)]
+mod test_audio;
 
 use device::{
     DetectedDevice, DeviceBackend, DeviceCapabilities, DeviceFamily, IpodBackend, ZuneBackend,
@@ -960,6 +964,7 @@ mod tests {
                     total_time_ms: None,
                     location: None,
                     kind: None,
+                    acoustic_id: None,
                 },
                 library::Track {
                     id: 2,
@@ -973,6 +978,7 @@ mod tests {
                     total_time_ms: None,
                     location: None,
                     kind: None,
+                    acoustic_id: None,
                 },
                 library::Track {
                     id: 3,
@@ -986,6 +992,7 @@ mod tests {
                     total_time_ms: None,
                     location: None,
                     kind: None,
+                    acoustic_id: None,
                 },
             ],
         }
@@ -1265,6 +1272,7 @@ mod tests {
             total_time_ms: None,
             location: Some(path.into()),
             kind: None,
+            acoustic_id: None,
         }
     }
 
