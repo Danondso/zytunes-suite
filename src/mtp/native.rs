@@ -641,6 +641,11 @@ impl NativeSession {
     /// one, we log it and proceed with the other. Confirmed to work on Zune
     /// v1.4 firmware `01.04.00485.00-00425` even though these props are not
     /// listed in `GetObjectPropsSupported(0x3009)`.
+    ///
+    /// Called from each track-collect path (ZMDB fast path, cache-hit
+    /// refresh, slow fallback); callers may invoke it multiple times per
+    /// session and `enrich_one_prop`'s "unavailable" log fires per call —
+    /// not rate-limited.
     fn enrich_with_playcounts(&mut self, tracks: &mut [DeviceEntry]) {
         // Avoid needless round-trips when nothing in the list could be
         // matched — e.g. ZMDB on a fresh connect with no prior cache.

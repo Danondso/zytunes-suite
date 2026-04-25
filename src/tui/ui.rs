@@ -2529,12 +2529,15 @@ fn draw_track_info_overlay(f: &mut Frame, app: &App) {
         .style(t.header())
         .height(1);
 
-    // Display width available for the value column. Must match the column
-    // widths below (Length(20) field + 1 cell column gap + Min(10) value),
-    // otherwise the marqueed string and the rendered cell disagree on size
-    // and the popup background bleeds through under truncated text.
-    let widths = [Constraint::Length(20), Constraint::Min(10)];
+    // Display width available for the value column. Both the marqueed string
+    // and ratatui's column allocator must agree on this exact width — using
+    // `Length(value_col_w)` (instead of `Min(10)`) makes the agreement
+    // structural so the popup background never bleeds through truncated text.
     let value_col_w = (inner.width as usize).saturating_sub(21);
+    let widths = [
+        Constraint::Length(20),
+        Constraint::Length(value_col_w as u16),
+    ];
 
     let rows: Vec<Row> = pairs
         .iter()

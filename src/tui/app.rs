@@ -956,6 +956,30 @@ impl App {
         self.track_info_lib = None;
     }
 
+    /// Re-resolve the cached lib `Track` against the current library. Called
+    /// from the `BgEvent::LibraryLoaded` handler so an open popup repaints
+    /// from the freshly-scanned metadata instead of the stale clone captured
+    /// when it was first opened. When the popup is closed, drop the cache —
+    /// `open_track_info` resolves on demand the next time it runs.
+    pub fn refresh_track_info_lib(&mut self) {
+        if !self.show_track_info {
+            self.track_info_lib = None;
+            return;
+        }
+        let Some(track) = self.track_list.get(self.track_selected) else {
+            self.track_info_lib = None;
+            return;
+        };
+        self.track_info_lib = self.library.as_ref().and_then(|lib| {
+            lib.tracks_by_name(&track.name)
+                .find(|t| {
+                    t.artist.eq_ignore_ascii_case(&track.artist)
+                        && t.album.eq_ignore_ascii_case(&track.album)
+                })
+                .cloned()
+        });
+    }
+
     /// Move the popup scroll cursor by `delta` rows. Negative values clamp
     /// at zero; positive values are clamped against the actual content
     /// height in the renderer (the App layer doesn't know the popup's
@@ -1187,6 +1211,11 @@ impl App {
     }
 
     pub fn clear_device_index(&mut self) {
+        // Drop any open track-info popup before wiping the index. Today the
+        // popup is Library-mode-only and the browse-mode reset below makes
+        // this a no-op, but if the gating is ever relaxed an open popup
+        // could survive a disconnect and paint stale device state.
+        self.close_track_info();
         self.device.artists.clear();
         self.device.albums.clear();
         self.device.album_tracks.clear();
@@ -2018,6 +2047,11 @@ impl App {
                 match result {
                     Ok(lib) => {
                         self.library = Some(lib);
+                        // Re-resolve the popup's cached lib `Track` against
+                        // the new library *before* `refresh_sidebar` clears
+                        // `track_list` — closed popups drop the cache, open
+                        // ones repaint from the freshly-scanned metadata.
+                        self.refresh_track_info_lib();
                         self.rebuild_artist_device_status();
                         self.refresh_sidebar();
                     }
@@ -3977,6 +4011,25 @@ mod tests {
     }
 
     #[test]
+    fn clear_device_index_closes_track_info_popup() {
+        let mut app = App::new();
+        app.show_track_info = true;
+        app.track_info_scroll = 7;
+        app.track_info_lib = Some(zytunes::library::Track {
+            name: "Song".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            ..Default::default()
+        });
+
+        app.clear_device_index();
+
+        assert!(!app.show_track_info);
+        assert_eq!(app.track_info_scroll, 0);
+        assert!(app.track_info_lib.is_none());
+    }
+
+    #[test]
     fn skip_forward_wraps() {
         let mut app = App::new();
         app.active_panel = Panel::Library;
@@ -4043,6 +4096,59 @@ mod tests {
 
     fn make_minimal_library() -> Box<dyn zytunes::library::MusicLibrary + Send> {
         Box::new(EmptyLibrary)
+    }
+
+    /// In-memory `MusicLibrary` for tests that need real `Track` values
+    /// (popup-refresh path exercises `tracks_by_name`).
+    struct VecLibrary {
+        tracks: Vec<zytunes::library::Track>,
+    }
+    impl zytunes::library::MusicLibrary for VecLibrary {
+        fn artists(&self) -> Vec<&str> {
+            Vec::new()
+        }
+        fn albums(&self) -> Vec<(&str, &str)> {
+            Vec::new()
+        }
+        fn artist_tracks<'a>(
+            &'a self,
+            _: &str,
+        ) -> Box<dyn Iterator<Item = &'a zytunes::library::Track> + 'a> {
+            Box::new(std::iter::empty())
+        }
+        fn album_tracks<'a>(
+            &'a self,
+            _: &str,
+        ) -> Box<dyn Iterator<Item = &'a zytunes::library::Track> + 'a> {
+            Box::new(std::iter::empty())
+        }
+        fn album_tracks_by_artist<'a>(
+            &'a self,
+            _: &str,
+            _: &str,
+        ) -> Box<dyn Iterator<Item = &'a zytunes::library::Track> + 'a> {
+            Box::new(std::iter::empty())
+        }
+        fn tracks_by_name<'a>(
+            &'a self,
+            name: &str,
+        ) -> Box<dyn Iterator<Item = &'a zytunes::library::Track> + 'a> {
+            let owned = name.to_string();
+            Box::new(
+                self.tracks
+                    .iter()
+                    .filter(move |t| t.name.eq_ignore_ascii_case(&owned)),
+            )
+        }
+        fn track_count(&self) -> usize {
+            self.tracks.len()
+        }
+        fn all_tracks(&self) -> Box<dyn Iterator<Item = &zytunes::library::Track> + '_> {
+            Box::new(self.tracks.iter())
+        }
+        fn music_folder(&self) -> Option<&str> {
+            None
+        }
     }
 
     #[test]
@@ -4115,6 +4221,76 @@ mod tests {
         assert!(app.scan_phrase.is_none());
         assert!(app.scan_progress.is_none());
         assert!(app.scan_samples.is_empty());
+    }
+
+    #[test]
+    fn library_loaded_refreshes_open_track_info_popup() {
+        let mut app = App::new();
+
+        // Stage 1: initial library with bpm=120 for "Song".
+        let initial_track = zytunes::library::Track {
+            id: 1,
+            name: "Song".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            bpm: Some(120),
+            ..Default::default()
+        };
+        app.library = Some(Box::new(VecLibrary {
+            tracks: vec![initial_track],
+        }));
+        app.track_list.push(TrackInfo::new(
+            "Song".into(),
+            "Artist".into(),
+            "Album".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        ));
+        app.track_selected = 0;
+        app.open_track_info();
+        assert!(app.show_track_info);
+        assert_eq!(app.track_info_lib.as_ref().and_then(|t| t.bpm), Some(120));
+
+        // Stage 2: deliver a new library with bpm=140 for the same track.
+        let updated_track = zytunes::library::Track {
+            id: 1,
+            name: "Song".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            bpm: Some(140),
+            ..Default::default()
+        };
+        let new_lib: Box<dyn zytunes::library::MusicLibrary + Send> = Box::new(VecLibrary {
+            tracks: vec![updated_track],
+        });
+        app.handle_bg_event(BgEvent::LibraryLoaded(Ok(new_lib)));
+
+        // Popup should remain open and now reflect the freshly-scanned bpm.
+        assert!(app.show_track_info);
+        assert_eq!(app.track_info_lib.as_ref().and_then(|t| t.bpm), Some(140));
+    }
+
+    #[test]
+    fn library_loaded_clears_track_info_lib_when_popup_closed() {
+        let mut app = App::new();
+        // Simulate a stale cached lib track left over from a prior popup.
+        app.show_track_info = false;
+        app.track_info_lib = Some(zytunes::library::Track {
+            name: "Stale".into(),
+            artist: "A".into(),
+            album: "B".into(),
+            bpm: Some(99),
+            ..Default::default()
+        });
+
+        app.handle_bg_event(BgEvent::LibraryLoaded(Ok(make_minimal_library())));
+
+        assert!(app.track_info_lib.is_none());
     }
 
     #[test]
