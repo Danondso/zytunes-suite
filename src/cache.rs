@@ -126,15 +126,29 @@ fn save_raw(dir_path: &str, cached: &CachedLibrary) {
             return;
         }
     };
-    if let Err(e) = std::fs::write(&path, &data) {
-        // Silent failure here is the worst-case UX: every launch re-runs the
-        // full lofty + chromaprint pass because the previous run's work
-        // never landed on disk. Surface it loudly.
+    // Atomic write: stage to a sibling .tmp, then rename. Without this, a
+    // kill mid-write (Ctrl+C, OOM, kernel panic) leaves a truncated JSON on
+    // disk; next launch fails to parse it and re-does the entire scan. The
+    // rename is atomic on every POSIX filesystem we care about, so the cache
+    // file is either the previous valid one or the new valid one — never a
+    // half-written mix.
+    let tmp = path.with_extension("json.tmp");
+    if let Err(e) = std::fs::write(&tmp, &data) {
         eprintln!(
             "zytunes: cache: write {} ({} bytes) failed: {e}",
-            path.display(),
+            tmp.display(),
             data.len()
         );
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        eprintln!(
+            "zytunes: cache: rename {} -> {} failed: {e}",
+            tmp.display(),
+            path.display()
+        );
+        // Best-effort cleanup of the orphan; nothing we can do if this fails.
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 

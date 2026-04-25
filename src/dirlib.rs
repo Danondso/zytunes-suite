@@ -4,13 +4,19 @@
 //! tags (MP3) or infers it from the directory structure (other formats).
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::Instant;
 
 use rayon::prelude::*;
+
+/// How many files the scan processes between cache snapshots. Sized so a
+/// crash (or Ctrl+C) costs at most ~chunk_size files of work, while keeping
+/// I/O overhead well under 1% of total scan time for a multi-hour first scan.
+const SAVE_CHUNK_SIZE: usize = 2_000;
 
 use crate::library::{MusicLibrary, Track};
 
@@ -120,79 +126,118 @@ impl DirectoryLibrary {
         let fp_computed = AtomicU64::new(0);
         let fp_failed = AtomicU64::new(0);
 
-        let entries: Vec<(String, crate::cache::CachedFile)> = paths
-            .par_iter()
-            .filter_map(|p| {
-                let key = p.to_string_lossy().to_string();
-                let fingerprint = crate::cache::FileFingerprint::from_path(p)?;
-
-                let (mut track, came_from_cache) = match cached.get(&key) {
-                    Some(entry) if entry.fingerprint == fingerprint => (entry.track.clone(), true),
-                    _ => {
-                        cache_miss.fetch_add(1, Ordering::Relaxed);
-                        (build_track(p, hash_path(p)), false)
-                    }
-                };
-
-                if came_from_cache {
-                    if track.acoustic_id.is_some() {
-                        cache_hit_with_fp.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        cache_hit_no_fp.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-
-                if track.acoustic_id.is_none() {
-                    // Fresh-parse already tried `read_embedded_fingerprint`
-                    // inside `track_from_lofty`; if that turned up nothing,
-                    // re-trying it would just re-open + re-parse the tag for
-                    // a guaranteed second `None`. Skip straight to compute.
-                    //
-                    // Cache-hit paths take the full pipeline: a pre-existing
-                    // cache from before the field was added has acoustic_id
-                    // = None despite the file possibly carrying a tag, so
-                    // the embedded read is worth attempting once.
-                    track.acoustic_id = if came_from_cache {
-                        crate::fingerprint::fingerprint_for(p)
-                    } else {
-                        crate::fingerprint::compute_fingerprint(p)
-                    };
-                    if track.acoustic_id.is_some() {
-                        fp_computed.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        fp_failed.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-
-                let n = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                on_progress(ScanProgress {
-                    completed: n,
-                    total,
-                    sample: Some(TrackSample {
-                        artist: track.artist.clone(),
-                        album: track.album.clone(),
-                        name: track.name.clone(),
-                    }),
-                });
-
-                Some((key, crate::cache::CachedFile { fingerprint, track }))
-            })
-            .collect();
-
-        let tracks: HashMap<u64, Track> = entries
+        // Process in chunks of `SAVE_CHUNK_SIZE` and snapshot the cache after
+        // each one. The working map starts as a clone of the previous cache,
+        // gets per-file entries inserted as chunks complete, and is what we
+        // serialise on every snapshot. Files we haven't visited yet survive
+        // in the working map (still pointing at the previous-scan entry), so
+        // a Ctrl+C mid-scan only loses the current chunk's work — never the
+        // previous run's entries for files we just haven't reached yet.
+        let extant_paths: HashSet<String> = paths
             .iter()
-            .map(|(_, cf)| (cf.track.id, cf.track.clone()))
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let working: Mutex<HashMap<String, crate::cache::CachedFile>> = Mutex::new(cached.clone());
+
+        for chunk in paths.chunks(SAVE_CHUNK_SIZE) {
+            let chunk_entries: Vec<(String, crate::cache::CachedFile)> = chunk
+                .par_iter()
+                .filter_map(|p| {
+                    let key = p.to_string_lossy().to_string();
+                    let fingerprint = crate::cache::FileFingerprint::from_path(p)?;
+
+                    let (mut track, came_from_cache) = match cached.get(&key) {
+                        Some(entry) if entry.fingerprint == fingerprint => {
+                            (entry.track.clone(), true)
+                        }
+                        _ => {
+                            cache_miss.fetch_add(1, Ordering::Relaxed);
+                            (build_track(p, hash_path(p)), false)
+                        }
+                    };
+
+                    if came_from_cache {
+                        if track.acoustic_id.is_some() {
+                            cache_hit_with_fp.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            cache_hit_no_fp.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+
+                    if track.acoustic_id.is_none() {
+                        // Fresh-parse already tried `read_embedded_fingerprint`
+                        // inside `track_from_lofty`; if that turned up nothing,
+                        // re-trying it would just re-open + re-parse the tag
+                        // for a guaranteed second `None`. Skip straight to
+                        // compute.
+                        //
+                        // Cache-hit paths take the full pipeline: a pre-existing
+                        // cache from before the field was added has acoustic_id
+                        // = None despite the file possibly carrying a tag, so
+                        // the embedded read is worth attempting once.
+                        track.acoustic_id = if came_from_cache {
+                            crate::fingerprint::fingerprint_for(p)
+                        } else {
+                            crate::fingerprint::compute_fingerprint(p)
+                        };
+                        if track.acoustic_id.is_some() {
+                            fp_computed.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            fp_failed.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+
+                    let n = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                    on_progress(ScanProgress {
+                        completed: n,
+                        total,
+                        sample: Some(TrackSample {
+                            artist: track.artist.clone(),
+                            album: track.album.clone(),
+                            name: track.name.clone(),
+                        }),
+                    });
+
+                    Some((key, crate::cache::CachedFile { fingerprint, track }))
+                })
+                .collect();
+
+            // Merge chunk results into the working cache, then snapshot.
+            // Snapshot via clone so the I/O happens outside the lock.
+            let snapshot = {
+                let mut w = working.lock().expect("working cache lock");
+                for (k, v) in chunk_entries {
+                    w.insert(k, v);
+                }
+                w.clone()
+            };
+            crate::cache::save_dirlib_cache(path, snapshot);
+        }
+
+        // Final pass: drop entries whose files disappeared since the previous
+        // scan. We only do this at the end — partial saves can't prune,
+        // because unprocessed paths aren't yet known to be missing-vs-pending.
+        let mut final_cache = working.into_inner().expect("working cache lock");
+        let pruned = {
+            let before = final_cache.len();
+            final_cache.retain(|k, _| extant_paths.contains(k));
+            before - final_cache.len()
+        };
+        if pruned > 0 {
+            eprintln!("zytunes: scan: pruned {pruned} stale cache entries (files removed)");
+        }
+
+        let tracks: HashMap<u64, Track> = final_cache
+            .values()
+            .map(|cf| (cf.track.id, cf.track.clone()))
             .collect();
 
-        // Persist the fresh cache — implicitly drops entries for files that
-        // disappeared from the tree since the last scan.
-        let new_cache: HashMap<String, crate::cache::CachedFile> = entries.into_iter().collect();
-        let saved_with_fp = new_cache
+        let saved_with_fp = final_cache
             .values()
             .filter(|c| c.track.acoustic_id.is_some())
             .count();
-        let saved_total = new_cache.len();
-        crate::cache::save_dirlib_cache(path, new_cache);
+        let saved_total = final_cache.len();
+        crate::cache::save_dirlib_cache(path, final_cache);
 
         eprintln!(
             "zytunes: scan: completed in {:.1}s — {saved_total} tracks ({saved_with_fp} with fingerprints) | \
