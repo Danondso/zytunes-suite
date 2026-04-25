@@ -1358,6 +1358,94 @@ impl DeviceSession for NativeSession {
 }
 
 impl NativeSession {
+    /// Phase 4a probe: list MTP object properties the device advertises for
+    /// the given object format. `format = 0x3009` is MP3 (the most common
+    /// Zune content type). Returns the property codes in the same order the
+    /// device emits them.
+    pub fn probe_supported_props(&mut self, format: u16) -> Result<Vec<u16>, String> {
+        self.session
+            .get_object_props_supported(format)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Phase 4a probe: read a single MTP object property as raw bytes.
+    /// Caller decodes per the property's MTP data type.
+    pub fn probe_prop_value(&mut self, object_id: u32, prop: u16) -> Result<Vec<u8>, String> {
+        self.session
+            .get_object_prop_value(object_id, prop)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Phase 4a probe: read a u32 MTP object property. `Ok(None)` when
+    /// the device returns no value bytes (interpreted as "unset").
+    pub fn probe_prop_u32(&mut self, object_id: u32, prop: u16) -> Result<Option<u32>, String> {
+        self.session
+            .get_object_prop_u32(object_id, prop)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Phase 4a probe: dump the raw ZMDB binary (vendor op `0x9217`). Used
+    /// for diff-based playcount investigation: dump before, play a track on
+    /// the device, dump after, hex-diff the binaries to find changed bytes
+    /// the parser currently ignores.
+    ///
+    /// Mirrors the firmware-version guard from `try_zmdb` so users on v1.4
+    /// hardware get a friendly message instead of a bare
+    /// `0x2005 OperationNotSupported` from the device.
+    pub fn probe_zmdb_dump(&mut self) -> Result<Vec<u8>, String> {
+        if !self.supports_modern_vendor_ops() {
+            let v = self.firmware_version.as_deref().unwrap_or("unknown");
+            return Err(format!(
+                "firmware {v} predates ZMDB (added in firmware 3.0); ZMDB dump unavailable"
+            ));
+        }
+        self.session.get_zmdb(1).map_err(|e| {
+            if e.is_operation_not_supported() {
+                "device does not support ZMDB bulk query".to_string()
+            } else {
+                e.to_string()
+            }
+        })
+    }
+
+    /// Phase 4a probe: BFS over the device's object tree from the active
+    /// storage's root and return the first audio object's `(handle, format)`.
+    /// Recursion is necessary because `get_object_handles(storage, MTP_ROOT)`
+    /// returns top-level *folders* (`/Music`, `/Photos`, …) — all
+    /// `ASSOCIATION_FORMAT` — and never the audio files which live nested
+    /// under `/Music/Artist/Album/`.
+    ///
+    /// Audio formats whitelisted: MP3 (0x3009), WMA (0xB901), AAC (0xB903).
+    /// MP4 container (0xB982) is intentionally excluded — that's the Zune's
+    /// video format and would mislabel a video as audio.
+    ///
+    /// Used by the probe command to pick a target track without forcing the
+    /// caller to know an object ID.
+    pub fn probe_first_audio_handle(&mut self) -> Result<Option<(u32, u16)>, String> {
+        let storage = self.storage_id;
+        let mut queue: Vec<u32> = vec![MTP_ROOT];
+        while let Some(parent) = queue.pop() {
+            let handles = self
+                .session
+                .get_object_handles(storage, parent)
+                .map_err(|e| e.to_string())?;
+            for h in handles {
+                let info = match self.session.get_object_info(h) {
+                    Ok(i) => i,
+                    Err(_) => continue,
+                };
+                let fmt = info.object_format;
+                if matches!(fmt, 0x3009 | 0xB901 | 0xB903) {
+                    return Ok(Some((h, fmt)));
+                }
+                if fmt == ASSOCIATION_FORMAT {
+                    queue.push(h);
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// Path for the sync progress cache file.
     /// Path for the device library cache file.
     fn library_cache_path(&self) -> Option<PathBuf> {

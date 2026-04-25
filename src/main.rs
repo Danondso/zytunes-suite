@@ -102,6 +102,7 @@ fn run(args: &[String]) -> Result<(), String> {
                     or pass a directory: zytunes video-sync <dir>")?;
             cmd_video_sync(&dir)
         }
+        "probe" => cmd_probe(&args[2..]),
         "help" | "--help" | "-h" => {
             println!("zytunes v0.3.0 — sync music to a Zune 30\n");
             println!("Usage: zytunes <command> [args...]\n");
@@ -131,6 +132,14 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("  zytunes video-sync ~/Videos/zune");
             println!("  zytunes ls /Music");
             println!("  zytunes rm \"/Music/Artist/Album\"");
+            println!("\nDiagnostics:");
+            println!("  probe props [format]   List MTP properties the Zune advertises");
+            println!(
+                "                         (format: 0x3009 MP3 [default], 0xB901 WMA, 0xB903 AAC)"
+            );
+            println!("  probe playcount [obj]  Read playcount-related props for an audio object");
+            println!("                         (uses first audio object if obj-id omitted)");
+            println!("  probe zmdb-dump <out>  Dump raw ZMDB binary for diff-based analysis");
             Ok(())
         }
         other => Err(format!(
@@ -589,6 +598,222 @@ fn cmd_rm(paths: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Diagnostic probe subcommand used to investigate what playcount-related
+/// MTP properties the Zune exposes, and to snapshot the ZMDB binary for
+/// before/after diff. Zune-only — connects directly via the ZuneBackend
+/// instead of the generic `connect()` so it can access the concrete
+/// `NativeSession` and its probe methods.
+fn cmd_probe(args: &[String]) -> Result<(), String> {
+    let sub = args
+        .first()
+        .map(|s| s.as_str())
+        .ok_or("Usage: zytunes probe <props|playcount|zmdb-dump> [args...]")?;
+
+    // Detect + open a Zune session. We bypass the generic connect() because
+    // it returns Box<dyn DeviceSession>; the probe methods live on the
+    // concrete NativeSession and this is a Zune-only command anyway.
+    use zytunes::device::zune::{ZuneBackend, ZuneDeviceData};
+    use zytunes::device::DeviceBackend;
+    let backend = ZuneBackend;
+    let detected = backend.detect()?;
+    println!("Detected: {}", detected.name);
+    let data = detected
+        .backend_data
+        .downcast_ref::<ZuneDeviceData>()
+        .ok_or("Internal: Zune detection returned wrong backend data")?;
+    let mut session = zytunes::mtp::NativeSession::open(data.product_id, &|msg: &str| {
+        eprintln!("{msg}");
+    })?;
+    println!("Session ready.\n");
+
+    match sub {
+        "props" => {
+            let fmt = args
+                .get(1)
+                .map(|s| parse_u16_maybe_hex(s))
+                .transpose()?
+                .unwrap_or(0x3009);
+            print_known_format_label(fmt);
+            let props = session.probe_supported_props(fmt)?;
+            if props.is_empty() {
+                println!("Device advertised no properties for format 0x{fmt:04X}.");
+                println!("(This is unexpected for a supported audio format — file with the session state.)");
+            } else {
+                println!("Advertised properties ({}):", props.len());
+                for p in &props {
+                    let label = prop_label(*p);
+                    println!("  0x{p:04X}  {label}");
+                }
+            }
+            Ok(())
+        }
+        "playcount" => {
+            let target = match args.get(1) {
+                Some(s) => parse_u32_maybe_hex(s)?,
+                None => match session.probe_first_audio_handle()? {
+                    Some((h, fmt)) => {
+                        println!("Auto-selected first audio object: handle=0x{h:08X} format=0x{fmt:04X}");
+                        h
+                    }
+                    None => {
+                        return Err(
+                            "No audio objects found on device — sync a track first.".into()
+                        )
+                    }
+                },
+            };
+            println!();
+            probe_playcount_props(&mut session, target)
+        }
+        "zmdb-dump" => {
+            let out = args
+                .get(1)
+                .ok_or("Usage: zytunes probe zmdb-dump <output-path>")?;
+            let bytes = session.probe_zmdb_dump()?;
+            std::fs::write(out, &bytes).map_err(|e| format!("write {out}: {e}"))?;
+            println!("Wrote {} bytes to {out}", bytes.len());
+            println!("\nNext steps:");
+            println!(
+                "  1. Play a track on the Zune past the 50%-or-4-minute mark (iTunes threshold)."
+            );
+            println!("  2. Re-run `zytunes probe zmdb-dump` to a different output path.");
+            println!("  3. Diff the two dumps with e.g. `cmp -l before.bin after.bin | head`.");
+            println!("     Bytes that changed identify where the playcount lives.");
+            Ok(())
+        }
+        other => Err(format!(
+            "Unknown probe subcommand: {other}\nUsage: zytunes probe <props|playcount|zmdb-dump> [args...]"
+        )),
+    }
+}
+
+/// Query each known playcount-adjacent property on `object_id` and report
+/// what the device returns. Labels unsupported props clearly so missing
+/// entries are obvious.
+fn probe_playcount_props(
+    session: &mut zytunes::mtp::NativeSession,
+    object_id: u32,
+) -> Result<(), String> {
+    use zune_mtp::proplist::{
+        PROP_DATE_ADDED, PROP_LAST_ACCESSED, PROP_RATING, PROP_SKIP_COUNT, PROP_USE_COUNT,
+    };
+
+    let targets = [
+        (PROP_USE_COUNT, "UseCount (playcount)"),
+        (PROP_SKIP_COUNT, "SkipCount"),
+        (PROP_LAST_ACCESSED, "LastAccessed"),
+        (PROP_RATING, "Rating"),
+        (PROP_DATE_ADDED, "DateAdded"),
+    ];
+
+    println!("Querying playcount-adjacent properties on object 0x{object_id:08X}:");
+    println!();
+    for (code, label) in targets {
+        match session.probe_prop_value(object_id, code) {
+            Ok(bytes) => {
+                let preview = preview_bytes(&bytes);
+                println!(
+                    "  0x{code:04X}  {label:<22}  OK  {} bytes  {preview}",
+                    bytes.len()
+                );
+            }
+            Err(e) => {
+                // Most likely "0x200A InvalidObjectPropCode" meaning the
+                // device doesn't advertise this prop for this object.
+                println!("  0x{code:04X}  {label:<22}  ERR  {e}");
+            }
+        }
+    }
+    println!();
+    println!("Interpretation:");
+    println!("  - OK + non-zero bytes on UseCount → MTP prop path is viable; Phase 4b can read");
+    println!("    playcounts via `session.get_object_prop_u32(handle, PROP_USE_COUNT)`.");
+    println!("  - All ERR → Zune doesn't expose playcount via MTP props; use the ZMDB diff");
+    println!("    approach instead (`zytunes probe zmdb-dump`).");
+    Ok(())
+}
+
+fn prop_label(code: u16) -> &'static str {
+    match code {
+        0xDC01 => "StorageID",
+        0xDC02 => "ObjectFormat",
+        0xDC03 => "ProtectionStatus",
+        0xDC04 => "ObjectSize",
+        0xDC07 => "ObjectFileName",
+        0xDC08 => "DateCreated",
+        0xDC09 => "DateModified",
+        0xDC0B => "ParentObject",
+        0xDC41 => "PersistentUniqueObjectIdentifier",
+        0xDC44 => "Name",
+        0xDC46 => "Artist",
+        0xDC47 => "DateAuthored",
+        0xDC4E => "DateAdded",
+        0xDC86 => "RepresentativeSampleData",
+        0xDC89 => "Duration",
+        0xDC8A => "Rating",
+        0xDC8B => "Track",
+        0xDC8C => "Genre",
+        0xDC8E => "Lyrics",
+        0xDC91 => "UseCount (playcount)",
+        0xDC92 => "SkipCount",
+        0xDC93 => "LastAccessed",
+        0xDC95 => "MetaGenre",
+        0xDAB9 => "ArtistId (Zune-specific)",
+        _ => "(unknown — look up in MTP spec / libmtp)",
+    }
+}
+
+fn print_known_format_label(fmt: u16) {
+    let label = match fmt {
+        0x3009 => "MP3",
+        0x3008 => "WAV",
+        0xB901 => "WMA",
+        0xB903 => "AAC / MP4 audio",
+        0xB982 => "MP4 container",
+        0xB984 => "FLAC",
+        _ => "unknown format",
+    };
+    println!("Querying supported properties for format 0x{fmt:04X} ({label})\n");
+}
+
+fn parse_u16_maybe_hex(s: &str) -> Result<u16, String> {
+    let trimmed = s.trim_start_matches("0x").trim_start_matches("0X");
+    if trimmed != s {
+        u16::from_str_radix(trimmed, 16).map_err(|e| format!("bad hex u16 {s:?}: {e}"))
+    } else {
+        s.parse::<u16>().map_err(|e| format!("bad u16 {s:?}: {e}"))
+    }
+}
+
+fn parse_u32_maybe_hex(s: &str) -> Result<u32, String> {
+    let trimmed = s.trim_start_matches("0x").trim_start_matches("0X");
+    if trimmed != s {
+        u32::from_str_radix(trimmed, 16).map_err(|e| format!("bad hex u32 {s:?}: {e}"))
+    } else {
+        s.parse::<u32>().map_err(|e| format!("bad u32 {s:?}: {e}"))
+    }
+}
+
+/// Format raw prop bytes for display. Renders as a little-endian u32 when
+/// the length is 4 (most integer props); otherwise hex-dump the first 16
+/// bytes so strings and blobs are still legible.
+fn preview_bytes(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return "(empty)".into();
+    }
+    if bytes.len() == 4 {
+        let v = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        return format!("u32={v}");
+    }
+    if bytes.len() == 2 {
+        let v = u16::from_le_bytes([bytes[0], bytes[1]]);
+        return format!("u16={v}");
+    }
+    let head: Vec<String> = bytes.iter().take(16).map(|b| format!("{b:02x}")).collect();
+    let tail = if bytes.len() > 16 { "…" } else { "" };
+    format!("hex=[{}{tail}]", head.join(" "))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -604,5 +829,49 @@ mod tests {
         assert!(run(&args(&["zytunes", "rm"])).is_err());
         assert!(run(&args(&["zytunes", "sync"])).is_err());
         assert!(run(&args(&["zytunes", "help"])).is_ok());
+    }
+
+    #[test]
+    fn parse_u16_maybe_hex_accepts_hex_and_decimal() {
+        assert_eq!(parse_u16_maybe_hex("0x3009").unwrap(), 0x3009);
+        assert_eq!(parse_u16_maybe_hex("0X3009").unwrap(), 0x3009);
+        assert_eq!(parse_u16_maybe_hex("12297").unwrap(), 12_297);
+        assert!(parse_u16_maybe_hex("0xZZZZ").is_err());
+        assert!(parse_u16_maybe_hex("not-a-number").is_err());
+    }
+
+    #[test]
+    fn parse_u32_maybe_hex_accepts_hex_and_decimal() {
+        assert_eq!(parse_u32_maybe_hex("0xDEADBEEF").unwrap(), 0xDEAD_BEEF);
+        assert_eq!(parse_u32_maybe_hex("42").unwrap(), 42);
+        assert!(parse_u32_maybe_hex("0xG").is_err());
+    }
+
+    #[test]
+    fn preview_bytes_decodes_u32_le() {
+        assert_eq!(preview_bytes(&[0x2A, 0x00, 0x00, 0x00]), "u32=42");
+        assert_eq!(preview_bytes(&[0xFF, 0xFF, 0xFF, 0xFF]), "u32=4294967295");
+    }
+
+    #[test]
+    fn preview_bytes_decodes_u16_le() {
+        assert_eq!(preview_bytes(&[0x2A, 0x00]), "u16=42");
+    }
+
+    #[test]
+    fn preview_bytes_falls_back_to_hex() {
+        assert_eq!(preview_bytes(&[]), "(empty)");
+        let long = vec![0xABu8; 32];
+        let got = preview_bytes(&long);
+        assert!(got.starts_with("hex=[ab ab ab"));
+        assert!(got.ends_with("…]"));
+    }
+
+    #[test]
+    fn prop_label_identifies_playcount_family() {
+        assert_eq!(prop_label(0xDC91), "UseCount (playcount)");
+        assert_eq!(prop_label(0xDC92), "SkipCount");
+        assert_eq!(prop_label(0xDC93), "LastAccessed");
+        assert!(prop_label(0xFFFF).starts_with("(unknown"));
     }
 }

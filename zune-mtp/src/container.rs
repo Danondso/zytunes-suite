@@ -25,6 +25,10 @@ pub enum OperationCode {
     DeleteObject = 0x100b,
     GetDevicePropValue = 0x1015,
     SetDevicePropValue = 0x1016,
+    /// Read a single property value for an object (0x9803). Smaller than
+    /// `GetObjectPropList` for one-off probes; production reads of multiple
+    /// properties should batch through `GetObjectPropList` instead.
+    GetObjectPropValue = 0x9803,
     SetObjectPropValue = 0x9804,
     GetObjectPropList = 0x9805,
     GetObjectPropsSupported = 0x9806,

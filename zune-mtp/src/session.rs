@@ -420,6 +420,59 @@ impl MtpSession {
         )
     }
 
+    /// Read a single property value for a specific object (0x9803).
+    /// Returns the raw value bytes — caller decodes per the property's MTP
+    /// data type (u16, u32, string, etc.). For reading many props from many
+    /// objects, prefer `get_object_prop_list` to batch over the wire.
+    pub fn get_object_prop_value(
+        &mut self,
+        object_id: u32,
+        prop: u16,
+    ) -> Result<Vec<u8>, MtpError> {
+        self.execute_data_in(OperationCode::GetObjectPropValue, &[object_id, prop as u32])
+    }
+
+    /// Convenience: read a u32-typed object property. Returns `Ok(None)` when
+    /// the device returns no value bytes (interpreted as "unset"); returns
+    /// an error for any other short read.
+    pub fn get_object_prop_u32(
+        &mut self,
+        object_id: u32,
+        prop: u16,
+    ) -> Result<Option<u32>, MtpError> {
+        let bytes = self.get_object_prop_value(object_id, prop)?;
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        if bytes.len() < 4 {
+            return Err(MtpError::Protocol(format!(
+                "GetObjectPropValue(0x{prop:04x}) returned {} bytes; need 4 for u32",
+                bytes.len()
+            )));
+        }
+        Ok(Some(le_u32(&bytes, 0)))
+    }
+
+    /// Convenience: read a u16-typed object property. Same `Ok(None)` /
+    /// short-read semantics as `get_object_prop_u32`.
+    pub fn get_object_prop_u16(
+        &mut self,
+        object_id: u32,
+        prop: u16,
+    ) -> Result<Option<u16>, MtpError> {
+        let bytes = self.get_object_prop_value(object_id, prop)?;
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        if bytes.len() < 2 {
+            return Err(MtpError::Protocol(format!(
+                "GetObjectPropValue(0x{prop:04x}) returned {} bytes; need 2 for u16",
+                bytes.len()
+            )));
+        }
+        Ok(Some(le_u16(&bytes, 0)))
+    }
+
     /// Set a property value on an object (0x9804).
     pub fn set_object_prop_value(
         &mut self,
@@ -821,5 +874,22 @@ mod tests {
     fn parse_response_params_none() {
         let resp = vec![0u8; 12]; // header only, no params
         assert!(parse_response_params(&resp).is_empty());
+    }
+
+    /// Guard against accidental edits to the playcount-related MTP property
+    /// codes — Phase 4a probes and Phase 4b production code both depend on
+    /// these matching the libmtp / MTP spec values exactly.
+    #[test]
+    fn playcount_prop_codes_match_mtp_spec() {
+        assert_eq!(crate::proplist::PROP_USE_COUNT, 0xDC91);
+        assert_eq!(crate::proplist::PROP_SKIP_COUNT, 0xDC92);
+        assert_eq!(crate::proplist::PROP_LAST_ACCESSED, 0xDC93);
+        assert_eq!(crate::proplist::PROP_RATING, 0xDC8A);
+        assert_eq!(crate::proplist::PROP_DATE_ADDED, 0xDC4E);
+    }
+
+    #[test]
+    fn get_object_prop_value_op_code_matches_mtp_spec() {
+        assert_eq!(OperationCode::GetObjectPropValue as u16, 0x9803);
     }
 }

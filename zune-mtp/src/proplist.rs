@@ -21,6 +21,16 @@ pub const PROP_ARTIST_ID: u16 = 0xDAB9;
 pub const PROP_DATE_AUTHORED: u16 = 0xDC47;
 pub const PROP_REPRESENTATIVE_SAMPLE_DATA: u16 = 0xDC86;
 
+// MTP playcount-related property codes (per libmtp / MTP spec).
+// Standardised but not advertised by every device — the Zune is the open
+// question. Phase 4a probes test which (if any) of these the Zune exposes
+// for audio objects.
+pub const PROP_DATE_ADDED: u16 = 0xDC4E;
+pub const PROP_RATING: u16 = 0xDC8A;
+pub const PROP_USE_COUNT: u16 = 0xDC91;
+pub const PROP_SKIP_COUNT: u16 = 0xDC92;
+pub const PROP_LAST_ACCESSED: u16 = 0xDC93;
+
 /// Builder for MTP property lists used with SendObjectPropList.
 pub struct PropListBuilder {
     data: Vec<u8>,
