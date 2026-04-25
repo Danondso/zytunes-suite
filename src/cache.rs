@@ -76,8 +76,33 @@ fn dirlib_cache_name(dir_path: &str) -> String {
 
 fn load_raw(dir_path: &str) -> Option<CachedLibrary> {
     let path = cache_path(&dirlib_cache_name(dir_path))?;
-    let data = std::fs::read(&path).ok()?;
-    serde_json::from_slice(&data).ok()
+    let data = match std::fs::read(&path) {
+        Ok(d) => d,
+        Err(e) => {
+            // ENOENT on first launch is normal; only log if it's something
+            // else (permission denied, bad symlink, etc.).
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("zytunes: cache: read {} failed: {e}", path.display());
+            } else {
+                eprintln!(
+                    "zytunes: cache: no cache file at {} (first scan or previous run failed to save)",
+                    path.display()
+                );
+            }
+            return None;
+        }
+    };
+    match serde_json::from_slice::<CachedLibrary>(&data) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            eprintln!(
+                "zytunes: cache: parse {} ({} bytes) failed: {e} — treating as empty",
+                path.display(),
+                data.len()
+            );
+            None
+        }
+    }
 }
 
 fn save_raw(dir_path: &str, cached: &CachedLibrary) {
@@ -118,7 +143,19 @@ fn save_raw(dir_path: &str, cached: &CachedLibrary) {
 pub fn load_dirlib_cache(dir_path: &str) -> HashMap<String, CachedFile> {
     match load_raw(dir_path) {
         Some(c) if c.root == dir_path => c.files,
-        _ => HashMap::new(),
+        Some(c) => {
+            // Path normalisation skew is the silent killer here — a single
+            // trailing slash difference between launches (e.g. `~/Music`
+            // vs `~/Music/`) silently invalidates the entire cache.
+            eprintln!(
+                "zytunes: cache: stored root {:?} != requested root {:?} — discarding {} cached entries",
+                c.root,
+                dir_path,
+                c.files.len()
+            );
+            HashMap::new()
+        }
+        None => HashMap::new(),
     }
 }
 
