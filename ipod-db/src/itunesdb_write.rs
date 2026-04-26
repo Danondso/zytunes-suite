@@ -229,8 +229,8 @@ fn write_mhit(
     buf.write_u8(0).unwrap(); // +0x1C type1 (0=CBR, 1=VBR MP3)
     buf.write_u8(if is_mp3 { 1 } else { 0 }).unwrap(); // +0x1D type2 (1=MP3, 0=AAC)
     buf.write_u8(0).unwrap(); // +0x1E compilation
-    buf.write_u8(0).unwrap(); // +0x1F rating
-                              // +0x20
+    buf.write_u8(track.rating).unwrap(); // +0x1F rating (0..=100, 5-star × 20)
+                                         // +0x20
     buf.write_u32::<LittleEndian>(now).unwrap(); // time_modified
     buf.write_u32::<LittleEndian>(track.file_size).unwrap(); // size
     buf.write_u32::<LittleEndian>(track.total_time_ms.unwrap_or(0))
@@ -251,9 +251,9 @@ fn write_mhit(
     buf.write_u32::<LittleEndian>(0).unwrap(); // stoptime
     buf.write_u32::<LittleEndian>(0).unwrap(); // soundcheck
                                                // +0x50
-    buf.write_u32::<LittleEndian>(0).unwrap(); // playcount
-    buf.write_u32::<LittleEndian>(0).unwrap(); // playcount2
-    buf.write_u32::<LittleEndian>(0).unwrap(); // time_played
+    buf.write_u32::<LittleEndian>(track.play_count).unwrap(); // playcount
+    buf.write_u32::<LittleEndian>(track.play_count).unwrap(); // playcount2 (libgpod duplicates)
+    buf.write_u32::<LittleEndian>(track.last_played).unwrap(); // last_played (Mac HFS epoch)
     buf.write_u32::<LittleEndian>(track.disc_number.unwrap_or(0) as u32)
         .unwrap(); // cd_nr
                    // +0x60
@@ -279,9 +279,9 @@ fn write_mhit(
     buf.write_u16::<LittleEndian>(0).unwrap(); // explicit_flag
     buf.write_u32::<LittleEndian>(0).unwrap(); // +0x94 unk148
     buf.write_u32::<LittleEndian>(0).unwrap(); // +0x98 unk152
-    buf.write_u32::<LittleEndian>(0).unwrap(); // +0x9C skipcount
-                                               // +0xA0
-    buf.write_u32::<LittleEndian>(0).unwrap(); // last_skipped
+    buf.write_u32::<LittleEndian>(track.skip_count).unwrap(); // +0x9C skipcount
+                                                              // +0xA0
+    buf.write_u32::<LittleEndian>(track.last_skipped).unwrap(); // last_skipped (Mac HFS epoch)
     buf.write_u8(if artwork_count > 0 { 1 } else { 2 }).unwrap(); // +0xA4 has_artwork (1=yes, 2=no)
     buf.write_u8(0).unwrap(); // +0xA5 skip_when_shuffling
     buf.write_u8(0).unwrap(); // +0xA6 remember_playback_position
@@ -808,10 +808,8 @@ fn build_album_dataset(tracks: &[IpodTrack]) -> Vec<u8> {
     }
 
     let mut album_data = Vec::new();
-    let mut album_id = 1u32;
-    for ((album_name, artist), count) in &album_map {
+    for (album_id, ((album_name, artist), count)) in (1u32..).zip(album_map.iter()) {
         album_data.extend(write_mhia(album_id, album_name, artist, *count));
-        album_id += 1;
     }
 
     let album_count = album_map.len() as u32;

@@ -306,8 +306,8 @@ fn print_analysis(label: &str, headers: &[(u32, u64, Vec<u8>)]) {
 
     // Print ALL fields, highlighting non-zero ones
     println!(
-        "  {:>6}  {:>24}  {:>5}  {:>10}  {:>10}  {:>8}  {}",
-        "OFFSET", "FIELD", "NZ/%", "MIN", "MAX", "UNIQUE", "NOTE"
+        "  {:>6}  {:>24}  {:>5}  {:>10}  {:>10}  {:>8}  NOTE",
+        "OFFSET", "FIELD", "NZ/%", "MIN", "MAX", "UNIQUE"
     );
     println!("  {}", "-".repeat(90));
 
@@ -351,8 +351,8 @@ fn print_analysis(label: &str, headers: &[(u32, u64, Vec<u8>)]) {
         header_size
     );
     println!(
-        "  {:>6}  {:>24}  {:>5}  {:>12}  {:>12}  {}",
-        "OFFSET", "FIELD", "NZ/%", "EXAMPLE_VAL", "HEX", "CLASSIFICATION"
+        "  {:>6}  {:>24}  {:>5}  {:>12}  {:>12}  CLASSIFICATION",
+        "OFFSET", "FIELD", "NZ/%", "EXAMPLE_VAL", "HEX"
     );
     println!("  {}", "-".repeat(85));
 
@@ -414,8 +414,8 @@ fn main() {
         let stats2 = analyze_extended_fields(&headers2);
 
         println!(
-            "  {:>6}  {:>24}  {:>12}  {:>12}  {}",
-            "OFFSET", "FIELD", "REF_EXAMPLE", "OURS", "STATUS"
+            "  {:>6}  {:>24}  {:>12}  {:>12}  STATUS",
+            "OFFSET", "FIELD", "REF_EXAMPLE", "OURS"
         );
         println!("  {}", "-".repeat(75));
 

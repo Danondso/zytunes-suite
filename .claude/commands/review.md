@@ -1,3 +1,7 @@
+---
+description: Local code review of the current branch's diff, posted as PR comments
+---
+
 # review
 
 Local code review of the current branch's diff against main, posted as PR comments, then fixed.

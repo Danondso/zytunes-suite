@@ -952,7 +952,7 @@ impl App {
         label
     }
 
-    /// In-memory half of [`cycle_show_player`]: advances the preference and
+    /// In-memory half of [`Self::cycle_show_player`]: advances the preference and
     /// returns the label, without touching the on-disk config. Split out for
     /// unit tests.
     fn cycle_show_player_in_memory(&mut self) -> &'static str {
@@ -988,7 +988,7 @@ impl App {
         crate::config::update(|c| c.album_art_style = Some(style));
     }
 
-    /// In-memory half of [`toggle_album_art_style`]: flips the style and
+    /// In-memory half of [`Self::toggle_album_art_style`]: flips the style and
     /// invalidates the cached art for the old style. Split out so unit tests
     /// can exercise the state transition without touching the on-disk config.
     fn flip_art_style_in_memory(&mut self) {
@@ -2860,10 +2860,8 @@ impl App {
                 self.refresh_sidebar();
                 self.active_panel = Panel::Library;
             }
-            KeyCode::Char('4') => {
-                if !self.sync.queue.is_empty() {
-                    self.active_panel = Panel::SyncQueue;
-                }
+            KeyCode::Char('4') if !self.sync.queue.is_empty() => {
+                self.active_panel = Panel::SyncQueue;
             }
             KeyCode::Char('t') => {
                 self.open_theme_picker();
@@ -2871,10 +2869,8 @@ impl App {
             KeyCode::Char('T') => {
                 self.toggle_album_art_style();
             }
-            KeyCode::Char('I') => {
-                if self.active_panel == Panel::TrackList {
-                    self.open_track_info();
-                }
+            KeyCode::Char('I') if self.active_panel == Panel::TrackList => {
+                self.open_track_info();
             }
             KeyCode::Char('P') => {
                 let label = self.cycle_show_player();
@@ -2889,12 +2885,10 @@ impl App {
                     self.set_toast("Connect a device first".into(), true);
                 }
             }
-            KeyCode::Char('c') => {
-                if self.device.status == DeviceStatus::Disconnected {
-                    self.device.status = DeviceStatus::Detecting;
-                    self.connection_anim_start = Some(self.anim_frame);
-                    let _ = cmd_tx.send(BgCommand::Connect);
-                }
+            KeyCode::Char('c') if self.device.status == DeviceStatus::Disconnected => {
+                self.device.status = DeviceStatus::Detecting;
+                self.connection_anim_start = Some(self.anim_frame);
+                let _ = cmd_tx.send(BgCommand::Connect);
             }
             KeyCode::Char('d') => match self.active_panel {
                 Panel::SyncQueue => {
@@ -2910,11 +2904,9 @@ impl App {
                 }
                 _ => {}
             },
-            KeyCode::Char('r') => {
-                if self.device.status == DeviceStatus::Connected {
-                    let _ = cmd_tx.send(BgCommand::LoadDeviceTracks);
-                    self.set_toast("Refreshing device tracks...".into(), false);
-                }
+            KeyCode::Char('r') if self.device.status == DeviceStatus::Connected => {
+                let _ = cmd_tx.send(BgCommand::LoadDeviceTracks);
+                self.set_toast("Refreshing device tracks...".into(), false);
             }
             KeyCode::Up => {
                 self.move_up();
@@ -2937,15 +2929,11 @@ impl App {
             KeyCode::Char(' ') => {
                 self.toggle_playback(audio_tx);
             }
-            KeyCode::Char('<') | KeyCode::Char(',') => {
-                if self.now_playing.is_some() {
-                    let _ = audio_tx.send(AudioCommand::Scrub { delta_ms: -5000 });
-                }
+            KeyCode::Char('<') | KeyCode::Char(',') if self.now_playing.is_some() => {
+                let _ = audio_tx.send(AudioCommand::Scrub { delta_ms: -5000 });
             }
-            KeyCode::Char('>') | KeyCode::Char('.') => {
-                if self.now_playing.is_some() {
-                    let _ = audio_tx.send(AudioCommand::Scrub { delta_ms: 5000 });
-                }
+            KeyCode::Char('>') | KeyCode::Char('.') if self.now_playing.is_some() => {
+                let _ = audio_tx.send(AudioCommand::Scrub { delta_ms: 5000 });
             }
             KeyCode::Char('n') => {
                 self.next_track(audio_tx);
@@ -2977,10 +2965,8 @@ impl App {
                 self.search_active = true;
                 self.search_query.clear();
             }
-            KeyCode::Char('s') => {
-                if self.active_panel == Panel::TrackList {
-                    self.cycle_sort();
-                }
+            KeyCode::Char('s') if self.active_panel == Panel::TrackList => {
+                self.cycle_sort();
             }
             KeyCode::Char('L') => {
                 let path = std::path::PathBuf::from("/tmp/zytunes-log.txt");
@@ -3001,11 +2987,9 @@ impl App {
                     Err(e) => self.set_toast(format!("Log dump failed: {}", e), true),
                 }
             }
-            KeyCode::Char('S') => {
-                if !self.sync.queue.is_empty() {
-                    self.active_panel = Panel::SyncQueue;
-                    self.execute_sync(cmd_tx);
-                }
+            KeyCode::Char('S') if !self.sync.queue.is_empty() => {
+                self.active_panel = Panel::SyncQueue;
+                self.execute_sync(cmd_tx);
             }
             KeyCode::Char('a') => {
                 if self.browse_mode == BrowseMode::Device {
@@ -3032,10 +3016,10 @@ impl App {
                     self.add_all_visible_to_queue();
                 }
             }
-            KeyCode::Char('D') => {
-                if self.browse_mode == BrowseMode::Device && !self.removal_queue.is_empty() {
-                    self.pending_removal = Some(self.removal_queue.clone());
-                }
+            KeyCode::Char('D')
+                if self.browse_mode == BrowseMode::Device && !self.removal_queue.is_empty() =>
+            {
+                self.pending_removal = Some(self.removal_queue.clone());
             }
             KeyCode::Char('C') => {
                 if self.browse_mode == BrowseMode::Device {
@@ -3048,10 +3032,8 @@ impl App {
                     self.clear_queue();
                 }
             }
-            KeyCode::Char('U') => {
-                if self.browse_mode == BrowseMode::Device {
-                    self.dedupe_device(cmd_tx);
-                }
+            KeyCode::Char('U') if self.browse_mode == BrowseMode::Device => {
+                self.dedupe_device(cmd_tx);
             }
             KeyCode::Char('X') => {
                 self.pending_cache_clear = true;

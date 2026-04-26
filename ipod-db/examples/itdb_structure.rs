@@ -1,7 +1,10 @@
-/// Binary structure comparison tool for iTunesDB files.
-///
-/// Walks chunk headers (mhbd, mhsd, mhlt, mhit, mhod, mhyp, mhip, mhlp, mhla)
-/// and prints a structural summary useful for debugging rewrite mismatches.
+//! Binary structure comparison tool for iTunesDB files.
+//!
+//! Walks chunk headers (mhbd, mhsd, mhlt, mhit, mhod, mhyp, mhip, mhlp, mhla)
+//! and prints a structural summary useful for debugging rewrite mismatches.
+
+#![allow(dead_code)] // introspection tool — fields are parsed for completeness, not all printed
+
 use std::env;
 use std::fs;
 use std::io::{Cursor, Read, Seek, SeekFrom};
@@ -160,7 +163,7 @@ fn parse_mhod(cur: &mut Cursor<&[u8]>) -> Option<(MhodInfo, Option<String>)> {
     let mhod_type = cur.read_u32::<LittleEndian>().ok()?;
 
     // Try to read string for types 1-18
-    let string_val = if mhod_type >= 1 && mhod_type <= 18 {
+    let string_val = if (1..=18).contains(&mhod_type) {
         read_mhod_string(cur, start, header_size)
     } else {
         None

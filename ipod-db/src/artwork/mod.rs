@@ -427,6 +427,7 @@ mod tests {
             last_played: 0,
             skip_count: 0,
             last_skipped: 0,
+            rating: 0,
             raw_mhit_header: None,
         });
 
@@ -500,6 +501,7 @@ mod tests {
             last_played: 0,
             skip_count: 0,
             last_skipped: 0,
+            rating: 0,
             raw_mhit_header: None,
         });
 
@@ -554,6 +556,7 @@ mod tests {
             last_played: 0,
             skip_count: 0,
             last_skipped: 0,
+            rating: 0,
             raw_mhit_header: None,
         });
 
@@ -611,6 +614,7 @@ mod tests {
             last_played: 0,
             skip_count: 0,
             last_skipped: 0,
+            rating: 0,
             raw_mhit_header: None,
         });
         // No artwork initialized.

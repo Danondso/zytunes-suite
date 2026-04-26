@@ -37,15 +37,11 @@ fn read_sysinfo(mount: &Path) -> (Option<String>, Option<String>, Option<String>
             let value = value.trim().to_string();
             match key {
                 "ModelNumStr" => model = Some(value),
-                "pszSerialNumber" | "FirewireGuid" => {
-                    if serial.is_none() {
-                        serial = Some(value);
-                    }
+                "pszSerialNumber" | "FirewireGuid" if serial.is_none() => {
+                    serial = Some(value);
                 }
-                "visibleBuildID" | "buildID" => {
-                    if firmware.is_none() {
-                        firmware = Some(value);
-                    }
+                "visibleBuildID" | "buildID" if firmware.is_none() => {
+                    firmware = Some(value);
                 }
                 _ => {}
             }

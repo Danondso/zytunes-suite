@@ -1,3 +1,7 @@
+---
+description: Spawn research agents on a problem and form ranked hypotheses with validation steps
+---
+
 # debug
 
 Spawn research agents on a problem, aggregate their findings into `DEBUG.md`, then form ranked hypotheses with validation steps.

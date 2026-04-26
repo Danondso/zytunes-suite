@@ -122,7 +122,9 @@ fn parse_string_mhod(
 
 /// Parse an mhit (track item) and its child mhods.
 ///
-/// mhit field layout (offsets from chunk start, all little-endian):
+/// mhit field layout matching libgpod's `Itdb_Track` struct (offsets from
+/// chunk start, little-endian). The corresponding writer in
+/// `itunesdb_write::write_mhit` mirrors this exactly.
 ///
 /// Core fields (+4 to +108, always present):
 ///   +4   header_size     u32    +56  bitrate           u32
@@ -131,33 +133,34 @@ fn parse_string_mhod(
 ///   +16  track_id        u32    +68  start_time        u32  ms
 ///   +20  visible         u32    +72  stop_time         u32  ms
 ///   +24  filetype        u32    +76  sound_check       u32
-///   +28  type            u8     +80  play_count        u32
-///   +29  compilation     u8     +84  last_played       u32  Mac timestamp
-///   +30  rating          u8     +88  date_added_to_device u32 Mac timestamp
-///   +31  padding         u8     +92  disc_number       u32
-///   +32  date_modified   u32    +96  disc_total        u32
-///   +36  file_size       u32    +100 sort_order        u32
+///   +28  type1           u8     +80  play_count        u32
+///   +29  type2           u8     +84  play_count_dup    u32  libgpod duplicates
+///   +30  compilation     u8     +88  last_played       u32  Mac timestamp
+///   +31  rating          u8     +92  disc_number       u32
+///   +32  date_modified   u32    +96  total_discs       u32
+///   +36  file_size       u32    +100 drm_userid        u32
 ///   +40  total_time_ms   u32    +104 date_added        u32  Mac timestamp
-///   +44  track_number    u32    +108 date_released     u32  Mac timestamp
+///   +44  track_number    u32    +108 bookmark_time     u32
 ///   +48  total_tracks    u32
 ///   +52  year            u32
 ///
-/// Extended fields (+112 to +208, require header_size >= 212):
-///   +112 dbid            u64    +168 dbid2             u64  duplicate
-///   +120 checked         u32    +176 lyrics_flag       u32
-///   +124 app_rating      u32    +180 movie_flag        u32
-///   +128 bpm             u32    +184 mark_unplayed     u32
-///   +132 artwork_count   u32    +188 size_on_disk      u32
-///   +136 sample_rate_dup u32    +192 date_modified2    u32
-///   +140 date_released2  u32    +196 hash              u32
-///   +144 explicit_flag   u32    +200 media_type        u32
-///   +148 skip_count      u32    +204 season|episode    u32
-///   +152 last_skipped    u32    +208 has_gapless_data  u32
-///   +156 has_artwork     u32
-///   +160 skip_shuffling  u32
-///   +164 remember_pos    u32
+/// Extended fields (+112 to +216, require header_size >= 220):
+///   +112 dbid            u64    +156 skip_count        u32
+///   +120 checked|app_rating|bpm  +160 last_skipped     u32  Mac timestamp
+///   +124 artwork_count|unk126    +164 has_artwork|skip_shuffle|remember_pos|flag4
+///   +128 artwork_size    u32    +168 dbid2             u64  duplicate
+///   +132 unk132          u32    +176 lyrics|movie|unplayed|unk179
+///   +136 samplerate2     u32  IEEE float dup           +180 unk180  u32
+///   +140 time_released   u32    +184 pregap            u32
+///   +144 unk144|explicit_flag    +188 samplecount      u64  (split as two u32s)
+///   +148 unk148          u32    +196 unk196            u32
+///   +152 unk152          u32    +200 postgap           u32
+///                               +204 unk204            u32
+///                               +208 media_type        u32
+///                               +212 season_nr         u32
+///                               +216 episode_nr        u32
 ///
-/// Fields beyond +212 (gapless data, album IDs, etc.) vary by generation
+/// Fields beyond +220 (gapless data, album IDs, etc.) vary by generation
 /// and are skipped via header_size.
 fn parse_mhit(cur: &mut Cursor<&[u8]>, start: u64) -> crate::Result<IpodTrack> {
     // Read the minimum header fields (offsets +4 through +108, 108 bytes).
@@ -168,10 +171,10 @@ fn parse_mhit(cur: &mut Cursor<&[u8]>, start: u64) -> crate::Result<IpodTrack> {
     let track_id = cur.read_u32::<LittleEndian>()?; // +16
     let _visible = cur.read_u32::<LittleEndian>()?; // +20
     let filetype = cur.read_u32::<LittleEndian>()?; // +24
-    let _type_byte = cur.read_u8()?; // +28
-    let _compilation = cur.read_u8()?; // +29
-    let _rating = cur.read_u8()?; // +30
-    let _padding = cur.read_u8()?; // +31
+    let _type1 = cur.read_u8()?; // +28  CBR/VBR flag
+    let _type2 = cur.read_u8()?; // +29  1=MP3, 0=AAC (libgpod naming)
+    let _compilation = cur.read_u8()?; // +30
+    let rating = cur.read_u8()?; // +31  user rating 0..=100 (5-star × 20)
     let _date_modified = cur.read_u32::<LittleEndian>()?; // +32
     let file_size = cur.read_u32::<LittleEndian>()?; // +36
     let total_time = cur.read_u32::<LittleEndian>()?; // +40
@@ -186,13 +189,13 @@ fn parse_mhit(cur: &mut Cursor<&[u8]>, start: u64) -> crate::Result<IpodTrack> {
     let _stop_time = cur.read_u32::<LittleEndian>()?; // +72
     let _sound_check = cur.read_u32::<LittleEndian>()?; // +76
     let play_count = cur.read_u32::<LittleEndian>()?; // +80
-    let last_played = cur.read_u32::<LittleEndian>()?; // +84   Mac timestamp
-    let _date_added_to_device = cur.read_u32::<LittleEndian>()?; // +88   Mac timestamp
+    let _play_count_dup = cur.read_u32::<LittleEndian>()?; // +84   libgpod duplicates playcount
+    let last_played = cur.read_u32::<LittleEndian>()?; // +88   Mac timestamp
     let disc_number = cur.read_u32::<LittleEndian>()?; // +92
     let total_discs = cur.read_u32::<LittleEndian>()?; // +96
-    let _sort_order = cur.read_u32::<LittleEndian>()?; // +100
+    let _drm_userid = cur.read_u32::<LittleEndian>()?; // +100
     let _date_added = cur.read_u32::<LittleEndian>()?; // +104  Mac timestamp
-    let _date_released = cur.read_u32::<LittleEndian>()?; // +108  Mac timestamp
+    let _bookmark_time = cur.read_u32::<LittleEndian>()?; // +108
                                                           // Sequential read ends at +112. Remaining fields need header_size guards.
 
     // Extended fields (offsets +112 through +320). Only present in larger headers.
@@ -205,29 +208,33 @@ fn parse_mhit(cur: &mut Cursor<&[u8]>, start: u64) -> crate::Result<IpodTrack> {
 
     let mut skip_count: u32 = 0;
     let mut last_skipped: u32 = 0;
-    if header_size >= 212 {
-        let _checked = cur.read_u32::<LittleEndian>()?; // +120
-        let _app_rating = cur.read_u32::<LittleEndian>()?; // +124
-        let _bpm = cur.read_u32::<LittleEndian>()?; // +128
-        let _artwork_count = cur.read_u32::<LittleEndian>()?; // +132
-        let _sample_rate_dup = cur.read_u32::<LittleEndian>()?; // +136  fixed-point dup
-        let _date_released2 = cur.read_u32::<LittleEndian>()?; // +140
-        let _explicit_flag = cur.read_u32::<LittleEndian>()?; // +144
-        skip_count = cur.read_u32::<LittleEndian>()?; // +148
-        last_skipped = cur.read_u32::<LittleEndian>()?; // +152  Mac timestamp
-        let _has_artwork = cur.read_u32::<LittleEndian>()?; // +156
-        let _skip_shuffling = cur.read_u32::<LittleEndian>()?; // +160
-        let _remember_pos = cur.read_u32::<LittleEndian>()?; // +164
+    if header_size >= 220 {
+        // Layout matches libgpod's `Itdb_Track` struct exactly. Each named
+        // field below maps to the matching slot in `itunesdb_write::write_mhit`.
+        let _checked_app_rating_bpm = cur.read_u32::<LittleEndian>()?; // +120  checked(u8)+app_rating(u8)+BPM(u16)
+        let _artwork_count_unk126 = cur.read_u32::<LittleEndian>()?; // +124  artwork_count(u16)+unk126(u16)
+        let _artwork_size = cur.read_u32::<LittleEndian>()?; // +128
+        let _unk132 = cur.read_u32::<LittleEndian>()?; // +132
+        let _samplerate2 = cur.read_u32::<LittleEndian>()?; // +136  IEEE-float sample rate dup
+        let _time_released = cur.read_u32::<LittleEndian>()?; // +140
+        let _unk144_explicit = cur.read_u32::<LittleEndian>()?; // +144  unk144(u16)+explicit_flag(u16)
+        let _unk148 = cur.read_u32::<LittleEndian>()?; // +148
+        let _unk152 = cur.read_u32::<LittleEndian>()?; // +152
+        skip_count = cur.read_u32::<LittleEndian>()?; // +156
+        last_skipped = cur.read_u32::<LittleEndian>()?; // +160  Mac timestamp
+        let _has_artwork_skip_shuffle = cur.read_u32::<LittleEndian>()?; // +164  has_artwork(u8)+skip_shuffle(u8)+remember_pos(u8)+flag4(u8)
         let _dbid2 = cur.read_u64::<LittleEndian>()?; // +168  persistent ID dup
-        let _lyrics_flag = cur.read_u32::<LittleEndian>()?; // +176
-        let _movie_flag = cur.read_u32::<LittleEndian>()?; // +180
-        let _mark_unplayed = cur.read_u32::<LittleEndian>()?; // +184
-        let _size_on_disk = cur.read_u32::<LittleEndian>()?; // +188
-        let _date_modified2 = cur.read_u32::<LittleEndian>()?; // +192
-        let _hash = cur.read_u32::<LittleEndian>()?; // +196
-        let _media_type = cur.read_u32::<LittleEndian>()?; // +200
-        let _season_episode = cur.read_u32::<LittleEndian>()?; // +204
-        let _has_gapless = cur.read_u32::<LittleEndian>()?; // +208
+        let _lyrics_movie_unplayed = cur.read_u32::<LittleEndian>()?; // +176  lyrics(u8)+movie(u8)+unplayed(u8)+unk179(u8)
+        let _unk180 = cur.read_u32::<LittleEndian>()?; // +180
+        let _pregap = cur.read_u32::<LittleEndian>()?; // +184
+        let _samplecount_lo = cur.read_u32::<LittleEndian>()?; // +188  samplecount low half (u64 split)
+        let _samplecount_hi = cur.read_u32::<LittleEndian>()?; // +192  samplecount high half
+        let _unk196 = cur.read_u32::<LittleEndian>()?; // +196
+        let _postgap = cur.read_u32::<LittleEndian>()?; // +200
+        let _unk204 = cur.read_u32::<LittleEndian>()?; // +204
+        let _media_type = cur.read_u32::<LittleEndian>()?; // +208
+        let _season_nr = cur.read_u32::<LittleEndian>()?; // +212
+        let _episode_nr = cur.read_u32::<LittleEndian>()?; // +216
     }
     // Sequential read ends at +212. Remaining header bytes (212..header_size)
     // contain gapless data, album IDs, and other fields that vary by generation.
@@ -331,6 +338,7 @@ fn parse_mhit(cur: &mut Cursor<&[u8]>, start: u64) -> crate::Result<IpodTrack> {
         last_played,
         skip_count,
         last_skipped,
+        rating,
         raw_mhit_header,
     })
 }
@@ -553,6 +561,7 @@ mod tests {
             last_played: 0,
             skip_count: 0,
             last_skipped: 0,
+            rating: 0,
             raw_mhit_header: None,
         });
 
@@ -608,6 +617,7 @@ mod tests {
             last_played: 0,
             skip_count: 0,
             last_skipped: 0,
+            rating: 0,
             raw_mhit_header: None,
         });
         let dbid2 = db.add_track(IpodTrack {
@@ -634,6 +644,7 @@ mod tests {
             last_played: 0,
             skip_count: 0,
             last_skipped: 0,
+            rating: 0,
             raw_mhit_header: None,
         });
 
@@ -680,10 +691,11 @@ mod tests {
             ipod_path: ":iPod_Control:Music:F05:XYZW.mp3".into(),
             filetype: 0x4d503320,
             filetype_string: None,
-            play_count: 0,
-            last_played: 0,
-            skip_count: 0,
-            last_skipped: 0,
+            play_count: 12,
+            last_played: 0xDEAD_BEEF,
+            skip_count: 3,
+            last_skipped: 0xFEED_FACE,
+            rating: 80,
             raw_mhit_header: None,
         });
 
@@ -707,13 +719,14 @@ mod tests {
         assert_eq!(t.filetype, 0x4d503320);
         assert_eq!(t.dbid, db.tracks[0].dbid);
         assert_eq!(t.track_id, db.tracks[0].track_id);
-        // Playcount fields are plumbed through the parser even when the
-        // serialized value is zero. The writer still zeros these on
-        // export — fixing that round-trip is Phase 2 of the playcount work.
-        assert_eq!(t.play_count, 0);
-        assert_eq!(t.last_played, 0);
-        assert_eq!(t.skip_count, 0);
-        assert_eq!(t.last_skipped, 0);
+        // Play-tracking fields now round-trip end-to-end: writer wires
+        // track.play_count/last_played/skip_count/last_skipped/rating into
+        // the mhit header, parser reads them back into IpodTrack.
+        assert_eq!(t.play_count, 12);
+        assert_eq!(t.last_played, 0xDEAD_BEEF);
+        assert_eq!(t.skip_count, 3);
+        assert_eq!(t.last_skipped, 0xFEED_FACE);
+        assert_eq!(t.rating, 80);
     }
 
     /// Direct parser test: hand-craft a minimal valid mhit chunk with
@@ -751,22 +764,23 @@ mod tests {
             last_played: 0,
             skip_count: 0,
             last_skipped: 0,
+            rating: 0,
             raw_mhit_header: None,
         });
         let mut bytes = itunesdb_write::serialize(&db);
-        // Locate the mhit chunk and patch the play_count field at offset +80
-        // (relative to the mhit start). The serialized stream contains the
-        // 4-byte `mhit` magic; we add 80 to the offset of that byte.
+        // Locate the mhit chunk and patch the playcount/last_played fields
+        // by relative offset. The serialized stream contains the 4-byte
+        // `mhit` magic; offsets below are relative to that byte.
         let mhit_start = bytes
             .windows(4)
             .position(|w| w == b"mhit")
             .expect("mhit chunk should be present in serialized output");
+        // play_count at +80 (libgpod canonical Itdb_Track::playcount).
         let pc_offset = mhit_start + 80;
         let mut cur = std::io::Cursor::new(&mut bytes[pc_offset..pc_offset + 4]);
         cur.write_u32::<LittleEndian>(42).unwrap();
-        // Patch +84 too so we cover last_played; +148 is in extended header
-        // and may not be present on all sized headers, so leave it alone.
-        let lp_offset = mhit_start + 84;
+        // last_played at +88, NOT +84 (+84 is the playcount duplicate slot).
+        let lp_offset = mhit_start + 88;
         let mut cur = std::io::Cursor::new(&mut bytes[lp_offset..lp_offset + 4]);
         cur.write_u32::<LittleEndian>(0xDEAD_BEEF).unwrap();
 
@@ -803,6 +817,7 @@ mod tests {
             last_played: 0,
             skip_count: 0,
             last_skipped: 0,
+            rating: 0,
             raw_mhit_header: None,
         });
 
@@ -857,6 +872,7 @@ mod tests {
             last_played: 0,
             skip_count: 0,
             last_skipped: 0,
+            rating: 0,
             raw_mhit_header: None,
         });
 
@@ -970,6 +986,7 @@ mod tests {
             last_played: 0,
             skip_count: 0,
             last_skipped: 0,
+            rating: 0,
             raw_mhit_header: None,
         });
         db.add_track(IpodTrack {
@@ -996,6 +1013,7 @@ mod tests {
             last_played: 0,
             skip_count: 0,
             last_skipped: 0,
+            rating: 0,
             raw_mhit_header: None,
         });
 
@@ -1068,6 +1086,7 @@ mod tests {
             last_played: 0,
             skip_count: 0,
             last_skipped: 0,
+            rating: 0,
             raw_mhit_header: None,
         });
         db.add_track(IpodTrack {
@@ -1094,6 +1113,7 @@ mod tests {
             last_played: 0,
             skip_count: 0,
             last_skipped: 0,
+            rating: 0,
             raw_mhit_header: None,
         });
 
@@ -1163,6 +1183,7 @@ mod tests {
                 last_played: 0,
                 skip_count: 0,
                 last_skipped: 0,
+                rating: 0,
                 raw_mhit_header: None,
             });
         }
@@ -1334,5 +1355,96 @@ mod tests {
             time_added > 3_800_000_000,
             "time_added should be an HFS timestamp, got {time_added}"
         );
+    }
+
+    /// End-to-end: build a DB with tracks, serialize, parse it back, then
+    /// fold a hand-crafted Play Counts sidecar into the parsed tracks.
+    /// Exercises the writer + parser + sidecar parser together — catches
+    /// any layout drift the unit tests would miss.
+    #[test]
+    fn test_serialize_parse_then_apply_play_counts_sidecar() {
+        use crate::play_counts;
+        use byteorder::WriteBytesExt;
+
+        // Build a DB with two tracks, one with prior plays, one fresh.
+        let mut db = IpodDatabase::new(PathBuf::from("/mnt/IPOD"));
+        db.add_track(IpodTrack {
+            title: "T1".into(),
+            artist: "A".into(),
+            album: "B".into(),
+            ipod_path: ":iPod_Control:Music:F00:t1.mp3".into(),
+            filetype: 0x4d503320,
+            file_size: 100,
+            play_count: 5,
+            last_played: 1000,
+            skip_count: 1,
+            last_skipped: 500,
+            rating: 60,
+            ..Default::default()
+        });
+        db.add_track(IpodTrack {
+            title: "T2".into(),
+            artist: "A".into(),
+            album: "B".into(),
+            ipod_path: ":iPod_Control:Music:F00:t2.mp3".into(),
+            filetype: 0x4d503320,
+            file_size: 200,
+            ..Default::default()
+        });
+
+        let bytes = itunesdb_write::serialize(&db);
+        let mut parsed = parse(&bytes, PathBuf::from("/mnt/IPOD")).unwrap();
+
+        // Confirm the round-trip preserved both tracks' play state.
+        assert_eq!(parsed.tracks[0].play_count, 5);
+        assert_eq!(parsed.tracks[0].rating, 60);
+        assert_eq!(parsed.tracks[1].play_count, 0);
+
+        // Build a 28-byte-entry Play Counts sidecar with deltas: T1 got 2
+        // more plays + 1 more skip (with newer timestamps); T2 got 3 plays
+        // and a fresh 80 rating.
+        let mut sidecar = Vec::new();
+        sidecar.extend_from_slice(b"mhdp");
+        sidecar.write_u32::<LittleEndian>(96).unwrap(); // header_size
+        sidecar.write_u32::<LittleEndian>(28).unwrap(); // entry_length
+        sidecar.write_u32::<LittleEndian>(2).unwrap(); // num_entries
+        for _ in 0..((96 - 16) / 4) {
+            sidecar.write_u32::<LittleEndian>(0).unwrap();
+        }
+        // Entry 0 (T1): play_count=2, last_played=2000, audiobook_speed=0,
+        // rating=0xFF (unset → preserve mhit's 60), bookmark=0,
+        // play_count_total=99 (ignored), skip_count=1.
+        sidecar.write_u32::<LittleEndian>(2).unwrap();
+        sidecar.write_u32::<LittleEndian>(2000).unwrap();
+        sidecar.write_u32::<LittleEndian>(0).unwrap();
+        sidecar.write_u32::<LittleEndian>(0xFF).unwrap();
+        sidecar.write_u32::<LittleEndian>(0).unwrap();
+        sidecar.write_u32::<LittleEndian>(99).unwrap();
+        sidecar.write_u32::<LittleEndian>(1).unwrap();
+        // Entry 1 (T2): play_count=3, last_played=3000, audiobook_speed=0,
+        // rating=80 (set), bookmark=0, play_count_total=0, skip_count=0.
+        sidecar.write_u32::<LittleEndian>(3).unwrap();
+        sidecar.write_u32::<LittleEndian>(3000).unwrap();
+        sidecar.write_u32::<LittleEndian>(0).unwrap();
+        sidecar.write_u32::<LittleEndian>(80).unwrap();
+        sidecar.write_u32::<LittleEndian>(0).unwrap();
+        sidecar.write_u32::<LittleEndian>(0).unwrap();
+        sidecar.write_u32::<LittleEndian>(0).unwrap();
+
+        let entries = play_counts::parse(&sidecar).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(play_counts::apply_to_tracks(&mut parsed.tracks, &entries));
+
+        // T1: counts are deltas (added), timestamp wins via max(),
+        // rating=0xFF preserves the original.
+        assert_eq!(parsed.tracks[0].play_count, 7); // 5 + 2
+        assert_eq!(parsed.tracks[0].last_played, 2000); // > 1000
+        assert_eq!(parsed.tracks[0].skip_count, 2); // 1 + 1
+        assert_eq!(parsed.tracks[0].rating, 60); // unchanged
+
+        // T2: fresh track, all values come from sidecar.
+        assert_eq!(parsed.tracks[1].play_count, 3);
+        assert_eq!(parsed.tracks[1].last_played, 3000);
+        assert_eq!(parsed.tracks[1].rating, 80);
     }
 }

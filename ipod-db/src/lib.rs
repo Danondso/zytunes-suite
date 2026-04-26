@@ -110,6 +110,7 @@ pub mod fs;
 pub mod hash;
 pub mod itunesdb;
 pub mod itunesdb_write;
+pub mod play_counts;
 
 use std::path::PathBuf;
 use thiserror::Error;
@@ -190,6 +191,11 @@ pub struct IpodTrack {
     /// Last-skipped timestamp (mhit `+152`). Same Mac HFS epoch as
     /// `last_played`. `0` when the track has never been skipped.
     pub last_skipped: u32,
+    /// User-set rating byte at mhit `+30`. Range 0..=100 (5-star × 20:
+    /// 0=unrated, 20=½, 40=★, 60=★½, 80=★★, 100=★★★★★). `0` is the
+    /// "unrated" sentinel — the firmware writes 20/40/60/80/100 for
+    /// half-star through five-star ratings.
+    pub rating: u8,
     /// Raw mhit header bytes (full 624-byte header from parsed database).
     /// When present, the serializer replays this and patches only the fields
     /// it actively manages (artwork_count, has_artwork, total_size, num_mhods).

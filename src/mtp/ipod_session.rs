@@ -406,10 +406,15 @@ impl DeviceSession for IpodSession {
                     } else {
                         None
                     },
-                    // iTunesDB has a `rating` byte at mhit +30 but the
-                    // parser currently discards it; wiring that up is
-                    // tracked separately. Zune is the rating-enabled path.
-                    rating: None,
+                    // mhit +30 is a 0..=100 byte (5-star × 20). `0` is the
+                    // "unrated" sentinel — lift to `None` so the UI shows
+                    // an em-dash for unrated tracks rather than a literal
+                    // zero.
+                    rating: if t.rating > 0 {
+                        Some(t.rating as u16)
+                    } else {
+                        None
+                    },
                 }
             })
             .collect();
@@ -421,5 +426,58 @@ impl DeviceSession for IpodSession {
         // Flush the database as the "save" operation.
         // Errors are silently ignored (same pattern as Zune backend).
         let _ = self.flush();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn track(rating: u8, play_count: u32, last_played: u32, skip_count: u32) -> ipod_db::IpodTrack {
+        // `raw_mhit_header` is `pub(crate)` to ipod-db, so `..Default::default()`
+        // doesn't work from outside the crate. Build via Default + mutate.
+        let mut t = ipod_db::IpodTrack::default();
+        t.title = "T".into();
+        t.artist = "A".into();
+        t.album = "B".into();
+        t.ipod_path = ":iPod_Control:Music:F00:t.mp3".into();
+        t.filetype = 0x4d503320;
+        t.file_size = 100;
+        t.rating = rating;
+        t.play_count = play_count;
+        t.last_played = last_played;
+        t.skip_count = skip_count;
+        t
+    }
+
+    /// `collect_all_tracks` lifts the mhit play/skip/rating bytes into
+    /// `DeviceEntry` fields, mapping `0` to `None` so the UI can render
+    /// "never played" / "unrated" as an em-dash rather than a literal zero.
+    #[test]
+    fn collect_all_tracks_maps_zero_to_none() {
+        let mut db = ipod_db::IpodDatabase::new(PathBuf::from("/mnt/IPOD"));
+        db.add_track(track(0, 0, 0, 0));
+        let mut session = IpodSession::new(db, None);
+        let entries = session.collect_all_tracks("").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].play_count, None);
+        assert_eq!(entries[0].last_played, None);
+        assert_eq!(entries[0].skip_count, None);
+        assert_eq!(entries[0].rating, None);
+    }
+
+    #[test]
+    fn collect_all_tracks_surfaces_nonzero_play_state() {
+        let mut db = ipod_db::IpodDatabase::new(PathBuf::from("/mnt/IPOD"));
+        db.add_track(track(80, 7, 3_900_000_000, 2));
+        let mut session = IpodSession::new(db, None);
+        let entries = session.collect_all_tracks("").unwrap();
+        assert_eq!(entries[0].play_count, Some(7));
+        assert_eq!(entries[0].last_played, Some(3_900_000_000));
+        assert_eq!(entries[0].skip_count, Some(2));
+        // Rating passes through as raw 0..=100 (Zune's MTP rating uses the
+        // same scale, so DeviceEntry.rating is unit-consistent across both
+        // backends).
+        assert_eq!(entries[0].rating, Some(80));
     }
 }

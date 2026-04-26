@@ -3,9 +3,9 @@
 /tools
 /.zytunes-cache
 
-# Claude Code (keep skills tracked, ignore local config/memory)
+# Claude Code (keep slash commands tracked, ignore local config/memory)
 .claude/*
-!.claude/skills/
+!.claude/commands/
 
 # Music files (test artifacts, copyrighted content)
 *.mp3

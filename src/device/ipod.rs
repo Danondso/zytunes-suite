@@ -75,7 +75,7 @@ impl DeviceBackend for IpodBackend {
             .join("iTunes")
             .join("iTunesDB");
 
-        let db = if db_path.exists() {
+        let mut db = if db_path.exists() {
             let raw =
                 std::fs::read(&db_path).map_err(|e| format!("Failed to read iTunesDB: {}", e))?;
             let parsed = ipod_db::itunesdb::parse(&raw, data.mount_point.clone())
@@ -90,6 +90,40 @@ impl DeviceBackend for IpodBackend {
             log_fn("No existing iTunesDB — creating fresh database");
             ipod_db::IpodDatabase::new(data.mount_point.clone())
         };
+
+        // Fold the firmware-written `Play Counts` sidecar into mhit values
+        // before exposing tracks. The firmware accumulates plays/skips here
+        // between syncs; iTunes folds them into iTunesDB and deletes the
+        // file (we mirror that — `IpodSession::flush()` deletes after the
+        // next write). Best-effort: a malformed/missing sidecar is logged
+        // and ignored so it never blocks connect.
+        let pc_path = data
+            .mount_point
+            .join("iPod_Control")
+            .join("iTunes")
+            .join("Play Counts");
+        if pc_path.exists() {
+            match std::fs::read(&pc_path) {
+                Ok(bytes) => match ipod_db::play_counts::parse(&bytes) {
+                    Ok(entries) => {
+                        if ipod_db::play_counts::apply_to_tracks(&mut db.tracks, &entries) {
+                            log_fn(&format!(
+                                "Folded {} Play Counts entries into iTunesDB",
+                                entries.len()
+                            ));
+                        } else {
+                            log_fn(&format!(
+                                "Play Counts has {} entries but iTunesDB has {} tracks — skipped merge",
+                                entries.len(),
+                                db.tracks.len()
+                            ));
+                        }
+                    }
+                    Err(e) => log_fn(&format!("Failed to parse Play Counts: {}", e)),
+                },
+                Err(e) => log_fn(&format!("Failed to read Play Counts: {}", e)),
+            }
+        }
 
         // Parse FirewireGuid for hash58 signing.
         let firewire_id = data

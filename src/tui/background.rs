@@ -279,11 +279,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                         zune_product_id,
                                     );
                                     let used = total.saturating_sub(free);
-                                    let pct = if total > 0 {
-                                        (used * 100 / total) as u8
-                                    } else {
-                                        0
-                                    };
+                                    let pct = (used * 100).checked_div(total).unwrap_or(0) as u8;
                                     let _ = event_tx.send(BgEvent::DeviceDetected(DeviceInfo {
                                         name: model.to_string(),
                                         firmware_version: fw,
@@ -353,11 +349,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                 // Query storage for UI.
                                 if let Ok((total, free)) = s.get_storage_info() {
                                     let used = total.saturating_sub(free);
-                                    let pct = if total > 0 {
-                                        (used * 100 / total) as u8
-                                    } else {
-                                        0
-                                    };
+                                    let pct = (used * 100).checked_div(total).unwrap_or(0) as u8;
                                     let _ = event_tx.send(BgEvent::DeviceDetected(DeviceInfo {
                                         name: detected.name.clone(),
                                         firmware_version: detected.firmware.clone(),
@@ -564,7 +556,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                         if !session_dead {
                             if let Ok((tot, free)) = s.get_storage_info() {
                                 let used = tot.saturating_sub(free);
-                                let pct = if tot > 0 { (used * 100 / tot) as u8 } else { 0 };
+                                let pct = (used * 100).checked_div(tot).unwrap_or(0) as u8;
                                 let _ = event_tx.send(BgEvent::StorageUpdated(StorageInfo {
                                     total_bytes: tot,
                                     free_bytes: free,
@@ -680,7 +672,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
 
                         if let Ok((tot, free)) = s.get_storage_info() {
                             let used = tot.saturating_sub(free);
-                            let pct = if tot > 0 { (used * 100 / tot) as u8 } else { 0 };
+                            let pct = (used * 100).checked_div(tot).unwrap_or(0) as u8;
                             let _ = event_tx.send(BgEvent::StorageUpdated(StorageInfo {
                                 total_bytes: tot,
                                 free_bytes: free,
@@ -809,7 +801,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
 
                         if let Ok((tot, free)) = s.get_storage_info() {
                             let used = tot.saturating_sub(free);
-                            let pct = if tot > 0 { (used * 100 / tot) as u8 } else { 0 };
+                            let pct = (used * 100).checked_div(tot).unwrap_or(0) as u8;
                             let _ = event_tx.send(BgEvent::StorageUpdated(StorageInfo {
                                 total_bytes: tot,
                                 free_bytes: free,
@@ -864,15 +856,13 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                             while let Ok(cmd) = cmd_rx.try_recv() {
                                 match cmd {
                                     BgCommand::CancelSync => cancelled = true,
-                                    BgCommand::AppendSyncQueue(more) => {
-                                        if !more.is_empty() {
-                                            let _ = event_tx.send(BgEvent::SyncMessage(format!(
-                                                "Queued {} more track(s) during sync",
-                                                more.len()
-                                            )));
-                                            total += more.len();
-                                            sync_queue.extend(more);
-                                        }
+                                    BgCommand::AppendSyncQueue(more) if !more.is_empty() => {
+                                        let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                                            "Queued {} more track(s) during sync",
+                                            more.len()
+                                        )));
+                                        total += more.len();
+                                        sync_queue.extend(more);
                                     }
                                     // Other commands dropped during sync; the
                                     // TUI doesn't send them while SyncStatus is Running.
@@ -1030,7 +1020,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                         if let Ok((tot, free)) = s.get_storage_info() {
                                             let used = tot.saturating_sub(free);
                                             let pct =
-                                                if tot > 0 { (used * 100 / tot) as u8 } else { 0 };
+                                                (used * 100).checked_div(tot).unwrap_or(0) as u8;
                                             let _ = event_tx.send(BgEvent::StorageUpdated(
                                                 StorageInfo {
                                                     total_bytes: tot,

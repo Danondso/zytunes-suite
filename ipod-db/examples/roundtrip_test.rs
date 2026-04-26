@@ -95,13 +95,11 @@ fn summarize(data: &[u8]) -> DbSummary {
 
                 pos += mhit_total;
             }
-        } else if (ds_type == 2 || ds_type == 3)
+        } else if ds_type == 2
             && list_start + 12 <= data.len()
             && &data[list_start..list_start + 4] == b"mhlp"
         {
-            if ds_type == 2 {
-                playlist_count = u32_at(data, list_start + 8);
-            }
+            playlist_count = u32_at(data, list_start + 8);
         }
 
         cursor += ds_total as usize;
