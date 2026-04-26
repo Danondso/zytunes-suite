@@ -200,16 +200,18 @@ impl TrackCache {
                 continue;
             }
             // Format evolution: original cache had 5 fields; play_count
-            // (column 5) was added in Phase 4b alongside rating (column 6).
-            // Old caches still parse — missing fields stay `None`. `lines()`
-            // already strips `\n` and `\r\n`, so per-field newline trimming
-            // would be redundant.
-            let parts: Vec<&str> = line.splitn(7, '\t').collect();
+            // (column 5) and rating (column 6) were added in Phase 4b;
+            // skip_count (column 7) was added in Phase 3 alongside the
+            // local-plays sidecar. Old caches still parse — missing fields
+            // stay `None`. `lines()` already strips `\n` and `\r\n`, so
+            // per-field newline trimming would be redundant.
+            let parts: Vec<&str> = line.splitn(8, '\t').collect();
             if parts.len() < 5 {
                 continue;
             }
             let play_count = parts.get(5).and_then(|s| s.parse::<u32>().ok());
             let rating = parts.get(6).and_then(|s| s.parse::<u16>().ok());
+            let skip_count = parts.get(7).and_then(|s| s.parse::<u32>().ok());
             entries.push(DeviceEntry {
                 object_id: parts[0].parse().unwrap_or(0),
                 storage_id: parts[1].parse().unwrap_or(0),
@@ -218,6 +220,7 @@ impl TrackCache {
                 name: parts[4].to_string(),
                 play_count,
                 rating,
+                skip_count,
                 ..Default::default()
             });
         }
@@ -631,16 +634,21 @@ impl NativeSession {
         Ok(current)
     }
 
-    /// Enrich `tracks` with `play_count` (from `0xDC91 UseCount`) and
-    /// `rating` (from `0xDC8A Rating`) using bulk `GetObjectPropList`
-    /// queries — one round-trip per property for the whole library, not
-    /// one per track. Tracks whose `object_id` is `0` (ZMDB entries before
-    /// any cache merge has restored the handle) are skipped silently.
+    /// Enrich `tracks` with `play_count` (from `0xDC91 UseCount`),
+    /// `rating` (from `0xDC8A Rating`), and `skip_count` (from `0xDC92
+    /// SkipCount`) using bulk `GetObjectPropList` queries — one round-trip
+    /// per property for the whole library, not one per track. Tracks whose
+    /// `object_id` is `0` (ZMDB entries before any cache merge has restored
+    /// the handle) are skipped silently.
     ///
-    /// Both queries are best-effort and independent: if the device rejects
-    /// one, we log it and proceed with the other. Confirmed to work on Zune
-    /// v1.4 firmware `01.04.00485.00-00425` even though these props are not
-    /// listed in `GetObjectPropsSupported(0x3009)`.
+    /// All three queries are best-effort and independent: if the device
+    /// rejects one, we log it and proceed with the others. UseCount and
+    /// Rating are confirmed to work on Zune v1.4 firmware
+    /// `01.04.00485.00-00425` even though they're not listed in
+    /// `GetObjectPropsSupported(0x3009)`; SkipCount is in the same
+    /// neighbourhood and may behave the same way, but if v1.4 rejects it
+    /// the merge logic at the App layer just sees `delta = 0` for the skip
+    /// dimension — no harm done.
     ///
     /// Called from each track-collect path (ZMDB fast path, cache-hit
     /// refresh, slow fallback); callers may invoke it multiple times per
@@ -654,6 +662,7 @@ impl NativeSession {
         }
         self.enrich_one_prop(tracks, PROP_USE_COUNT, "playcounts", apply_playcounts);
         self.enrich_one_prop(tracks, PROP_RATING, "ratings", apply_ratings);
+        self.enrich_one_prop(tracks, PROP_SKIP_COUNT, "skip counts", apply_skip_counts);
     }
 
     /// Issue a single bulk `GetObjectPropList` for `prop` across all MP3
@@ -689,6 +698,7 @@ impl NativeSession {
                 .filter(|t| match p {
                     PROP_USE_COUNT => t.play_count.is_some(),
                     PROP_RATING => t.rating.is_some(),
+                    PROP_SKIP_COUNT => t.skip_count.is_some(),
                     _ => false,
                 })
                 .count()
@@ -1767,16 +1777,18 @@ impl NativeSession {
     }
 }
 
-/// Serialize one `DeviceEntry` to its on-disk track-cache line. Tabs in the
-/// name are flattened to spaces so the splitn(7, '\t') loader stays in sync.
-/// `play_count` and `rating` are emitted as digits or empty for `None`.
+/// Serialize one `DeviceEntry` to its on-disk track-cache line. Tabs in
+/// the name are flattened to spaces so the `splitn(8, '\t')` loader stays
+/// in sync. `play_count`, `rating`, and `skip_count` are emitted as digits
+/// or empty for `None`.
 fn serialize_entry(entry: &DeviceEntry) -> String {
     let safe_name = entry.name.replace('\t', " ");
     let pc = entry.play_count.map(|v| v.to_string()).unwrap_or_default();
     let rt = entry.rating.map(|v| v.to_string()).unwrap_or_default();
+    let sk = entry.skip_count.map(|v| v.to_string()).unwrap_or_default();
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-        entry.object_id, entry.storage_id, entry.format, entry.size, safe_name, pc, rt
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        entry.object_id, entry.storage_id, entry.format, entry.size, safe_name, pc, rt, sk
     )
 }
 
@@ -1829,6 +1841,32 @@ fn apply_ratings(tracks: &mut [DeviceEntry], elements: &[PropListElement]) {
         }
         if let Some(&r) = ratings.get(&(t.object_id as u32)) {
             t.rating = Some(r);
+        }
+    }
+}
+
+/// Project parsed `GetObjectPropList` elements onto tracks, populating
+/// `skip_count` for entries whose `object_id` matches a returned handle.
+/// Same shape as `apply_playcounts` but for `0xDC92 SkipCount` (UINT32).
+/// Tracks without `object_id` are skipped silently.
+fn apply_skip_counts(tracks: &mut [DeviceEntry], elements: &[PropListElement]) {
+    let mut counts: HashMap<u32, u32> = HashMap::new();
+    for e in elements {
+        if e.prop_code == PROP_SKIP_COUNT {
+            if let Some(v) = e.as_u32() {
+                counts.insert(e.object_handle, v);
+            }
+        }
+    }
+    if counts.is_empty() {
+        return;
+    }
+    for t in tracks.iter_mut() {
+        if t.object_id == 0 {
+            continue;
+        }
+        if let Some(&n) = counts.get(&(t.object_id as u32)) {
+            t.skip_count = Some(n);
         }
     }
 }
@@ -2814,6 +2852,106 @@ mod tests {
         };
         apply_ratings(&mut tracks, &[use_count]);
         assert_eq!(tracks[0].rating, None);
+    }
+
+    #[test]
+    fn apply_skip_counts_populates_matched_handles() {
+        let mut tracks = vec![
+            sample_entry("a.mp3", 500),
+            sample_entry("b.mp3", 501),
+            sample_entry("c.mp3", 502),
+        ];
+        let elements = vec![
+            PropListElement {
+                object_handle: 500,
+                prop_code: PROP_SKIP_COUNT,
+                datatype: 0x0006,
+                value: 3u32.to_le_bytes().to_vec(),
+            },
+            PropListElement {
+                object_handle: 502,
+                prop_code: PROP_SKIP_COUNT,
+                datatype: 0x0006,
+                value: 0u32.to_le_bytes().to_vec(),
+            },
+        ];
+        apply_skip_counts(&mut tracks, &elements);
+        assert_eq!(tracks[0].skip_count, Some(3));
+        assert_eq!(tracks[1].skip_count, None, "unmatched handle stays None");
+        assert_eq!(tracks[2].skip_count, Some(0));
+    }
+
+    #[test]
+    fn apply_skip_counts_skips_zero_object_ids() {
+        // ZMDB tracks land with object_id=0 before any cache merge — they
+        // must stay None even when an element has handle=0.
+        let mut tracks = vec![DeviceEntry {
+            object_id: 0,
+            ..sample_entry("a.mp3", 0)
+        }];
+        let elements = vec![PropListElement {
+            object_handle: 0,
+            prop_code: PROP_SKIP_COUNT,
+            datatype: 0x0006,
+            value: 5u32.to_le_bytes().to_vec(),
+        }];
+        apply_skip_counts(&mut tracks, &elements);
+        assert_eq!(tracks[0].skip_count, None);
+    }
+
+    #[test]
+    fn apply_skip_counts_ignores_non_skip_count_props() {
+        // A UseCount element must not be misinterpreted as a skip count.
+        let mut tracks = vec![sample_entry("a.mp3", 600)];
+        let use_count = PropListElement {
+            object_handle: 600,
+            prop_code: PROP_USE_COUNT,
+            datatype: 0x0006,
+            value: 5u32.to_le_bytes().to_vec(),
+        };
+        apply_skip_counts(&mut tracks, &[use_count]);
+        assert_eq!(tracks[0].skip_count, None);
+    }
+
+    #[test]
+    fn track_cache_round_trips_skip_count() {
+        let cache = make_cache(Some("skipcount-rt"));
+        let entries = vec![
+            DeviceEntry {
+                skip_count: Some(2),
+                ..sample_entry("Artist/Album/skipped.mp3", 100)
+            },
+            sample_entry("Artist/Album/never.mp3", 101),
+        ];
+        cache.save(&entries, 1_000).expect("save");
+
+        let (_, loaded) = cache.load().unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].skip_count, Some(2));
+        assert_eq!(loaded[1].skip_count, None);
+
+        if let Some(p) = cache.cache_path() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn track_cache_loads_seven_field_format_without_skip_count() {
+        // A pre-Phase-3 cache (7 fields: id, sid, fmt, size, name, pc, rt)
+        // must still parse — `skip_count` defaults to None.
+        let cache = make_cache(Some("seven-field-legacy"));
+        if let Some(p) = cache.cache_path() {
+            let _ = std::fs::write(
+                &p,
+                "#free_bytes:0\n1\t1\tmp3\t100\tA/B/legacy.mp3\t12\t80\n",
+            );
+            let (_, loaded) = cache.load().unwrap();
+            assert_eq!(loaded.len(), 1);
+            assert_eq!(loaded[0].play_count, Some(12));
+            assert_eq!(loaded[0].rating, Some(80));
+            assert_eq!(loaded[0].skip_count, None);
+            let _ = std::fs::remove_file(p);
+        }
     }
 
     #[test]

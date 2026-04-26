@@ -9,9 +9,21 @@ use zytunes::dirlib::TrackSample;
 use zytunes::library::{MusicLibrary, Track};
 use zytunes::mtp::parse::DeviceEntry;
 
+use std::path::PathBuf;
+
 use crate::audio::{AudioCommand, AudioEvent};
 use crate::background::{BgCommand, BgEvent, StorageInfo, SyncItem};
 use crate::theme::{all_themes, Theme};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use zytunes::local_plays::{self, LocalPlays};
+
+/// Result of dispatching a single keyboard event through `App::handle_key`.
+/// `Quit` signals the run loop to break.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyOutcome {
+    Continue,
+    Quit,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Panel {
@@ -181,6 +193,11 @@ pub struct DeviceTrackInfo {
     /// User-set rating from the device (MTP `0xDC8A`, range 0–100).
     /// `None` if the device doesn't surface ratings.
     pub rating: Option<u16>,
+    /// How many times the device has skipped this track (MTP `0xDC92`).
+    /// `None` when the device family doesn't surface a skip count. Carried
+    /// here so device-mode rows that lack a library counterpart can still
+    /// surface the device-side skip count (parity with `play_count`).
+    pub skip_count: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -308,6 +325,14 @@ pub struct NowPlaying {
     pub playlist: Arc<[TrackInfo]>,
     /// Frame at which playback was paused (freezes animation).
     pub paused_frame: Option<usize>,
+    /// Library `Track::id` resolved at play time; `None` when the playing
+    /// row has no library match (device-mode play, scratch file). Used to
+    /// key the local-plays sidecar — when `None` no play/skip is recorded.
+    pub track_id: Option<u64>,
+    /// Set true once this playback session has been recorded as either a
+    /// play or a skip. Idempotency guard so multiple Position events past
+    /// the threshold count exactly once.
+    pub counted: bool,
 }
 
 #[derive(Clone)]
@@ -348,6 +373,7 @@ pub struct DeviceState {
 }
 
 impl DeviceState {
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         DeviceState {
             status: DeviceStatus::Disconnected,
@@ -410,6 +436,7 @@ impl DeviceState {
                 disc_number: entry.disc_number,
                 play_count: entry.play_count,
                 rating: entry.rating,
+                skip_count: entry.skip_count,
             });
 
         let artist_key = normalize_for_match(&artist);
@@ -539,6 +566,32 @@ impl DeviceState {
 /// Parse a device-relative track name (e.g. `"Artist/Album/01 track.mp3"`) into
 /// (artist, album, display_name). Missing segments fall back to `Unknown Artist`
 /// and `Unknown Album`. The display name has its file extension stripped.
+/// Look up a library `Track::id` for a device-side `(artist, display_name)`
+/// pair. Tries the raw name first, then the `strip_track_number`-stripped
+/// form so device filenames like `"01 Smells Like Teen Spirit"` still resolve
+/// to library titles like `"Smells Like Teen Spirit"`. Mirrors the matching
+/// strategy used by `merge_device_plays_into_local` so the displayed
+/// aggregate stays consistent with the merged sidecar.
+fn resolve_library_id_for_device_track(
+    lib: &dyn zytunes::library::MusicLibrary,
+    artist: &str,
+    display_name: &str,
+) -> Option<u64> {
+    let lookup = |name: &str| -> Option<u64> {
+        lib.tracks_by_name(name)
+            .find(|t| t.artist.eq_ignore_ascii_case(artist))
+            .map(|t| t.id)
+    };
+    if let Some(id) = lookup(display_name) {
+        return Some(id);
+    }
+    let stripped = zytunes::strip_track_number(display_name.trim());
+    if stripped != display_name {
+        return lookup(stripped);
+    }
+    None
+}
+
 fn parse_device_track_parts(name: &str) -> (String, String, String) {
     let parts: Vec<&str> = name.splitn(3, '/').collect();
     let (artist, album, filename) = match parts.len() {
@@ -577,6 +630,7 @@ pub struct SyncState {
 }
 
 impl SyncState {
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         SyncState {
             queue: Vec::new(),
@@ -691,6 +745,15 @@ pub struct App {
     pub show_player: Option<bool>,
     /// Background commands to send after event handling (main loop flushes these).
     pub pending_bg_commands: Vec<BgCommand>,
+    /// Aggregate play/skip counters across the TUI and any connected device.
+    /// TUI plays bump it directly via `record_now_playing_play`/`_skip`;
+    /// device-side counters merge in via `merge_device_observation` on each
+    /// reconnect. Persisted to `local_plays_save_path` after every mutation.
+    pub local_plays: LocalPlays,
+    /// Sidecar path for `local_plays` persistence. Defaults to
+    /// `~/.cache/zytunes/local-plays.json`; tests set `None` to disable disk
+    /// writes or override with a temp path.
+    pub local_plays_save_path: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -714,13 +777,34 @@ pub struct TrackInfo {
     pub disc_number: Option<u32>,
     pub genre: Option<String>,
     pub on_device: bool,
-    /// Number of plays on the device. Populated when this row was built
-    /// from a `DeviceTrackInfo`; `None` for library-side rows (we don't
-    /// track local TUI plays yet — that's Phase 3 of the playcount work).
+    /// Aggregate play count across the TUI and any connected devices,
+    /// resolved from the local-plays sidecar via library `Track::id`. For
+    /// device-mode rows that have a matching library track, also resolved
+    /// from the sidecar; for device-mode rows without a library match it
+    /// falls back to the raw device counter so the column never shows
+    /// `None` when the device knows about plays.
     pub play_count: Option<u32>,
+    /// Aggregate skip count, same provenance as `play_count`.
+    pub skip_count: Option<u32>,
     /// User-set rating from the device (MTP `0xDC8A`, range 0–100, displayed
     /// as 0–5 stars by dividing by 20). Populated from `DeviceTrackInfo`.
     pub rating: Option<u16>,
+    /// Unix epoch ms of the last TUI play. `None` until the user actually
+    /// plays the track in this TUI — device-side plays don't fabricate a
+    /// timestamp.
+    pub last_played_at_ms: Option<u64>,
+    /// Unix epoch ms of the most recent device-baseline sync for this
+    /// track, sourced from `local_plays.device_baselines[<key>].
+    /// last_synced_at_ms`. `None` for tracks that have never been observed
+    /// on a device.
+    pub last_synced_from_device_at_ms: Option<u64>,
+    /// Library `Track::id` for rows that have a library counterpart. Cached
+    /// here so the live-refresh path (`refresh_play_stats_for_id`) can locate
+    /// affected rows in `track_list` after a sidecar mutation without
+    /// re-running the lookup. `None` for device-only rows (sideloads,
+    /// podcasts) — they don't appear in the library and don't get sidecar
+    /// records, so there's nothing to refresh.
+    pub library_id: Option<u64>,
     /// Pre-normalized (lowercased, trimmed, edge-stripped) artist key.
     /// Computed once at construction so hot paths (`retag_on_device`, per-frame
     /// filter passes) do not re-allocate on every render.
@@ -763,7 +847,11 @@ impl TrackInfo {
             genre,
             on_device,
             play_count: None,
+            skip_count: None,
             rating: None,
+            last_played_at_ms: None,
+            last_synced_from_device_at_ms: None,
+            library_id: None,
             artist_key,
             name_key,
         }
@@ -771,6 +859,7 @@ impl TrackInfo {
 }
 
 impl App {
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         App {
             active_panel: Panel::Library,
@@ -833,7 +922,23 @@ impl App {
             },
             show_player: crate::config::load().show_player,
             pending_bg_commands: Vec::new(),
+            // Disk state is loaded explicitly by `load_local_plays_from_disk`
+            // so unit tests get a clean default `App` without inheriting
+            // whatever sidecar exists on the developer's machine.
+            local_plays_save_path: None,
+            local_plays: LocalPlays::default(),
         }
+    }
+
+    /// Wire `local_plays` to the on-disk sidecar (`~/.cache/zytunes/local-plays.json`)
+    /// and load any existing state. Production code calls this once after
+    /// `App::new()`; tests skip it so they don't pick up developer-machine state.
+    pub fn load_local_plays_from_disk(&mut self) {
+        let path = local_plays::default_save_path();
+        if let Some(p) = path.as_deref() {
+            self.local_plays = LocalPlays::load_from(p);
+        }
+        self.local_plays_save_path = path;
     }
 
     /// Cycle through the three player-panel preferences:
@@ -1009,6 +1114,10 @@ impl App {
         if self.track_list.is_empty() {
             return;
         }
+        // If the prior session never crossed the play threshold, transitioning
+        // out counts as a skip — record before we lose the old `now_playing`.
+        self.record_now_playing_skip();
+
         let index = self.track_selected.min(self.track_list.len() - 1);
         let track = &self.track_list[index];
         let path = match &track.location {
@@ -1018,6 +1127,7 @@ impl App {
                 return;
             }
         };
+        let track_id = self.resolve_library_track_id(track);
         let _ = audio_tx.send(AudioCommand::Play { path });
         self.now_playing = Some(NowPlaying {
             track_name: track.name.clone(),
@@ -1029,6 +1139,8 @@ impl App {
             track_index: index,
             playlist: Arc::from(self.track_list.as_slice()),
             paused_frame: None,
+            track_id,
+            counted: false,
         });
     }
 
@@ -1055,6 +1167,10 @@ impl App {
     }
 
     pub fn next_track(&mut self, audio_tx: &mpsc::Sender<AudioCommand>) {
+        // Skip recorded before the transition since `play_from_playlist`
+        // (or the end-of-playlist branch) overwrites `now_playing`. No-op
+        // if the prior session was already counted as a play.
+        self.record_now_playing_skip();
         if let Some(ref np) = self.now_playing {
             let next_idx = np.track_index + 1;
             let playlist = Arc::clone(&np.playlist);
@@ -1069,10 +1185,19 @@ impl App {
     }
 
     pub fn prev_track(&mut self, audio_tx: &mpsc::Sender<AudioCommand>) {
+        // Restarting the current track (>3s elapsed) keeps the same session,
+        // so don't record a skip there — only record when actually moving
+        // to the previous row.
+        let restart = self
+            .now_playing
+            .as_ref()
+            .is_some_and(|np| np.elapsed_ms > 3000 || np.track_index == 0);
+        if !restart {
+            self.record_now_playing_skip();
+        }
         if let Some(ref np) = self.now_playing {
             let playlist = Arc::clone(&np.playlist);
-            let index = if np.elapsed_ms > 3000 || np.track_index == 0 {
-                // Restart current track
+            let index = if restart {
                 np.track_index
             } else {
                 np.track_index - 1
@@ -1082,6 +1207,7 @@ impl App {
     }
 
     pub fn stop_playback(&mut self, audio_tx: &mpsc::Sender<AudioCommand>) {
+        self.record_now_playing_skip();
         let _ = audio_tx.send(AudioCommand::Stop);
         self.now_playing = None;
     }
@@ -1092,7 +1218,7 @@ impl App {
         playlist: Arc<[TrackInfo]>,
         audio_tx: &mpsc::Sender<AudioCommand>,
     ) {
-        let track = &playlist[index];
+        let track = playlist[index].clone();
         let path = match &track.location {
             Some(p) => p.clone(),
             None => {
@@ -1100,6 +1226,7 @@ impl App {
                 return;
             }
         };
+        let track_id = self.resolve_library_track_id(&track);
         let _ = audio_tx.send(AudioCommand::Play { path });
         self.now_playing = Some(NowPlaying {
             track_name: track.name.clone(),
@@ -1111,6 +1238,8 @@ impl App {
             track_index: index,
             playlist,
             paused_frame: None,
+            track_id,
+            counted: false,
         });
     }
 
@@ -1120,14 +1249,266 @@ impl App {
                 if let Some(ref mut np) = self.now_playing {
                     np.elapsed_ms = elapsed_ms;
                 }
+                self.maybe_record_play_for_threshold();
             }
             AudioEvent::TrackEnded => {
+                // Fallback path for tracks that ended before any Position
+                // event past the threshold (very short clips, race between
+                // the end signal and the 250 ms position-poll). After this
+                // call `next_track`'s skip-record is a no-op because
+                // `counted` is already true.
+                self.record_now_playing_play();
                 self.next_track(audio_tx);
             }
             AudioEvent::PlaybackError(msg) => {
+                // A playback failure isn't a user-initiated skip — drop
+                // the session without recording either way.
                 self.now_playing = None;
                 self.set_toast(format!("Playback: {}", msg), true);
             }
+        }
+    }
+
+    /// Look up the library `Track::id` matching the given playable row
+    /// (same `(name, artist, album)` lookup used by the popup-resolve path).
+    /// Returns `None` for device-mode rows or scratch files with no library
+    /// counterpart — in either case no local play is recorded.
+    ///
+    /// Tries the raw name first, then the `strip_track_number`-stripped form
+    /// so a device-mode row whose name is `"01 Song"` still finds the library
+    /// title `"Song"`. Without this fallback, playing a device-mode row that
+    /// originated from a track-number-prefixed filename would silently skip
+    /// recording the play.
+    fn resolve_library_track_id(&self, track: &TrackInfo) -> Option<u64> {
+        let lib = self.library.as_deref()?;
+        let lookup = |name: &str| -> Option<u64> {
+            lib.tracks_by_name(name)
+                .find(|t| {
+                    t.artist.eq_ignore_ascii_case(&track.artist)
+                        && t.album.eq_ignore_ascii_case(&track.album)
+                })
+                .map(|t| t.id)
+        };
+        if let Some(id) = lookup(&track.name) {
+            return Some(id);
+        }
+        let stripped = zytunes::strip_track_number(track.name.trim());
+        if stripped != track.name {
+            return lookup(stripped);
+        }
+        None
+    }
+
+    /// Persist `local_plays` to disk. Saves to `local_plays_save_path` if
+    /// set; tests construct an `App` with `None` to skip disk writes.
+    fn persist_local_plays(&self) {
+        if let Some(p) = &self.local_plays_save_path {
+            self.local_plays.save_to(p);
+        }
+    }
+
+    /// If the current `now_playing` session has crossed the play threshold
+    /// (50% of duration or 4 minutes, whichever first) and hasn't yet been
+    /// counted, record it as a play. Idempotent within the session.
+    fn maybe_record_play_for_threshold(&mut self) {
+        let trip = match &self.now_playing {
+            Some(np) => {
+                !np.counted
+                    && np.duration_ms > 0
+                    && np.elapsed_ms >= local_plays::play_threshold_ms(np.duration_ms)
+            }
+            None => false,
+        };
+        if trip {
+            self.record_now_playing_play();
+        }
+    }
+
+    /// Record the current session as a play if not already counted. Bumps
+    /// the aggregate count, refreshes `last_played_at_ms`, persists the
+    /// sidecar, and flips the session's `counted` flag so subsequent
+    /// triggers no-op.
+    fn record_now_playing_play(&mut self) {
+        let Some(np) = self.now_playing.as_mut() else {
+            return;
+        };
+        if np.counted {
+            return;
+        }
+        let recorded_id = np.track_id;
+        if let Some(id) = recorded_id {
+            self.local_plays.record_play(id, local_plays::now_unix_ms());
+            self.persist_local_plays();
+        }
+        // Always flip the flag — even if there's no library ID we don't
+        // want to keep retrying the threshold check on every Position event.
+        if let Some(np) = self.now_playing.as_mut() {
+            np.counted = true;
+        }
+        // Push the new aggregate into any visible row + the popup snapshot
+        // so the user sees the count update live without having to navigate
+        // away and back to rebuild `track_list`.
+        if let Some(id) = recorded_id {
+            self.refresh_play_stats_for_id(id);
+        }
+    }
+
+    /// Record the current session as a skip if not already counted. Same
+    /// idempotency as `record_now_playing_play`; safe to call from any
+    /// transition path (`next_track`, `prev_track`, `stop_playback`,
+    /// `play_selected_track`).
+    fn record_now_playing_skip(&mut self) {
+        let Some(np) = self.now_playing.as_mut() else {
+            return;
+        };
+        if np.counted {
+            return;
+        }
+        let recorded_id = np.track_id;
+        if let Some(id) = recorded_id {
+            self.local_plays.record_skip(id);
+            self.persist_local_plays();
+        }
+        if let Some(np) = self.now_playing.as_mut() {
+            np.counted = true;
+        }
+        if let Some(id) = recorded_id {
+            self.refresh_play_stats_for_id(id);
+        }
+    }
+
+    /// Push the current sidecar values for `library_id` back into any
+    /// `track_list` row that references it (and the popup snapshot, which
+    /// the renderer reads independently). Without this the user records a
+    /// play but the column / popup keeps showing the pre-bump number until
+    /// they navigate away and back, which rebuilds `track_list`.
+    fn refresh_play_stats_for_id(&mut self, library_id: u64) {
+        let entry = match self.local_plays.get(library_id) {
+            Some(p) => p.clone(),
+            None => return,
+        };
+        let device_key = self.current_device_baseline_key();
+        let last_synced = device_key
+            .as_deref()
+            .and_then(|k| entry.device_baselines.get(k))
+            .map(|b| b.last_synced_at_ms);
+        for row in self.track_list.iter_mut() {
+            if row.library_id != Some(library_id) {
+                continue;
+            }
+            row.play_count = Some(entry.play_count);
+            row.skip_count = if entry.skip_count > 0 {
+                Some(entry.skip_count)
+            } else {
+                None
+            };
+            row.last_played_at_ms = if entry.last_played_at_ms > 0 {
+                Some(entry.last_played_at_ms)
+            } else {
+                None
+            };
+            // Only override the popup-visible "Last synced" timestamp when
+            // we actually have a baseline for the current device — leaves
+            // device-disconnected popups showing the row's last known value.
+            if last_synced.is_some() {
+                row.last_synced_from_device_at_ms = last_synced;
+            }
+        }
+    }
+
+    /// Build the per-device baseline key for the currently-connected device,
+    /// or `None` when no device is connected. Cached on the `App` so the
+    /// per-frame TrackInfo construction doesn't re-run the format on each
+    /// row — but this helper is the single source of truth used by both
+    /// the merge path and the display path.
+    fn current_device_baseline_key(&self) -> Option<String> {
+        self.device.family.map(|family| {
+            local_plays::device_baseline_key(
+                family,
+                self.device.serial.as_deref(),
+                self.device.firmware.as_deref(),
+            )
+        })
+    }
+
+    /// Fold the device's per-track `play_count` and `skip_count` into the
+    /// aggregate `local_plays` sidecar via per-(track, device) baselines.
+    /// First sight of a device adopts its full count; subsequent reconnects
+    /// only contribute the delta. Idempotent — safe to call from both the
+    /// `DeviceTracksLoaded` and `LibraryLoaded` handlers (whichever fires
+    /// later wins, both leave the state correct).
+    ///
+    /// Match strategy mirrors `add_indexed_track`: parse each device entry
+    /// path into `(artist, display_name)`, normalize, and look up the
+    /// matching library track via `(artist_key, name_key)`. Both raw and
+    /// `strip_track_number`-stripped name keys are indexed so library
+    /// titles without a leading "01 " still match device filenames that
+    /// have one.
+    pub fn merge_device_plays_into_local(&mut self) {
+        let Some(device_key) = self.current_device_baseline_key() else {
+            return;
+        };
+        if self.device.tracks.is_empty() {
+            return;
+        }
+        let Some(lib) = self.library.as_ref() else {
+            return;
+        };
+
+        let now_ms = local_plays::now_unix_ms();
+
+        // Index device tracks by normalized (artist_key, name_key) → (play, skip).
+        // Building the index here (instead of reusing `device.track_metadata`)
+        // keeps `DeviceTrackMeta`'s shape unchanged at the cost of one O(D)
+        // pass — acceptable since this runs once per reconnect, not per render.
+        let mut by_key: std::collections::HashMap<(String, String), (u32, u32)> =
+            std::collections::HashMap::new();
+        for dt in &self.device.tracks {
+            if dt.is_dir() {
+                continue;
+            }
+            let (artist, _, display_name) = parse_device_track_parts(&dt.name);
+            let artist_key = normalize_for_match(&artist);
+            let raw = normalize_for_match(&display_name);
+            let stripped = normalize_for_match(zytunes::strip_track_number(display_name.trim()));
+            let pair = (dt.play_count.unwrap_or(0), dt.skip_count.unwrap_or(0));
+            by_key.insert((artist_key.clone(), raw.clone()), pair);
+            if stripped != raw {
+                by_key.insert((artist_key, stripped), pair);
+            }
+        }
+
+        // Walk the library and collect matches into a Vec — defers the
+        // mutable borrow of `self.local_plays` to a second pass so the
+        // immutable borrow of `self.library` and `self.device.tracks`
+        // (via `lib` and `by_key`) can outlive the lookup.
+        let to_merge: Vec<(u64, u32, u32)> = lib
+            .all_tracks()
+            .filter_map(|t| {
+                let artist_key = normalize_for_match(&t.artist);
+                let name_key = normalize_for_match(&t.name);
+                by_key
+                    .get(&(artist_key, name_key))
+                    .map(|(p, s)| (t.id, *p, *s))
+            })
+            .collect();
+
+        if to_merge.is_empty() {
+            return;
+        }
+
+        // Capture the affected library IDs before the move so we can push
+        // the freshly-merged values into any visible `track_list` rows
+        // (otherwise the popup / track table keeps showing pre-merge
+        // numbers until the user navigates away and back).
+        let affected_ids: Vec<u64> = to_merge.iter().map(|(id, _, _)| *id).collect();
+        for (id, play, skip) in to_merge {
+            self.local_plays
+                .merge_device_observation(id, &device_key, play, skip, now_ms);
+        }
+        self.persist_local_plays();
+        for id in affected_ids {
+            self.refresh_play_stats_for_id(id);
         }
     }
 
@@ -1503,7 +1884,13 @@ impl App {
             }
             SidebarEntry::Album { album, .. } => {
                 self.album_list.clear();
-                self.track_list = tracks_to_info(lib.album_tracks(album), &self.device);
+                let device_key = self.current_device_baseline_key();
+                self.track_list = tracks_to_info(
+                    lib.album_tracks(album),
+                    &self.device,
+                    &self.local_plays,
+                    device_key.as_deref(),
+                );
                 self.sort_tracks();
                 self.track_selected = 0;
                 self.track_scroll = 0;
@@ -1540,8 +1927,15 @@ impl App {
             SidebarEntry::Album { artist, album } => {
                 self.album_list.clear();
                 let key = (artist.clone(), album.clone());
+                let device_key = self.current_device_baseline_key();
+                let lib_ref = self.library.as_deref();
                 self.track_list = match self.device.album_tracks.get(&key) {
-                    Some(tracks) => device_tracks_to_info(tracks),
+                    Some(tracks) => device_tracks_to_info(
+                        tracks,
+                        lib_ref,
+                        &self.local_plays,
+                        device_key.as_deref(),
+                    ),
                     None => Vec::new(),
                 };
                 self.track_selected = 0;
@@ -1561,8 +1955,12 @@ impl App {
 
         if self.browse_mode == BrowseMode::Device {
             let key = (album.artist.clone(), album.name.clone());
+            let device_key = self.current_device_baseline_key();
+            let lib_ref = self.library.as_deref();
             self.track_list = match self.device.album_tracks.get(&key) {
-                Some(tracks) => device_tracks_to_info(tracks),
+                Some(tracks) => {
+                    device_tracks_to_info(tracks, lib_ref, &self.local_plays, device_key.as_deref())
+                }
                 None => Vec::new(),
             };
             sort_album_tracks(&mut self.track_list);
@@ -1576,9 +1974,12 @@ impl App {
             None => return,
         };
 
+        let device_key = self.current_device_baseline_key();
         self.track_list = tracks_to_info(
             lib.album_tracks_by_artist(&album.artist, &album.name),
             &self.device,
+            &self.local_plays,
+            device_key.as_deref(),
         );
         sort_album_tracks(&mut self.track_list);
         self.track_selected = 0;
@@ -2054,6 +2455,10 @@ impl App {
                         self.refresh_track_info_lib();
                         self.rebuild_artist_device_status();
                         self.refresh_sidebar();
+                        // If a device connected before the library finished
+                        // scanning, the merge couldn't fire on
+                        // `DeviceTracksLoaded`. Catch up now.
+                        self.merge_device_plays_into_local();
                     }
                     Err(e) => {
                         self.set_toast(format!("Library: {}", e), true);
@@ -2139,6 +2544,11 @@ impl App {
                 if self.browse_mode == BrowseMode::Library {
                     self.retag_on_device();
                 }
+                // Fold the device's per-track play/skip counters into the
+                // aggregate local-plays sidecar via per-(track, device)
+                // baselines. No-op when the library hasn't loaded yet —
+                // the `LibraryLoaded` handler runs the merge in that order.
+                self.merge_device_plays_into_local();
             }
             BgEvent::DeviceTrackAdded(entry) => {
                 self.device.add_indexed_track(&entry);
@@ -2280,6 +2690,382 @@ impl App {
         if self.loading_library {
             self.maybe_rotate_scan_phrase();
         }
+    }
+
+    /// Single-source-of-truth keyboard dispatcher for the TUI.
+    ///
+    /// Handles the same modal-then-global cascade the run loop used to inline:
+    /// search, theme picker, cache-clear confirm, removal confirm, help, and
+    /// track-info popup are all gated before the global match. Returns
+    /// `KeyOutcome::Quit` for `q` / `Ctrl+C` so the run loop can break.
+    pub fn handle_key(
+        &mut self,
+        key: KeyEvent,
+        cmd_tx: &mpsc::Sender<BgCommand>,
+        audio_tx: &mpsc::Sender<AudioCommand>,
+    ) -> KeyOutcome {
+        if self.search_active {
+            match key.code {
+                KeyCode::Esc => {
+                    self.search_active = false;
+                    self.search_query.clear();
+                    self.apply_sidebar_filter();
+                }
+                KeyCode::Enter => {
+                    self.search_active = false;
+                    self.active_panel = Panel::Library;
+                }
+                KeyCode::Backspace => {
+                    self.search_query.pop();
+                    self.apply_sidebar_filter();
+                }
+                KeyCode::Char(c) => {
+                    self.search_query.push(c);
+                    self.apply_sidebar_filter();
+                }
+                _ => {}
+            }
+            return KeyOutcome::Continue;
+        }
+
+        if self.show_theme_picker {
+            match key.code {
+                KeyCode::Esc => self.theme_picker_cancel(),
+                KeyCode::Enter => self.theme_picker_confirm(),
+                KeyCode::Up => self.theme_picker_move(-1),
+                KeyCode::Down => self.theme_picker_move(1),
+                _ => {}
+            }
+            return KeyOutcome::Continue;
+        }
+
+        if self.pending_cache_clear {
+            match key.code {
+                KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.pending_cache_clear = false;
+                    let playback_dir = std::env::temp_dir().join("zytunes-playback");
+                    let mut total: u64 = 0;
+                    if playback_dir.exists() {
+                        if let Ok(entries) = std::fs::read_dir(&playback_dir) {
+                            for entry in entries.flatten() {
+                                total += entry.metadata().map(|m| m.len()).unwrap_or(0);
+                            }
+                        }
+                        let _ = std::fs::remove_dir_all(&playback_dir);
+                    }
+                    if total > 0 {
+                        let mb = total as f64 / (1024.0 * 1024.0);
+                        self.set_toast(format!("Cleared {:.1} MB of cached audio", mb), false);
+                    } else {
+                        self.set_toast("Cache is already empty".into(), false);
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                    self.pending_cache_clear = false;
+                }
+                _ => {}
+            }
+            return KeyOutcome::Continue;
+        }
+
+        if self.pending_removal.is_some() {
+            match key.code {
+                KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    if let Some(items) = self.pending_removal.take() {
+                        let count = items.len();
+                        self.set_toast(
+                            format!("Removing {} track(s) from device...", count),
+                            false,
+                        );
+                        let _ = cmd_tx.send(BgCommand::RemoveFromDevice(items));
+                        self.removal_queue.clear();
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                    self.pending_removal = None;
+                }
+                _ => {}
+            }
+            return KeyOutcome::Continue;
+        }
+
+        if self.show_help {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
+                    self.show_help = false;
+                }
+                _ => {}
+            }
+            return KeyOutcome::Continue;
+        }
+
+        if self.show_track_info {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('I') => {
+                    self.close_track_info();
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.track_info_move(-1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.track_info_move(1);
+                }
+                KeyCode::PageUp => {
+                    self.track_info_page(-1);
+                }
+                KeyCode::PageDown => {
+                    self.track_info_page(1);
+                }
+                KeyCode::Char('g') => {
+                    self.track_info_home();
+                }
+                KeyCode::Char('G') => {
+                    self.track_info_end();
+                }
+                _ => {}
+            }
+            return KeyOutcome::Continue;
+        }
+
+        match key.code {
+            KeyCode::Char('q') => {
+                self.should_quit = true;
+                return KeyOutcome::Quit;
+            }
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.should_quit = true;
+                return KeyOutcome::Quit;
+            }
+            KeyCode::Char('?') => {
+                self.show_help = true;
+            }
+            KeyCode::Char('h') => {
+                self.show_keys = !self.show_keys;
+            }
+            KeyCode::Tab => {
+                self.cycle_panel();
+            }
+            KeyCode::BackTab => {
+                self.cycle_panel_back();
+            }
+            KeyCode::Char('1') => {
+                self.save_sidebar_pos();
+                self.sidebar_mode = SidebarMode::Artists;
+                self.refresh_sidebar();
+                self.active_panel = Panel::Library;
+            }
+            KeyCode::Char('2') => {
+                self.save_sidebar_pos();
+                self.sidebar_mode = SidebarMode::Albums;
+                self.refresh_sidebar();
+                self.active_panel = Panel::Library;
+            }
+            KeyCode::Char('4') => {
+                if !self.sync.queue.is_empty() {
+                    self.active_panel = Panel::SyncQueue;
+                }
+            }
+            KeyCode::Char('t') => {
+                self.open_theme_picker();
+            }
+            KeyCode::Char('T') => {
+                self.toggle_album_art_style();
+            }
+            KeyCode::Char('I') => {
+                if self.active_panel == Panel::TrackList {
+                    self.open_track_info();
+                }
+            }
+            KeyCode::Char('P') => {
+                let label = self.cycle_show_player();
+                self.set_toast(label.to_string(), false);
+            }
+            KeyCode::Char('v') => {
+                if self.browse_mode == BrowseMode::Device
+                    || self.device.status == DeviceStatus::Connected
+                {
+                    self.toggle_browse_mode();
+                } else {
+                    self.set_toast("Connect a device first".into(), true);
+                }
+            }
+            KeyCode::Char('c') => {
+                if self.device.status == DeviceStatus::Disconnected {
+                    self.device.status = DeviceStatus::Detecting;
+                    self.connection_anim_start = Some(self.anim_frame);
+                    let _ = cmd_tx.send(BgCommand::Connect);
+                }
+            }
+            KeyCode::Char('d') => match self.active_panel {
+                Panel::SyncQueue => {
+                    self.remove_queue_item();
+                }
+                Panel::Device => {
+                    let _ = cmd_tx.send(BgCommand::Disconnect);
+                    self.device.status = DeviceStatus::Disconnected;
+                    self.device.name = None;
+                    self.device.tracks.clear();
+                    self.clear_device_index();
+                    self.set_toast("Disconnected".into(), false);
+                }
+                _ => {}
+            },
+            KeyCode::Char('r') => {
+                if self.device.status == DeviceStatus::Connected {
+                    let _ = cmd_tx.send(BgCommand::LoadDeviceTracks);
+                    self.set_toast("Refreshing device tracks...".into(), false);
+                }
+            }
+            KeyCode::Up => {
+                self.move_up();
+            }
+            KeyCode::Down => {
+                self.move_down();
+            }
+            KeyCode::PageUp => {
+                self.sync.log_scroll_up(10);
+            }
+            KeyCode::PageDown => {
+                self.sync.log_scroll_down(10);
+            }
+            KeyCode::Right => {
+                self.skip_forward();
+            }
+            KeyCode::Left => {
+                self.skip_back();
+            }
+            KeyCode::Char(' ') => {
+                self.toggle_playback(audio_tx);
+            }
+            KeyCode::Char('<') | KeyCode::Char(',') => {
+                if self.now_playing.is_some() {
+                    let _ = audio_tx.send(AudioCommand::Scrub { delta_ms: -5000 });
+                }
+            }
+            KeyCode::Char('>') | KeyCode::Char('.') => {
+                if self.now_playing.is_some() {
+                    let _ = audio_tx.send(AudioCommand::Scrub { delta_ms: 5000 });
+                }
+            }
+            KeyCode::Char('n') => {
+                self.next_track(audio_tx);
+            }
+            KeyCode::Char('p') => {
+                self.prev_track(audio_tx);
+            }
+            KeyCode::Enter => match self.active_panel {
+                Panel::Library => {
+                    self.select_sidebar_item();
+                    if self.has_album_browser() {
+                        self.active_panel = Panel::Albums;
+                    } else {
+                        self.active_panel = Panel::TrackList;
+                    }
+                }
+                Panel::Albums => {
+                    self.active_panel = Panel::TrackList;
+                }
+                Panel::TrackList => {
+                    self.play_selected_track(audio_tx);
+                }
+                Panel::SyncQueue => {
+                    self.execute_sync(cmd_tx);
+                }
+                _ => {}
+            },
+            KeyCode::Char('/') => {
+                self.search_active = true;
+                self.search_query.clear();
+            }
+            KeyCode::Char('s') => {
+                if self.active_panel == Panel::TrackList {
+                    self.cycle_sort();
+                }
+            }
+            KeyCode::Char('L') => {
+                let path = std::path::PathBuf::from("/tmp/zytunes-log.txt");
+                let content = self.sync.log.join("\n");
+                match std::fs::write(&path, &content) {
+                    Ok(_) => {
+                        let path_str = path.display().to_string();
+                        let toast = match copy_to_clipboard(&path_str) {
+                            Ok(()) => {
+                                format!("Log dumped to {} (copied to clipboard)", path_str)
+                            }
+                            Err(e) => {
+                                format!("Log dumped to {} (clipboard: {})", path_str, e)
+                            }
+                        };
+                        self.set_toast(toast, false);
+                    }
+                    Err(e) => self.set_toast(format!("Log dump failed: {}", e), true),
+                }
+            }
+            KeyCode::Char('S') => {
+                if !self.sync.queue.is_empty() {
+                    self.active_panel = Panel::SyncQueue;
+                    self.execute_sync(cmd_tx);
+                }
+            }
+            KeyCode::Char('a') => {
+                if self.browse_mode == BrowseMode::Device {
+                    self.queue_device_removal();
+                } else {
+                    match self.active_panel {
+                        Panel::TrackList => {
+                            self.add_selected_track_to_queue();
+                        }
+                        Panel::Library => {
+                            self.add_sidebar_item_to_queue();
+                        }
+                        Panel::Albums => {
+                            self.add_all_visible_to_queue();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            KeyCode::Char('A') => {
+                if self.browse_mode == BrowseMode::Device {
+                    self.queue_device_removal();
+                } else if self.active_panel == Panel::TrackList {
+                    self.add_all_visible_to_queue();
+                }
+            }
+            KeyCode::Char('D') => {
+                if self.browse_mode == BrowseMode::Device && !self.removal_queue.is_empty() {
+                    self.pending_removal = Some(self.removal_queue.clone());
+                }
+            }
+            KeyCode::Char('C') => {
+                if self.browse_mode == BrowseMode::Device {
+                    let count = self.removal_queue.len();
+                    self.clear_removal_queue();
+                    if count > 0 {
+                        self.set_toast(format!("Cleared {} queued removal(s)", count), false);
+                    }
+                } else if self.active_panel == Panel::SyncQueue {
+                    self.clear_queue();
+                }
+            }
+            KeyCode::Char('U') => {
+                if self.browse_mode == BrowseMode::Device {
+                    self.dedupe_device(cmd_tx);
+                }
+            }
+            KeyCode::Char('X') => {
+                self.pending_cache_clear = true;
+            }
+            KeyCode::Esc => {
+                if matches!(self.sync.status, SyncStatus::Running { .. }) {
+                    let _ = cmd_tx.send(BgCommand::CancelSync);
+                }
+                self.toast_message = None;
+            }
+            _ => {}
+        }
+
+        KeyOutcome::Continue
     }
 
     pub fn track_count(&self) -> usize {
@@ -2519,7 +3305,12 @@ fn first_char_upper(s: &str) -> char {
         .unwrap_or(' ')
 }
 
-fn tracks_to_info<'a, I>(tracks: I, device: &DeviceState) -> Vec<TrackInfo>
+fn tracks_to_info<'a, I>(
+    tracks: I,
+    device: &DeviceState,
+    local_plays: &LocalPlays,
+    device_baseline_key: Option<&str>,
+) -> Vec<TrackInfo>
 where
     I: IntoIterator<Item = &'a Track>,
 {
@@ -2529,18 +3320,42 @@ where
             let artist_key = normalize_for_match(&t.artist);
             let name_key = normalize_for_match(&t.name);
             let on_device = device.contains_track(&artist_key, &name_key);
-            // Library rows have no plays/rating of their own (we don't track
-            // local TUI plays yet). When the same track exists on the device,
-            // surface its on-device counters so the user sees the same data
-            // in either browse mode without having to flip via `v`.
-            let (play_count, rating) = if on_device {
+            // Aggregate counters live in the local-plays sidecar; the device
+            // delta has already been merged in via `merge_device_observation`
+            // by the time we render. The popup row "Plays" shows this number,
+            // and the track-table column reads `track.play_count` directly.
+            let entry = local_plays.get(t.id);
+            let (aggregate_plays, aggregate_skips, last_played) = match entry {
+                Some(p) => (
+                    Some(p.play_count),
+                    if p.skip_count > 0 {
+                        Some(p.skip_count)
+                    } else {
+                        None
+                    },
+                    if p.last_played_at_ms > 0 {
+                        Some(p.last_played_at_ms)
+                    } else {
+                        None
+                    },
+                ),
+                None => (None, None, None),
+            };
+            let last_synced_from_device_at_ms = device_baseline_key
+                .filter(|_| on_device)
+                .and_then(|k| entry?.device_baselines.get(k))
+                .map(|b| b.last_synced_at_ms);
+            // Rating remains a device-side concept; pull from track_metadata
+            // when on-device, else None.
+            let rating = if on_device {
                 device
                     .track_metadata
                     .get(&(artist_key.clone(), name_key.clone()))
                     .copied()
                     .unwrap_or((None, None))
+                    .1
             } else {
-                (None, None)
+                None
             };
             TrackInfo {
                 name: t.name.clone(),
@@ -2553,8 +3368,12 @@ where
                 disc_number: t.disc_number,
                 genre: t.genre.clone(),
                 on_device,
-                play_count,
+                play_count: aggregate_plays,
+                skip_count: aggregate_skips,
                 rating,
+                last_played_at_ms: last_played,
+                last_synced_from_device_at_ms,
+                library_id: Some(t.id),
                 artist_key,
                 name_key,
             }
@@ -2647,7 +3466,12 @@ fn sort_album_tracks(tracks: &mut [TrackInfo]) {
     });
 }
 
-fn device_tracks_to_info(tracks: &[DeviceTrackInfo]) -> Vec<TrackInfo> {
+fn device_tracks_to_info(
+    tracks: &[DeviceTrackInfo],
+    library: Option<&dyn zytunes::library::MusicLibrary>,
+    local_plays: &LocalPlays,
+    device_baseline_key: Option<&str>,
+) -> Vec<TrackInfo> {
     tracks
         .iter()
         .map(|dt| {
@@ -2663,8 +3487,39 @@ fn device_tracks_to_info(tracks: &[DeviceTrackInfo]) -> Vec<TrackInfo> {
                 None,
                 false,
             );
-            info.play_count = dt.play_count;
+            // Try to resolve the matching library track and pull the
+            // aggregate count from the sidecar. Falls back to the raw
+            // device counter for tracks that aren't in the library — those
+            // are still meaningful to the user (a device-only podcast,
+            // sideloaded sample) and dropping their plays would surprise.
+            // The lookup tries both the raw and `strip_track_number`-stripped
+            // form so the displayed aggregate matches what
+            // `merge_device_plays_into_local` already folded into the sidecar
+            // for filenames like `"01 Song"`.
+            let lib_id = library
+                .and_then(|lib| resolve_library_id_for_device_track(lib, &dt.artist, &dt.name));
+            let entry = lib_id.and_then(|id| local_plays.get(id));
+            info.play_count = match entry {
+                Some(p) => Some(p.play_count),
+                None => dt.play_count,
+            };
+            info.skip_count = match entry {
+                Some(p) if p.skip_count > 0 => Some(p.skip_count),
+                Some(_) => None,
+                // Device-only tracks still surface their device-side skips —
+                // mirrors the play-count fallback above so the two columns
+                // don't show inconsistent provenance for sideloaded rows.
+                None => dt.skip_count.filter(|&n| n > 0),
+            };
+            info.last_played_at_ms = match entry {
+                Some(p) if p.last_played_at_ms > 0 => Some(p.last_played_at_ms),
+                _ => None,
+            };
+            info.last_synced_from_device_at_ms = device_baseline_key
+                .and_then(|k| entry?.device_baselines.get(k))
+                .map(|b| b.last_synced_at_ms);
             info.rating = dt.rating;
+            info.library_id = lib_id;
             info
         })
         .collect()
@@ -2697,6 +3552,13 @@ pub fn format_duration(ms: u64) -> String {
     let mins = total_secs / 60;
     let secs = total_secs % 60;
     format!("{}:{:02}", mins, secs)
+}
+
+/// Copy `text` to the system clipboard. Returns an error message on failure
+/// (headless session, missing DISPLAY, etc.) so the caller can surface it.
+fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    let mut clip = arboard::Clipboard::new().map_err(|e| e.to_string())?;
+    clip.set_text(text).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -2842,6 +3704,7 @@ mod tests {
                 disc_number: None,
                 play_count: None,
                 rating: None,
+                skip_count: None,
             }],
         );
         build_match_sets(&mut app.device);
@@ -2923,6 +3786,7 @@ mod tests {
                 disc_number: None,
                 play_count: None,
                 rating: None,
+                skip_count: None,
             }],
         );
         build_match_sets(&mut app.device);
@@ -3036,6 +3900,7 @@ mod tests {
                     disc_number: None,
                     play_count: None,
                     rating: None,
+                    skip_count: None,
                 },
                 DeviceTrackInfo {
                     name: "Bohemian Rhapsody".into(),
@@ -3048,6 +3913,7 @@ mod tests {
                     disc_number: None,
                     play_count: None,
                     rating: None,
+                    skip_count: None,
                 },
                 DeviceTrackInfo {
                     name: "Bohemian Rhapsody".into(),
@@ -3060,6 +3926,7 @@ mod tests {
                     disc_number: None,
                     play_count: None,
                     rating: None,
+                    skip_count: None,
                 },
                 // Unique within the same album — must NOT appear in the
                 // dedupe set.
@@ -3073,6 +3940,7 @@ mod tests {
                     disc_number: None,
                     play_count: None,
                     rating: None,
+                    skip_count: None,
                 },
             ],
         );
@@ -3090,6 +3958,7 @@ mod tests {
                 disc_number: None,
                 play_count: None,
                 rating: None,
+                skip_count: None,
             }],
         );
         build_match_sets(&mut app.device);
@@ -3120,6 +3989,7 @@ mod tests {
                     disc_number: None,
                     play_count: None,
                     rating: None,
+                    skip_count: None,
                 },
                 DeviceTrackInfo {
                     name: "Bohemian Rhapsody".into(),
@@ -3132,6 +4002,7 @@ mod tests {
                     disc_number: None,
                     play_count: None,
                     rating: None,
+                    skip_count: None,
                 },
             ],
         );
@@ -3169,6 +4040,7 @@ mod tests {
                 disc_number: None,
                 play_count: None,
                 rating: None,
+                skip_count: None,
             }],
         );
         build_match_sets(&mut app.device);
@@ -3202,6 +4074,7 @@ mod tests {
                     disc_number: None,
                     play_count: None,
                     rating: None,
+                    skip_count: None,
                 },
                 DeviceTrackInfo {
                     name: "Bohemian Rhapsody".into(),
@@ -3214,6 +4087,7 @@ mod tests {
                     disc_number: None,
                     play_count: None,
                     rating: None,
+                    skip_count: None,
                 },
                 DeviceTrackInfo {
                     name: "Love of My Life".into(),
@@ -3225,6 +4099,7 @@ mod tests {
                     disc_number: None,
                     play_count: None,
                     rating: None,
+                    skip_count: None,
                 },
             ],
         );
@@ -3260,6 +4135,7 @@ mod tests {
                 disc_number: None,
                 play_count: None,
                 rating: None,
+                skip_count: None,
             }],
         );
         build_match_sets(&mut app.device);
@@ -3485,6 +4361,7 @@ mod tests {
                 disc_number: None,
                 play_count: None,
                 rating: None,
+                skip_count: None,
             }],
         );
         build_match_sets(&mut app.device);
@@ -3585,11 +4462,114 @@ mod tests {
         let played = dt.iter().find(|t| t.name == "played").unwrap();
         assert_eq!(played.play_count, Some(7));
 
-        let infos = device_tracks_to_info(dt);
+        let local_plays = LocalPlays::new();
+        let infos = device_tracks_to_info(dt, None, &local_plays, None);
         let played = infos.iter().find(|t| t.name == "played").unwrap();
         let never = infos.iter().find(|t| t.name == "never").unwrap();
+        // No library, no sidecar entry → falls back to the raw device count.
         assert_eq!(played.play_count, Some(7));
         assert_eq!(never.play_count, None);
+    }
+
+    #[test]
+    fn device_tracks_to_info_resolves_track_number_prefixed_filenames() {
+        // Regression: a device filename like "01 Smells Like Teen Spirit"
+        // must resolve to the library title "Smells Like Teen Spirit" so the
+        // displayed aggregate matches what `merge_device_plays_into_local`
+        // already folded into the sidecar. Without strip_track_number
+        // fallback, the lookup misses and the row falls through to the raw
+        // device counter — the user sees "7" in device mode but "9" in
+        // library mode for the same track.
+        let mut app = App::new();
+        app.device.tracks = vec![DeviceEntry {
+            play_count: Some(7),
+            skip_count: Some(2),
+            ..make_device_entry(
+                "Nirvana/Nevermind/01 Smells Like Teen Spirit.mp3",
+                4_000_000,
+            )
+        }];
+        app.build_device_index();
+
+        let dt = app
+            .device
+            .album_tracks
+            .get(&("Nirvana".into(), "Nevermind".into()))
+            .unwrap();
+
+        let lib: Box<dyn zytunes::library::MusicLibrary + Send> = Box::new(VecLibrary {
+            tracks: vec![zytunes::library::Track {
+                id: 42,
+                name: "Smells Like Teen Spirit".into(),
+                artist: "Nirvana".into(),
+                album: "Nevermind".into(),
+                ..Default::default()
+            }],
+        });
+
+        // Sidecar has the post-merge aggregate: 2 prior TUI plays + 7 device.
+        let mut local_plays = LocalPlays::new();
+        local_plays.record_play(42, 100);
+        local_plays.record_play(42, 200);
+        local_plays.merge_device_observation(42, "Zune-ABC", 7, 2, 1_000);
+
+        let infos = device_tracks_to_info(dt, Some(&*lib), &local_plays, Some("Zune-ABC"));
+        let row = infos.iter().find(|t| t.name.contains("Smells")).unwrap();
+        // The aggregate from the sidecar (9 plays, 2 skips), not the raw
+        // device counters (7 plays, 2 skips).
+        assert_eq!(row.play_count, Some(9));
+        assert_eq!(row.skip_count, Some(2));
+    }
+
+    #[test]
+    fn device_tracks_to_info_skip_count_falls_back_to_device_for_unmatched_rows() {
+        // Mirror of the play_count fallback for sideloaded / podcast rows
+        // that have no library counterpart. Before the fix, skip_count
+        // dropped to None even when the device reported a non-zero value,
+        // while play_count correctly fell back to dt.play_count.
+        let mut app = App::new();
+        app.device.tracks = vec![DeviceEntry {
+            play_count: Some(4),
+            skip_count: Some(3),
+            ..make_device_entry("Podcast/Show/episode-12.mp3", 30_000_000)
+        }];
+        app.build_device_index();
+
+        let dt = app
+            .device
+            .album_tracks
+            .get(&("Podcast".into(), "Show".into()))
+            .unwrap();
+        let local_plays = LocalPlays::new();
+        let infos = device_tracks_to_info(dt, None, &local_plays, None);
+        let row = &infos[0];
+        assert_eq!(row.play_count, Some(4), "play_count must fall back");
+        assert_eq!(
+            row.skip_count,
+            Some(3),
+            "skip_count fallback must mirror play_count's"
+        );
+    }
+
+    #[test]
+    fn device_tracks_to_info_omits_zero_skip_count() {
+        // A device-side skip_count of 0 should suppress the column the same
+        // way a sidecar `skip_count == 0` does — keeps the row terse.
+        let mut app = App::new();
+        app.device.tracks = vec![DeviceEntry {
+            play_count: Some(4),
+            skip_count: Some(0),
+            ..make_device_entry("Artist/Album/never-skipped.mp3", 4_000_000)
+        }];
+        app.build_device_index();
+        let dt = app
+            .device
+            .album_tracks
+            .get(&("Artist".into(), "Album".into()))
+            .unwrap();
+        let local_plays = LocalPlays::new();
+        let infos = device_tracks_to_info(dt, None, &local_plays, None);
+        assert_eq!(infos[0].skip_count, None);
     }
 
     #[test]
@@ -4876,6 +5856,7 @@ mod tests {
                 disc_number: None,
                 play_count: None,
                 rating: None,
+                skip_count: None,
             }],
         );
         build_match_sets(&mut device);
@@ -5053,6 +6034,7 @@ mod tests {
                 disc_number: None,
                 play_count: None,
                 rating: None,
+                skip_count: None,
             }],
         );
         build_match_sets(&mut app.device);
@@ -5112,6 +6094,7 @@ mod tests {
                 disc_number: None,
                 play_count: None,
                 rating: None,
+                skip_count: None,
             }],
         );
         build_match_sets(&mut device);
@@ -5209,6 +6192,7 @@ mod tests {
                     disc_number: None,
                     play_count: None,
                     rating: None,
+                    skip_count: None,
                 },
                 DeviceTrackInfo {
                     name: "Karma Police".into(),
@@ -5220,6 +6204,7 @@ mod tests {
                     disc_number: None,
                     play_count: None,
                     rating: None,
+                    skip_count: None,
                 },
             ],
         );
@@ -5235,6 +6220,7 @@ mod tests {
                 disc_number: None,
                 play_count: None,
                 rating: None,
+                skip_count: None,
             }],
         );
         build_match_sets(&mut app.device);
@@ -5362,6 +6348,8 @@ mod tests {
             track_index: 0,
             playlist: Arc::from([] as [TrackInfo; 0]),
             paused_frame: None,
+            track_id: None,
+            counted: false,
         });
         app.show_player = None;
         assert!(!app.should_show_player(19));
@@ -5381,6 +6369,8 @@ mod tests {
             track_index: 0,
             playlist: Arc::from([] as [TrackInfo; 0]),
             paused_frame: None,
+            track_id: None,
+            counted: false,
         });
         app.show_player = Some(false);
         assert!(!app.should_show_player(100));
@@ -5401,6 +6391,8 @@ mod tests {
             track_index: 0,
             playlist: Arc::from([] as [TrackInfo; 0]),
             paused_frame: None,
+            track_id: None,
+            counted: false,
         });
         app.show_player = Some(true);
         assert!(app.should_show_player(12));
@@ -5416,5 +6408,673 @@ mod tests {
         assert_eq!(app.show_player, Some(true));
         assert_eq!(app.cycle_show_player_in_memory(), "Player: auto");
         assert_eq!(app.show_player, None);
+    }
+
+    // -- local-plays wiring (Phase 3 commit 2) --
+
+    /// Build an `App` with a one-track library and a `now_playing` session
+    /// pointing at it. Disk persistence is disabled (`local_plays_save_path =
+    /// None`) so tests don't pollute `~/.cache/zytunes/`. The playlist is
+    /// populated with one matching `TrackInfo` so transition paths
+    /// (`next_track`/`prev_track`) don't index into an empty slice.
+    fn app_with_now_playing(track_id: u64, duration_ms: u64) -> App {
+        let mut app = App::new();
+        app.local_plays_save_path = None;
+        let track = zytunes::library::Track {
+            id: track_id,
+            name: "Song".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            total_time_ms: Some(duration_ms),
+            ..Default::default()
+        };
+        app.library = Some(Box::new(VecLibrary {
+            tracks: vec![track],
+        }));
+        let info = TrackInfo::new(
+            "Song".into(),
+            "Artist".into(),
+            "Album".into(),
+            Some(duration_ms),
+            None,
+            Some("/tmp/song.mp3".into()),
+            None,
+            None,
+            None,
+            false,
+        );
+        let playlist: Arc<[TrackInfo]> = Arc::from(vec![info]);
+        app.now_playing = Some(NowPlaying {
+            track_name: "Song".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            duration_ms,
+            elapsed_ms: 0,
+            state: PlaybackState::Playing,
+            track_index: 0,
+            playlist,
+            paused_frame: None,
+            track_id: Some(track_id),
+            counted: false,
+        });
+        app
+    }
+
+    fn dummy_audio_tx() -> mpsc::Sender<AudioCommand> {
+        let (tx, _rx) = mpsc::channel::<AudioCommand>();
+        tx
+    }
+
+    #[test]
+    fn end_to_end_play_records_and_propagates_last_played() {
+        // Mirror the production flow as closely as a unit test can: build a
+        // library track, run it through `tracks_to_info` so library_id is
+        // populated by the real builder, install as track_list, then play it
+        // past the threshold via the audio event handler. Both `play_count`
+        // and `last_played_at_ms` should be Some on the visible row, and
+        // `format_metadata_pairs` should emit a "Last played" entry.
+        let mut app = App::new();
+        let track = zytunes::library::Track {
+            id: 4242,
+            name: "Track".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            total_time_ms: Some(240_000),
+            location: Some("/tmp/track.mp3".into()),
+            ..Default::default()
+        };
+        app.library = Some(Box::new(VecLibrary {
+            tracks: vec![track.clone()],
+        }));
+        // Build track_list through the real builder so library_id wiring is
+        // exercised end-to-end.
+        let lib_ref = app.library.as_deref().unwrap();
+        let device_key = app.current_device_baseline_key();
+        app.track_list = tracks_to_info(
+            std::iter::once(&track),
+            &app.device,
+            &app.local_plays,
+            device_key.as_deref(),
+        );
+        assert_eq!(app.track_list.len(), 1);
+        assert_eq!(app.track_list[0].library_id, Some(4242));
+        assert!(app.track_list[0].last_played_at_ms.is_none());
+        // Borrow check: drop the immutable lib_ref before we touch app
+        // again.
+        let _ = lib_ref;
+
+        app.track_selected = 0;
+        let tx = dummy_audio_tx();
+        app.play_selected_track(&tx);
+        assert_eq!(
+            app.now_playing.as_ref().and_then(|np| np.track_id),
+            Some(4242),
+            "now_playing.track_id must resolve via resolve_library_track_id"
+        );
+        // Past threshold (50% of 240s = 120s).
+        app.handle_audio_event(
+            AudioEvent::Position {
+                elapsed_ms: 130_000,
+            },
+            &tx,
+        );
+        assert_eq!(app.local_plays.get(4242).unwrap().play_count, 1);
+        assert!(
+            app.local_plays.get(4242).unwrap().last_played_at_ms > 0,
+            "sidecar must record a non-zero last_played_at_ms"
+        );
+        assert_eq!(app.track_list[0].play_count, Some(1));
+        assert!(
+            app.track_list[0].last_played_at_ms.is_some(),
+            "live refresh must push last_played into the visible row"
+        );
+
+        let pairs =
+            crate::ui::format_metadata_pairs(&app.track_list[0], app.track_info_lib.as_ref());
+        let keys: Vec<&str> = pairs
+            .iter()
+            .filter_map(|r| match r {
+                crate::ui::MetadataRow::Field { key, .. } => Some(*key),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            keys.contains(&"Last played"),
+            "popup formatter must emit a Last played row after a TUI play"
+        );
+    }
+
+    #[test]
+    fn record_play_refreshes_visible_track_list_row() {
+        // Regression: recording a play must push the new aggregate into any
+        // visible `track_list` row tagged with the same `library_id`. Without
+        // the live refresh, the popup / track table kept showing the
+        // pre-bump number until the user navigated away to force a rebuild.
+        let mut app = app_with_now_playing(42, 240_000);
+        let mut info = TrackInfo::new(
+            "Song".into(),
+            "Artist".into(),
+            "Album".into(),
+            Some(240_000),
+            None,
+            Some("/tmp/song.mp3".into()),
+            None,
+            None,
+            None,
+            false,
+        );
+        info.library_id = Some(42);
+        info.play_count = Some(0);
+        app.track_list = vec![info];
+        let tx = dummy_audio_tx();
+        app.handle_audio_event(
+            AudioEvent::Position {
+                elapsed_ms: 130_000,
+            },
+            &tx,
+        );
+        assert_eq!(
+            app.track_list[0].play_count,
+            Some(1),
+            "track_list row must reflect the just-recorded play live"
+        );
+        assert!(
+            app.track_list[0].last_played_at_ms.is_some(),
+            "last_played_at_ms must update live"
+        );
+    }
+
+    #[test]
+    fn record_skip_refreshes_visible_track_list_row() {
+        let mut app = app_with_now_playing(99, 240_000);
+        let mut info = TrackInfo::new(
+            "Song".into(),
+            "Artist".into(),
+            "Album".into(),
+            Some(240_000),
+            None,
+            Some("/tmp/song.mp3".into()),
+            None,
+            None,
+            None,
+            false,
+        );
+        info.library_id = Some(99);
+        info.skip_count = None;
+        app.track_list = vec![info];
+        let tx = dummy_audio_tx();
+        // Listen briefly then skip.
+        app.handle_audio_event(AudioEvent::Position { elapsed_ms: 5_000 }, &tx);
+        app.stop_playback(&tx);
+        assert_eq!(
+            app.track_list[0].skip_count,
+            Some(1),
+            "track_list row must reflect the just-recorded skip live"
+        );
+    }
+
+    #[test]
+    fn refresh_play_stats_for_id_only_touches_matching_rows() {
+        // Multiple rows in track_list with different library_ids: refreshing
+        // one must not stomp the others.
+        let mut app = app_with_now_playing(1, 240_000);
+        let mk = |id: u64, plays: u32| {
+            let mut t = TrackInfo::new(
+                format!("Song-{id}"),
+                "Artist".into(),
+                "Album".into(),
+                Some(240_000),
+                None,
+                Some("/tmp/song.mp3".into()),
+                None,
+                None,
+                None,
+                false,
+            );
+            t.library_id = Some(id);
+            t.play_count = Some(plays);
+            t
+        };
+        app.track_list = vec![mk(1, 0), mk(2, 5), mk(3, 7)];
+        app.local_plays.record_play(1, 1_000);
+        app.refresh_play_stats_for_id(1);
+        assert_eq!(app.track_list[0].play_count, Some(1), "row 1 refreshed");
+        assert_eq!(
+            app.track_list[1].play_count,
+            Some(5),
+            "row 2 untouched (library_id mismatch)"
+        );
+        assert_eq!(
+            app.track_list[2].play_count,
+            Some(7),
+            "row 3 untouched (library_id mismatch)"
+        );
+    }
+
+    #[test]
+    fn position_at_threshold_records_play_once() {
+        // 4-min track: threshold is 2 min. First Position past threshold
+        // should bump play_count to 1; subsequent ones don't double-count.
+        let mut app = app_with_now_playing(42, 240_000);
+        let tx = dummy_audio_tx();
+        app.handle_audio_event(
+            AudioEvent::Position {
+                elapsed_ms: 119_999,
+            },
+            &tx,
+        );
+        assert_eq!(
+            app.local_plays.get(42).map(|p| p.play_count).unwrap_or(0),
+            0,
+            "below threshold must not count"
+        );
+
+        app.handle_audio_event(
+            AudioEvent::Position {
+                elapsed_ms: 120_000,
+            },
+            &tx,
+        );
+        assert_eq!(app.local_plays.get(42).unwrap().play_count, 1);
+
+        app.handle_audio_event(
+            AudioEvent::Position {
+                elapsed_ms: 200_000,
+            },
+            &tx,
+        );
+        app.handle_audio_event(
+            AudioEvent::Position {
+                elapsed_ms: 230_000,
+            },
+            &tx,
+        );
+        assert_eq!(
+            app.local_plays.get(42).unwrap().play_count,
+            1,
+            "post-threshold ticks must not double-count"
+        );
+    }
+
+    #[test]
+    fn position_threshold_caps_at_four_minutes() {
+        // 20-min track: 50% would be 10 min, but cap is 4 min.
+        let mut app = app_with_now_playing(7, 1_200_000);
+        let tx = dummy_audio_tx();
+        app.handle_audio_event(
+            AudioEvent::Position {
+                elapsed_ms: 239_999,
+            },
+            &tx,
+        );
+        assert_eq!(app.local_plays.get(7).map(|p| p.play_count).unwrap_or(0), 0);
+        app.handle_audio_event(
+            AudioEvent::Position {
+                elapsed_ms: 240_000,
+            },
+            &tx,
+        );
+        assert_eq!(app.local_plays.get(7).unwrap().play_count, 1);
+    }
+
+    #[test]
+    fn track_ended_records_play_for_short_clips() {
+        // 1.5s clip: threshold is 750ms but Position events poll at ~250ms,
+        // so a tiny race could miss the threshold. TrackEnded is the safety
+        // net.
+        let mut app = app_with_now_playing(99, 1_500);
+        let tx = dummy_audio_tx();
+        app.handle_audio_event(AudioEvent::TrackEnded, &tx);
+        assert_eq!(app.local_plays.get(99).unwrap().play_count, 1);
+    }
+
+    #[test]
+    fn track_ended_after_play_recorded_is_idempotent() {
+        let mut app = app_with_now_playing(1, 240_000);
+        let tx = dummy_audio_tx();
+        app.handle_audio_event(
+            AudioEvent::Position {
+                elapsed_ms: 130_000,
+            },
+            &tx,
+        );
+        assert_eq!(app.local_plays.get(1).unwrap().play_count, 1);
+        // Track ends after threshold; play_count stays 1.
+        app.handle_audio_event(AudioEvent::TrackEnded, &tx);
+        assert_eq!(app.local_plays.get(1).unwrap().play_count, 1);
+    }
+
+    #[test]
+    fn next_before_threshold_records_skip() {
+        let mut app = app_with_now_playing(5, 240_000);
+        let tx = dummy_audio_tx();
+        // Listen for 30s, then skip.
+        app.handle_audio_event(AudioEvent::Position { elapsed_ms: 30_000 }, &tx);
+        app.next_track(&tx);
+        let entry = app.local_plays.get(5).unwrap();
+        assert_eq!(entry.play_count, 0);
+        assert_eq!(entry.skip_count, 1);
+    }
+
+    #[test]
+    fn next_after_threshold_does_not_record_skip() {
+        let mut app = app_with_now_playing(5, 240_000);
+        let tx = dummy_audio_tx();
+        app.handle_audio_event(
+            AudioEvent::Position {
+                elapsed_ms: 130_000,
+            },
+            &tx,
+        );
+        // Skipping after the threshold is a play, not a skip.
+        app.next_track(&tx);
+        let entry = app.local_plays.get(5).unwrap();
+        assert_eq!(entry.play_count, 1);
+        assert_eq!(entry.skip_count, 0);
+    }
+
+    #[test]
+    fn prev_before_3s_with_index_zero_restarts_no_skip() {
+        // Pressing prev within the first 3s with track_index=0 restarts
+        // the same track — same session, no skip recorded.
+        let mut app = app_with_now_playing(8, 240_000);
+        let tx = dummy_audio_tx();
+        app.handle_audio_event(AudioEvent::Position { elapsed_ms: 1_000 }, &tx);
+        app.prev_track(&tx);
+        let entry = app.local_plays.get(8);
+        assert!(
+            entry.is_none() || entry.unwrap().skip_count == 0,
+            "restart-current must not record a skip"
+        );
+    }
+
+    #[test]
+    fn stop_before_threshold_records_skip() {
+        let mut app = app_with_now_playing(11, 240_000);
+        let tx = dummy_audio_tx();
+        app.handle_audio_event(AudioEvent::Position { elapsed_ms: 10_000 }, &tx);
+        app.stop_playback(&tx);
+        assert_eq!(app.local_plays.get(11).unwrap().skip_count, 1);
+        assert!(app.now_playing.is_none());
+    }
+
+    #[test]
+    fn playback_error_records_neither() {
+        let mut app = app_with_now_playing(13, 240_000);
+        let tx = dummy_audio_tx();
+        app.handle_audio_event(AudioEvent::Position { elapsed_ms: 30_000 }, &tx);
+        app.handle_audio_event(AudioEvent::PlaybackError("boom".into()), &tx);
+        let entry = app.local_plays.get(13);
+        assert!(
+            entry.is_none() || (entry.unwrap().play_count == 0 && entry.unwrap().skip_count == 0)
+        );
+        assert!(app.now_playing.is_none());
+    }
+
+    #[test]
+    fn replay_after_stop_starts_fresh_session() {
+        // After stop+replay, the second listen-through should bump
+        // play_count again (not be blocked by the prior session's flag).
+        let mut app = app_with_now_playing(17, 240_000);
+        let tx = dummy_audio_tx();
+        app.handle_audio_event(
+            AudioEvent::Position {
+                elapsed_ms: 130_000,
+            },
+            &tx,
+        );
+        assert_eq!(app.local_plays.get(17).unwrap().play_count, 1);
+
+        // Simulate stop + manual replay (the production path goes through
+        // play_selected_track; here we install a fresh NowPlaying directly).
+        app.now_playing = Some(NowPlaying {
+            track_name: "Song".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            duration_ms: 240_000,
+            elapsed_ms: 0,
+            state: PlaybackState::Playing,
+            track_index: 0,
+            playlist: Arc::from([] as [TrackInfo; 0]),
+            paused_frame: None,
+            track_id: Some(17),
+            counted: false,
+        });
+        app.handle_audio_event(
+            AudioEvent::Position {
+                elapsed_ms: 130_000,
+            },
+            &tx,
+        );
+        assert_eq!(app.local_plays.get(17).unwrap().play_count, 2);
+    }
+
+    #[test]
+    fn no_track_id_skips_recording_silently() {
+        // Device-mode rows don't resolve a library track_id. The threshold
+        // must still flip `counted` (so we don't keep checking), but
+        // local_plays stays empty.
+        let mut app = app_with_now_playing(0, 240_000);
+        if let Some(np) = app.now_playing.as_mut() {
+            np.track_id = None;
+        }
+        let tx = dummy_audio_tx();
+        app.handle_audio_event(
+            AudioEvent::Position {
+                elapsed_ms: 130_000,
+            },
+            &tx,
+        );
+        assert!(app.local_plays.is_empty());
+        assert!(app.now_playing.as_ref().unwrap().counted);
+    }
+
+    #[test]
+    fn play_selected_track_resolves_track_number_prefixed_name() {
+        // Regression: a device-mode TrackInfo with name "01 Song" must
+        // resolve to the library track titled "Song" so the play actually
+        // gets recorded. Before the fix, `resolve_library_track_id` did an
+        // exact name lookup and returned None for any track-number-prefixed
+        // filename, silently dropping the play.
+        let mut app = App::new();
+        let track = zytunes::library::Track {
+            id: 99,
+            name: "Song".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            total_time_ms: Some(240_000),
+            ..Default::default()
+        };
+        app.library = Some(Box::new(VecLibrary {
+            tracks: vec![track],
+        }));
+        // Build a TrackInfo as device_tracks_to_info would: name carries
+        // the leading track-number prefix from the device filename.
+        let info = TrackInfo::new(
+            "01 Song".into(),
+            "Artist".into(),
+            "Album".into(),
+            Some(240_000),
+            None,
+            Some("/tmp/song.mp3".into()),
+            None,
+            None,
+            None,
+            false,
+        );
+        app.track_list = vec![info];
+        app.track_selected = 0;
+        let tx = dummy_audio_tx();
+        app.play_selected_track(&tx);
+        assert_eq!(
+            app.now_playing.as_ref().and_then(|np| np.track_id),
+            Some(99),
+            "device-mode TrackInfo with track-number prefix must still resolve a library id"
+        );
+    }
+
+    // -- merge_device_plays_into_local (Phase 3 commit 4) --
+
+    fn app_with_library_for_merge() -> App {
+        let mut app = App::new();
+        app.local_plays_save_path = None;
+        let track = zytunes::library::Track {
+            id: 42,
+            name: "Smells Like Teen Spirit".into(),
+            artist: "Nirvana".into(),
+            album: "Nevermind".into(),
+            ..Default::default()
+        };
+        app.library = Some(Box::new(VecLibrary {
+            tracks: vec![track],
+        }));
+        app.device.family = Some(zytunes::device::DeviceFamily::Zune);
+        app.device.serial = Some("ABC123".into());
+        app
+    }
+
+    fn matching_device_track(play: u32, skip: u32) -> DeviceEntry {
+        DeviceEntry {
+            object_id: 9001,
+            storage_id: 65537,
+            format: "MP3".to_string(),
+            name: "Nirvana/Nevermind/01 Smells Like Teen Spirit.mp3".to_string(),
+            play_count: Some(play),
+            skip_count: Some(skip),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn merge_walks_user_example() {
+        // The user's spec: 2 TUI plays, then connect device with 7 plays
+        // → aggregate 9. Reconnect with no change → still 9.
+        let mut app = app_with_library_for_merge();
+        app.local_plays.record_play(42, 100);
+        app.local_plays.record_play(42, 200);
+        assert_eq!(app.local_plays.get(42).unwrap().play_count, 2);
+
+        app.device.tracks = vec![matching_device_track(7, 0)];
+        app.merge_device_plays_into_local();
+        assert_eq!(app.local_plays.get(42).unwrap().play_count, 9);
+
+        // Reconnect, device still reports 7 — count holds at 9.
+        app.merge_device_plays_into_local();
+        assert_eq!(app.local_plays.get(42).unwrap().play_count, 9);
+    }
+
+    #[test]
+    fn merge_subsequent_observation_uses_delta_only() {
+        let mut app = app_with_library_for_merge();
+        app.device.tracks = vec![matching_device_track(5, 0)];
+        app.merge_device_plays_into_local();
+        assert_eq!(app.local_plays.get(42).unwrap().play_count, 5);
+
+        // Device went 5 → 8 between syncs.
+        app.device.tracks = vec![matching_device_track(8, 0)];
+        app.merge_device_plays_into_local();
+        assert_eq!(app.local_plays.get(42).unwrap().play_count, 8);
+    }
+
+    #[test]
+    fn merge_handles_track_number_prefix_in_filename() {
+        // Library Track.name is "Smells Like Teen Spirit" (from ID3 title);
+        // device filename is "01 Smells Like Teen Spirit.mp3". They must
+        // still match via `strip_track_number` normalization.
+        let mut app = app_with_library_for_merge();
+        app.device.tracks = vec![matching_device_track(3, 1)];
+        app.merge_device_plays_into_local();
+        assert_eq!(app.local_plays.get(42).unwrap().play_count, 3);
+        assert_eq!(app.local_plays.get(42).unwrap().skip_count, 1);
+    }
+
+    #[test]
+    fn merge_no_op_without_library() {
+        let mut app = App::new();
+        app.local_plays_save_path = None;
+        app.device.family = Some(zytunes::device::DeviceFamily::Zune);
+        app.device.tracks = vec![matching_device_track(5, 0)];
+        app.merge_device_plays_into_local();
+        // No library yet — nothing should land in the sidecar.
+        assert!(app.local_plays.is_empty());
+    }
+
+    #[test]
+    fn merge_no_op_without_device_family() {
+        let mut app = app_with_library_for_merge();
+        app.device.family = None; // device hasn't connected
+        app.device.tracks = vec![matching_device_track(5, 0)];
+        app.merge_device_plays_into_local();
+        assert!(app.local_plays.is_empty());
+    }
+
+    #[test]
+    fn merge_no_op_when_no_library_match() {
+        let mut app = app_with_library_for_merge();
+        app.device.tracks = vec![DeviceEntry {
+            object_id: 5000,
+            storage_id: 65537,
+            format: "MP3".into(),
+            name: "Not An Artist/Some Album/track.mp3".into(),
+            play_count: Some(10),
+            skip_count: Some(2),
+            ..Default::default()
+        }];
+        app.merge_device_plays_into_local();
+        assert!(app.local_plays.is_empty());
+    }
+
+    #[test]
+    fn library_loaded_after_device_runs_merge() {
+        // Order-of-events test: device tracks land before library finishes
+        // scanning. The DeviceTracksLoaded handler's merge no-ops (no
+        // library yet); the LibraryLoaded handler's merge catches up.
+        let mut app = App::new();
+        app.local_plays_save_path = None;
+        app.device.family = Some(zytunes::device::DeviceFamily::Zune);
+        app.device.serial = Some("ABC123".into());
+        app.handle_bg_event(BgEvent::DeviceTracksLoaded(vec![matching_device_track(
+            7, 0,
+        )]));
+        assert!(app.local_plays.is_empty(), "merge before library = no-op");
+
+        let lib: Box<dyn zytunes::library::MusicLibrary + Send> = Box::new(VecLibrary {
+            tracks: vec![zytunes::library::Track {
+                id: 42,
+                name: "Smells Like Teen Spirit".into(),
+                artist: "Nirvana".into(),
+                album: "Nevermind".into(),
+                ..Default::default()
+            }],
+        });
+        app.handle_bg_event(BgEvent::LibraryLoaded(Ok(lib)));
+        assert_eq!(app.local_plays.get(42).unwrap().play_count, 7);
+    }
+
+    #[test]
+    fn device_tracks_after_library_runs_merge() {
+        // Reverse order: library loads first, device follows. The
+        // DeviceTracksLoaded handler's merge does the work.
+        let mut app = App::new();
+        app.local_plays_save_path = None;
+        app.device.family = Some(zytunes::device::DeviceFamily::Zune);
+        app.device.serial = Some("ABC123".into());
+
+        let lib: Box<dyn zytunes::library::MusicLibrary + Send> = Box::new(VecLibrary {
+            tracks: vec![zytunes::library::Track {
+                id: 42,
+                name: "Smells Like Teen Spirit".into(),
+                artist: "Nirvana".into(),
+                album: "Nevermind".into(),
+                ..Default::default()
+            }],
+        });
+        app.handle_bg_event(BgEvent::LibraryLoaded(Ok(lib)));
+        assert!(app.local_plays.is_empty(), "no device tracks yet");
+
+        app.handle_bg_event(BgEvent::DeviceTracksLoaded(vec![matching_device_track(
+            7, 0,
+        )]));
+        assert_eq!(app.local_plays.get(42).unwrap().play_count, 7);
     }
 }

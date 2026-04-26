@@ -34,6 +34,16 @@ serde_json = "1"
 unicode-width = "0.2"
 arboard = { version = "3", default-features = false }
 
+[features]
+# Exposes the TUI modules through the lib crate so integration tests can
+# drive App against ratatui's TestBackend without touching the real terminal
+# or background worker. Off by default — release builds of the binary do not
+# need it.
+tui-testing = []
+
+[dev-dependencies]
+insta = "1"
+
 [[bin]]
 name = "zytunes"
 path = "src/main.rs"

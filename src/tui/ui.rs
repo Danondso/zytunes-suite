@@ -98,6 +98,10 @@ impl LayoutMetrics {
 
     /// Returns (device_w, sidebar_w, album_w, keys_w) for album art
     /// pre-render calculations in the event loop.
+    // Only the binary's run loop calls this; under `tui-testing` the lib
+    // build sees a dead-code warning since main.rs isn't part of the lib
+    // compilation unit.
+    #[allow(dead_code)]
     pub(crate) fn panel_widths(
         width: u16,
         show_keys: bool,
@@ -2409,19 +2413,44 @@ pub fn format_metadata_pairs(track: &TrackInfo, lib: Option<&Track>) -> Vec<Meta
         out.append(&mut note_rows);
     }
 
+    // -- Listening (aggregate plays/skips, valid whether on-device or not) --
+    let mut listening_rows: Vec<MetadataRow> = Vec::new();
+    if let Some(p) = track.play_count {
+        listening_rows.push(MetadataRow::Field {
+            key: "Plays",
+            value: p.to_string(),
+        });
+    }
+    if let Some(s) = track.skip_count {
+        listening_rows.push(MetadataRow::Field {
+            key: "Skips",
+            value: s.to_string(),
+        });
+    }
+    if let Some(t) = track.last_played_at_ms {
+        listening_rows.push(MetadataRow::Field {
+            key: "Last played",
+            value: humanize_relative_ms(t, now_unix_ms_for_humanize()),
+        });
+    }
+    if !listening_rows.is_empty() {
+        out.push(MetadataRow::Section("Listening"));
+        out.append(&mut listening_rows);
+    }
+
     // -- Device-side bits (only when on-device) --
     if track.on_device {
         let mut dev_rows: Vec<MetadataRow> = Vec::new();
-        if let Some(p) = track.play_count {
-            dev_rows.push(MetadataRow::Field {
-                key: "Plays",
-                value: p.to_string(),
-            });
-        }
         if let Some(r) = track.rating {
             dev_rows.push(MetadataRow::Field {
                 key: "Device Rating",
                 value: format!("{}/100", r),
+            });
+        }
+        if let Some(t) = track.last_synced_from_device_at_ms {
+            dev_rows.push(MetadataRow::Field {
+                key: "Last synced",
+                value: humanize_relative_ms(t, now_unix_ms_for_humanize()),
             });
         }
         if !dev_rows.is_empty() {
@@ -2431,6 +2460,105 @@ pub fn format_metadata_pairs(track: &TrackInfo, lib: Option<&Track>) -> Vec<Meta
     }
 
     out
+}
+
+/// Wall-clock now in unix ms. Wrapped here so the popup formatter has a
+/// single point to swap for tests (the `humanize_relative_ms` helper takes
+/// `now_ms` explicitly so unit tests pin the relative output).
+fn now_unix_ms_for_humanize() -> u64 {
+    use std::time::SystemTime;
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Render a unix-epoch-ms timestamp as a relative string against `now_ms`,
+/// e.g. `"just now"`, `"5 minutes ago"`, `"yesterday"`, `"3 days ago"`,
+/// or `"2026-04-12"` for older. Future timestamps (clock skew between
+/// devices) clamp to "just now" so the popup never shows nonsense like
+/// "in 5 minutes."
+pub fn humanize_relative_ms(then_ms: u64, now_ms: u64) -> String {
+    if then_ms >= now_ms {
+        return "just now".to_string();
+    }
+    let secs = (now_ms - then_ms) / 1000;
+    if secs < 60 {
+        return "just now".to_string();
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        return if mins == 1 {
+            "1 minute ago".to_string()
+        } else {
+            format!("{mins} minutes ago")
+        };
+    }
+    let hours = mins / 60;
+    if hours < 24 {
+        return if hours == 1 {
+            "1 hour ago".to_string()
+        } else {
+            format!("{hours} hours ago")
+        };
+    }
+    let days = hours / 24;
+    if days == 1 {
+        return "yesterday".to_string();
+    }
+    if days < 7 {
+        return format!("{days} days ago");
+    }
+    if days < 30 {
+        let weeks = days / 7;
+        return if weeks == 1 {
+            "1 week ago".to_string()
+        } else {
+            format!("{weeks} weeks ago")
+        };
+    }
+    // Older than a month — render as a calendar date in the user's local
+    // sense of "year-month-day". We don't pull in chrono just for this;
+    // do the math by hand against the unix epoch (1970-01-01 UTC).
+    format_iso_date(then_ms / 1000)
+}
+
+/// Format a unix-second timestamp as `YYYY-MM-DD` (UTC). Standalone helper
+/// instead of pulling in chrono — the popup only ever needs UTC date,
+/// not full datetime formatting.
+fn format_iso_date(unix_secs: u64) -> String {
+    // Days since 1970-01-01.
+    let mut days = (unix_secs / 86_400) as i64;
+    let mut year: i64 = 1970;
+    loop {
+        let dy = if is_leap_year(year) { 366 } else { 365 };
+        if days < dy {
+            break;
+        }
+        days -= dy;
+        year += 1;
+    }
+    let months_normal = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let months_leap = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let months = if is_leap_year(year) {
+        &months_leap
+    } else {
+        &months_normal
+    };
+    let mut month: i64 = 1;
+    for &dm in months {
+        if days < dm {
+            break;
+        }
+        days -= dm;
+        month += 1;
+    }
+    let day = days + 1; // 1-based day
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+fn is_leap_year(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
 /// Helper: append a `Field` row from a library getter, only when the value
@@ -3473,5 +3601,222 @@ mod tests {
                 (m.device_width, m.sidebar_width, m.album_width, m.keys_width)
             );
         }
+    }
+
+    // -- humanize_relative_ms / format_iso_date (Phase 3 commit 5) --
+
+    #[test]
+    fn humanize_just_now_for_under_one_minute() {
+        let now = 1_700_000_000_000u64;
+        assert_eq!(humanize_relative_ms(now, now), "just now");
+        assert_eq!(humanize_relative_ms(now - 30_000, now), "just now"); // 30s ago
+        assert_eq!(humanize_relative_ms(now - 59_999, now), "just now");
+    }
+
+    #[test]
+    fn humanize_future_clamps_to_just_now() {
+        // Clock skew between TUI and device shouldn't show "in 5 minutes".
+        let now = 1_700_000_000_000u64;
+        assert_eq!(humanize_relative_ms(now + 300_000, now), "just now");
+    }
+
+    #[test]
+    fn humanize_minutes() {
+        let now = 1_700_000_000_000u64;
+        assert_eq!(humanize_relative_ms(now - 60_000, now), "1 minute ago");
+        assert_eq!(humanize_relative_ms(now - 600_000, now), "10 minutes ago");
+        assert_eq!(
+            humanize_relative_ms(now - 59 * 60_000, now),
+            "59 minutes ago"
+        );
+    }
+
+    #[test]
+    fn humanize_hours() {
+        let now = 1_700_000_000_000u64;
+        assert_eq!(humanize_relative_ms(now - 3_600_000, now), "1 hour ago");
+        assert_eq!(
+            humanize_relative_ms(now - 5 * 3_600_000, now),
+            "5 hours ago"
+        );
+    }
+
+    #[test]
+    fn humanize_yesterday_then_days() {
+        let now = 1_700_000_000_000u64;
+        let day = 86_400_000u64;
+        assert_eq!(humanize_relative_ms(now - day, now), "yesterday");
+        assert_eq!(humanize_relative_ms(now - 3 * day, now), "3 days ago");
+        assert_eq!(humanize_relative_ms(now - 6 * day, now), "6 days ago");
+    }
+
+    #[test]
+    fn humanize_weeks() {
+        let now = 1_700_000_000_000u64;
+        let day = 86_400_000u64;
+        assert_eq!(humanize_relative_ms(now - 7 * day, now), "1 week ago");
+        assert_eq!(humanize_relative_ms(now - 14 * day, now), "2 weeks ago");
+        assert_eq!(humanize_relative_ms(now - 28 * day, now), "4 weeks ago");
+    }
+
+    #[test]
+    fn humanize_falls_through_to_iso_date_after_a_month() {
+        // 1_700_000_000_000 ms = 2023-11-14 22:13:20 UTC.
+        // Subtract 60 days → 2023-09-15.
+        let now = 1_700_000_000_000u64;
+        let day = 86_400_000u64;
+        let result = humanize_relative_ms(now - 60 * day, now);
+        assert_eq!(result, "2023-09-15");
+    }
+
+    #[test]
+    fn format_iso_date_unix_epoch() {
+        assert_eq!(format_iso_date(0), "1970-01-01");
+    }
+
+    #[test]
+    fn format_iso_date_known_dates() {
+        // 2023-11-14 22:13:20 UTC.
+        assert_eq!(format_iso_date(1_700_000_000), "2023-11-14");
+        // 2024-02-29 00:00:00 UTC — leap day exercises the Feb-29 branch.
+        assert_eq!(format_iso_date(1_709_164_800), "2024-02-29");
+        // 2000-03-01 — year 2000 *is* a leap year (`y % 400 == 0`), so this
+        // is the day after Feb 29; exercises `is_leap_year`'s `% 400` branch.
+        assert_eq!(format_iso_date(951_868_800), "2000-03-01");
+        // 2100-02-28 + 1 day → 2100-03-01: year 2100 is *not* a leap year
+        // (`y % 100 == 0 && y % 400 != 0`); guards against the most common
+        // leap-year miscalculation.
+        let day = 86_400u64;
+        let feb28_2100 = 4_107_456_000;
+        assert_eq!(format_iso_date(feb28_2100), "2100-02-28");
+        assert_eq!(format_iso_date(feb28_2100 + day), "2100-03-01");
+    }
+
+    // -- format_metadata_pairs: aggregate listening rows --
+
+    #[test]
+    fn format_metadata_pairs_renders_aggregate_plays_and_skips() {
+        let mut ti = empty_track_info();
+        ti.play_count = Some(9);
+        ti.skip_count = Some(2);
+        let rows = format_metadata_pairs(&ti, None);
+        let listening_rows: Vec<(&str, &str)> = rows
+            .iter()
+            .filter_map(|r| match r {
+                MetadataRow::Field { key, value } => Some((*key, value.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert!(listening_rows.contains(&("Plays", "9")));
+        assert!(listening_rows.contains(&("Skips", "2")));
+    }
+
+    #[test]
+    fn format_metadata_pairs_renders_last_played_when_set() {
+        let mut ti = empty_track_info();
+        ti.play_count = Some(1);
+        ti.last_played_at_ms = Some(1_700_000_000_000);
+        let rows = format_metadata_pairs(&ti, None);
+        let keys: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| match r {
+                MetadataRow::Field { key, .. } => Some(*key),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            keys.contains(&"Last played"),
+            "Last played row must appear when last_played_at_ms is Some"
+        );
+    }
+
+    #[test]
+    fn format_metadata_pairs_omits_last_played_when_only_device_plays() {
+        // Mirrors the case the user would see for a track that only has
+        // device-merged plays (no TUI play): play_count is set but
+        // last_played_at_ms stays None because we don't fabricate a
+        // timestamp from sync time.
+        let mut ti = empty_track_info();
+        ti.play_count = Some(7);
+        ti.last_played_at_ms = None;
+        let rows = format_metadata_pairs(&ti, None);
+        let keys: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| match r {
+                MetadataRow::Field { key, .. } => Some(*key),
+                _ => None,
+            })
+            .collect();
+        assert!(keys.contains(&"Plays"));
+        assert!(!keys.contains(&"Last played"));
+    }
+
+    #[test]
+    fn format_metadata_pairs_omits_skips_row_when_unset() {
+        // Skip count of None → no "Skips" row at all (the `tracks_to_info`
+        // builder sets it to None when the sidecar value is 0).
+        let mut ti = empty_track_info();
+        ti.play_count = Some(5);
+        ti.skip_count = None;
+        let rows = format_metadata_pairs(&ti, None);
+        let keys: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| match r {
+                MetadataRow::Field { key, .. } => Some(*key),
+                _ => None,
+            })
+            .collect();
+        assert!(keys.contains(&"Plays"));
+        assert!(!keys.contains(&"Skips"));
+    }
+
+    #[test]
+    fn format_metadata_pairs_listening_section_appears_off_device() {
+        // Aggregate stats are valid even when the track isn't on the
+        // device — the user might have only ever played in the TUI.
+        let mut ti = empty_track_info();
+        ti.on_device = false;
+        ti.play_count = Some(4);
+        let rows = format_metadata_pairs(&ti, None);
+        let sections: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| match r {
+                MetadataRow::Section(name) => Some(*name),
+                _ => None,
+            })
+            .collect();
+        assert!(sections.contains(&"Listening"));
+    }
+
+    #[test]
+    fn format_metadata_pairs_last_synced_only_when_on_device() {
+        // The "Last synced" row needs both on_device == true AND a
+        // last_synced_from_device_at_ms timestamp.
+        let mut ti = empty_track_info();
+        ti.on_device = false;
+        ti.last_synced_from_device_at_ms = Some(1_700_000_000_000);
+        let rows = format_metadata_pairs(&ti, None);
+        let keys: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| match r {
+                MetadataRow::Field { key, .. } => Some(*key),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !keys.contains(&"Last synced"),
+            "Last synced row must not appear off-device"
+        );
+
+        ti.on_device = true;
+        let rows = format_metadata_pairs(&ti, None);
+        let keys: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| match r {
+                MetadataRow::Field { key, .. } => Some(*key),
+                _ => None,
+            })
+            .collect();
+        assert!(keys.contains(&"Last synced"));
     }
 }

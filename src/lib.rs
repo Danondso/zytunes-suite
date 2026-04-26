@@ -1,14 +1,52 @@
+// Self-alias the crate so TUI source files re-included via `#[path]` (gated
+// by `tui-testing`) can keep referring to lib items as `zytunes::*` exactly
+// like they do when compiled as part of the `zytunes-tui` binary, where the
+// lib is a normal external dependency.
+#[cfg(feature = "tui-testing")]
+extern crate self as zytunes;
+
 pub mod art_cache;
 pub mod cache;
 pub mod device;
 pub mod dirlib;
 pub mod fingerprint;
 pub mod library;
+pub mod local_plays;
 pub mod mtp;
 pub mod paths;
 
 #[cfg(test)]
 mod test_audio;
+
+// TUI modules re-exposed through the lib crate so integration tests can drive
+// the App against a ratatui TestBackend. Declared at the crate root (not under
+// a `tui::` namespace) so the same `crate::audio` / `crate::background` /
+// etc. paths inside the module sources resolve identically whether they're
+// compiled as part of the `zytunes-tui` binary or as part of this lib.
+#[cfg(feature = "tui-testing")]
+#[path = "tui/anim.rs"]
+pub mod anim;
+#[cfg(feature = "tui-testing")]
+#[path = "tui/app.rs"]
+pub mod app;
+#[cfg(feature = "tui-testing")]
+#[path = "tui/audio.rs"]
+pub mod audio;
+#[cfg(feature = "tui-testing")]
+#[path = "tui/background.rs"]
+pub mod background;
+#[cfg(feature = "tui-testing")]
+#[path = "tui/config.rs"]
+pub mod config;
+#[cfg(feature = "tui-testing")]
+#[path = "tui/testing.rs"]
+pub mod testing;
+#[cfg(feature = "tui-testing")]
+#[path = "tui/theme.rs"]
+pub mod theme;
+#[cfg(feature = "tui-testing")]
+#[path = "tui/ui.rs"]
+pub mod ui;
 
 use device::{
     DetectedDevice, DeviceBackend, DeviceCapabilities, DeviceFamily, IpodBackend, ZuneBackend,
