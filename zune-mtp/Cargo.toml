@@ -2,7 +2,7 @@
 name = "zune-mtp"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.94"
+rust-version = "1.95"
 description = "Native MTP/MTPZ library for USB device communication (macOS IOKit, Linux libusb)"
 license = "MIT"
 

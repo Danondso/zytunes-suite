@@ -31,7 +31,7 @@ CLI commands: `ls [path]`, `push <files...>`, `rm <paths...>`, `sync <type> <nam
 
 ## Architecture
 
-**Workspace layout:** The project is a Cargo workspace with three members: the root `zytunes` crate, the `zune-mtp` MTPZ library crate, and the `ipod-db` iTunesDB parser/writer crate. All workspace crates specify `rust-version = "1.94"`. A `tools/mtp-probe` directory (gitignored) contains the MTP vendor operation probe tool used for reverse engineering.
+**Workspace layout:** The project is a Cargo workspace with three members: the root `zytunes` crate, the `zune-mtp` MTPZ library crate, and the `ipod-db` iTunesDB parser/writer crate. All workspace crates specify `rust-version = "1.95"`. A `tools/mtp-probe` directory (gitignored) contains the MTP vendor operation probe tool used for reverse engineering.
 
 **Device abstraction:** `src/device/` defines `DeviceBackend` (detect + open session) and `DeviceCapabilities` (family, supported formats, transcode target, music root, max art dims). `ZuneBackend` (MTPZ-over-IOKit) and `IpodBackend` (USB mass storage + iTunesDB) both implement it, so CLI and TUI iterate backends instead of hardcoding Zune. `DetectedDevice` carries a type-erased `backend_data: Box<dyn Any>` that the backend downcasts when opening a session.
 
