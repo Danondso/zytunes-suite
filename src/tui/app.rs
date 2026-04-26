@@ -333,6 +333,92 @@ pub struct NowPlaying {
     /// play or a skip. Idempotency guard so multiple Position events past
     /// the threshold count exactly once.
     pub counted: bool,
+    /// Album year resolved from the library `Track` at play time. `None`
+    /// when the row has no library counterpart or the tag is missing.
+    pub year: Option<u32>,
+    /// Pre-formatted marquee line of extended metadata (genre, BPM, key,
+    /// bitrate, sample rate, file size, …) joined by ` | `. Built once at
+    /// play time so per-frame rendering stays cheap. Empty string when no
+    /// metadata is available.
+    pub metadata_marquee: String,
+}
+
+/// Extract the year and assemble a `|`-separated metadata marquee from a
+/// library `Track`. Empty inputs (or `None`) produce `(None, "".into())`.
+/// Each segment is only added when the underlying tag is present, so a
+/// lightly-tagged file produces a short line and a fully-tagged one runs
+/// long enough to scroll. Order is roughly "audible / musical → technical
+/// → credits → file" so the most relevant info passes first.
+pub fn build_now_playing_metadata(track: Option<&Track>) -> (Option<u32>, String) {
+    let Some(t) = track else {
+        return (None, String::new());
+    };
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(g) = &t.genre {
+        parts.push(format!("Genre: {}", g));
+    }
+    if let Some(b) = t.bpm {
+        parts.push(format!("BPM: {}", b));
+    }
+    if let Some(k) = &t.initial_key {
+        parts.push(format!("Key: {}", k));
+    }
+    if let Some(m) = &t.mood {
+        parts.push(format!("Mood: {}", m));
+    }
+    if let Some(br) = t.audio_bitrate_kbps {
+        parts.push(format!("{} kbps", br));
+    }
+    if let Some(sr) = t.sample_rate {
+        parts.push(format!("{:.1} kHz", sr as f64 / 1000.0));
+    }
+    if let Some(bd) = t.bit_depth {
+        parts.push(format!("{}-bit", bd));
+    }
+    if let Some(ch) = t.channels {
+        let label = match ch {
+            1 => "Mono".to_string(),
+            2 => "Stereo".to_string(),
+            n => format!("{}ch", n),
+        };
+        parts.push(label);
+    }
+    if let Some(aa) = &t.album_artist {
+        if !aa.eq_ignore_ascii_case(&t.artist) {
+            parts.push(format!("Album Artist: {}", aa));
+        }
+    }
+    if let Some(c) = &t.composer {
+        parts.push(format!("Composer: {}", c));
+    }
+    if let Some(p) = &t.publisher {
+        parts.push(format!("Publisher: {}", p));
+    }
+    if let Some(s) = t.file_size_bytes {
+        parts.push(format_bytes_compact(s));
+    }
+    if let Some(e) = &t.encoder {
+        parts.push(format!("Encoder: {}", e));
+    }
+    (t.year, parts.join(" | "))
+}
+
+/// Compact human-readable byte size used in the now-playing marquee.
+/// Matches the rendering convention in `tui::ui::format_bytes`; kept local
+/// here so `app.rs` does not need a back-edge into the renderer module.
+fn format_bytes_compact(n: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+    if n >= GB {
+        format!("{:.2} GB", n as f64 / GB as f64)
+    } else if n >= MB {
+        format!("{:.1} MB", n as f64 / MB as f64)
+    } else if n >= KB {
+        format!("{:.1} KB", n as f64 / KB as f64)
+    } else {
+        format!("{n} B")
+    }
 }
 
 #[derive(Clone)]
@@ -1127,7 +1213,9 @@ impl App {
                 return;
             }
         };
-        let track_id = self.resolve_library_track_id(track);
+        let lib_track = self.lookup_library_track(track);
+        let track_id = lib_track.as_ref().map(|t| t.id);
+        let (year, metadata_marquee) = build_now_playing_metadata(lib_track.as_ref());
         let _ = audio_tx.send(AudioCommand::Play { path });
         self.now_playing = Some(NowPlaying {
             track_name: track.name.clone(),
@@ -1141,6 +1229,8 @@ impl App {
             paused_frame: None,
             track_id,
             counted: false,
+            year,
+            metadata_marquee,
         });
     }
 
@@ -1226,7 +1316,9 @@ impl App {
                 return;
             }
         };
-        let track_id = self.resolve_library_track_id(&track);
+        let lib_track = self.lookup_library_track(&track);
+        let track_id = lib_track.as_ref().map(|t| t.id);
+        let (year, metadata_marquee) = build_now_playing_metadata(lib_track.as_ref());
         let _ = audio_tx.send(AudioCommand::Play { path });
         self.now_playing = Some(NowPlaying {
             track_name: track.name.clone(),
@@ -1240,6 +1332,8 @@ impl App {
             paused_frame: None,
             track_id,
             counted: false,
+            year,
+            metadata_marquee,
         });
     }
 
@@ -1269,28 +1363,26 @@ impl App {
         }
     }
 
-    /// Look up the library `Track::id` matching the given playable row
-    /// (same `(name, artist, album)` lookup used by the popup-resolve path).
-    /// Returns `None` for device-mode rows or scratch files with no library
-    /// counterpart — in either case no local play is recorded.
-    ///
-    /// Tries the raw name first, then the `strip_track_number`-stripped form
-    /// so a device-mode row whose name is `"01 Song"` still finds the library
-    /// title `"Song"`. Without this fallback, playing a device-mode row that
-    /// originated from a track-number-prefixed filename would silently skip
-    /// recording the play.
-    fn resolve_library_track_id(&self, track: &TrackInfo) -> Option<u64> {
+    /// Look up the full library `Track` matching the given playable row.
+    /// Same `(name, artist, album)` lookup as the popup-resolve path,
+    /// including a `strip_track_number` fallback for device-mode rows
+    /// whose names start with a track-number prefix (e.g. `"01 Song"`
+    /// resolves to `"Song"`). Returns a cloned `Track` so callers can read
+    /// extended metadata (year, genre, BPM, …)
+    /// without holding a borrow on `self.library`. `None` for device-mode
+    /// rows or scratch files with no library counterpart.
+    fn lookup_library_track(&self, track: &TrackInfo) -> Option<Track> {
         let lib = self.library.as_deref()?;
-        let lookup = |name: &str| -> Option<u64> {
+        let lookup = |name: &str| -> Option<Track> {
             lib.tracks_by_name(name)
                 .find(|t| {
                     t.artist.eq_ignore_ascii_case(&track.artist)
                         && t.album.eq_ignore_ascii_case(&track.album)
                 })
-                .map(|t| t.id)
+                .cloned()
         };
-        if let Some(id) = lookup(&track.name) {
-            return Some(id);
+        if let Some(t) = lookup(&track.name) {
+            return Some(t);
         }
         let stripped = zytunes::strip_track_number(track.name.trim());
         if stripped != track.name {
@@ -3565,6 +3657,104 @@ mod tests {
         assert_eq!(format_duration(61_000), "1:01");
         assert_eq!(format_duration(3_723_000), "62:03");
         assert_eq!(format_duration(500), "0:00"); // rounds down
+    }
+
+    #[test]
+    fn format_bytes_compact_cases() {
+        assert_eq!(format_bytes_compact(0), "0 B");
+        assert_eq!(format_bytes_compact(512), "512 B");
+        assert_eq!(format_bytes_compact(1500), "1.5 KB");
+        assert_eq!(format_bytes_compact(2 * 1024 * 1024), "2.0 MB");
+        assert_eq!(format_bytes_compact(3 * 1024 * 1024 * 1024), "3.00 GB");
+    }
+
+    #[test]
+    fn build_now_playing_metadata_none_track_yields_empty() {
+        let (year, line) = build_now_playing_metadata(None);
+        assert_eq!(year, None);
+        assert!(line.is_empty());
+    }
+
+    #[test]
+    fn build_now_playing_metadata_skips_missing_fields() {
+        // A bare-bones Track with only the identity fields populated should
+        // produce no marquee segments — every Option is `None` so nothing
+        // makes it into the line.
+        let t = Track {
+            id: 1,
+            name: "Song".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            ..Track::default()
+        };
+        let (year, line) = build_now_playing_metadata(Some(&t));
+        assert_eq!(year, None);
+        assert_eq!(line, "");
+    }
+
+    #[test]
+    fn build_now_playing_metadata_assembles_segments_in_order() {
+        let t = Track {
+            id: 1,
+            name: "Song".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            year: Some(2023),
+            genre: Some("Rock".into()),
+            bpm: Some(128),
+            initial_key: Some("Am".into()),
+            audio_bitrate_kbps: Some(320),
+            sample_rate: Some(44_100),
+            bit_depth: Some(16),
+            channels: Some(2),
+            file_size_bytes: Some(8 * 1024 * 1024),
+            ..Track::default()
+        };
+        let (year, line) = build_now_playing_metadata(Some(&t));
+        assert_eq!(year, Some(2023));
+        // Order locks the user-visible reading flow: musical first, then
+        // technical, then file. Renames here will surprise users mid-track.
+        assert_eq!(
+            line,
+            "Genre: Rock | BPM: 128 | Key: Am | 320 kbps | 44.1 kHz | 16-bit | Stereo | 8.0 MB"
+        );
+    }
+
+    #[test]
+    fn build_now_playing_metadata_suppresses_redundant_album_artist() {
+        // When album_artist matches artist (common for non-compilation
+        // releases) it adds no signal, so we drop it from the marquee
+        // rather than padding the line with "Album Artist: <same>".
+        let t = Track {
+            id: 1,
+            name: "Song".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            album_artist: Some("artist".into()),
+            ..Track::default()
+        };
+        let (_, line) = build_now_playing_metadata(Some(&t));
+        assert!(
+            !line.contains("Album Artist"),
+            "expected no album-artist segment, got `{}`",
+            line
+        );
+    }
+
+    #[test]
+    fn build_now_playing_metadata_includes_distinct_album_artist() {
+        // Compilations and split-credit releases still want the album-artist
+        // visible — that's how a "Various Artists" marker shows up.
+        let t = Track {
+            id: 1,
+            name: "Song".into(),
+            artist: "Sufjan Stevens".into(),
+            album: "Compilation".into(),
+            album_artist: Some("Various Artists".into()),
+            ..Track::default()
+        };
+        let (_, line) = build_now_playing_metadata(Some(&t));
+        assert!(line.contains("Album Artist: Various Artists"), "{line}");
     }
 
     #[test]
@@ -6332,6 +6522,8 @@ mod tests {
             paused_frame: None,
             track_id: None,
             counted: false,
+            year: None,
+            metadata_marquee: String::new(),
         });
         app.show_player = None;
         assert!(!app.should_show_player(19));
@@ -6353,6 +6545,8 @@ mod tests {
             paused_frame: None,
             track_id: None,
             counted: false,
+            year: None,
+            metadata_marquee: String::new(),
         });
         app.show_player = Some(false);
         assert!(!app.should_show_player(100));
@@ -6375,6 +6569,8 @@ mod tests {
             paused_frame: None,
             track_id: None,
             counted: false,
+            year: None,
+            metadata_marquee: String::new(),
         });
         app.show_player = Some(true);
         assert!(app.should_show_player(12));
@@ -6438,6 +6634,8 @@ mod tests {
             paused_frame: None,
             track_id: Some(track_id),
             counted: false,
+            year: None,
+            metadata_marquee: String::new(),
         });
         app
     }
@@ -6821,6 +7019,8 @@ mod tests {
             paused_frame: None,
             track_id: Some(17),
             counted: false,
+            year: None,
+            metadata_marquee: String::new(),
         });
         app.handle_audio_event(
             AudioEvent::Position {

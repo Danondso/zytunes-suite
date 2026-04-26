@@ -1815,17 +1815,37 @@ fn draw_now_playing(f: &mut Frame, app: &App, np: &NowPlaying, area: Rect, art_w
     }
 
     // --- Info (left side) ---
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1), // track name
-            Constraint::Length(1), // artist — album
-            Constraint::Length(1), // controls
-            Constraint::Length(1), // progress bar
-            Constraint::Length(1), // time + hints
-            Constraint::Min(0),    // absorb extra
-        ])
-        .split(info_area);
+    // Slot the metadata marquee in just under the time row when there's
+    // both content to show and a row of vertical headroom. Falls back to
+    // the original 5-row layout otherwise so cramped windows degrade
+    // gracefully.
+    let show_marquee = !np.metadata_marquee.is_empty() && info_area.height >= 6;
+    let rows = if show_marquee {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // track name
+                Constraint::Length(1), // artist — album (year)
+                Constraint::Length(1), // controls
+                Constraint::Length(1), // progress bar
+                Constraint::Length(1), // time + hints
+                Constraint::Length(1), // metadata marquee
+                Constraint::Min(0),    // absorb extra
+            ])
+            .split(info_area)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // track name
+                Constraint::Length(1), // artist — album (year)
+                Constraint::Length(1), // controls
+                Constraint::Length(1), // progress bar
+                Constraint::Length(1), // time + hints
+                Constraint::Min(0),    // absorb extra
+            ])
+            .split(info_area)
+    };
 
     // Track name
     f.render_widget(
@@ -1838,10 +1858,13 @@ fn draw_now_playing(f: &mut Frame, app: &App, np: &NowPlaying, area: Rect, art_w
         rows[0],
     );
 
-    // Artist — Album
+    // Artist — Album (year)
+    let album_line = match np.year {
+        Some(y) => format!(" {} — {} ({})", &np.artist, &np.album, y),
+        None => format!(" {} — {}", &np.artist, &np.album),
+    };
     f.render_widget(
-        Paragraph::new(format!(" {} — {}", &np.artist, &np.album))
-            .style(Style::default().fg(t.header_text)),
+        Paragraph::new(album_line).style(Style::default().fg(t.header_text)),
         rows[1],
     );
 
@@ -1903,6 +1926,20 @@ fn draw_now_playing(f: &mut Frame, app: &App, np: &NowPlaying, area: Rect, art_w
         Paragraph::new(time_line).style(Style::default().fg(t.header_text)),
         rows[4],
     );
+
+    // Metadata marquee — extended tag info (genre, BPM, key, bitrate, …)
+    // joined by ` | `, scrolling on the same 12-frame-pause / 4-frame-step
+    // cadence as the rest of the TUI's marqueed text. Pre-built once at
+    // play time on `NowPlaying::metadata_marquee`, so per-frame work here
+    // is just the windowing slice from `marquee()`.
+    if show_marquee {
+        let marquee_w = (rows[5].width as usize).saturating_sub(2);
+        let scrolled = marquee(&np.metadata_marquee, marquee_w, app.anim_frame);
+        f.render_widget(
+            Paragraph::new(format!("  {}", scrolled)).style(Style::default().fg(t.dim_text)),
+            rows[5],
+        );
+    }
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect, footer_left_width: u16) {
