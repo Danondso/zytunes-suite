@@ -39,6 +39,11 @@ jobs:
           echo "old_version=$OLD_VERSION" >> "$GITHUB_OUTPUT"
 
           # Analyze conventional commits to determine bump type.
+          # `tformat:` (not `format:`) terminates every line with `\n` so
+          # `read` sees the final commit subject. `format:` omits the
+          # trailing newline, which silently drops single-commit ranges
+          # (the loop body never runs for the only commit, BUMP stays
+          # empty, and the release is skipped).
           BUMP=""
           while IFS= read -r msg; do
             if echo "$msg" | grep -qiE "BREAKING[ -]CHANGE|^[a-z]+(\(.+\))?!:"; then
@@ -49,7 +54,7 @@ jobs:
             elif [ -z "$BUMP" ] && echo "$msg" | grep -qE "^(fix|perf)(\(.+\))?:"; then
               BUMP="patch"
             fi
-          done < <(git log "$RANGE" --pretty=format:"%s" 2>/dev/null)
+          done < <(git log "$RANGE" --pretty=tformat:"%s" 2>/dev/null)
 
           if [ -z "$BUMP" ]; then
             echo "No version-bumping commits found (feat/fix/perf/BREAKING). Skipping release."
@@ -167,7 +172,7 @@ jobs:
             echo "notes<<RELEASE_EOF"
             echo "## What's Changed"
             echo ""
-            git log "$RANGE" --pretty=format:"- %s" | grep -E "^- (feat|fix|perf|refactor|docs)" || true
+            git log "$RANGE" --pretty=tformat:"- %s" | grep -E "^- (feat|fix|perf|refactor|docs)" || true
             echo ""
             echo ""
             echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${LATEST_TAG}...v${{ needs.check-version.outputs.new_version }}"
