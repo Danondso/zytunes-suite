@@ -1742,22 +1742,6 @@ impl NativeSession {
             .map_err(|e| e.to_string())
     }
 
-    /// Phase 4a probe: read a single MTP object property as raw bytes.
-    /// Caller decodes per the property's MTP data type.
-    pub fn probe_prop_value(&mut self, object_id: u32, prop: u16) -> Result<Vec<u8>, String> {
-        self.session
-            .get_object_prop_value(object_id, prop)
-            .map_err(|e| e.to_string())
-    }
-
-    /// Phase 4a probe: read a u32 MTP object property. `Ok(None)` when
-    /// the device returns no value bytes (interpreted as "unset").
-    pub fn probe_prop_u32(&mut self, object_id: u32, prop: u16) -> Result<Option<u32>, String> {
-        self.session
-            .get_object_prop_u32(object_id, prop)
-            .map_err(|e| e.to_string())
-    }
-
     /// Phase 4a probe: ask the device for ALL properties on `object_id`,
     /// regardless of what `GetObjectPropsSupported` advertises. Devices
     /// frequently serve unadvertised properties — particularly Microsoft-
