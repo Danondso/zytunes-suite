@@ -2,7 +2,7 @@
 
 ## MTPZ keys
 
-The Zune 30 requires MTPZ authentication keys (`~/.mtpz-data`) to complete
+The Zune requires MTPZ authentication keys (`~/.mtpz-data`) to complete
 its handshake. These keys are **not distributed** with zytunes. Obtain them
 from the [libmtp-zune](https://github.com/kbhomes/libmtp-zune) project, which
 reverse-engineered the Zune MTPZ protocol. See `README.md` for setup

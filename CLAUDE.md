@@ -23,7 +23,7 @@ cargo clippy                  # Lint
 
 ## What This Is
 
-A Rust tool for syncing music (and, on the Zune, photos/videos) to a Microsoft Zune 30 or classic iPod from macOS and Linux. Detects the device over USB and speaks whichever protocol the device needs: MTPZ (encrypted MTP) for the Zune, raw mass-storage iTunesDB writes for the iPod.
+A Rust tool for syncing music (and, on the Zune, photos/videos) to a Microsoft Zune or classic iPod from macOS and Linux. Detects the device over USB and speaks whichever protocol the device needs: MTPZ (encrypted MTP) for the Zune, raw mass-storage iTunesDB writes for the iPod.
 
 CLI commands: `ls [path]`, `push <files...>`, `rm <paths...>`, `sync <type> <name>`, `library [query]`, `photo-sync [dir]`, `video-sync [dir]`, `help`.
 
@@ -83,7 +83,7 @@ CLI commands: `ls [path]`, `push <files...>`, `rm <paths...>`, `sync <type> <nam
 
 **External tool dependencies:** `libusb` (via rusb). Optional: `ffmpeg` — **required** for `video-sync` (wmv2/wmav2 transcode to the Zune's native video format), optional for TUI playback of WMA files. Audio sync uses pure-Rust transcoding and does not need ffmpeg.
 
-**Audio transcoding:** Non-native formats (FLAC, OGG, WAV, M4A, OPUS, ALAC, AIFF) are automatically transcoded to MP3 using pure Rust libraries (symphonia for decoding, mp3lame-encoder for encoding, lofty for metadata). Native formats (MP3, WMA, AAC) skip transcoding entirely. Album art is resized to 200x200 JPEG via the image crate (Zune 30 rejects larger art with error `0xa803`). The M4A/ALAC path trims trailing silence leaked by symphonia's isomp4 demuxer: edit-list (`elst`) atoms parse but never apply, so the trimmed region decodes to bit-exact zeros and LAME would re-encode it as real silence. The transcoder holds back zero-valued frames during encoding and drops them at EOF; they only reach LAME once a later non-zero sample proves they were mid-track, preserving intentional silence between audio regions. Also: `FlushGap` (not `FlushNoGap`) on standalone-track flush, and mono sources route through `MonoPcm` instead of the stereo-hardcoded `InterleavedPcm`.
+**Audio transcoding:** Non-native formats (FLAC, OGG, WAV, M4A, OPUS, ALAC, AIFF) are automatically transcoded to MP3 using pure Rust libraries (symphonia for decoding, mp3lame-encoder for encoding, lofty for metadata). Native formats (MP3, WMA, AAC) skip transcoding entirely. Album art is resized to 200x200 JPEG via the image crate (Zune rejects larger art with error `0xa803`). The M4A/ALAC path trims trailing silence leaked by symphonia's isomp4 demuxer: edit-list (`elst`) atoms parse but never apply, so the trimmed region decodes to bit-exact zeros and LAME would re-encode it as real silence. The transcoder holds back zero-valued frames during encoding and drops them at EOF; they only reach LAME once a later non-zero sample proves they were mid-track, preserving intentional silence between audio regions. Also: `FlushGap` (not `FlushNoGap`) on standalone-track flush, and mono sources route through `MonoPcm` instead of the stereo-hardcoded `InterleavedPcm`.
 
 ## Claude Code Slash Commands
 
@@ -137,7 +137,7 @@ Scopes are optional: `feat(tui): add theme picker` is fine. Commits that don't m
 - `Play Counts` is deleted after import to match libgpod behaviour — otherwise stale entries accumulate
 - See `DEBUG.md` for the full iPod bring-up investigation; port is from-scratch against libgpod, not a wrapping
 
-## Zune 30 Constraints
+## Zune Constraints
 
 - Only accepts MP3, WMA, AAC formats
 - MTPZ keys must exist at `~/.mtpz-data`

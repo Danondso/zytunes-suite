@@ -15,7 +15,13 @@ use crate::audio::{AudioCommand, AudioEvent};
 use crate::background::{BgCommand, BgEvent, StorageInfo, SyncItem};
 use crate::theme::{all_themes, Theme};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use zytunes::listen_log::{ListenEvent, ListenLog};
 use zytunes::local_plays::{self, LocalPlays};
+use zytunes::playlist::{
+    self as playlist_mod, GenerationParams, Playlist, PlaylistKind, SeedStrategy,
+};
+use zytunes::playlist_store::{self, PlaylistStore};
+use zytunes::recommender::{BigramTable, Recommender, WeightedRecommender};
 
 /// Result of dispatching a single keyboard event through `App::handle_key`.
 /// `Quit` signals the run loop to break.
@@ -44,16 +50,27 @@ pub enum SidebarMode {
 pub enum BrowseMode {
     Library,
     Device,
+    Playlists,
 }
 
-/// A single sidebar row, either a bare artist entry or a paired
-/// (artist, album) entry. Storing the parts structured avoids the previous
-/// `format!("{} — {}")` / `split_once(" — ")` round-trip that every lookup
-/// had to unpack.
+/// A single sidebar row, either a bare artist entry, a paired
+/// (artist, album) entry, or a playlist row. Storing the parts structured
+/// avoids the previous `format!("{} — {}")` / `split_once(" — ")` round-trip
+/// that every lookup had to unpack.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SidebarEntry {
     Artist(String),
-    Album { artist: String, album: String },
+    Album {
+        artist: String,
+        album: String,
+    },
+    /// Playlist entry: `id` is the stable `Playlist::id` for lookup, `name`
+    /// is cached for display. Renamed playlists rebuild the sidebar source so
+    /// `name` stays in sync without per-frame store reads.
+    Playlist {
+        id: u64,
+        name: String,
+    },
 }
 
 impl SidebarEntry {
@@ -64,15 +81,18 @@ impl SidebarEntry {
             SidebarEntry::Album { artist, album } => {
                 std::borrow::Cow::Owned(format!("{} \u{2014} {}", artist, album))
             }
+            SidebarEntry::Playlist { name, .. } => std::borrow::Cow::Borrowed(name.as_str()),
         }
     }
 
-    /// Key used for first-letter jump navigation. Both variants key off the
-    /// artist name so navigation is uniform across sidebar modes.
+    /// Key used for first-letter jump navigation. Artist/album variants key
+    /// off the artist name so navigation is uniform across sidebar modes;
+    /// playlist rows key off the playlist name.
     pub fn nav_key(&self) -> &str {
         match self {
             SidebarEntry::Artist(a) => a.as_str(),
             SidebarEntry::Album { artist, .. } => artist.as_str(),
+            SidebarEntry::Playlist { name, .. } => name.as_str(),
         }
     }
 
@@ -89,6 +109,7 @@ impl SidebarEntry {
                 out.push_str(&album.to_lowercase());
                 out
             }
+            SidebarEntry::Playlist { name, .. } => name.to_lowercase(),
         }
     }
 }
@@ -100,6 +121,7 @@ impl std::fmt::Display for SidebarEntry {
             SidebarEntry::Album { artist, album } => {
                 write!(f, "{} \u{2014} {}", artist, album)
             }
+            SidebarEntry::Playlist { name, .. } => f.write_str(name),
         }
     }
 }
@@ -840,6 +862,360 @@ pub struct App {
     /// `~/.cache/zytunes/local-plays.json`; tests set `None` to disable disk
     /// writes or override with a temp path.
     pub local_plays_save_path: Option<PathBuf>,
+    /// User-authored playlists (manual + generated). Loaded once at TUI
+    /// launch via `load_playlists_from_disk`; `App::new()` leaves this empty
+    /// so unit tests don't pick up developer-machine state.
+    pub playlists: PlaylistStore,
+    /// Sidecar path for `playlists` persistence. Defaults to
+    /// `~/.config/zytunes/playlists.json`; tests set `None` to skip disk
+    /// writes or pass a temp path.
+    pub playlists_save_path: Option<PathBuf>,
+    /// In-progress text input for the playlist-name modal (open via `N`).
+    /// `Some(_)` means the modal is up and key events route to it.
+    pub playlist_name_input: Option<String>,
+    /// Set when the playlist-name modal is in rename mode; carries the ID
+    /// being renamed. `None` means create-new.
+    pub playlist_rename_target: Option<u64>,
+    /// Pending playlist deletion awaiting confirmation. The confirmation
+    /// overlay branch checks this before consulting `pending_removal`.
+    pub pending_playlist_delete: Option<u64>,
+    /// In-progress "add to playlist" picker. When `Some`, a popup lists
+    /// existing playlists; up/down/enter pick one and the selected library
+    /// track ID gets appended.
+    pub add_to_playlist_picker: Option<AddToPlaylistPicker>,
+    /// Playlist-generation form. `Some(_)` means the modal is open and key
+    /// events route to it; the dispatcher gates on this exactly like
+    /// `playlist_name_input`.
+    pub generation_form: Option<GenerationFormState>,
+    /// Playlists awaiting device-side creation, queued when the user
+    /// enqueues a playlist for sync. Drained into `BgCommand::ImportPlaylist`
+    /// commands once the file sync emits `BgEvent::SyncComplete` so the
+    /// device-side resolver sees the freshly-uploaded tracks. Cleared on
+    /// sync cancellation.
+    pub pending_playlist_imports: Vec<PendingPlaylistImport>,
+    /// Whether device-side playlist sync (Phase 3) is enabled. Defaults
+    /// from `ZYTUNES_EXPERIMENTAL_PLAYLIST_SYNC=1` at startup. Off after
+    /// the 2026-04-26 iPod-iTunesDB-corruption incident; library-side
+    /// playlists still work, only the device push is gated. Tests set
+    /// this directly to avoid env-var races.
+    pub experimental_playlist_sync: bool,
+    /// Append-only log of every TUI play / skip. Drives the Phase 4
+    /// sequence-aware recommender via `BigramTable`. Loaded from
+    /// `~/.cache/zytunes/listen-log.jsonl` at startup; tests skip the
+    /// disk path entirely (no `with_save_path`) so they don't pick up
+    /// developer-machine state.
+    pub listen_log: ListenLog,
+}
+
+/// One entry in `App::pending_playlist_imports`. Carries the playlist's
+/// display name plus its ordered `(artist, album, title)` tuples so the
+/// background worker can resolve them against the device's current track
+/// set after the file sync lands.
+#[derive(Debug, Clone)]
+pub struct PendingPlaylistImport {
+    pub name: String,
+    pub track_keys: Vec<(String, String, String)>,
+}
+
+/// State for the "add this track to a playlist" overlay (opened with `+` on
+/// a Library track row). Built when the user invokes the action; dropped on
+/// confirm/cancel.
+#[derive(Debug, Clone)]
+pub struct AddToPlaylistPicker {
+    /// Library `Track::id` being added.
+    pub track_id: u64,
+    /// Display name shown in the popup header.
+    pub track_label: String,
+    /// Snapshot of `(playlist_id, name)` at popup-open time so renames
+    /// during the popup's lifetime don't shift selection.
+    pub options: Vec<(u64, String)>,
+    pub selected: usize,
+}
+
+/// In-progress state for the "Generate Playlist" modal.
+///
+/// Fields mirror [`GenerationParams`] one-to-one but live as primitives the
+/// modal can edit incrementally. `commit()` (in the App impl) builds a
+/// `GenerationParams` + name pair and hands it off to the recommender.
+///
+/// `selected_field` is the cursor — index into the field list rendered by
+/// `draw_generation_form_overlay`. Tab/Shift-Tab move it. Field types know
+/// what input keys mean for them (text accepts chars, radios respond to
+/// up/down, sliders to `<` / `>`, checkboxes to space).
+#[derive(Debug, Clone)]
+pub struct GenerationFormState {
+    pub name: String,
+    pub seed_strategy_idx: usize, // 0=TopPlayed 1=Recent 2=Track 3=Artist 4=Genre
+    pub window_days: u32,
+    pub seed_count: usize,
+    pub target_length: usize,
+    pub max_per_artist: usize,
+    pub max_per_album: usize,
+    /// Slider 0..1, applied to `GenerationParams::diversity_lambda_bits`.
+    pub diversity: f32,
+    /// Slider 0..1, applied to `GenerationParams::novelty_bits`.
+    pub novelty: f32,
+    pub exclude_on_device: bool,
+    /// Optional explicit context for `Track`/`Artist`/`Genre` strategies —
+    /// captured at form-open time when the user invoked from a track row
+    /// (`R` on a track) so the strategy can be applied without re-resolving.
+    pub seed_context: SeedContext,
+    /// `Some(playlist_id)` means we're regenerating that playlist in place;
+    /// `None` means a brand-new generated playlist.
+    pub regenerating: Option<u64>,
+    pub selected_field: usize,
+}
+
+/// Captured context for non-behavioral seed strategies. Filled when the
+/// form is opened with a specific seed (e.g. `R` on a track row); ignored
+/// for the behavioral strategies.
+#[derive(Debug, Clone, Default)]
+pub struct SeedContext {
+    pub track_id: Option<u64>,
+    pub artist: Option<String>,
+    pub genre: Option<String>,
+}
+
+impl GenerationFormState {
+    /// Total form fields the cursor can land on. Kept in one place so the
+    /// dispatcher and the renderer stay in sync.
+    pub const FIELD_COUNT: usize = 10;
+    pub const FIELD_NAME: usize = 0;
+    pub const FIELD_SEED_STRATEGY: usize = 1;
+    pub const FIELD_WINDOW_DAYS: usize = 2;
+    pub const FIELD_SEED_COUNT: usize = 3;
+    pub const FIELD_TARGET_LEN: usize = 4;
+    pub const FIELD_MAX_PER_ARTIST: usize = 5;
+    pub const FIELD_MAX_PER_ALBUM: usize = 6;
+    pub const FIELD_DIVERSITY: usize = 7;
+    pub const FIELD_NOVELTY: usize = 8;
+    pub const FIELD_EXCLUDE_DEVICE: usize = 9;
+
+    /// Build a fresh form pre-filled from the Discover Weekly defaults plus
+    /// a date-stamped name. Use [`Self::for_track_seed`] when the user
+    /// invoked from `R` on a track row.
+    pub fn discover_weekly_default(now_ms: u64) -> Self {
+        let p = GenerationParams::default_discover_weekly();
+        GenerationFormState {
+            name: format!("Discover Weekly · {}", short_date(now_ms)),
+            seed_strategy_idx: match &p.seed_strategy {
+                SeedStrategy::TopPlayed { .. } => 0,
+                SeedStrategy::RecentlyPlayed { .. } => 1,
+                SeedStrategy::Track(_) => 2,
+                SeedStrategy::Artist(_) => 3,
+                SeedStrategy::Genre(_) => 4,
+            },
+            window_days: 30,
+            seed_count: 10,
+            target_length: p.target_length,
+            max_per_artist: p.max_per_artist,
+            max_per_album: p.max_per_album,
+            diversity: p.diversity_lambda(),
+            novelty: p.novelty(),
+            exclude_on_device: p.exclude_on_device,
+            seed_context: SeedContext::default(),
+            regenerating: None,
+            selected_field: 0,
+        }
+    }
+
+    /// Form pre-filled with the available seed contexts (track id, artist
+    /// name, genre tag) so the user can flip between Track / Artist / Genre
+    /// strategies in the form without having to re-invoke from a different
+    /// row. `default_strategy_idx` picks which radio option lights up first
+    /// — pass 2 for Track, 3 for Artist, 4 for Genre.
+    ///
+    /// `label` drives the default playlist name. Pass the track title for
+    /// Track-seeded forms, the artist for Artist-seeded forms, etc.
+    pub fn for_library_context(
+        now_ms: u64,
+        track_id: Option<u64>,
+        artist: Option<String>,
+        genre: Option<String>,
+        default_strategy_idx: usize,
+        label: &str,
+    ) -> Self {
+        let mut s = Self::discover_weekly_default(now_ms);
+        s.seed_strategy_idx = default_strategy_idx.min(4);
+        s.seed_context = SeedContext {
+            track_id,
+            artist,
+            genre,
+        };
+        s.name = format!("More like {} · {}", label, short_date(now_ms));
+        s
+    }
+
+    /// Convenience: the existing "more like this track" shortcut. Equivalent
+    /// to `for_library_context(now, Some(id), None, None, 2, label)`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn for_track_seed(now_ms: u64, track_id: u64, label: &str) -> Self {
+        Self::for_library_context(now_ms, Some(track_id), None, None, 2, label)
+    }
+
+    /// Returns `Ok(())` when the currently-selected strategy has the
+    /// context fields it needs to actually generate, or `Err(message)`
+    /// describing what's missing. Surfaced as a toast at submit time.
+    pub fn validate_strategy_context(&self) -> Result<(), &'static str> {
+        match self.seed_strategy_idx {
+            // Behavioural strategies — always usable.
+            0 | 1 => Ok(()),
+            // Track requires an explicit id.
+            2 => {
+                if self.seed_context.track_id.is_some() {
+                    Ok(())
+                } else {
+                    Err("Track strategy needs a seed track — open the form from a Library track row")
+                }
+            }
+            3 => {
+                if self
+                    .seed_context
+                    .artist
+                    .as_deref()
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false)
+                {
+                    Ok(())
+                } else {
+                    Err("Artist strategy needs an artist — open the form from a Library artist or album sidebar row")
+                }
+            }
+            4 => {
+                if self
+                    .seed_context
+                    .genre
+                    .as_deref()
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false)
+                {
+                    Ok(())
+                } else {
+                    Err("Genre strategy needs a genre — open the form from a Library track row whose genre tag is populated")
+                }
+            }
+            _ => Err("Unknown seed strategy"),
+        }
+    }
+
+    /// Short display of the value backing the currently-selected strategy.
+    /// Surfaced next to the radio in the form so the user can see what
+    /// they'll generate from. `None` means "no context" — the form
+    /// renderer flags this as `(none)`.
+    pub fn current_context_label(&self) -> Option<String> {
+        match self.seed_strategy_idx {
+            0 | 1 => None,
+            2 => self.seed_context.track_id.map(|id| format!("track #{id}")),
+            3 => self.seed_context.artist.clone(),
+            4 => self.seed_context.genre.clone(),
+            _ => None,
+        }
+    }
+
+    /// Form pre-filled to regenerate an existing generated playlist using
+    /// its stored params.
+    pub fn for_regenerate(playlist: &Playlist) -> Option<Self> {
+        let (params, _gen_at) = match &playlist.kind {
+            PlaylistKind::Generated {
+                params,
+                last_generated_ms,
+            } => (params.clone(), *last_generated_ms),
+            PlaylistKind::Manual => return None,
+        };
+        let (window_days, seed_count) = match &params.seed_strategy {
+            SeedStrategy::TopPlayed { window_days, count } => (*window_days, *count),
+            SeedStrategy::RecentlyPlayed { count } => (0, *count),
+            _ => (0, 0),
+        };
+        let mut ctx = SeedContext::default();
+        match &params.seed_strategy {
+            SeedStrategy::Track(id) => ctx.track_id = Some(*id),
+            SeedStrategy::Artist(name) => ctx.artist = Some(name.clone()),
+            SeedStrategy::Genre(name) => ctx.genre = Some(name.clone()),
+            _ => {}
+        }
+        Some(GenerationFormState {
+            name: playlist.name.clone(),
+            seed_strategy_idx: match &params.seed_strategy {
+                SeedStrategy::TopPlayed { .. } => 0,
+                SeedStrategy::RecentlyPlayed { .. } => 1,
+                SeedStrategy::Track(_) => 2,
+                SeedStrategy::Artist(_) => 3,
+                SeedStrategy::Genre(_) => 4,
+            },
+            window_days,
+            seed_count,
+            target_length: params.target_length,
+            max_per_artist: params.max_per_artist,
+            max_per_album: params.max_per_album,
+            diversity: params.diversity_lambda(),
+            novelty: params.novelty(),
+            exclude_on_device: params.exclude_on_device,
+            seed_context: ctx,
+            regenerating: Some(playlist.id),
+            selected_field: 0,
+        })
+    }
+
+    /// Compose [`GenerationParams`] from the current field values.
+    pub fn to_params(&self) -> GenerationParams {
+        let strategy = match self.seed_strategy_idx {
+            0 => SeedStrategy::TopPlayed {
+                window_days: self.window_days,
+                count: self.seed_count.max(1),
+            },
+            1 => SeedStrategy::RecentlyPlayed {
+                count: self.seed_count.max(1),
+            },
+            2 => SeedStrategy::Track(self.seed_context.track_id.unwrap_or(0)),
+            3 => SeedStrategy::Artist(self.seed_context.artist.clone().unwrap_or_default()),
+            _ => SeedStrategy::Genre(self.seed_context.genre.clone().unwrap_or_default()),
+        };
+        GenerationParams {
+            seed_strategy: strategy,
+            target_length: self.target_length.max(1),
+            max_per_artist: self.max_per_artist.max(1),
+            max_per_album: self.max_per_album.max(1),
+            diversity_lambda_bits: self.diversity.clamp(0.0, 1.0).to_bits(),
+            novelty_bits: self.novelty.clamp(0.0, 1.0).to_bits(),
+            weights: zytunes::playlist::ScoringWeights::default(),
+            exclude_artists: Vec::new(),
+            exclude_track_ids: Vec::new(),
+            exclude_on_device: self.exclude_on_device,
+        }
+    }
+}
+
+/// Whether the device-side playlist push (Phase 3) is enabled. Off by
+/// default after the 2026-04-26 incident: writing a playlist to a real
+/// iPod produced a corrupted iTunesDB. Until the write path round-trips
+/// safely on hardware, this stays opt-in via
+/// `ZYTUNES_EXPERIMENTAL_PLAYLIST_SYNC=1`.
+pub fn device_playlist_sync_enabled() -> bool {
+    std::env::var("ZYTUNES_EXPERIMENTAL_PLAYLIST_SYNC")
+        .ok()
+        .as_deref()
+        == Some("1")
+}
+
+/// Short YYYY-MM-DD-ish date for default playlist names. Cheap stand-alone
+/// math beats pulling in `chrono` just for one stamp.
+fn short_date(now_ms: u64) -> String {
+    // Days since unix epoch.
+    let total_days = (now_ms / 86_400_000) as i64;
+    // Civil-from-days algorithm (Howard Hinnant) — accurate, no leap-year
+    // edge cases, no allocations.
+    let z = total_days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
 #[derive(Clone)]
@@ -1013,6 +1389,572 @@ impl App {
             // whatever sidecar exists on the developer's machine.
             local_plays_save_path: None,
             local_plays: LocalPlays::default(),
+            playlists: PlaylistStore::default(),
+            playlists_save_path: None,
+            playlist_name_input: None,
+            playlist_rename_target: None,
+            pending_playlist_delete: None,
+            add_to_playlist_picker: None,
+            generation_form: None,
+            pending_playlist_imports: Vec::new(),
+            experimental_playlist_sync: device_playlist_sync_enabled(),
+            listen_log: ListenLog::new(),
+        }
+    }
+
+    /// Load the listen log from `~/.cache/zytunes/listen-log.jsonl` and
+    /// bind future `append`s to the same path. Production code calls this
+    /// once after `App::new()`; tests skip it so the in-memory log starts
+    /// empty and never writes to the developer's home dir.
+    pub fn load_listen_log_from_disk(&mut self) {
+        self.listen_log = ListenLog::load();
+    }
+
+    /// Wire `playlists` to the on-disk file (`~/.config/zytunes/playlists.json`)
+    /// and load any existing state. Production code calls this once after
+    /// `App::new()`; tests skip it to avoid picking up developer-machine state.
+    pub fn load_playlists_from_disk(&mut self) {
+        let path = playlist_store::default_save_path();
+        if let Some(p) = path.as_deref() {
+            self.playlists = PlaylistStore::load_from(p);
+        }
+        self.playlists_save_path = path;
+    }
+
+    /// Persist the playlist store. Called after every mutation since the
+    /// file is bounded by playlist count (small).
+    pub fn persist_playlists(&self) {
+        if let Some(p) = &self.playlists_save_path {
+            self.playlists.save_to(p);
+        }
+    }
+
+    /// Commit the in-progress playlist name input. Routes to either create
+    /// (when `playlist_rename_target` is `None`) or rename (when set).
+    /// Empty/whitespace-only names cancel the modal with an error toast.
+    fn commit_playlist_name_input(&mut self) {
+        let raw = match self.playlist_name_input.take() {
+            Some(s) => s,
+            None => return,
+        };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            self.playlist_rename_target = None;
+            self.set_toast("Playlist name cannot be empty".into(), true);
+            return;
+        }
+        let name = trimmed.to_string();
+
+        match self.playlist_rename_target.take() {
+            Some(id) => match self.playlists.rename(id, &name) {
+                Ok(()) => {
+                    self.persist_playlists();
+                    self.refresh_sidebar();
+                    self.set_toast(format!("Renamed to \"{}\"", name), false);
+                }
+                Err(e) => {
+                    self.set_toast(format!("Rename failed: {e}"), true);
+                }
+            },
+            None => {
+                let new_id = self.playlists.add(Playlist::new_manual(name.clone()));
+                self.persist_playlists();
+                self.refresh_sidebar();
+                // Move selection to the freshly-created playlist so the
+                // user can immediately start adding tracks. The sidebar is
+                // sorted Generated-first, then by `updated_at_ms` desc, so
+                // a new manual playlist lands first within the manual block.
+                if let Some(idx) = self
+                    .sidebar_items
+                    .iter()
+                    .position(|e| matches!(e, SidebarEntry::Playlist { id, .. } if *id == new_id))
+                {
+                    self.sidebar_selected = idx;
+                }
+                self.set_toast(format!("Created \"{}\"", name), false);
+            }
+        }
+    }
+
+    /// Apply a confirmed playlist deletion. Adjusts sidebar selection so we
+    /// don't leave the cursor pointing at a freed slot.
+    fn commit_playlist_delete(&mut self, id: u64) {
+        let name = self
+            .playlists
+            .get(id)
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| "playlist".to_string());
+        if !self.playlists.remove(id) {
+            return;
+        }
+        self.persist_playlists();
+        let prior = self.sidebar_selected;
+        self.refresh_sidebar();
+        if !self.sidebar_items.is_empty() {
+            self.sidebar_selected = prior.min(self.sidebar_items.len() - 1);
+        }
+        self.set_toast(format!("Deleted \"{}\"", name), false);
+    }
+
+    /// Drop the selected track from the currently-viewed playlist (used by
+    /// `d` on a playlist's track row). No-op when the active playlist or
+    /// selected track can't be resolved.
+    fn remove_selected_track_from_playlist(&mut self) {
+        let entry = match self.sidebar_items.get(self.sidebar_selected) {
+            Some(e) => e.clone(),
+            None => return,
+        };
+        let playlist_id = match entry {
+            SidebarEntry::Playlist { id, .. } => id,
+            _ => return,
+        };
+        let track = match self.track_list.get(self.track_selected) {
+            Some(t) => t.clone(),
+            None => return,
+        };
+        let track_id = match track.library_id {
+            Some(id) => id,
+            None => return,
+        };
+        if self.playlists.remove_track(playlist_id, track_id) {
+            self.persist_playlists();
+            // Re-render the playlist's tracks.
+            self.select_sidebar_item();
+            // Clamp track selection to the new bounds.
+            if !self.track_list.is_empty() && self.track_selected >= self.track_list.len() {
+                self.track_selected = self.track_list.len() - 1;
+            }
+            self.set_toast(format!("Removed \"{}\" from playlist", track.name), false);
+        }
+    }
+
+    /// Open the "add this track to a playlist" picker. Snapshots the current
+    /// list of playlists at open time so renames during the popup's lifetime
+    /// don't shift selection. Toasts an error if there are no playlists yet.
+    fn open_add_to_playlist_picker(&mut self) {
+        let track = match self.track_list.get(self.track_selected) {
+            Some(t) => t.clone(),
+            None => return,
+        };
+        let track_id = match track.library_id {
+            Some(id) => id,
+            None => {
+                self.set_toast("Track has no library ID".into(), true);
+                return;
+            }
+        };
+        if self.playlists.is_empty() {
+            self.set_toast(
+                "No playlists yet — switch to Playlists (v) and press N".into(),
+                true,
+            );
+            return;
+        }
+        let options: Vec<(u64, String)> = self
+            .playlists
+            .playlists()
+            .iter()
+            .map(|p| (p.id, p.name.clone()))
+            .collect();
+        self.add_to_playlist_picker = Some(AddToPlaylistPicker {
+            track_id,
+            track_label: format!("{} — {}", track.artist, track.name),
+            options,
+            selected: 0,
+        });
+    }
+
+    /// Apply the picker's selection, adding the track to the chosen playlist.
+    fn confirm_add_to_playlist(&mut self) {
+        let picker = match self.add_to_playlist_picker.take() {
+            Some(p) => p,
+            None => return,
+        };
+        let (playlist_id, playlist_name) = match picker.options.get(picker.selected) {
+            Some(opt) => opt.clone(),
+            None => return,
+        };
+        if self.playlists.add_track(playlist_id, picker.track_id) {
+            self.persist_playlists();
+            self.set_toast(
+                format!("Added \"{}\" to \"{}\"", picker.track_label, playlist_name),
+                false,
+            );
+        } else {
+            self.set_toast(
+                format!(
+                    "\"{}\" already in \"{}\"",
+                    picker.track_label, playlist_name
+                ),
+                false,
+            );
+        }
+    }
+
+    /// Open the Generation form. The source panel decides what context is
+    /// stashed (and which seed strategy is pre-selected); the user can
+    /// then toggle strategies in the form to use whatever they want from
+    /// the same context.
+    ///
+    /// - **Library + TrackList panel**: track id, artist, and genre are
+    ///   all captured from the focused row → defaults to Track strategy
+    ///   but Artist and Genre are also unlocked.
+    /// - **Library + Albums panel**: artist + album captured → defaults to
+    ///   Artist strategy.
+    /// - **Library + Library (sidebar) panel** with an Artist or Album
+    ///   sidebar row: artist captured → defaults to Artist strategy.
+    /// - **Anywhere else** (Playlists mode, no focused library row,
+    ///   sidebar empty): Discover Weekly defaults — no context.
+    pub fn open_generation_form(&mut self) {
+        let now = playlist_mod::now_unix_ms();
+        if self.browse_mode == BrowseMode::Library {
+            // Track-row context: collect everything we can.
+            if self.active_panel == Panel::TrackList {
+                if let Some(t) = self.track_list.get(self.track_selected) {
+                    let track_id = t.library_id;
+                    let artist = if t.artist.is_empty() {
+                        None
+                    } else {
+                        Some(t.artist.clone())
+                    };
+                    let genre = t.genre.clone().filter(|g| !g.trim().is_empty());
+                    let label = if track_id.is_some() {
+                        t.name.clone()
+                    } else {
+                        // Track has no library id (device-only row, etc).
+                        // Default to artist seeding when we have one.
+                        t.artist.clone()
+                    };
+                    let default_idx = if track_id.is_some() {
+                        2 // Track
+                    } else if artist.is_some() {
+                        3 // Artist
+                    } else {
+                        0 // TopPlayed
+                    };
+                    self.generation_form = Some(GenerationFormState::for_library_context(
+                        now,
+                        track_id,
+                        artist,
+                        genre,
+                        default_idx,
+                        &label,
+                    ));
+                    return;
+                }
+            }
+            // Album-row context (browsing artist's album list).
+            if self.active_panel == Panel::Albums {
+                if let Some(a) = self.album_list.get(self.album_selected) {
+                    self.generation_form = Some(GenerationFormState::for_library_context(
+                        now,
+                        None,
+                        Some(a.artist.clone()),
+                        None,
+                        3, // Artist
+                        &a.artist,
+                    ));
+                    return;
+                }
+            }
+            // Sidebar-row context (Artists or Albums sidebar mode).
+            if self.active_panel == Panel::Library {
+                if let Some(entry) = self.sidebar_items.get(self.sidebar_selected) {
+                    let (artist, label) = match entry {
+                        SidebarEntry::Artist(a) => (Some(a.clone()), a.clone()),
+                        SidebarEntry::Album { artist, .. } => {
+                            (Some(artist.clone()), artist.clone())
+                        }
+                        SidebarEntry::Playlist { .. } => (None, String::new()),
+                    };
+                    if let Some(a) = artist {
+                        self.generation_form = Some(GenerationFormState::for_library_context(
+                            now,
+                            None,
+                            Some(a),
+                            None,
+                            3, // Artist
+                            &label,
+                        ));
+                        return;
+                    }
+                }
+            }
+        }
+        self.generation_form = Some(GenerationFormState::discover_weekly_default(now));
+    }
+
+    /// Open the Generation form pre-filled to regenerate the currently
+    /// selected generated playlist. No-op outside Playlists mode or for
+    /// manual playlists.
+    pub fn open_generation_form_for_regenerate(&mut self) {
+        if self.browse_mode != BrowseMode::Playlists {
+            return;
+        }
+        let entry = match self.sidebar_items.get(self.sidebar_selected) {
+            Some(e) => e.clone(),
+            None => return,
+        };
+        let id = match entry {
+            SidebarEntry::Playlist { id, .. } => id,
+            _ => return,
+        };
+        let playlist = match self.playlists.get(id) {
+            Some(p) => p.clone(),
+            None => return,
+        };
+        match GenerationFormState::for_regenerate(&playlist) {
+            Some(form) => self.generation_form = Some(form),
+            None => self.set_toast("Only generated playlists can be regenerated".into(), true),
+        }
+    }
+
+    /// Route a non-Tab/Enter/Esc key to the active form field's editor.
+    fn generation_form_dispatch_field_key(&mut self, key: KeyEvent) {
+        let f = match &mut self.generation_form {
+            Some(f) => f,
+            None => return,
+        };
+        // Numeric/slider helpers — explicit `<`/`>` always works; `+`/`-`
+        // works when the focused field is one of the numeric ones (avoids
+        // conflicting with the name input which also accepts those chars).
+        let is_dec = matches!(key.code, KeyCode::Char('<') | KeyCode::Left);
+        let is_inc = matches!(key.code, KeyCode::Char('>') | KeyCode::Right);
+        match f.selected_field {
+            GenerationFormState::FIELD_NAME => match key.code {
+                KeyCode::Backspace => {
+                    f.name.pop();
+                }
+                KeyCode::Char(c) => {
+                    f.name.push(c);
+                }
+                _ => {}
+            },
+            GenerationFormState::FIELD_SEED_STRATEGY => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    f.seed_strategy_idx = if f.seed_strategy_idx == 0 {
+                        4
+                    } else {
+                        f.seed_strategy_idx - 1
+                    };
+                }
+                KeyCode::Down | KeyCode::Char('j') | KeyCode::Char(' ') => {
+                    f.seed_strategy_idx = (f.seed_strategy_idx + 1) % 5;
+                }
+                _ => {}
+            },
+            GenerationFormState::FIELD_WINDOW_DAYS => {
+                if is_inc {
+                    f.window_days = f.window_days.saturating_add(1);
+                } else if is_dec {
+                    f.window_days = f.window_days.saturating_sub(1);
+                }
+            }
+            GenerationFormState::FIELD_SEED_COUNT => {
+                if is_inc {
+                    f.seed_count = (f.seed_count + 1).min(100);
+                } else if is_dec {
+                    f.seed_count = f.seed_count.saturating_sub(1).max(1);
+                }
+            }
+            GenerationFormState::FIELD_TARGET_LEN => {
+                if is_inc {
+                    f.target_length = (f.target_length + 1).min(500);
+                } else if is_dec {
+                    f.target_length = f.target_length.saturating_sub(1).max(1);
+                }
+            }
+            GenerationFormState::FIELD_MAX_PER_ARTIST => {
+                if is_inc {
+                    f.max_per_artist = (f.max_per_artist + 1).min(20);
+                } else if is_dec {
+                    f.max_per_artist = f.max_per_artist.saturating_sub(1).max(1);
+                }
+            }
+            GenerationFormState::FIELD_MAX_PER_ALBUM => {
+                if is_inc {
+                    f.max_per_album = (f.max_per_album + 1).min(20);
+                } else if is_dec {
+                    f.max_per_album = f.max_per_album.saturating_sub(1).max(1);
+                }
+            }
+            GenerationFormState::FIELD_DIVERSITY => {
+                if is_inc {
+                    f.diversity = (f.diversity + 0.05).min(1.0);
+                } else if is_dec {
+                    f.diversity = (f.diversity - 0.05).max(0.0);
+                }
+            }
+            GenerationFormState::FIELD_NOVELTY => {
+                if is_inc {
+                    f.novelty = (f.novelty + 0.05).min(1.0);
+                } else if is_dec {
+                    f.novelty = (f.novelty - 0.05).max(0.0);
+                }
+            }
+            GenerationFormState::FIELD_EXCLUDE_DEVICE => {
+                if matches!(key.code, KeyCode::Char(' ') | KeyCode::Enter) {
+                    f.exclude_on_device = !f.exclude_on_device;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Submit the Generation form: build params, run the recommender, save
+    /// the resulting playlist (replacing in place if `regenerating` is set).
+    /// Routes the toast message based on success / empty result.
+    fn commit_generation_form(&mut self) {
+        let form = match self.generation_form.take() {
+            Some(f) => f,
+            None => return,
+        };
+        // Reject submits where the chosen strategy doesn't have its
+        // backing context. Re-stash the form so the user can fix it
+        // without retyping anything.
+        if let Err(msg) = form.validate_strategy_context() {
+            self.set_toast(msg.into(), true);
+            self.generation_form = Some(form);
+            return;
+        }
+        let params = form.to_params();
+        let trimmed = form.name.trim();
+        if trimmed.is_empty() {
+            self.set_toast("Playlist name cannot be empty".into(), true);
+            self.generation_form = Some(form);
+            return;
+        }
+        let name = trimmed.to_string();
+        let regen_target = form.regenerating;
+
+        let lib = match &self.library {
+            Some(l) => l.as_ref(),
+            None => {
+                self.set_toast("Library not loaded yet".into(), true);
+                return;
+            }
+        };
+
+        // Optional "exclude already on device" filter — only meaningful when
+        // a device is connected. Build the exclusion set from the
+        // device-side track-id set keyed by (artist, name) and resolved back
+        // to library ids. Cheap because we already index by `(artist_key,
+        // name_key)` on the library scan.
+        let mut params_with_excludes = params;
+        if params_with_excludes.exclude_on_device && self.device.status == DeviceStatus::Connected {
+            let on_device_ids: Vec<u64> = lib
+                .all_tracks()
+                .filter(|t| {
+                    let ak = normalize_for_match(&t.artist);
+                    let nk = normalize_for_match(&t.name);
+                    self.device.track_set.contains(&(ak, nk))
+                })
+                .map(|t| t.id)
+                .collect();
+            params_with_excludes.exclude_track_ids.extend(on_device_ids);
+        }
+
+        // Soft-penalty bag for regenerations.
+        let prev: Vec<u64> = match regen_target.and_then(|id| self.playlists.get(id)) {
+            Some(p) => {
+                let mut bag = p.previously_recommended.clone();
+                // Treat the prior selection itself as previously-recommended
+                // so the next regeneration drifts off it.
+                bag.extend(p.track_ids.iter().copied());
+                bag.sort_unstable();
+                bag.dedup();
+                bag
+            }
+            None => Vec::new(),
+        };
+
+        // Phase 4: build the Markov bigram table from the listen log so
+        // the sequence-aware term contributes when the user has enough
+        // history. The recommender internally gates on `is_useful()` so
+        // brand-new users aren't dragged around by spurious one-offs.
+        let bigrams = BigramTable::from_log(&self.listen_log);
+        let outcome = WeightedRecommender.generate(
+            lib,
+            &self.local_plays,
+            &params_with_excludes,
+            &prev,
+            Some(&bigrams),
+            playlist_mod::now_unix_ms(),
+        );
+
+        if outcome.track_ids.is_empty() {
+            self.set_toast(
+                format!(
+                    "No tracks matched (eligible: {}, candidates: {})",
+                    outcome.eligible_count, outcome.candidate_count
+                ),
+                true,
+            );
+            // Keep an empty record only if regenerating — the user
+            // intentionally re-ran something they care about.
+            if regen_target.is_none() {
+                return;
+            }
+        }
+
+        match regen_target {
+            Some(id) => {
+                if let Some(p) = self.playlists.get_mut(id) {
+                    // Promote the prior pick into the soft-penalty bag for
+                    // the *next* regen.
+                    let mut bag = p.previously_recommended.clone();
+                    bag.extend(p.track_ids.iter().copied());
+                    bag.sort_unstable();
+                    bag.dedup();
+                    p.previously_recommended = bag;
+                    p.track_ids = outcome.track_ids.clone();
+                    p.name = name.clone();
+                    p.kind = PlaylistKind::Generated {
+                        params: params_with_excludes,
+                        last_generated_ms: playlist_mod::now_unix_ms(),
+                    };
+                    p.updated_at_ms = playlist_mod::now_unix_ms();
+                }
+                self.persist_playlists();
+                self.refresh_sidebar();
+                self.set_toast(
+                    format!(
+                        "Regenerated \"{}\" — {} tracks (seeds: {}, eligible: {})",
+                        name,
+                        outcome.track_ids.len(),
+                        outcome.seed_count,
+                        outcome.eligible_count
+                    ),
+                    false,
+                );
+            }
+            None => {
+                let new_pl = Playlist::new_generated(
+                    name.clone(),
+                    params_with_excludes,
+                    outcome.track_ids.clone(),
+                );
+                let new_id = self.playlists.add(new_pl);
+                self.persist_playlists();
+                self.refresh_sidebar();
+                if let Some(idx) = self
+                    .sidebar_items
+                    .iter()
+                    .position(|e| matches!(e, SidebarEntry::Playlist { id, .. } if *id == new_id))
+                {
+                    self.sidebar_selected = idx;
+                }
+                self.set_toast(
+                    format!(
+                        "Generated \"{}\" — {} tracks (seeds: {}, eligible: {})",
+                        name,
+                        outcome.track_ids.len(),
+                        outcome.seed_count,
+                        outcome.eligible_count
+                    ),
+                    false,
+                );
+            }
         }
     }
 
@@ -1429,8 +2371,17 @@ impl App {
         }
         let recorded_id = np.track_id;
         if let Some(id) = recorded_id {
-            self.local_plays.record_play(id, local_plays::now_unix_ms());
+            let now = local_plays::now_unix_ms();
+            self.local_plays.record_play(id, now);
             self.persist_local_plays();
+            // Phase 4: append to the listen log so the sequence model
+            // sees this play. `completed: true` because we crossed the
+            // play threshold (50% / 4 min).
+            self.listen_log.append(ListenEvent {
+                ts: now,
+                id,
+                completed: true,
+            });
         }
         // Always flip the flag — even if there's no library ID we don't
         // want to keep retrying the threshold check on every Position event.
@@ -1460,6 +2411,14 @@ impl App {
         if let Some(id) = recorded_id {
             self.local_plays.record_skip(id);
             self.persist_local_plays();
+            // Phase 4: log the skip so the sequence model can de-weight
+            // transitions to tracks the user keeps abandoning. The bigram
+            // builder treats `completed: false` as half-weight.
+            self.listen_log.append(ListenEvent {
+                ts: local_plays::now_unix_ms(),
+                id,
+                completed: false,
+            });
         }
         if let Some(np) = self.now_playing.as_mut() {
             np.counted = true;
@@ -1704,11 +2663,23 @@ impl App {
         }
     }
 
+    /// Cycle the browse mode: Library → Device → Playlists → Library.
+    /// `Device` is skipped when no device is connected (parallels the
+    /// existing `v` gate). Playlists mode is always reachable so users can
+    /// still curate without a device hooked up.
     pub fn toggle_browse_mode(&mut self) {
         self.save_sidebar_pos();
+        let device_connected = self.device.status == DeviceStatus::Connected;
         self.browse_mode = match self.browse_mode {
-            BrowseMode::Library => BrowseMode::Device,
-            BrowseMode::Device => BrowseMode::Library,
+            BrowseMode::Library => {
+                if device_connected {
+                    BrowseMode::Device
+                } else {
+                    BrowseMode::Playlists
+                }
+            }
+            BrowseMode::Device => BrowseMode::Playlists,
+            BrowseMode::Playlists => BrowseMode::Library,
         };
         self.refresh_sidebar();
         self.active_panel = Panel::Library;
@@ -1784,6 +2755,9 @@ impl App {
                         .collect()
                 })
                 .unwrap_or_default(),
+            // Playlist removal goes through `pending_playlist_delete`, not
+            // the device-removal queue — playlists live library-side only.
+            SidebarEntry::Playlist { .. } => Vec::new(),
         }
     }
 
@@ -1800,6 +2774,10 @@ impl App {
                 (artist.clone(), album)
             }
             SidebarEntry::Album { artist, album } => (artist.clone(), album.clone()),
+            // Playlists never resolve to a device-side (artist, album) pair.
+            // Callers are gated on `BrowseMode::Device` so this arm is
+            // structurally unreachable in production but kept exhaustive.
+            SidebarEntry::Playlist { .. } => (String::new(), String::new()),
         }
     }
 
@@ -1827,6 +2805,30 @@ impl App {
     /// index). Call when the underlying data changes, not on every keystroke.
     fn rebuild_sidebar_source(&mut self) {
         self.sidebar_items_full = match self.browse_mode {
+            BrowseMode::Playlists => {
+                // Sort: generated playlists first, then by `updated_at_ms`
+                // descending. Most-recently-touched stays at the top.
+                let mut entries: Vec<(&Playlist, SidebarEntry)> = self
+                    .playlists
+                    .playlists()
+                    .iter()
+                    .map(|p| {
+                        (
+                            p,
+                            SidebarEntry::Playlist {
+                                id: p.id,
+                                name: p.name.clone(),
+                            },
+                        )
+                    })
+                    .collect();
+                entries.sort_by(|(a, _), (b, _)| {
+                    b.is_generated()
+                        .cmp(&a.is_generated())
+                        .then_with(|| b.updated_at_ms.cmp(&a.updated_at_ms))
+                });
+                entries.into_iter().map(|(_, e)| e).collect()
+            }
             BrowseMode::Library => {
                 let lib = match &self.library {
                     Some(l) => l,
@@ -1939,6 +2941,11 @@ impl App {
             return;
         }
 
+        if self.browse_mode == BrowseMode::Playlists {
+            self.select_sidebar_item_playlist(&entry);
+            return;
+        }
+
         let lib = match &self.library {
             Some(l) => l,
             None => return,
@@ -1988,7 +2995,63 @@ impl App {
                 self.track_scroll = 0;
                 self.refresh_album_art();
             }
+            // Library mode never produces Playlist entries; gated above.
+            SidebarEntry::Playlist { .. } => {}
         }
+    }
+
+    /// Resolve a Playlist sidebar entry into a populated `track_list` of
+    /// library-side `TrackInfo`s in playlist order. Tracks whose IDs no
+    /// longer resolve in the library (file moved/deleted) are silently
+    /// skipped — Phase 2 will add a load-time resolver that re-binds via
+    /// `(artist, album, title)` lookup. For Phase 1 a quiet drop is fine.
+    fn select_sidebar_item_playlist(&mut self, entry: &SidebarEntry) {
+        let id = match entry {
+            SidebarEntry::Playlist { id, .. } => *id,
+            _ => return,
+        };
+        self.album_list.clear();
+        self.album_art = None;
+        self.album_art_key.clear();
+        self.album_art_cache = None;
+        self.album_art_size = (0, 0);
+
+        let lib = match &self.library {
+            Some(l) => l,
+            None => {
+                self.track_list.clear();
+                return;
+            }
+        };
+        let playlist = match self.playlists.get(id) {
+            Some(p) => p,
+            None => {
+                self.track_list.clear();
+                return;
+            }
+        };
+
+        // Build a quick lookup from `Track::id` so we resolve playlist IDs
+        // in O(N + M) rather than M * N. The library is iterated once.
+        let mut by_id: HashMap<u64, &Track> = HashMap::new();
+        for t in lib.all_tracks() {
+            by_id.insert(t.id, t);
+        }
+        let device_key = self.current_device_baseline_key();
+        let resolved: Vec<&Track> = playlist
+            .track_ids
+            .iter()
+            .filter_map(|tid| by_id.get(tid).copied())
+            .collect();
+        self.track_list = tracks_to_info(
+            resolved,
+            &self.device,
+            &self.local_plays,
+            device_key.as_deref(),
+        );
+        // Don't sort — playlists carry user-meaningful order.
+        self.track_selected = 0;
+        self.track_scroll = 0;
     }
 
     fn select_sidebar_item_device(&mut self, entry: &SidebarEntry) {
@@ -2033,6 +3096,8 @@ impl App {
                 self.track_selected = 0;
                 self.track_scroll = 0;
             }
+            // Device mode never produces Playlist entries.
+            SidebarEntry::Playlist { .. } => {}
         }
     }
 
@@ -2344,6 +3409,82 @@ impl App {
                 self.select_sidebar_item();
                 self.add_all_visible_to_queue();
             }
+            SidebarEntry::Playlist { id, name } => {
+                // Build SyncItems by resolving each track ID against the
+                // library. Tracks the library can't resolve (file moved or
+                // deleted) are silently skipped — Phase 2 adds the resolver
+                // that re-binds via (artist, album, title).
+                let lib = match &self.library {
+                    Some(l) => l,
+                    None => return,
+                };
+                let playlist = match self.playlists.get(*id) {
+                    Some(p) => p.clone(),
+                    None => return,
+                };
+                let by_id: HashMap<u64, &Track> = lib.all_tracks().map(|t| (t.id, t)).collect();
+                let mut items = Vec::new();
+                let mut missing = 0usize;
+                for tid in &playlist.track_ids {
+                    match by_id.get(tid) {
+                        Some(t) => {
+                            if let Some(loc) = &t.location {
+                                items.push(SyncItem {
+                                    artist: t.artist.clone(),
+                                    album: t.album.clone(),
+                                    name: t.name.clone(),
+                                    location: loc.clone(),
+                                    track_number: t.track_number,
+                                    genre: t.genre.clone(),
+                                    overwrite_targets: Vec::new(),
+                                });
+                            } else {
+                                missing += 1;
+                            }
+                        }
+                        None => missing += 1,
+                    }
+                }
+                if items.is_empty() {
+                    self.set_toast(
+                        format!("Playlist \"{}\" has no playable tracks", name),
+                        true,
+                    );
+                    return;
+                }
+                let count = items.len();
+                // Build the (artist, album, title) tuple list before moving
+                // `items` into the queue so the device-side resolver has the
+                // exact same ordering the user sees in the playlist.
+                let track_keys: Vec<(String, String, String)> = items
+                    .iter()
+                    .map(|i| (i.artist.clone(), i.album.clone(), i.name.clone()))
+                    .collect();
+                self.sync.queue.push(QueuedItem {
+                    label: name.clone(),
+                    tracks: items,
+                });
+                // Register a follow-up playlist creation for the next
+                // `SyncComplete` event. The actual device push is gated
+                // per-backend at drain time (see `handle_bg_event`'s
+                // SyncComplete arm): Zune is always-on after the
+                // 2026-04-26 hardware validation; iPod stays gated
+                // behind `ZYTUNES_EXPERIMENTAL_PLAYLIST_SYNC=1` until
+                // the iTunesDB-corruption incident root-cause is found.
+                self.pending_playlist_imports
+                    .retain(|p| p.name.as_str() != name.as_str());
+                self.pending_playlist_imports.push(PendingPlaylistImport {
+                    name: name.clone(),
+                    track_keys,
+                });
+                let toast = if missing > 0 {
+                    format!("Added {count} tracks to queue ({missing} unresolved)")
+                } else {
+                    format!("Added {count} tracks to queue")
+                };
+                self.set_toast(toast, false);
+                self.forward_last_queue_item_if_syncing();
+            }
         }
     }
 
@@ -2402,6 +3543,10 @@ impl App {
     pub fn clear_queue(&mut self) {
         self.sync.queue.clear();
         self.sync.queue_selected = 0;
+        // Drop any pending playlist creations — they only make sense if
+        // their tracks are about to land on-device, and clearing the queue
+        // means the user changed their mind.
+        self.pending_playlist_imports.clear();
     }
 
     pub fn queue_device_removal(&mut self) {
@@ -2699,6 +3844,46 @@ impl App {
                     format!("Sync complete: {} done, {} failed", success, failed)
                 };
                 self.set_toast(msg, failed > 0 || skipped > 0);
+                // Drain queued playlist imports — the file sync completed,
+                // so the device-side resolver will now see freshly-uploaded
+                // tracks. Per-backend gating decides whether each spec
+                // actually fires:
+                //   - Zune: always fire (validated end-to-end on hw 2026-04-26)
+                //   - iPod: only fire when ZYTUNES_EXPERIMENTAL_PLAYLIST_SYNC=1
+                //     until the iTunesDB-corruption incident is root-caused
+                //   - Unknown family: skip (defensive — no point sending to
+                //     a backend whose Err semantics we don't trust yet)
+                let family = self.device.family;
+                let allow = match family {
+                    Some(zytunes::device::DeviceFamily::Zune) => true,
+                    Some(zytunes::device::DeviceFamily::Ipod) => self.experimental_playlist_sync,
+                    None => false,
+                };
+                let drained: Vec<_> = self.pending_playlist_imports.drain(..).collect();
+                for spec in drained {
+                    if allow {
+                        self.sync
+                            .log
+                            .push(format!("Importing playlist \"{}\" to device", spec.name));
+                        self.pending_bg_commands.push(BgCommand::ImportPlaylist {
+                            name: spec.name,
+                            track_keys: spec.track_keys,
+                        });
+                    } else {
+                        let reason = match family {
+                            Some(zytunes::device::DeviceFamily::Ipod) => {
+                                "iPod playlist sync gated off after 2026-04-26 \
+                                 iTunesDB-corruption incident; set \
+                                 ZYTUNES_EXPERIMENTAL_PLAYLIST_SYNC=1 to opt in"
+                            }
+                            _ => "no device session active",
+                        };
+                        self.sync.log.push(format!(
+                            "Playlist \"{}\": device-side push skipped ({reason})",
+                            spec.name
+                        ));
+                    }
+                }
             }
             BgEvent::RemoveProgress {
                 current,
@@ -2737,6 +3922,29 @@ impl App {
             BgEvent::AcquiredItemsCount(count) => {
                 self.device.acquired_items = count;
             }
+            BgEvent::PlaylistImported { name, summary } => match summary {
+                Ok(s) => {
+                    let verb = if s.replaced { "Replaced" } else { "Created" };
+                    let msg = if s.skipped > 0 {
+                        format!(
+                            "{verb} playlist \"{}\" on device — {} tracks ({} unresolved)",
+                            name, s.resolved, s.skipped
+                        )
+                    } else {
+                        format!(
+                            "{verb} playlist \"{}\" on device — {} tracks",
+                            name, s.resolved
+                        )
+                    };
+                    self.sync.log.push(msg.clone());
+                    self.set_toast(msg, false);
+                }
+                Err(e) => {
+                    let msg = format!("Playlist \"{}\" import failed: {}", name, e);
+                    self.sync.log.push(msg.clone());
+                    self.set_toast(msg, true);
+                }
+            },
         }
     }
 
@@ -2796,6 +4004,106 @@ impl App {
         cmd_tx: &mpsc::Sender<BgCommand>,
         audio_tx: &mpsc::Sender<AudioCommand>,
     ) -> KeyOutcome {
+        // Playlist name input modal — handles both create-new and rename.
+        if self.playlist_name_input.is_some() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.playlist_name_input = None;
+                    self.playlist_rename_target = None;
+                }
+                KeyCode::Enter => {
+                    self.commit_playlist_name_input();
+                }
+                KeyCode::Backspace => {
+                    if let Some(buf) = &mut self.playlist_name_input {
+                        buf.pop();
+                    }
+                }
+                KeyCode::Char(c) => {
+                    if let Some(buf) = &mut self.playlist_name_input {
+                        buf.push(c);
+                    }
+                }
+                _ => {}
+            }
+            return KeyOutcome::Continue;
+        }
+
+        // Playlist Generation form.
+        if self.generation_form.is_some() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.generation_form = None;
+                }
+                KeyCode::Enter => {
+                    self.commit_generation_form();
+                }
+                KeyCode::Tab => {
+                    if let Some(f) = &mut self.generation_form {
+                        f.selected_field =
+                            (f.selected_field + 1) % GenerationFormState::FIELD_COUNT;
+                    }
+                }
+                KeyCode::BackTab => {
+                    if let Some(f) = &mut self.generation_form {
+                        f.selected_field = if f.selected_field == 0 {
+                            GenerationFormState::FIELD_COUNT - 1
+                        } else {
+                            f.selected_field - 1
+                        };
+                    }
+                }
+                _ => {
+                    self.generation_form_dispatch_field_key(key);
+                }
+            }
+            return KeyOutcome::Continue;
+        }
+
+        // "Add this track to a playlist" picker.
+        if self.add_to_playlist_picker.is_some() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.add_to_playlist_picker = None;
+                }
+                KeyCode::Enter => {
+                    self.confirm_add_to_playlist();
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if let Some(p) = &mut self.add_to_playlist_picker {
+                        if p.selected > 0 {
+                            p.selected -= 1;
+                        }
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if let Some(p) = &mut self.add_to_playlist_picker {
+                        if p.selected + 1 < p.options.len() {
+                            p.selected += 1;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return KeyOutcome::Continue;
+        }
+
+        // Playlist delete confirmation.
+        if self.pending_playlist_delete.is_some() {
+            match key.code {
+                KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    if let Some(id) = self.pending_playlist_delete.take() {
+                        self.commit_playlist_delete(id);
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('n') => {
+                    self.pending_playlist_delete = None;
+                }
+                _ => {}
+            }
+            return KeyOutcome::Continue;
+        }
+
         if self.search_active {
             match key.code {
                 KeyCode::Esc => {
@@ -2969,13 +4277,13 @@ impl App {
                 self.set_toast(label.to_string(), false);
             }
             KeyCode::Char('v') => {
-                if self.browse_mode == BrowseMode::Device
-                    || self.device.status == DeviceStatus::Connected
-                {
-                    self.toggle_browse_mode();
-                } else {
-                    self.set_toast("Connect a device first".into(), true);
-                }
+                // `toggle_browse_mode` already skips `Device` when nothing's
+                // connected, so cycling Library → Playlists → Library always
+                // works and never requires a device. The old "Connect a
+                // device first" gate was a holdover from when there were
+                // only two modes — drop it so users can reach Playlists
+                // without plugging anything in.
+                self.toggle_browse_mode();
             }
             KeyCode::Char('c') if self.device.status == DeviceStatus::Disconnected => {
                 self.device.status = DeviceStatus::Detecting;
@@ -2994,8 +4302,47 @@ impl App {
                     self.clear_device_index();
                     self.set_toast("Disconnected".into(), false);
                 }
+                Panel::Library if self.browse_mode == BrowseMode::Playlists => {
+                    if let Some(SidebarEntry::Playlist { id, .. }) =
+                        self.sidebar_items.get(self.sidebar_selected).cloned()
+                    {
+                        self.pending_playlist_delete = Some(id);
+                    }
+                }
+                Panel::TrackList if self.browse_mode == BrowseMode::Playlists => {
+                    self.remove_selected_track_from_playlist();
+                }
                 _ => {}
             },
+            KeyCode::Char('N') if self.browse_mode == BrowseMode::Playlists => {
+                self.playlist_name_input = Some(String::new());
+                self.playlist_rename_target = None;
+            }
+            KeyCode::Char('e') if self.browse_mode == BrowseMode::Playlists => {
+                if let Some(SidebarEntry::Playlist { id, name }) =
+                    self.sidebar_items.get(self.sidebar_selected).cloned()
+                {
+                    self.playlist_name_input = Some(name);
+                    self.playlist_rename_target = Some(id);
+                }
+            }
+            KeyCode::Char('+')
+                if self.browse_mode == BrowseMode::Library
+                    && self.active_panel == Panel::TrackList =>
+            {
+                self.open_add_to_playlist_picker();
+            }
+            // Open Generation form. Pre-fills with the focused track's id
+            // when invoked from a Library track row, otherwise the
+            // Discover-Weekly defaults.
+            KeyCode::Char('G') => {
+                self.open_generation_form();
+            }
+            // Regenerate the selected generated playlist (Playlists mode).
+            // Falls through to the device-refresh handler below otherwise.
+            KeyCode::Char('R') if self.browse_mode == BrowseMode::Playlists => {
+                self.open_generation_form_for_regenerate();
+            }
             KeyCode::Char('r') if self.device.status == DeviceStatus::Connected => {
                 let _ = cmd_tx.send(BgCommand::LoadDeviceTracks);
                 self.set_toast("Refreshing device tracks...".into(), false);
@@ -3133,6 +4480,10 @@ impl App {
             KeyCode::Esc => {
                 if matches!(self.sync.status, SyncStatus::Running { .. }) {
                     let _ = cmd_tx.send(BgCommand::CancelSync);
+                    // The user is bailing on the sync — drop any
+                    // playlist-creation follow-ups so they don't fire on
+                    // whatever partial sync did finish.
+                    self.pending_playlist_imports.clear();
                 }
                 self.toast_message = None;
             }
@@ -5137,16 +6488,72 @@ mod tests {
     }
 
     #[test]
-    fn toggle_browse_mode_switches_and_resets() {
+    fn toggle_browse_mode_skips_device_when_disconnected() {
+        // No device connected → cycle is Library → Playlists → Library;
+        // Device is skipped because there's nothing to browse.
         let mut app = App::new();
         assert_eq!(app.browse_mode, BrowseMode::Library);
+        assert_eq!(app.device.status, DeviceStatus::Disconnected);
 
         app.toggle_browse_mode();
-        assert_eq!(app.browse_mode, BrowseMode::Device);
+        assert_eq!(app.browse_mode, BrowseMode::Playlists);
         assert_eq!(app.active_panel, Panel::Library);
 
         app.toggle_browse_mode();
         assert_eq!(app.browse_mode, BrowseMode::Library);
+    }
+
+    #[test]
+    fn toggle_browse_mode_includes_device_when_connected() {
+        // Connected → cycle is Library → Device → Playlists → Library.
+        let mut app = App::new();
+        app.device.status = DeviceStatus::Connected;
+
+        app.toggle_browse_mode();
+        assert_eq!(app.browse_mode, BrowseMode::Device);
+
+        app.toggle_browse_mode();
+        assert_eq!(app.browse_mode, BrowseMode::Playlists);
+
+        app.toggle_browse_mode();
+        assert_eq!(app.browse_mode, BrowseMode::Library);
+    }
+
+    #[test]
+    fn v_key_reaches_playlists_without_device_connected() {
+        // Regression: an old gate on the `v` handler ("Connect a device
+        // first") blocked users from reaching Playlists mode without
+        // plugging in a device. `toggle_browse_mode` already skips Device
+        // when nothing's connected, so `v` should always be live.
+        use crate::audio::AudioCommand;
+        use crate::background::BgCommand;
+        let (cmd_tx, _cmd_rx) = std::sync::mpsc::channel::<BgCommand>();
+        let (audio_tx, _audio_rx) = std::sync::mpsc::channel::<AudioCommand>();
+        let mut app = App::new();
+        assert_eq!(app.browse_mode, BrowseMode::Library);
+        assert_eq!(app.device.status, DeviceStatus::Disconnected);
+
+        app.handle_key(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('v'),
+                crossterm::event::KeyModifiers::empty(),
+            ),
+            &cmd_tx,
+            &audio_tx,
+        );
+
+        assert_eq!(app.browse_mode, BrowseMode::Playlists);
+        // No "Connect a device first" toast must have fired.
+        assert!(
+            app.toast_message.is_none()
+                || !app
+                    .toast_message
+                    .as_ref()
+                    .unwrap()
+                    .0
+                    .contains("Connect a device"),
+            "should not have shown the device-required toast"
+        );
     }
 
     #[test]
@@ -7258,5 +8665,1074 @@ mod tests {
             7, 0,
         )]));
         assert_eq!(app.local_plays.get(42).unwrap().play_count, 7);
+    }
+
+    // ------------------------------------------------------------------
+    // Playlist integration: sidebar build, selection, sync queue, modals.
+    // The unit tests on `Playlist` and `PlaylistStore` verify the data
+    // layer; these tests verify the TUI wiring sits on top of them
+    // correctly without re-testing the data layer's invariants.
+    // ------------------------------------------------------------------
+
+    fn lib_with_tracks(rows: &[(u64, &str, &str, &str)]) -> Box<dyn MusicLibrary + Send> {
+        let tracks: Vec<Track> = rows
+            .iter()
+            .map(|(id, artist, album, name)| Track {
+                id: *id,
+                name: (*name).to_string(),
+                artist: (*artist).to_string(),
+                album: (*album).to_string(),
+                location: Some(format!("/tmp/{}.mp3", id)),
+                ..Default::default()
+            })
+            .collect();
+        Box::new(VecLibrary { tracks })
+    }
+
+    #[test]
+    fn playlists_browse_mode_sidebar_lists_playlists() {
+        let mut app = App::new();
+        app.playlists.add(Playlist::new_manual("Faves"));
+        app.playlists.add(Playlist::new_manual("Workout"));
+        app.browse_mode = BrowseMode::Playlists;
+        app.refresh_sidebar();
+
+        assert_eq!(app.sidebar_items.len(), 2);
+        for entry in &app.sidebar_items {
+            assert!(matches!(entry, SidebarEntry::Playlist { .. }));
+        }
+    }
+
+    #[test]
+    fn playlist_sidebar_sort_puts_generated_first() {
+        let mut app = App::new();
+        // Manual playlist created first → would otherwise lead by recency.
+        app.playlists.add(Playlist::new_manual("Manual A"));
+        // Sleep is overkill, but the second playlist may share `now_ms`;
+        // bump its updated_at so the sort tie-break is unambiguous.
+        let gen_id = app.playlists.add(Playlist::new_generated(
+            "Gen B",
+            zytunes::playlist::GenerationParams::default_discover_weekly(),
+            vec![1, 2],
+        ));
+        if let Some(p) = app.playlists.get_mut(gen_id) {
+            p.updated_at_ms = 100; // older than the manual one
+        }
+        app.browse_mode = BrowseMode::Playlists;
+        app.refresh_sidebar();
+
+        // Generated must lead even though it was updated earlier than the
+        // manual one — the sort prioritises kind first, then recency.
+        match &app.sidebar_items[0] {
+            SidebarEntry::Playlist { name, .. } => assert_eq!(name, "Gen B"),
+            other => panic!("expected playlist first, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn select_playlist_populates_track_list_in_playlist_order() {
+        let mut app = App::new();
+        // Library has three tracks with IDs 10, 20, 30.
+        app.library = Some(lib_with_tracks(&[
+            (10, "A", "Album", "First"),
+            (20, "A", "Album", "Second"),
+            (30, "A", "Album", "Third"),
+        ]));
+        // Build a playlist that orders them backwards.
+        let id = app.playlists.add(Playlist::new_manual("Backwards"));
+        app.playlists.add_track(id, 30);
+        app.playlists.add_track(id, 20);
+        app.playlists.add_track(id, 10);
+
+        app.browse_mode = BrowseMode::Playlists;
+        app.refresh_sidebar();
+        app.sidebar_selected = 0;
+        app.select_sidebar_item();
+
+        let names: Vec<&str> = app.track_list.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["Third", "Second", "First"]);
+    }
+
+    #[test]
+    fn select_playlist_skips_unresolvable_track_ids_silently() {
+        // Library has 10 and 30; the playlist references 20 which is gone.
+        let mut app = App::new();
+        app.library = Some(lib_with_tracks(&[
+            (10, "A", "Album", "First"),
+            (30, "A", "Album", "Third"),
+        ]));
+        let id = app.playlists.add(Playlist::new_manual("MixedRefs"));
+        app.playlists.add_track(id, 10);
+        app.playlists.add_track(id, 20);
+        app.playlists.add_track(id, 30);
+
+        app.browse_mode = BrowseMode::Playlists;
+        app.refresh_sidebar();
+        app.sidebar_selected = 0;
+        app.select_sidebar_item();
+
+        // Only the resolvable IDs surface; the unresolvable one is dropped.
+        assert_eq!(app.track_list.len(), 2);
+        assert_eq!(app.track_list[0].name, "First");
+        assert_eq!(app.track_list[1].name, "Third");
+    }
+
+    #[test]
+    fn add_sidebar_playlist_to_queue_includes_all_resolvable_tracks() {
+        let mut app = App::new();
+        app.library = Some(lib_with_tracks(&[
+            (10, "A", "Alb", "T1"),
+            (20, "B", "Alb", "T2"),
+        ]));
+        let id = app.playlists.add(Playlist::new_manual("Mix"));
+        app.playlists.add_track(id, 10);
+        app.playlists.add_track(id, 20);
+
+        app.browse_mode = BrowseMode::Playlists;
+        app.refresh_sidebar();
+        app.sidebar_selected = 0;
+        app.add_sidebar_item_to_queue();
+
+        assert_eq!(app.sync.queue.len(), 1);
+        let item = &app.sync.queue[0];
+        assert_eq!(item.label, "Mix");
+        assert_eq!(item.tracks.len(), 2);
+        // Order is preserved.
+        assert_eq!(item.tracks[0].name, "T1");
+        assert_eq!(item.tracks[1].name, "T2");
+    }
+
+    #[test]
+    fn commit_playlist_name_input_creates_then_renames() {
+        let mut app = App::new();
+        // Create.
+        app.playlist_name_input = Some("First".to_string());
+        app.playlist_rename_target = None;
+        app.commit_playlist_name_input();
+        assert_eq!(app.playlists.len(), 1);
+        let id = app.playlists.playlists()[0].id;
+        assert_eq!(app.playlists.get(id).unwrap().name, "First");
+
+        // Rename.
+        app.playlist_name_input = Some("Renamed".to_string());
+        app.playlist_rename_target = Some(id);
+        app.commit_playlist_name_input();
+        assert_eq!(app.playlists.get(id).unwrap().name, "Renamed");
+        assert_eq!(app.playlists.len(), 1, "rename must not duplicate");
+    }
+
+    #[test]
+    fn commit_playlist_name_input_rejects_empty_name() {
+        let mut app = App::new();
+        app.playlist_name_input = Some("   ".to_string());
+        app.commit_playlist_name_input();
+        assert!(app.playlists.is_empty());
+        assert!(
+            app.toast_message.as_ref().unwrap().2,
+            "should be error toast"
+        );
+    }
+
+    #[test]
+    fn commit_playlist_delete_removes_and_clamps_selection() {
+        let mut app = App::new();
+        let id_a = app.playlists.add(Playlist::new_manual("A"));
+        let _id_b = app.playlists.add(Playlist::new_manual("B"));
+        app.browse_mode = BrowseMode::Playlists;
+        app.refresh_sidebar();
+        app.sidebar_selected = 1; // pointing at the second row
+
+        app.commit_playlist_delete(id_a);
+
+        assert_eq!(app.playlists.len(), 1);
+        // Selection must be clamped — only one row left.
+        assert!(app.sidebar_selected < app.sidebar_items.len());
+    }
+
+    #[test]
+    fn remove_selected_track_from_playlist_drops_it() {
+        let mut app = App::new();
+        app.library = Some(lib_with_tracks(&[
+            (10, "A", "Alb", "T1"),
+            (20, "A", "Alb", "T2"),
+        ]));
+        let id = app.playlists.add(Playlist::new_manual("Mix"));
+        app.playlists.add_track(id, 10);
+        app.playlists.add_track(id, 20);
+
+        app.browse_mode = BrowseMode::Playlists;
+        app.refresh_sidebar();
+        app.sidebar_selected = 0;
+        app.select_sidebar_item();
+        app.track_selected = 1; // pointing at T2
+
+        app.remove_selected_track_from_playlist();
+
+        assert_eq!(app.playlists.get(id).unwrap().track_ids, vec![10]);
+        assert_eq!(app.track_list.len(), 1);
+        assert_eq!(app.track_list[0].name, "T1");
+    }
+
+    #[test]
+    fn add_to_playlist_picker_requires_existing_playlists() {
+        let mut app = App::new();
+        app.library = Some(lib_with_tracks(&[(10, "A", "Alb", "T1")]));
+        app.track_list = vec![TrackInfo {
+            name: "T1".into(),
+            artist: "A".into(),
+            album: "Alb".into(),
+            duration_ms: None,
+            kind: None,
+            location: Some("/tmp/10.mp3".into()),
+            track_number: None,
+            disc_number: None,
+            genre: None,
+            on_device: false,
+            play_count: None,
+            skip_count: None,
+            rating: None,
+            last_played_at_ms: None,
+            last_synced_from_device_at_ms: None,
+            library_id: Some(10),
+            artist_key: "a".into(),
+            name_key: "t1".into(),
+        }];
+        app.track_selected = 0;
+
+        app.open_add_to_playlist_picker();
+        assert!(
+            app.add_to_playlist_picker.is_none(),
+            "no playlists yet → picker must not open"
+        );
+        assert!(
+            app.toast_message.is_some(),
+            "should toast about missing playlists"
+        );
+    }
+
+    #[test]
+    fn add_to_playlist_picker_confirm_adds_track() {
+        let mut app = App::new();
+        let pid = app.playlists.add(Playlist::new_manual("Faves"));
+        app.library = Some(lib_with_tracks(&[(10, "A", "Alb", "T1")]));
+        app.track_list = vec![TrackInfo {
+            name: "T1".into(),
+            artist: "A".into(),
+            album: "Alb".into(),
+            duration_ms: None,
+            kind: None,
+            location: Some("/tmp/10.mp3".into()),
+            track_number: None,
+            disc_number: None,
+            genre: None,
+            on_device: false,
+            play_count: None,
+            skip_count: None,
+            rating: None,
+            last_played_at_ms: None,
+            last_synced_from_device_at_ms: None,
+            library_id: Some(10),
+            artist_key: "a".into(),
+            name_key: "t1".into(),
+        }];
+        app.track_selected = 0;
+
+        app.open_add_to_playlist_picker();
+        assert!(app.add_to_playlist_picker.is_some());
+        app.confirm_add_to_playlist();
+
+        assert!(app.add_to_playlist_picker.is_none());
+        assert_eq!(app.playlists.get(pid).unwrap().track_ids, vec![10]);
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 2: Generation form + recommender integration tests.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn generation_form_default_round_trips_to_params() {
+        let f = GenerationFormState::discover_weekly_default(10_000);
+        let p = f.to_params();
+        assert_eq!(p.target_length, 25);
+        assert!(p.exclude_on_device);
+        // Strategy round-trips back to TopPlayed.
+        assert!(matches!(p.seed_strategy, SeedStrategy::TopPlayed { .. }));
+    }
+
+    #[test]
+    fn generation_form_for_track_seed_carries_id() {
+        let f = GenerationFormState::for_track_seed(10_000, 42, "Roygbiv");
+        let p = f.to_params();
+        match p.seed_strategy {
+            SeedStrategy::Track(id) => assert_eq!(id, 42),
+            other => panic!("expected Track seed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn generation_form_for_regenerate_returns_none_for_manual() {
+        let p = Playlist::new_manual("Manual");
+        assert!(GenerationFormState::for_regenerate(&p).is_none());
+    }
+
+    #[test]
+    fn generation_form_for_regenerate_preserves_params() {
+        let mut params = GenerationParams::default_discover_weekly();
+        params.target_length = 7;
+        let pl = Playlist::new_generated("DW", params.clone(), vec![1, 2, 3]);
+        let f = GenerationFormState::for_regenerate(&pl).unwrap();
+        assert_eq!(f.target_length, 7);
+        assert_eq!(f.regenerating, Some(pl.id));
+        // round-trip back through `to_params` matches the source.
+        let round = f.to_params();
+        assert_eq!(round.target_length, params.target_length);
+    }
+
+    #[test]
+    fn commit_generation_form_creates_playlist_with_recommender_output() {
+        let mut app = App::new();
+        // Library: 6 tracks across 3 artists with one heavily-played seed.
+        app.library = Some(lib_with_tracks(&[
+            (1, "BoC", "Geogaddi", "Music Is Math"),
+            (2, "BoC", "Geogaddi", "Gyroscope"),
+            (3, "BoC", "Music Has The Right", "Roygbiv"),
+            (4, "Aphex", "SAW2", "Stone in Focus"),
+            (5, "Slayer", "Reign", "Raining Blood"),
+            (6, "Mozart", "Requiem", "Lacrimosa"),
+        ]));
+        app.local_plays.record_play(1, 1_000);
+        app.local_plays.record_play(1, 2_000);
+        app.local_plays.record_play(2, 1_000);
+
+        // Open with defaults (TopPlayed seed strategy → seeds = [1, 2]).
+        app.open_generation_form();
+        // Disable the on-device exclusion path (no device anyway, but
+        // makes the assertion direct).
+        if let Some(f) = &mut app.generation_form {
+            f.exclude_on_device = false;
+            f.target_length = 3;
+        }
+        app.commit_generation_form();
+
+        assert_eq!(app.playlists.len(), 1);
+        let p = &app.playlists.playlists()[0];
+        assert!(p.is_generated());
+        assert!(!p.track_ids.is_empty(), "recommender should produce tracks");
+        // Seeds (1 and 2) must not appear in the generated set — the
+        // recommender's `eligible` filter strips them.
+        for tid in &p.track_ids {
+            assert!(
+                !matches!(*tid, 1 | 2),
+                "seed track {tid} leaked into output"
+            );
+        }
+    }
+
+    #[test]
+    fn commit_generation_form_regenerate_replaces_track_ids_in_place() {
+        let mut app = App::new();
+        app.library = Some(lib_with_tracks(&[
+            (1, "A", "X", "T1"),
+            (2, "B", "X", "T2"),
+            (3, "C", "Y", "T3"),
+            (4, "D", "Z", "T4"),
+        ]));
+        app.local_plays.record_play(1, 1_000);
+
+        // Seed an existing generated playlist.
+        let mut params = GenerationParams::default_discover_weekly();
+        params.target_length = 2;
+        params.exclude_on_device = false;
+        let pid = app
+            .playlists
+            .add(Playlist::new_generated("DW", params, vec![3, 4]));
+
+        app.browse_mode = BrowseMode::Playlists;
+        app.refresh_sidebar();
+        app.sidebar_selected = 0;
+
+        app.open_generation_form_for_regenerate();
+        assert!(app.generation_form.is_some());
+        app.commit_generation_form();
+
+        // Same playlist id, replaced track_ids, previously_recommended
+        // now contains the prior selection so the next regen drifts.
+        let p = app.playlists.get(pid).unwrap();
+        assert!(p.previously_recommended.contains(&3));
+        assert!(p.previously_recommended.contains(&4));
+    }
+
+    #[test]
+    fn commit_generation_form_empty_name_rejects_with_toast() {
+        let mut app = App::new();
+        app.library = Some(lib_with_tracks(&[(1, "A", "X", "T1")]));
+        app.open_generation_form();
+        if let Some(f) = &mut app.generation_form {
+            f.name = "   ".into();
+        }
+        app.commit_generation_form();
+        assert!(app.playlists.is_empty());
+        assert!(app.toast_message.as_ref().unwrap().2);
+    }
+
+    #[test]
+    fn commit_generation_form_no_library_rejects_with_toast() {
+        let mut app = App::new();
+        app.library = None;
+        app.open_generation_form();
+        app.commit_generation_form();
+        assert!(app.playlists.is_empty());
+        assert!(app.toast_message.as_ref().unwrap().2);
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 3: device-side playlist sync wiring.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn enqueue_playlist_registers_pending_import() {
+        // Enqueue always populates pending_playlist_imports — the
+        // per-backend gate fires at drain time (handle_bg_event's
+        // SyncComplete), not at enqueue time.
+        let mut app = App::new();
+        app.library = Some(lib_with_tracks(&[
+            (10, "A", "Alb", "T1"),
+            (20, "B", "Alb", "T2"),
+        ]));
+        let pid = app.playlists.add(Playlist::new_manual("Faves"));
+        app.playlists.add_track(pid, 10);
+        app.playlists.add_track(pid, 20);
+
+        app.browse_mode = BrowseMode::Playlists;
+        app.refresh_sidebar();
+        app.sidebar_selected = 0;
+        app.add_sidebar_item_to_queue();
+
+        // Sync queue carries the file uploads as before.
+        assert_eq!(app.sync.queue.len(), 1);
+        // Pending import carries the (artist, album, title) tuples in the
+        // exact order of the playlist.
+        assert_eq!(app.pending_playlist_imports.len(), 1);
+        let spec = &app.pending_playlist_imports[0];
+        assert_eq!(spec.name, "Faves");
+        assert_eq!(
+            spec.track_keys,
+            vec![
+                ("A".into(), "Alb".into(), "T1".into()),
+                ("B".into(), "Alb".into(), "T2".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn enqueue_same_playlist_twice_replaces_pending_entry() {
+        // The user might enqueue, change their mind and re-enqueue. The
+        // second push should replace the first so the device only sees
+        // one playlist creation per queue cycle.
+        let mut app = App::new();
+        app.library = Some(lib_with_tracks(&[(10, "A", "Alb", "T1")]));
+        let pid = app.playlists.add(Playlist::new_manual("Faves"));
+        app.playlists.add_track(pid, 10);
+
+        app.browse_mode = BrowseMode::Playlists;
+        app.refresh_sidebar();
+        app.sidebar_selected = 0;
+        app.add_sidebar_item_to_queue();
+        app.add_sidebar_item_to_queue();
+
+        assert_eq!(app.pending_playlist_imports.len(), 1);
+    }
+
+    #[test]
+    fn sync_complete_drains_pending_imports_for_zune() {
+        // Zune is always-on after the 2026-04-26 hardware validation.
+        let mut app = App::new();
+        app.device.family = Some(zytunes::device::DeviceFamily::Zune);
+        app.pending_playlist_imports.push(PendingPlaylistImport {
+            name: "Faves".into(),
+            track_keys: vec![("A".into(), "X".into(), "T1".into())],
+        });
+        app.pending_playlist_imports.push(PendingPlaylistImport {
+            name: "Workout".into(),
+            track_keys: vec![("B".into(), "Y".into(), "T2".into())],
+        });
+        app.sync.status = SyncStatus::Running {
+            current: 5,
+            total: 5,
+        };
+
+        app.handle_bg_event(BgEvent::SyncComplete {
+            success: 5,
+            failed: 0,
+            skipped: 0,
+        });
+
+        assert!(app.pending_playlist_imports.is_empty(), "drained");
+        let import_count = app
+            .pending_bg_commands
+            .iter()
+            .filter(|c| matches!(c, BgCommand::ImportPlaylist { .. }))
+            .count();
+        assert_eq!(import_count, 2);
+    }
+
+    #[test]
+    fn sync_complete_skips_imports_for_ipod_when_gate_off() {
+        // iPod stays gated until the 2026-04-26 iTunesDB-corruption
+        // incident is root-caused. Pending import is dropped, file
+        // uploads still happen, sync log explains why.
+        let mut app = App::new();
+        app.device.family = Some(zytunes::device::DeviceFamily::Ipod);
+        assert!(!app.experimental_playlist_sync, "default off");
+        app.pending_playlist_imports.push(PendingPlaylistImport {
+            name: "Faves".into(),
+            track_keys: vec![("A".into(), "X".into(), "T1".into())],
+        });
+        app.sync.status = SyncStatus::Running {
+            current: 1,
+            total: 1,
+        };
+
+        app.handle_bg_event(BgEvent::SyncComplete {
+            success: 1,
+            failed: 0,
+            skipped: 0,
+        });
+
+        assert!(
+            app.pending_playlist_imports.is_empty(),
+            "drained either way"
+        );
+        let import_count = app
+            .pending_bg_commands
+            .iter()
+            .filter(|c| matches!(c, BgCommand::ImportPlaylist { .. }))
+            .count();
+        assert_eq!(import_count, 0, "iPod gate must hold");
+        assert!(
+            app.sync
+                .log
+                .iter()
+                .any(|l| l.contains("ZYTUNES_EXPERIMENTAL_PLAYLIST_SYNC")),
+            "sync log should explain the gate; got {:?}",
+            app.sync.log
+        );
+    }
+
+    #[test]
+    fn sync_complete_fires_imports_for_ipod_when_gate_on() {
+        let mut app = App::new();
+        app.device.family = Some(zytunes::device::DeviceFamily::Ipod);
+        app.experimental_playlist_sync = true;
+        app.pending_playlist_imports.push(PendingPlaylistImport {
+            name: "Faves".into(),
+            track_keys: vec![("A".into(), "X".into(), "T1".into())],
+        });
+        app.sync.status = SyncStatus::Running {
+            current: 1,
+            total: 1,
+        };
+
+        app.handle_bg_event(BgEvent::SyncComplete {
+            success: 1,
+            failed: 0,
+            skipped: 0,
+        });
+
+        let import_count = app
+            .pending_bg_commands
+            .iter()
+            .filter(|c| matches!(c, BgCommand::ImportPlaylist { .. }))
+            .count();
+        assert_eq!(import_count, 1);
+    }
+
+    #[test]
+    fn sync_complete_skips_imports_when_no_device_family() {
+        // Defensive: don't fire imports against an unknown backend.
+        let mut app = App::new();
+        app.device.family = None;
+        app.pending_playlist_imports.push(PendingPlaylistImport {
+            name: "Faves".into(),
+            track_keys: vec![],
+        });
+
+        app.handle_bg_event(BgEvent::SyncComplete {
+            success: 0,
+            failed: 0,
+            skipped: 0,
+        });
+
+        let import_count = app
+            .pending_bg_commands
+            .iter()
+            .filter(|c| matches!(c, BgCommand::ImportPlaylist { .. }))
+            .count();
+        assert_eq!(import_count, 0);
+    }
+
+    #[test]
+    fn clear_queue_drops_pending_imports() {
+        let mut app = App::new();
+        app.pending_playlist_imports.push(PendingPlaylistImport {
+            name: "Faves".into(),
+            track_keys: vec![],
+        });
+        app.sync.queue.push(QueuedItem {
+            label: "X".into(),
+            tracks: vec![],
+        });
+        app.clear_queue();
+        assert!(app.sync.queue.is_empty());
+        assert!(app.pending_playlist_imports.is_empty());
+    }
+
+    #[test]
+    fn playlist_imported_event_routes_to_toast() {
+        let mut app = App::new();
+        app.handle_bg_event(BgEvent::PlaylistImported {
+            name: "Faves".into(),
+            summary: Ok(zytunes::mtp::PlaylistImportSummary {
+                resolved: 12,
+                skipped: 1,
+                replaced: false,
+            }),
+        });
+        let (msg, _, is_err) = app.toast_message.as_ref().unwrap();
+        assert!(!is_err);
+        assert!(msg.contains("Created"));
+        assert!(msg.contains("12 tracks"));
+        assert!(msg.contains("1 unresolved"));
+    }
+
+    #[test]
+    fn playlist_imported_event_failure_routes_to_error_toast() {
+        let mut app = App::new();
+        app.handle_bg_event(BgEvent::PlaylistImported {
+            name: "Faves".into(),
+            summary: Err("device sync rejected".into()),
+        });
+        let (msg, _, is_err) = app.toast_message.as_ref().unwrap();
+        assert!(is_err);
+        assert!(msg.contains("Faves"));
+        assert!(msg.contains("device sync rejected"));
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 4: listen log + sequence-aware recommender wiring.
+    // ------------------------------------------------------------------
+
+    /// Fixture: install a `NowPlaying` for the given library track ID so the
+    /// `record_now_playing_*` paths have something to count.
+    fn install_now_playing(app: &mut App, track_id: u64) {
+        app.now_playing = Some(NowPlaying {
+            track_name: format!("T{}", track_id),
+            artist: "A".into(),
+            album: "X".into(),
+            duration_ms: 180_000,
+            elapsed_ms: 0,
+            state: PlaybackState::Playing,
+            track_index: 0,
+            playlist: Arc::from([] as [TrackInfo; 0]),
+            paused_frame: None,
+            track_id: Some(track_id),
+            counted: false,
+            year: None,
+            metadata_marquee: String::new(),
+        });
+    }
+
+    #[test]
+    fn record_play_appends_completed_event_to_listen_log() {
+        let mut app = App::new();
+        install_now_playing(&mut app, 42);
+        app.record_now_playing_play();
+        assert_eq!(app.listen_log.len(), 1);
+        assert_eq!(app.listen_log.events()[0].id, 42);
+        assert!(app.listen_log.events()[0].completed);
+    }
+
+    #[test]
+    fn record_skip_appends_uncompleted_event_to_listen_log() {
+        let mut app = App::new();
+        install_now_playing(&mut app, 7);
+        app.record_now_playing_skip();
+        assert_eq!(app.listen_log.len(), 1);
+        assert_eq!(app.listen_log.events()[0].id, 7);
+        assert!(!app.listen_log.events()[0].completed);
+    }
+
+    #[test]
+    fn record_play_idempotent_within_session_only_logs_once() {
+        let mut app = App::new();
+        install_now_playing(&mut app, 5);
+        app.record_now_playing_play();
+        app.record_now_playing_play(); // second call is no-op (counted=true)
+        assert_eq!(app.listen_log.len(), 1, "guard prevents duplicate logging");
+    }
+
+    #[test]
+    fn commit_generation_form_passes_bigrams_when_useful() {
+        // Build a library with a clear sequence-driven preference:
+        // seed track id=1, two equally-content-similar candidates 2 & 3.
+        // The listen log strongly biases 1→3.
+        let mut app = App::new();
+        app.library = Some(lib_with_tracks(&[
+            (1, "Same", "X", "T1"),
+            (2, "Diff", "Y", "Cand A"),
+            (3, "Other", "Z", "Cand B"),
+        ]));
+        // Heavy plays on track 1 so it dominates TopPlayed seed selection.
+        for i in 0..5 {
+            app.local_plays.record_play(1, 1_000 + i);
+        }
+
+        // Seed the listen log with 32 events / 2 sessions of 1→3 alternation
+        // (clears the BigramTable::is_useful threshold).
+        for i in 0..15 {
+            app.listen_log.append(ListenEvent {
+                ts: i * 1000,
+                id: 1,
+                completed: true,
+            });
+            app.listen_log.append(ListenEvent {
+                ts: i * 1000 + 100,
+                id: 3,
+                completed: true,
+            });
+        }
+        app.listen_log.append(ListenEvent {
+            ts: 5_000_000,
+            id: 1,
+            completed: true,
+        });
+        app.listen_log.append(ListenEvent {
+            ts: 5_001_000,
+            id: 3,
+            completed: true,
+        });
+
+        app.open_generation_form();
+        if let Some(f) = &mut app.generation_form {
+            f.exclude_on_device = false;
+            f.target_length = 1;
+        }
+        app.commit_generation_form();
+
+        let p = &app.playlists.playlists()[0];
+        assert_eq!(
+            p.track_ids,
+            vec![3],
+            "sequence-aware scorer should pick the bigram-followed track"
+        );
+    }
+
+    #[test]
+    fn commit_generation_form_works_when_listen_log_is_empty() {
+        // No listen-log events → BigramTable not useful → recommender
+        // skips the sequence term. Still must produce a result.
+        let mut app = App::new();
+        app.library = Some(lib_with_tracks(&[(1, "A", "X", "T1"), (2, "B", "Y", "T2")]));
+        app.local_plays.record_play(1, 1_000);
+
+        app.open_generation_form();
+        if let Some(f) = &mut app.generation_form {
+            f.exclude_on_device = false;
+            f.target_length = 1;
+        }
+        app.commit_generation_form();
+
+        assert_eq!(app.playlists.len(), 1);
+        assert!(!app.playlists.playlists()[0].track_ids.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 2 follow-up: Artist/Genre seed strategy context discovery.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn validate_strategy_context_passes_for_behavioural_strategies() {
+        let mut f = GenerationFormState::discover_weekly_default(0);
+        f.seed_strategy_idx = 0; // TopPlayed
+        assert!(f.validate_strategy_context().is_ok());
+        f.seed_strategy_idx = 1; // RecentlyPlayed
+        assert!(f.validate_strategy_context().is_ok());
+    }
+
+    #[test]
+    fn validate_strategy_context_rejects_track_without_id() {
+        let mut f = GenerationFormState::discover_weekly_default(0);
+        f.seed_strategy_idx = 2;
+        assert!(f.validate_strategy_context().is_err());
+        f.seed_context.track_id = Some(42);
+        assert!(f.validate_strategy_context().is_ok());
+    }
+
+    #[test]
+    fn validate_strategy_context_rejects_artist_without_name() {
+        let mut f = GenerationFormState::discover_weekly_default(0);
+        f.seed_strategy_idx = 3;
+        assert!(f.validate_strategy_context().is_err());
+        f.seed_context.artist = Some("   ".into());
+        assert!(
+            f.validate_strategy_context().is_err(),
+            "whitespace-only must be rejected"
+        );
+        f.seed_context.artist = Some("Boards of Canada".into());
+        assert!(f.validate_strategy_context().is_ok());
+    }
+
+    #[test]
+    fn validate_strategy_context_rejects_genre_without_name() {
+        let mut f = GenerationFormState::discover_weekly_default(0);
+        f.seed_strategy_idx = 4;
+        assert!(f.validate_strategy_context().is_err());
+        f.seed_context.genre = Some("Electronic".into());
+        assert!(f.validate_strategy_context().is_ok());
+    }
+
+    #[test]
+    fn for_library_context_carries_all_three_fields() {
+        let f = GenerationFormState::for_library_context(
+            10_000,
+            Some(42),
+            Some("BoC".into()),
+            Some("Electronic".into()),
+            2,
+            "Roygbiv",
+        );
+        assert_eq!(f.seed_context.track_id, Some(42));
+        assert_eq!(f.seed_context.artist.as_deref(), Some("BoC"));
+        assert_eq!(f.seed_context.genre.as_deref(), Some("Electronic"));
+        // Switching strategies in the form picks up the corresponding ctx.
+        let mut f = f;
+        f.seed_strategy_idx = 3;
+        assert_eq!(f.current_context_label().as_deref(), Some("BoC"));
+        f.seed_strategy_idx = 4;
+        assert_eq!(f.current_context_label().as_deref(), Some("Electronic"));
+    }
+
+    fn lib_with_genre_year_tracks(
+        rows: &[(u64, &str, &str, &str, &str)],
+    ) -> Box<dyn MusicLibrary + Send> {
+        let tracks: Vec<Track> = rows
+            .iter()
+            .map(|(id, artist, album, name, genre)| Track {
+                id: *id,
+                name: (*name).to_string(),
+                artist: (*artist).to_string(),
+                album: (*album).to_string(),
+                genre: Some((*genre).to_string()),
+                location: Some(format!("/tmp/{}.mp3", id)),
+                ..Default::default()
+            })
+            .collect();
+        Box::new(VecLibrary { tracks })
+    }
+
+    #[test]
+    fn open_generation_form_from_track_row_captures_artist_and_genre() {
+        let mut app = App::new();
+        app.library = Some(lib_with_genre_year_tracks(&[(
+            10,
+            "BoC",
+            "Geogaddi",
+            "Music Is Math",
+            "Electronic",
+        )]));
+        app.browse_mode = BrowseMode::Library;
+        app.active_panel = Panel::TrackList;
+        // Build the track_list manually with the relevant fields set.
+        app.track_list.push(TrackInfo {
+            name: "Music Is Math".into(),
+            artist: "BoC".into(),
+            album: "Geogaddi".into(),
+            duration_ms: None,
+            kind: None,
+            location: None,
+            track_number: None,
+            disc_number: None,
+            genre: Some("Electronic".into()),
+            on_device: false,
+            play_count: None,
+            skip_count: None,
+            rating: None,
+            last_played_at_ms: None,
+            last_synced_from_device_at_ms: None,
+            library_id: Some(10),
+            artist_key: "boc".into(),
+            name_key: "music is math".into(),
+        });
+        app.track_selected = 0;
+
+        app.open_generation_form();
+
+        let f = app.generation_form.as_ref().expect("form opens");
+        assert_eq!(f.seed_strategy_idx, 2, "defaults to Track");
+        assert_eq!(f.seed_context.track_id, Some(10));
+        assert_eq!(f.seed_context.artist.as_deref(), Some("BoC"));
+        assert_eq!(f.seed_context.genre.as_deref(), Some("Electronic"));
+    }
+
+    #[test]
+    fn open_generation_form_from_artist_sidebar_captures_artist() {
+        // VecLibrary's MusicLibrary impl returns empty for `artists()`, so
+        // refresh_sidebar can't populate the sidebar from the library. Push
+        // the entry directly — open_generation_form reads from
+        // `sidebar_items` and doesn't care how it got there.
+        let mut app = App::new();
+        app.library = Some(lib_with_tracks(&[(1, "Beatles", "Album", "T1")]));
+        app.browse_mode = BrowseMode::Library;
+        app.active_panel = Panel::Library;
+        app.sidebar_items = vec![SidebarEntry::Artist("Beatles".into())];
+        app.sidebar_selected = 0;
+
+        app.open_generation_form();
+
+        let f = app.generation_form.as_ref().expect("form opens");
+        assert_eq!(f.seed_strategy_idx, 3, "defaults to Artist");
+        assert_eq!(f.seed_context.artist.as_deref(), Some("Beatles"));
+    }
+
+    #[test]
+    fn open_generation_form_from_album_sidebar_captures_artist() {
+        let mut app = App::new();
+        app.library = Some(lib_with_tracks(&[(1, "Beatles", "Revolver", "T1")]));
+        app.browse_mode = BrowseMode::Library;
+        app.active_panel = Panel::Library;
+        app.sidebar_mode = SidebarMode::Albums;
+        app.sidebar_items = vec![SidebarEntry::Album {
+            artist: "Beatles".into(),
+            album: "Revolver".into(),
+        }];
+        app.sidebar_selected = 0;
+
+        app.open_generation_form();
+
+        let f = app.generation_form.as_ref().expect("form opens");
+        assert_eq!(f.seed_strategy_idx, 3, "defaults to Artist");
+        assert_eq!(f.seed_context.artist.as_deref(), Some("Beatles"));
+    }
+
+    #[test]
+    fn commit_form_with_artist_strategy_actually_generates() {
+        // End-to-end: form populated with Artist context, recommender
+        // resolves the strategy and produces a non-empty playlist.
+        let mut app = App::new();
+        app.library = Some(lib_with_genre_year_tracks(&[
+            (1, "BoC", "Music Has The Right", "Roygbiv", "Electronic"),
+            (2, "BoC", "Geogaddi", "Music Is Math", "Electronic"),
+            (3, "Aphex Twin", "SAW2", "Stone in Focus", "Electronic"),
+            (4, "Slayer", "Reign", "Raining Blood", "Metal"),
+        ]));
+        app.browse_mode = BrowseMode::Library;
+        app.active_panel = Panel::Library;
+        app.sidebar_items = vec![SidebarEntry::Artist("BoC".into())];
+        app.sidebar_selected = 0;
+
+        app.open_generation_form();
+        if let Some(f) = &mut app.generation_form {
+            f.exclude_on_device = false;
+            f.target_length = 2;
+        }
+        app.commit_generation_form();
+
+        assert_eq!(app.playlists.len(), 1);
+        let p = &app.playlists.playlists()[0];
+        assert!(!p.track_ids.is_empty(), "Artist strategy produces output");
+    }
+
+    #[test]
+    fn commit_form_with_genre_strategy_uses_genre_context() {
+        // Open from a track row → all three contexts captured. User then
+        // switches to Genre in the form and submits. With several
+        // electronic candidates available, the genre-similarity term
+        // should rank them above the unrelated metal track.
+        let mut app = App::new();
+        app.library = Some(lib_with_genre_year_tracks(&[
+            (1, "Aphex Twin", "SAW2", "Stone in Focus", "Electronic"),
+            (2, "BoC", "Geogaddi", "Music Is Math", "Electronic"),
+            (
+                3,
+                "Squarepusher",
+                "Hard Normal Daddy",
+                "Beep Street",
+                "Electronic",
+            ),
+            (4, "Autechre", "Tri Repetae", "Clipper", "Electronic"),
+            (5, "Slayer", "Reign", "Raining Blood", "Metal"),
+        ]));
+        app.browse_mode = BrowseMode::Library;
+        app.active_panel = Panel::TrackList;
+        app.track_list.push(TrackInfo {
+            name: "Stone in Focus".into(),
+            artist: "Aphex Twin".into(),
+            album: "SAW2".into(),
+            duration_ms: None,
+            kind: None,
+            location: None,
+            track_number: None,
+            disc_number: None,
+            genre: Some("Electronic".into()),
+            on_device: false,
+            play_count: None,
+            skip_count: None,
+            rating: None,
+            last_played_at_ms: None,
+            last_synced_from_device_at_ms: None,
+            library_id: Some(1),
+            artist_key: "aphex twin".into(),
+            name_key: "stone in focus".into(),
+        });
+        app.track_selected = 0;
+
+        app.open_generation_form();
+        // User switches the radio to Genre (idx 4).
+        if let Some(f) = &mut app.generation_form {
+            f.seed_strategy_idx = 4;
+            f.exclude_on_device = false;
+            // Genre seeding takes up to 8 matching tracks as seeds; with
+            // four electronic tracks all becoming seeds, only one
+            // (non-electronic) candidate remains in the pool. Asking for
+            // 1 result asserts the wiring without picking a fight with
+            // the seed-vs-candidate ratio.
+            f.target_length = 1;
+        }
+        app.commit_generation_form();
+
+        assert_eq!(app.playlists.len(), 1);
+        let p = &app.playlists.playlists()[0];
+        assert!(!p.track_ids.is_empty(), "Genre strategy produced output");
+        // The form's seed strategy must have round-tripped to Genre.
+        let stored = match &p.kind {
+            PlaylistKind::Generated { params, .. } => &params.seed_strategy,
+            _ => panic!("expected generated playlist"),
+        };
+        assert!(
+            matches!(stored, SeedStrategy::Genre(g) if g == "Electronic"),
+            "stored strategy must be Genre(Electronic), got {stored:?}"
+        );
+    }
+
+    #[test]
+    fn commit_form_rejects_artist_strategy_without_context() {
+        // Open with no library context → user cycles to Artist strategy →
+        // submit must reject and re-stash the form.
+        let mut app = App::new();
+        app.library = Some(lib_with_tracks(&[(1, "A", "X", "T1")]));
+        app.browse_mode = BrowseMode::Playlists; // no library context source
+        app.refresh_sidebar();
+        app.open_generation_form();
+        if let Some(f) = &mut app.generation_form {
+            f.seed_strategy_idx = 3; // Artist — but seed_context.artist is None
+        }
+        app.commit_generation_form();
+
+        assert!(app.playlists.is_empty(), "submit was rejected");
+        assert!(
+            app.generation_form.is_some(),
+            "form re-stashed so user can fix it"
+        );
+        assert!(app.toast_message.as_ref().unwrap().2);
     }
 }

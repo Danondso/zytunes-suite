@@ -26,8 +26,8 @@ fn char_disp_width(c: char) -> usize {
 use crate::anim;
 use crate::app::{
     format_duration, format_with_commas, AlbumArtCache, App, BrowseMode, DevicePresence,
-    DeviceStatus, NowPlaying, Panel, PlaybackState, SidebarEntry, SidebarMode, SortColumn,
-    SyncStatus, TrackInfo,
+    DeviceStatus, GenerationFormState, NowPlaying, Panel, PlaybackState, SidebarEntry, SidebarMode,
+    SortColumn, SyncStatus, TrackInfo,
 };
 use crate::theme;
 use zytunes::library::Track;
@@ -250,6 +250,27 @@ pub fn draw(f: &mut Frame, app: &App) {
     if app.search_active {
         draw_search_overlay(f, app);
     }
+
+    // Playlist name input modal (create or rename).
+    if app.playlist_name_input.is_some() {
+        draw_playlist_name_input(f, app);
+    }
+
+    // Add-to-playlist picker.
+    if app.add_to_playlist_picker.is_some() {
+        draw_add_to_playlist_picker(f, app);
+    }
+
+    // Playlist delete confirmation.
+    if app.pending_playlist_delete.is_some() {
+        draw_confirm_playlist_delete(f, app);
+    }
+
+    // Playlist generation form. Drawn last so it stacks above other
+    // transient UI (toasts can still appear over it via subsequent ticks).
+    if app.generation_form.is_some() {
+        draw_generation_form_overlay(f, app);
+    }
 }
 
 fn draw_startup(f: &mut Frame, app: &App, area: Rect) {
@@ -350,12 +371,18 @@ fn sidebar_icon_accent(theme: &theme::Theme, selected: bool) -> ratatui::style::
 fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
     let t = app.theme();
     let is_active = app.active_panel == Panel::Library;
-    let mode_label = match app.sidebar_mode {
-        SidebarMode::Artists => "Artists",
-        SidebarMode::Albums => "Albums",
+    // In Playlists mode the sidebar mode label is fixed — it lists
+    // playlists, not artist/album buckets.
+    let mode_label = if app.browse_mode == BrowseMode::Playlists {
+        "Playlists"
+    } else {
+        match app.sidebar_mode {
+            SidebarMode::Artists => "Artists",
+            SidebarMode::Albums => "Albums",
+        }
     };
     let browse_prefix = match app.browse_mode {
-        BrowseMode::Library => "",
+        BrowseMode::Library | BrowseMode::Playlists => "",
         BrowseMode::Device => match app.device.family {
             Some(zytunes::device::DeviceFamily::Ipod) => "iPod: ",
             _ => "Zune: ",
@@ -393,6 +420,7 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
                     "(empty)"
                 }
             }
+            BrowseMode::Playlists => "No playlists yet — press N to create one",
         };
         let p = Paragraph::new(msg).style(t.dim());
         f.render_widget(p, inner);
@@ -437,12 +465,31 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
                         .album_device_status
                         .get(&(artist.clone(), album.clone()))
                         .copied(),
+                    // Playlists never show device-presence indicators —
+                    // they're library-side state. (`show_device_status` is
+                    // also gated on `BrowseMode::Library` above.)
+                    SidebarEntry::Playlist { .. } => None,
                 };
                 let accent_fg = sidebar_icon_accent(t, i == app.sidebar_selected);
                 match presence {
                     Some(DevicePresence::Full) => ("✓ ", style.fg(accent_fg)),
                     Some(DevicePresence::Partial) => ("◐ ", style.fg(accent_fg)),
                     _ => ("  ", style),
+                }
+            } else if let SidebarEntry::Playlist { id, .. } = entry {
+                // Visual distinction: generated playlists get a "~ " prefix,
+                // manual playlists get the same two-space pad as device-mode
+                // rows so name alignment is uniform across the column.
+                let is_generated = app
+                    .playlists
+                    .get(*id)
+                    .map(|p| p.is_generated())
+                    .unwrap_or(false);
+                let accent_fg = sidebar_icon_accent(t, i == app.sidebar_selected);
+                if is_generated {
+                    ("~ ", style.fg(accent_fg))
+                } else {
+                    ("  ", style)
                 }
             } else {
                 ("", style)
@@ -1962,13 +2009,20 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect, footer_left_width: u16) {
                 format!(" {} on device", app.device.tracks.len())
             }
         }
+        BrowseMode::Playlists => format!(" {} playlists", app.playlists.len()),
     };
-    let right = if app.browse_mode == BrowseMode::Device {
-        "v:library | a:queue rm | D:delete | C:clr | ?:help".to_string()
-    } else if app.device.status == DeviceStatus::Connected {
-        "✓=synced ◐=partial | v:device | a:add | S:sync | q:quit | ?:help".to_string()
-    } else {
-        "v:device | a:add | S:sync | q:quit | ?:help".to_string()
+    let right = match app.browse_mode {
+        BrowseMode::Device => "v:cycle | a:queue rm | D:delete | C:clr | ?:help".to_string(),
+        BrowseMode::Playlists => {
+            "v:cycle | N:new | G:generate | R:regen | e:rename | d:delete | a:sync".to_string()
+        }
+        BrowseMode::Library => {
+            if app.device.status == DeviceStatus::Connected {
+                "✓=synced ◐=partial | v:cycle | a:add | +:playlist | S:sync | ?:help".to_string()
+            } else {
+                "v:cycle | a:add | +:playlist | S:sync | q:quit | ?:help".to_string()
+            }
+        }
     };
 
     let chunks = Layout::default()
@@ -1998,6 +2052,7 @@ fn draw_confirm_removal(f: &mut Frame, app: &App, count: usize) {
 
     let block = t
         .block()
+        .style(t.modal())
         .border_style(t.error())
         .title(" Confirm Delete ")
         .title_alignment(Alignment::Center);
@@ -2005,9 +2060,9 @@ fn draw_confirm_removal(f: &mut Frame, app: &App, count: usize) {
     let lines = vec![
         Line::from(""),
         Line::from(format!(" Delete {} track(s)?", count)),
-        Line::from(Span::styled(" Enter/y:yes  Esc/n:no", t.dim())),
+        Line::from(Span::styled(" Enter/y:yes  Esc/n:no", t.modal_dim())),
     ];
-    let p = Paragraph::new(lines).block(block);
+    let p = Paragraph::new(lines).block(block).style(t.modal());
     f.render_widget(p, rect);
 }
 
@@ -2024,6 +2079,7 @@ fn draw_confirm_cache_clear(f: &mut Frame, app: &App) {
 
     let block = t
         .block()
+        .style(t.modal())
         .border_style(t.error())
         .title(" Clear Cache ")
         .title_alignment(Alignment::Center);
@@ -2031,9 +2087,9 @@ fn draw_confirm_cache_clear(f: &mut Frame, app: &App) {
     let lines = vec![
         Line::from(""),
         Line::from(" Clear playback cache?"),
-        Line::from(Span::styled(" Enter/y:yes  Esc/n:no", t.dim())),
+        Line::from(Span::styled(" Enter/y:yes  Esc/n:no", t.modal_dim())),
     ];
-    let p = Paragraph::new(lines).block(block);
+    let p = Paragraph::new(lines).block(block).style(t.modal());
     f.render_widget(p, rect);
 }
 
@@ -2061,8 +2117,8 @@ fn draw_toast(f: &mut Frame, app: &App, msg: &str, is_error: bool) {
 fn draw_help_overlay(f: &mut Frame, app: &App) {
     let t = app.theme();
     let area = f.area();
-    let width = 50u16.min(area.width - 4);
-    let height = 30u16.min(area.height - 4);
+    let width = 56u16.min(area.width - 4);
+    let height = 38u16.min(area.height - 4);
     let x = (area.width.saturating_sub(width)) / 2;
     let y = (area.height.saturating_sub(height)) / 2;
     let rect = Rect::new(x, y, width, height);
@@ -2108,6 +2164,21 @@ fn draw_help_overlay(f: &mut Frame, app: &App) {
         "  A           Remove all visible tracks",
         "  U           Dedupe (remove duplicate copies, keep newest)",
         "",
+        "  Playlists view",
+        "  N           New manual playlist",
+        "  G           Generate (Discover Weekly form)",
+        "  R           Regenerate selected generated playlist",
+        "  e           Rename selected playlist",
+        "  d           Delete playlist (sidebar) / drop track (track list)",
+        "  a           Add playlist to sync queue",
+        "",
+        "  Library track list",
+        "  +           Add selected track to a playlist",
+        "  G           Generate playlist seeded by this track",
+        "",
+        "  Library sidebar / album list",
+        "  G           Generate playlist seeded by selected artist/album",
+        "",
         "  Device",
         "  c           Connect to Zune",
         "  r           Refresh device tracks",
@@ -2120,10 +2191,12 @@ fn draw_help_overlay(f: &mut Frame, app: &App) {
 
     let block = t
         .block()
-        .border_style(Style::default().fg(t.selection_bg))
+        .style(t.modal())
+        .border_style(Style::default().fg(t.selection_bg).bg(t.sidebar_bg))
         .title(" Help — press Esc to close ");
     let p = Paragraph::new(lines)
         .block(block)
+        .style(t.modal())
         .wrap(Wrap { trim: false });
     f.render_widget(p, rect);
 }
@@ -2143,9 +2216,9 @@ fn draw_theme_picker(f: &mut Frame, app: &App) {
 
     let block = t
         .block()
-        .border_style(Style::default().fg(t.selection_bg))
+        .border_style(Style::default().fg(t.selection_bg).bg(t.sidebar_bg))
         .title(" Theme [t] ")
-        .style(Style::default().bg(t.sidebar_bg));
+        .style(t.modal());
 
     let inner = block.inner(rect);
     f.render_widget(block, rect);
@@ -2749,10 +2822,331 @@ fn draw_search_overlay(f: &mut Frame, app: &App) {
 
     let block = t
         .block()
-        .border_style(Style::default().fg(t.selection_bg))
+        .style(t.modal())
+        .border_style(Style::default().fg(t.selection_bg).bg(t.sidebar_bg))
         .title(" Search ");
-    let p = Paragraph::new(format!(" {}_", app.search_query)).block(block);
+    let p = Paragraph::new(format!(" {}_", app.search_query))
+        .block(block)
+        .style(t.modal());
     f.render_widget(p, rect);
+}
+
+fn draw_playlist_name_input(f: &mut Frame, app: &App) {
+    let t = app.theme();
+    let area = f.area();
+    let width = 50u16.min(area.width.saturating_sub(4));
+    let height = 4u16.min(area.height.saturating_sub(2));
+    let x = (area.width.saturating_sub(width)) / 2;
+    let y = area.height / 3;
+    let rect = Rect::new(x, y, width, height);
+
+    f.render_widget(Clear, rect);
+
+    let title = if app.playlist_rename_target.is_some() {
+        " Rename Playlist "
+    } else {
+        " New Playlist "
+    };
+    let block = t
+        .block()
+        .style(t.modal())
+        .border_style(Style::default().fg(t.selection_bg).bg(t.sidebar_bg))
+        .title(title);
+    let buf = app.playlist_name_input.as_deref().unwrap_or("");
+    let lines = vec![
+        Line::from(format!(" {}_", buf)),
+        Line::from(Span::styled(" Enter:save  Esc:cancel", t.modal_dim())),
+    ];
+    let p = Paragraph::new(lines).block(block).style(t.modal());
+    f.render_widget(p, rect);
+}
+
+fn draw_add_to_playlist_picker(f: &mut Frame, app: &App) {
+    let t = app.theme();
+    let picker = match &app.add_to_playlist_picker {
+        Some(p) => p,
+        None => return,
+    };
+    let area = f.area();
+    // Size: roughly 60% of width, capped; height grows with options up to 12.
+    let width = (area.width * 6 / 10)
+        .clamp(40, 80)
+        .min(area.width.saturating_sub(4));
+    let visible_options = picker.options.len().min(10) as u16;
+    let height = (visible_options + 4).min(area.height.saturating_sub(2));
+    let x = (area.width.saturating_sub(width)) / 2;
+    let y = (area.height.saturating_sub(height)) / 2;
+    let rect = Rect::new(x, y, width, height);
+
+    f.render_widget(Clear, rect);
+
+    let block = t
+        .block()
+        .style(t.modal())
+        .border_style(Style::default().fg(t.selection_bg).bg(t.sidebar_bg))
+        .title(" Add to Playlist ");
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    if inner.height < 3 {
+        return;
+    }
+
+    // Header line: which track is being added.
+    let header = Paragraph::new(Line::from(vec![
+        Span::styled(" Track: ", t.modal_dim()),
+        Span::styled(picker.track_label.clone(), t.modal()),
+    ]))
+    .style(t.modal());
+    let header_rect = Rect::new(inner.x, inner.y, inner.width, 1);
+    f.render_widget(header, header_rect);
+
+    // Options list, vertical-scrolled around the selection.
+    let list_rect = Rect::new(
+        inner.x,
+        inner.y + 1,
+        inner.width,
+        inner.height.saturating_sub(2),
+    );
+    let visible = list_rect.height as usize;
+    let scroll = compute_scroll(picker.selected, visible, picker.options.len());
+    let items: Vec<ListItem> = picker
+        .options
+        .iter()
+        .enumerate()
+        .skip(scroll)
+        .take(visible)
+        .map(|(i, (_, name))| {
+            let style = if i == picker.selected {
+                t.sidebar_item_selected()
+            } else {
+                // Use modal() rather than sidebar_item() so the row's
+                // background matches the surrounding modal — sidebar_item
+                // omits a bg, which on themes like Newport Lights leaves
+                // the unselected rows looking transparent.
+                t.modal()
+            };
+            let cursor = if i == picker.selected { "> " } else { "  " };
+            ListItem::new(format!("{}{}", cursor, name)).style(style)
+        })
+        .collect();
+    f.render_widget(List::new(items).style(t.modal()), list_rect);
+
+    // Footer hint.
+    let hint_rect = Rect::new(
+        inner.x,
+        inner.y + inner.height.saturating_sub(1),
+        inner.width,
+        1,
+    );
+    let hint = Paragraph::new(Span::styled(
+        " ↑/↓:select  Enter:add  Esc:cancel",
+        t.modal_dim(),
+    ))
+    .style(t.modal());
+    f.render_widget(hint, hint_rect);
+}
+
+fn draw_confirm_playlist_delete(f: &mut Frame, app: &App) {
+    let t = app.theme();
+    let id = match app.pending_playlist_delete {
+        Some(id) => id,
+        None => return,
+    };
+    let name = app
+        .playlists
+        .get(id)
+        .map(|p| p.name.clone())
+        .unwrap_or_else(|| "playlist".to_string());
+
+    let area = f.area();
+    let title = format!(" Delete \"{}\"? ", name);
+    let label_len = title.len() as u16 + 4;
+    let w = label_len.max(36).min(area.width.saturating_sub(4));
+    let h = 5u16.min(area.height.saturating_sub(2));
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let rect = Rect::new(x, y, w, h);
+
+    f.render_widget(Clear, rect);
+
+    let block = t
+        .block()
+        .style(t.modal())
+        .border_style(t.error().bg(t.sidebar_bg))
+        .title(title)
+        .title_alignment(Alignment::Center);
+    let lines = vec![
+        Line::from(""),
+        Line::from(" Delete this playlist? Tracks remain in the library."),
+        Line::from(Span::styled(" Enter/y:yes  Esc/n:no", t.modal_dim())),
+    ];
+    let p = Paragraph::new(lines).block(block).style(t.modal());
+    f.render_widget(p, rect);
+}
+
+fn draw_generation_form_overlay(f: &mut Frame, app: &App) {
+    let t = app.theme();
+    let form = match &app.generation_form {
+        Some(f) => f,
+        None => return,
+    };
+    let area = f.area();
+    // Modal sized to ~70% of width × ~70% of height, clamped so it stays
+    // legible on small terminals.
+    let w = ((area.width * 7) / 10)
+        .clamp(50, 80)
+        .min(area.width.saturating_sub(4));
+    let h = ((area.height * 7) / 10)
+        .clamp(16, 22)
+        .min(area.height.saturating_sub(2));
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let rect = Rect::new(x, y, w, h);
+
+    f.render_widget(Clear, rect);
+    let title = if form.regenerating.is_some() {
+        " Regenerate Playlist "
+    } else {
+        " Generate Playlist "
+    };
+    let block = t
+        .block()
+        .style(t.modal())
+        .border_style(Style::default().fg(t.selection_bg).bg(t.sidebar_bg))
+        .title(title);
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    if inner.height < 6 {
+        let p = Paragraph::new("Terminal too small to show form.").style(t.modal());
+        f.render_widget(p, inner);
+        return;
+    }
+
+    // Build the field rows.
+    let mut lines: Vec<Line> = Vec::new();
+
+    let row = |label: &str, value: String, focused: bool| -> Line<'static> {
+        let label_style = if focused {
+            t.sidebar_item_selected().add_modifier(Modifier::BOLD)
+        } else {
+            // Carry the modal background so the unfocused label is on the
+            // same surface as the rest of the modal — bare `t.dim()` omits
+            // a background and shows the underlying main panel through.
+            t.modal_dim()
+        };
+        let cursor = if focused { "> " } else { "  " };
+        Line::from(vec![
+            Span::styled(format!("{cursor}{label:<16}"), label_style),
+            Span::styled(value, t.modal()),
+        ])
+    };
+
+    lines.push(row(
+        "Name",
+        if form.selected_field == GenerationFormState::FIELD_NAME {
+            format!("{}_", form.name)
+        } else {
+            form.name.clone()
+        },
+        form.selected_field == GenerationFormState::FIELD_NAME,
+    ));
+
+    let strategy_labels = [
+        "Top played",
+        "Recently played",
+        "More like a track",
+        "By artist",
+        "By genre",
+    ];
+    let label = strategy_labels
+        .get(form.seed_strategy_idx)
+        .copied()
+        .unwrap_or("?");
+    // Append the backing context next to the strategy so the user can see
+    // what value will actually drive the recommendation. Behavioural
+    // strategies (TopPlayed, RecentlyPlayed) have no context; Track,
+    // Artist, and Genre strategies surface "(none)" when nothing was
+    // captured at form-open time.
+    let strategy = match form.current_context_label() {
+        Some(ctx) => format!("( {} )  {}", label, ctx),
+        None if form.seed_strategy_idx >= 2 => format!("( {} )  (none)", label),
+        None => format!("( {} )", label),
+    };
+    lines.push(row(
+        "Seed strategy",
+        strategy,
+        form.selected_field == GenerationFormState::FIELD_SEED_STRATEGY,
+    ));
+    let win_label = if form.window_days == 0 {
+        "all-time".to_string()
+    } else {
+        format!("{} days", form.window_days)
+    };
+    lines.push(row(
+        "Window",
+        win_label,
+        form.selected_field == GenerationFormState::FIELD_WINDOW_DAYS,
+    ));
+    lines.push(row(
+        "Seed count",
+        form.seed_count.to_string(),
+        form.selected_field == GenerationFormState::FIELD_SEED_COUNT,
+    ));
+    lines.push(row(
+        "Length",
+        format!("{} tracks", form.target_length),
+        form.selected_field == GenerationFormState::FIELD_TARGET_LEN,
+    ));
+    lines.push(row(
+        "Max per artist",
+        form.max_per_artist.to_string(),
+        form.selected_field == GenerationFormState::FIELD_MAX_PER_ARTIST,
+    ));
+    lines.push(row(
+        "Max per album",
+        form.max_per_album.to_string(),
+        form.selected_field == GenerationFormState::FIELD_MAX_PER_ALBUM,
+    ));
+    lines.push(row(
+        "Diversity",
+        slider_str(form.diversity),
+        form.selected_field == GenerationFormState::FIELD_DIVERSITY,
+    ));
+    lines.push(row(
+        "Novelty",
+        slider_str(form.novelty),
+        form.selected_field == GenerationFormState::FIELD_NOVELTY,
+    ));
+    let chk = if form.exclude_on_device { "[x]" } else { "[ ]" };
+    lines.push(row(
+        "Exclude on-device",
+        chk.to_string(),
+        form.selected_field == GenerationFormState::FIELD_EXCLUDE_DEVICE,
+    ));
+
+    // Spacer + footer hint.
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " Tab/Shift-Tab move • </> adjust • Space toggle • Enter generate • Esc cancel",
+        t.modal_dim(),
+    )));
+
+    let p = Paragraph::new(lines)
+        .style(t.modal())
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, inner);
+}
+
+/// Render a 16-cell ASCII slider for a 0..1 value.
+fn slider_str(v: f32) -> String {
+    let cells = 16usize;
+    let filled = (v.clamp(0.0, 1.0) * cells as f32).round() as usize;
+    let bar: String = (0..cells)
+        .map(|i| if i < filled { '=' } else { '-' })
+        .collect();
+    format!("[{bar}] {v:.2}")
 }
 
 fn compute_scroll(selected: usize, visible: usize, total: usize) -> usize {

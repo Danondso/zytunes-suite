@@ -82,4 +82,37 @@ pub trait DeviceSession {
     fn collect_all_videos(&mut self) -> Result<Vec<DeviceEntry>, String> {
         Ok(Vec::new())
     }
+    /// Create or replace a playlist on the device.
+    ///
+    /// `track_keys` is an ordered list of `(artist, album, title)` tuples
+    /// taken from the library; each backend resolves them to its own
+    /// device-side ID scheme (iPod dbid, Zune object handle). Tuples that
+    /// don't resolve are skipped; the function only fails if the playlist
+    /// itself cannot be written. A playlist with the same `name` is
+    /// replaced atomically — the iPod's `master playlist` invariant is
+    /// preserved by the backend.
+    ///
+    /// Default is `Err("playlist sync not supported on this device")` so
+    /// backends opt in.
+    fn import_playlist(
+        &mut self,
+        _name: &str,
+        _track_keys: &[(String, String, String)],
+    ) -> Result<PlaylistImportSummary, String> {
+        Err("Playlist sync not supported on this device".into())
+    }
+}
+
+/// Result of a successful `import_playlist` call. The TUI surfaces the
+/// counts in the sync log so the user knows how many tracks made it onto
+/// the device-side playlist vs. how many couldn't be matched.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PlaylistImportSummary {
+    /// Tuples that resolved to a device-side track and landed in the playlist.
+    pub resolved: usize,
+    /// Tuples skipped because the device doesn't have a matching track.
+    pub skipped: usize,
+    /// `true` if a playlist with the same name was overwritten,
+    /// `false` if this was a fresh insert.
+    pub replaced: bool,
 }

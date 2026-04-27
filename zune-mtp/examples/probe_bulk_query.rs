@@ -10,8 +10,9 @@
 //! cargo run -p zune-mtp --example probe_bulk_query
 //! ```
 //!
-//! By default it targets a Zune 30 (pid=0x0710). Set `ZUNE_PID` in hex to
-//! target a different model — e.g. `ZUNE_PID=063e` for a Zune HD.
+//! By default it targets the Zune classic family (pid=0x0710 — covers Zune
+//! 4/8/16/30/80/120 in media mode). Set `ZUNE_PID` in hex to target a
+//! different mode — e.g. `ZUNE_PID=063e` for a Zune HD.
 //!
 //! No writes are made. Paste the output back when asking for help.
 

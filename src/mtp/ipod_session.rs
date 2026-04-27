@@ -427,6 +427,93 @@ impl DeviceSession for IpodSession {
         // Errors are silently ignored (same pattern as Zune backend).
         let _ = self.flush();
     }
+
+    fn import_playlist(
+        &mut self,
+        name: &str,
+        track_keys: &[(String, String, String)],
+    ) -> Result<super::PlaylistImportSummary, String> {
+        let summary = upsert_playlist(&mut self.db, name, track_keys)?;
+        self.flush()?;
+        Ok(summary)
+    }
+}
+
+/// Resolve `(artist, album, title)` tuples to iTunesDB dbids and either
+/// replace the existing playlist with the same name or append a new one.
+/// Pure DB mutation — no I/O — so the unit tests can exercise it without a
+/// writable iPod mount. Tuples that don't match are skipped (counted in the
+/// returned summary). The master playlist (always at `db.playlists[0]` per
+/// iPod firmware invariants) is left untouched — user playlists live at
+/// indices >= 1.
+fn upsert_playlist(
+    db: &mut ipod_db::IpodDatabase,
+    name: &str,
+    track_keys: &[(String, String, String)],
+) -> Result<super::PlaylistImportSummary, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("Playlist name cannot be empty".into());
+    }
+    if trimmed.eq_ignore_ascii_case("Library") || trimmed.eq_ignore_ascii_case("Master") {
+        // The master playlist owns these names by convention; reject so
+        // callers can't accidentally clobber it.
+        return Err(format!("\"{trimmed}\" is reserved for the master playlist"));
+    }
+
+    // Resolve every (artist, album, title) tuple to an iPod dbid. Match
+    // case-insensitively because library tag casing varies (e.g.
+    // "the beatles" vs. "The Beatles") and the iPod is case-sensitive on
+    // disk paths but not on display fields.
+    let mut resolved_dbids: Vec<u64> = Vec::with_capacity(track_keys.len());
+    let mut skipped = 0usize;
+    for (artist, album, title) in track_keys {
+        let found = db.tracks.iter().find(|t| {
+            t.title.eq_ignore_ascii_case(title)
+                && t.artist.eq_ignore_ascii_case(artist)
+                && t.album.eq_ignore_ascii_case(album)
+        });
+        match found {
+            Some(t) => {
+                if !resolved_dbids.contains(&t.dbid) {
+                    resolved_dbids.push(t.dbid);
+                }
+            }
+            None => skipped += 1,
+        }
+    }
+
+    // Replace by-name (case-insensitive — track resolution above is also
+    // case-insensitive, and the user shouldn't end up with two playlists
+    // that differ only by capitalisation). Skip index 0 (the master playlist).
+    let position = db
+        .playlists
+        .iter()
+        .skip(1)
+        .position(|p| p.name.eq_ignore_ascii_case(trimmed))
+        .map(|i| i + 1);
+
+    let new_playlist = ipod_db::IpodPlaylist {
+        name: trimmed.to_string(),
+        is_master: false,
+        track_ids: resolved_dbids.clone(),
+    };
+    let replaced = match position {
+        Some(idx) => {
+            db.playlists[idx] = new_playlist;
+            true
+        }
+        None => {
+            db.playlists.push(new_playlist);
+            false
+        }
+    };
+
+    Ok(super::PlaylistImportSummary {
+        resolved: resolved_dbids.len(),
+        skipped,
+        replaced,
+    })
 }
 
 #[cfg(test)]
@@ -479,5 +566,165 @@ mod tests {
         // same scale, so DeviceEntry.rating is unit-consistent across both
         // backends).
         assert_eq!(entries[0].rating, Some(80));
+    }
+
+    fn track_named(artist: &str, album: &str, title: &str) -> ipod_db::IpodTrack {
+        let mut t = ipod_db::IpodTrack::default();
+        t.title = title.into();
+        t.artist = artist.into();
+        t.album = album.into();
+        t.ipod_path = format!(":iPod_Control:Music:F00:{}.mp3", title);
+        t.filetype = 0x4d503320;
+        t.file_size = 100;
+        t
+    }
+
+    #[test]
+    fn upsert_playlist_appends_new_with_resolved_dbids() {
+        let mut db = ipod_db::IpodDatabase::new(PathBuf::from("/mnt/IPOD"));
+        let dbid_a = db.add_track(track_named("A", "X", "T1"));
+        let dbid_b = db.add_track(track_named("B", "Y", "T2"));
+
+        let summary = upsert_playlist(
+            &mut db,
+            "Faves",
+            &[
+                ("a".into(), "x".into(), "t1".into()),
+                ("B".into(), "Y".into(), "T2".into()),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(summary.resolved, 2);
+        assert_eq!(summary.skipped, 0);
+        assert!(!summary.replaced);
+
+        // Master at index 0 is intact, user playlist at index 1.
+        assert!(db.playlists[0].is_master);
+        assert_eq!(db.playlists.len(), 2);
+        let pl = &db.playlists[1];
+        assert_eq!(pl.name, "Faves");
+        assert!(!pl.is_master);
+        assert_eq!(pl.track_ids, vec![dbid_a, dbid_b]);
+    }
+
+    #[test]
+    fn upsert_playlist_replaces_existing_by_name() {
+        let mut db = ipod_db::IpodDatabase::new(PathBuf::from("/mnt/IPOD"));
+        let dbid_a = db.add_track(track_named("A", "X", "T1"));
+        let dbid_b = db.add_track(track_named("B", "Y", "T2"));
+
+        upsert_playlist(&mut db, "Faves", &[("A".into(), "X".into(), "T1".into())]).unwrap();
+        let summary = upsert_playlist(
+            &mut db,
+            "Faves",
+            &[
+                ("B".into(), "Y".into(), "T2".into()),
+                ("A".into(), "X".into(), "T1".into()),
+            ],
+        )
+        .unwrap();
+
+        assert!(summary.replaced);
+        assert_eq!(db.playlists.len(), 2, "no second playlist created");
+        let pl = &db.playlists[1];
+        assert_eq!(pl.name, "Faves");
+        assert_eq!(pl.track_ids, vec![dbid_b, dbid_a], "order honored");
+    }
+
+    #[test]
+    fn upsert_playlist_replaces_case_insensitively() {
+        // Track resolution is case-insensitive, so the by-name replace
+        // lookup must match. Otherwise the user creates a duplicate
+        // playlist by varying capitalisation.
+        let mut db = ipod_db::IpodDatabase::new(PathBuf::from("/mnt/IPOD"));
+        let dbid_a = db.add_track(track_named("A", "X", "T1"));
+
+        upsert_playlist(&mut db, "Workout", &[("A".into(), "X".into(), "T1".into())]).unwrap();
+        let summary =
+            upsert_playlist(&mut db, "workout", &[("A".into(), "X".into(), "T1".into())]).unwrap();
+
+        assert!(
+            summary.replaced,
+            "case-only difference must replace, not append"
+        );
+        assert_eq!(
+            db.playlists.len(),
+            2,
+            "still only master + one user playlist"
+        );
+        // The new name supplied by the latest call is the one stored — the
+        // user's intent was the more recent capitalisation.
+        assert_eq!(db.playlists[1].name, "workout");
+        assert_eq!(db.playlists[1].track_ids, vec![dbid_a]);
+    }
+
+    #[test]
+    fn upsert_playlist_skips_unresolvable_tuples() {
+        let mut db = ipod_db::IpodDatabase::new(PathBuf::from("/mnt/IPOD"));
+        let dbid_a = db.add_track(track_named("A", "X", "T1"));
+
+        let summary = upsert_playlist(
+            &mut db,
+            "Mixed",
+            &[
+                ("A".into(), "X".into(), "T1".into()),
+                ("Ghost".into(), "Album".into(), "Missing".into()),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(summary.resolved, 1);
+        assert_eq!(summary.skipped, 1);
+        assert_eq!(db.playlists[1].track_ids, vec![dbid_a]);
+    }
+
+    #[test]
+    fn upsert_playlist_dedupes_repeated_tuples() {
+        let mut db = ipod_db::IpodDatabase::new(PathBuf::from("/mnt/IPOD"));
+        let dbid_a = db.add_track(track_named("A", "X", "T1"));
+
+        let summary = upsert_playlist(
+            &mut db,
+            "Dup",
+            &[
+                ("A".into(), "X".into(), "T1".into()),
+                ("A".into(), "X".into(), "T1".into()),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(summary.resolved, 1, "deduped to one resolved");
+        assert_eq!(db.playlists[1].track_ids, vec![dbid_a]);
+    }
+
+    #[test]
+    fn upsert_playlist_rejects_empty_name() {
+        let mut db = ipod_db::IpodDatabase::new(PathBuf::from("/mnt/IPOD"));
+        assert!(upsert_playlist(&mut db, "  ", &[]).is_err());
+    }
+
+    #[test]
+    fn upsert_playlist_rejects_master_alias() {
+        let mut db = ipod_db::IpodDatabase::new(PathBuf::from("/mnt/IPOD"));
+        assert!(upsert_playlist(&mut db, "Library", &[]).is_err());
+        assert!(upsert_playlist(&mut db, "MASTER", &[]).is_err());
+    }
+
+    #[test]
+    fn upsert_playlist_master_remains_at_index_zero_with_all_tracks() {
+        // The iPod firmware requires the master playlist (index 0, is_master)
+        // to enumerate every track in the library. add_track maintains this
+        // automatically; this test pins the invariant against future
+        // refactors of the playlist insertion path.
+        let mut db = ipod_db::IpodDatabase::new(PathBuf::from("/mnt/IPOD"));
+        let dbid_a = db.add_track(track_named("A", "X", "T1"));
+        let dbid_b = db.add_track(track_named("B", "Y", "T2"));
+        upsert_playlist(&mut db, "Faves", &[("A".into(), "X".into(), "T1".into())]).unwrap();
+
+        let master = &db.playlists[0];
+        assert!(master.is_master);
+        assert!(master.track_ids.contains(&dbid_a));
+        assert!(master.track_ids.contains(&dbid_b));
     }
 }

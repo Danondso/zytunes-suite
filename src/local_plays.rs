@@ -103,6 +103,13 @@ impl LocalPlays {
         self.tracks.get(&track_id)
     }
 
+    /// Iterate over every `(track_id, plays)` pair. Used by the recommender
+    /// to rank seeds by play count / recency without needing internal
+    /// access to the storage map.
+    pub fn entries(&self) -> impl Iterator<Item = (u64, &TrackPlays)> + '_ {
+        self.tracks.iter().map(|(id, p)| (*id, p))
+    }
+
     pub fn len(&self) -> usize {
         self.tracks.len()
     }
@@ -409,6 +416,30 @@ mod tests {
         assert_eq!(entry.skip_count, 1);
         assert_eq!(entry.play_count, 0);
         assert_eq!(entry.last_played_at_ms, 0);
+    }
+
+    #[test]
+    fn entries_yields_every_recorded_track() {
+        // The recommender ranks seeds via this iterator (not by `get`),
+        // so an empty store must yield empty and a populated store must
+        // surface every (id, plays) pair regardless of insertion order.
+        let mut p = LocalPlays::new();
+        assert_eq!(p.entries().count(), 0, "empty store yields no entries");
+
+        p.record_play(1, 1_000);
+        p.record_play(2, 2_000);
+        p.record_play(2, 3_000);
+        p.record_skip(7);
+
+        let mut collected: Vec<(u64, u32, u32, u64)> = p
+            .entries()
+            .map(|(id, t)| (id, t.play_count, t.skip_count, t.last_played_at_ms))
+            .collect();
+        collected.sort_by_key(|x| x.0);
+        assert_eq!(
+            collected,
+            vec![(1, 1, 0, 1_000), (2, 2, 0, 3_000), (7, 0, 1, 0)],
+        );
     }
 
     // -- merge_device_observation: the meat of the aggregation algorithm --

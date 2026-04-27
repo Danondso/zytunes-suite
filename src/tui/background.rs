@@ -50,6 +50,14 @@ pub enum BgCommand {
     /// Append more items onto an already-running sync; dropped if no sync is active.
     AppendSyncQueue(Vec<SyncItem>),
     RemoveFromDevice(Vec<(String, u64)>),
+    /// Create or replace a playlist on the device. Each tuple is
+    /// `(artist, album, title)` referencing a library-side track that the
+    /// device backend resolves to its native ID scheme. Run after the file
+    /// sync finishes so the resolution sees the freshly-uploaded tracks.
+    ImportPlaylist {
+        name: String,
+        track_keys: Vec<(String, String, String)>,
+    },
     SyncPhotos {
         dir: String,
     },
@@ -160,6 +168,14 @@ pub enum BgEvent {
     AlbumArtLoaded {
         key: String,
         image: Option<image::DynamicImage>,
+    },
+    /// A `BgCommand::ImportPlaylist` finished. `summary` is `Ok` with the
+    /// resolved/skipped/replaced counts on success, `Err` with a
+    /// human-readable message on failure (most common: backend doesn't
+    /// support playlist sync, e.g. the Zune today).
+    PlaylistImported {
+        name: String,
+        summary: Result<zytunes::mtp::PlaylistImportSummary, String>,
     },
 }
 
@@ -1117,6 +1133,20 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                         extract_album_art_for_cache(&artist, &album, &paths, art_cache.as_ref())
                     });
                     let _ = event_tx.send(BgEvent::AlbumArtLoaded { key, image });
+                }
+                BgCommand::ImportPlaylist { name, track_keys } => {
+                    if let Some(ref mut s) = session {
+                        let result = s.import_playlist(&name, &track_keys);
+                        let _ = event_tx.send(BgEvent::PlaylistImported {
+                            name,
+                            summary: result,
+                        });
+                    } else {
+                        let _ = event_tx.send(BgEvent::PlaylistImported {
+                            name,
+                            summary: Err("No active device session".into()),
+                        });
+                    }
                 }
             }
         }

@@ -48,6 +48,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create app state.
     let mut app = App::new();
     app.load_local_plays_from_disk();
+    app.load_playlists_from_disk();
+    app.load_listen_log_from_disk();
     app.loading_library = true;
 
     if let Some(ref theme_name) = cfg.theme {

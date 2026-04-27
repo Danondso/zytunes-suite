@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.94%2B-orange.svg)](https://www.rust-lang.org)
 
-A Rust tool for syncing music (and photos/videos on Zune) to a Microsoft Zune 30 or classic iPod from macOS and Linux.
+A Rust tool for syncing music (and photos/videos on Zune) to a Microsoft Zune or classic iPod from macOS and Linux.
 
 ## Status
 
@@ -12,7 +12,7 @@ A Rust tool for syncing music (and photos/videos on Zune) to a Microsoft Zune 30
 
 ## What works
 
-- **Multi-device detection** — scans for both Microsoft Zune 30 (VID `0x045e`) and classic iPod via `rusb` plus mounted-volume probing. CLI and TUI iterate registered backends and open a session against whichever device is connected
+- **Multi-device detection** — scans for both Microsoft Zune (VID `0x045e`, all classic models + Zune HD) and classic iPod via `rusb` plus mounted-volume probing. CLI and TUI iterate registered backends and open a session against whichever device is connected
 - **MTPZ authentication (Zune)** — the Zune requires Microsoft's encrypted MTPZ handshake before exposing storage. Handled automatically via the native IOKit backend (`zune-mtp`)
 - **iPod Classic sync** — full music sync via a pure-Rust `ipod-db` crate. iTunesDB parser/writer with hash58 signing, ArtworkDB + ITHMB thumbnails, from-scratch libgpod-ported mhit writer for new tracks, and raw blob replay for lossless round-trip of existing tracks
 - **File listing** — `ls [path]` enumerates storage and prints the device's directory tree (device browser in the TUI shows human-readable `Artist/Album/Title.ext` paths on the iPod instead of the hashed F-dir filenames)
@@ -20,7 +20,7 @@ A Rust tool for syncing music (and photos/videos on Zune) to a Microsoft Zune 30
 - **Music removal** — `rm <device-paths...>` removes files/folders from the device (leaf-first for directories)
 - **Music library sync** — `sync <type> <name>` syncs tracks by artist, album, or track name by scanning a local music folder. Detects duplicates already on device and skips them. The TUI's queued sync also filters out tracks already on the device before dispatching the sync
 - **Photo & video sync (Zune)** — `photo-sync [dir]` and `video-sync [dir]` push images and videos to the Zune's Pictures/Video stores. Videos are transcoded to WMV2/WMAv2 via ffmpeg; photos are JPEG-normalised
-- **Auto-transcoding (audio)** — non-native formats (FLAC, OGG, WAV, M4A, OPUS, ALAC, AIFF) are transcoded to MP3 via pure-Rust symphonia + LAME, with album art resized to 200x200 (Zune 30 constraint). The M4A/ALAC path trims trailing silence leaked by symphonia's unapplied `elst` edit-list atoms
+- **Auto-transcoding (audio)** — non-native formats (FLAC, OGG, WAV, M4A, OPUS, ALAC, AIFF) are transcoded to MP3 via pure-Rust symphonia + LAME, with album art resized to 200x200 (Zune constraint). The M4A/ALAC path trims trailing silence leaked by symphonia's unapplied `elst` edit-list atoms
 - **MP3 passthrough** — native formats (MP3, WMA, AAC) skip transcoding entirely
 - **Library browsing** — `library [query]` browses/searches your music library
 - **Directory scanning** — point zytunes at a music folder. It reads tags via lofty (FLAC, M4A, OGG, WAV, MP3, etc.) and infers metadata from the directory structure (`Artist/Album/Track.ext`) for untagged files. Set `ZYTUNES_MUSIC_DIR` or add `music_dir` to `~/.config/zytunes/config.toml`
@@ -237,7 +237,7 @@ cargo build
 cargo run
 ```
 
-Connect your Zune 30 via USB, then run the tool.
+Connect your Zune via USB, then run the tool.
 
 ### Debugging
 
@@ -252,13 +252,13 @@ ZYTUNES_DUMP_ART=1 cargo run      # Dump the exact JPEG bytes sent for album art
 
 ### USB architecture
 
-The Zune 30 uses MTPZ — Microsoft's encrypted extension to MTP — which requires a cryptographic handshake before the device exposes any storage. This handshake involves data-out USB operations (host sending data to device) that are incompatible with libusb on macOS.
+The Zune uses MTPZ — Microsoft's encrypted extension to MTP — which requires a cryptographic handshake before the device exposes any storage. This handshake involves data-out USB operations (host sending data to device) that are incompatible with libusb on macOS.
 
 **The libusb/IOKit gap on macOS:** On macOS, USB communication can go through either:
 - **libusb** (used by the `rusb` Rust crate) — a cross-platform userspace USB library
 - **IOKit** — Apple's native USB framework
 
-The Zune 30's MTPZ data-out operations work correctly through IOKit but fail through libusb. Specifically:
+The Zune's MTPZ data-out operations work correctly through IOKit but fail through libusb. Specifically:
 - Standard MTP operations (GetDeviceInfo, OpenSession, GetStorageIDs) work fine via libusb
 - Data-out operations (SendWMDRMPDAppRequest for the MTPZ certificate exchange) consistently return `GeneralError (0x2002)` via libusb, regardless of payload content
 - The same operations succeed immediately via IOKit
@@ -294,11 +294,11 @@ The `NativeSession` in `src/mtp/native.rs` wraps `zune-mtp` and implements the `
 | Music organization | Music/{Artist}/{Album}/{Track} hierarchy |
 | MTP version | 1.0 with 85 supported operations |
 
-## Zune 30 MTP error codes
+## Zune MTP error codes
 
 Error codes encountered during development and what they mean in the Zune context:
 
-| Code | Name | Meaning on Zune 30 |
+| Code | Name | Meaning on Zune |
 |---|---|---|
 | `0x2001` | OK | Success |
 | `0x2002` | GeneralError | Operation rejected. On macOS with libusb: returned for ALL data-out MTP operations (the IOKit gap). Also returned when trying to `rm` a non-empty folder. |
@@ -306,7 +306,7 @@ Error codes encountered during development and what they mean in the Zune contex
 | `0x2008` | InvalidStorageID | Storage ID doesn't exist (storages are hidden until MTPZ auth completes) |
 | `0x200f` | SessionNotOpen | Returned by EnableTrustedFilesOperations when MTPZ confirmation step was not accepted by the device |
 | `0x2013` | StoreNotAvailable | Returned for GetObjectHandles on all-storages before MTPZ authentication |
-| `0x2016` | InvalidCodeFormat | File format not supported by device. The Zune 30 rejects FLAC, OGG, WAV, OPUS. Only MP3, WMA, and AAC are accepted. |
+| `0x2016` | InvalidCodeFormat | File format not supported by device. The Zune rejects FLAC, OGG, WAV, OPUS. Only MP3, WMA, and AAC are accepted. |
 | `0xa803` | InvalidObjectPropValue | A metadata property value was rejected. Triggered by embedded album art larger than ~200x200px. Resizing art to 200x200 JPEG before import fixes this. |
 | `0x201d` | InvalidParameter | Returned by OpenSession when a session is already open. The Zune auto-opens a session on USB connect, so this is normal. |
 

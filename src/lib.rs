@@ -10,10 +10,15 @@ pub mod cache;
 pub mod device;
 pub mod dirlib;
 pub mod fingerprint;
+pub mod genre_norm;
 pub mod library;
+pub mod listen_log;
 pub mod local_plays;
 pub mod mtp;
 pub mod paths;
+pub mod playlist;
+pub mod playlist_store;
+pub mod recommender;
 
 #[cfg(test)]
 mod test_audio;
@@ -136,7 +141,7 @@ pub fn load_library_with_options(
         .map(|l| Box::new(l) as Box<dyn MusicLibrary + Send>)
 }
 
-/// Formats the Zune 30 natively supports (no transcoding needed).
+/// Formats the Zune natively supports (no transcoding needed).
 pub const ZUNE_NATIVE_FORMATS: &[&str] = &["mp3", "wma", "aac"];
 
 /// Connect to a supported device using the backend registry.
@@ -214,7 +219,7 @@ pub fn strip_track_number(s: &str) -> &str {
     }
 }
 
-/// Check if a video file needs transcoding for the Zune 30 (only WMV is native).
+/// Check if a video file needs transcoding for the Zune (only WMV is native).
 pub fn needs_video_transcoding(path: &str) -> bool {
     let ext = Path::new(path)
         .extension()
@@ -235,9 +240,9 @@ pub fn check_ffmpeg_available() -> bool {
         .unwrap_or(false)
 }
 
-/// Transcode a video file to WMV format for the Zune 30 via ffmpeg.
+/// Transcode a video file to WMV format for the Zune via ffmpeg.
 ///
-/// Uses wmv2 video codec at 320x240 and wmav2 audio — the Zune 30's native
+/// Uses wmv2 video codec at 320x240 and wmav2 audio — the Zune's native
 /// playback format. Returns the path to the output WMV file.
 pub fn transcode_to_wmv(input: &str, temp_dir: &Path) -> Result<String, String> {
     std::fs::create_dir_all(temp_dir).map_err(|e| format!("Cannot create temp dir: {e}"))?;
@@ -875,7 +880,7 @@ fn collect_files_recursive_with_logger(
     }
 }
 
-/// Resize a photo to fit within the Zune 30 screen (240x320) and encode as JPEG.
+/// Resize a photo to fit within the Zune screen (240x320) and encode as JPEG.
 /// Preserves aspect ratio using Lanczos3 downsampling.
 pub fn resize_photo_for_zune(path: &str) -> Result<Vec<u8>, String> {
     let img = image::open(path).map_err(|e| format!("Cannot open image {}: {}", path, e))?;

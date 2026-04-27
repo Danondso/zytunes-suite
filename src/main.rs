@@ -104,7 +104,7 @@ fn run(args: &[String]) -> Result<(), String> {
         }
         "probe" => cmd_probe(&args[2..]),
         "help" | "--help" | "-h" => {
-            println!("zytunes v0.3.0 — sync music to a Zune 30\n");
+            println!("zytunes — sync music to a Zune or iPod Classic\n");
             println!("Usage: zytunes <command> [args...]\n");
             println!("Commands:");
             println!("  ls [path]              List device contents (default: /)");
@@ -121,7 +121,7 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("  sync track <name>      Sync a single track by name");
             println!("\nUnsupported formats (FLAC, OGG, WAV, M4A, OPUS, etc.)");
             println!("are auto-transcoded to MP3 with album art.");
-            println!("\nPhotos are resized to fit the Zune 30 screen (240x320).");
+            println!("\nPhotos are resized to fit the Zune screen (240x320).");
             println!("\nSet ZYTUNES_MUSIC_DIR or music_dir in ~/.config/zytunes/config.toml");
             println!("to point at your music folder.");
             println!("\nExamples:");

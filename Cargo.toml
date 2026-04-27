@@ -6,7 +6,7 @@ name = "zytunes"
 version = "2.1.0-alpha"
 edition = "2021"
 rust-version = "1.95"
-description = "A CLI tool for syncing music to a Microsoft Zune 30 on macOS"
+description = "A CLI + TUI for syncing music to Microsoft Zune and Apple iPod Classic on macOS and Linux"
 license = "MIT"
 
 [dependencies]

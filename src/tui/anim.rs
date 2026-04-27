@@ -189,7 +189,7 @@ pub fn connection_screen_lines(frame: usize) -> (&'static str, &'static str) {
                 2 => "Found..",
                 _ => "Found...",
             };
-            (dots, "Zune 30")
+            (dots, "Zune")
         }
         2 => {
             let dots = match (sub / 5) % 4 {

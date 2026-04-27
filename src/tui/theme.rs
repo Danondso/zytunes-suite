@@ -133,6 +133,28 @@ impl Theme {
             .border_type(self.border_type)
     }
 
+    /// Background + foreground style for modal/overlay surfaces. Pairs
+    /// `sidebar_bg` with `sidebar_text` because every theme is already
+    /// hand-tuned to keep that pair high-contrast — reusing it spares us
+    /// adding a new theme field. The "elevated surface" feel falls out of
+    /// the fact that `sidebar_bg` is darker (or visibly distinct) from
+    /// `main_bg` on every preset.
+    pub fn modal(&self) -> Style {
+        Style::default().bg(self.sidebar_bg).fg(self.sidebar_text)
+    }
+
+    /// Dim text style for hint lines *inside* a modal. Carries the modal
+    /// background so the foreground sits on the same surface as the rest of
+    /// the modal — the bare `t.dim()` style omits a background and
+    /// effectively renders against the terminal default, which is what
+    /// caused the Newport Lights contrast complaint.
+    pub fn modal_dim(&self) -> Style {
+        Style::default()
+            .bg(self.sidebar_bg)
+            .fg(self.dim_text)
+            .add_modifier(Self::modifier(self.dim_modifier))
+    }
+
     /// The most "active" accent color for the theme, used for pulse animations.
     pub fn accent_color(&self) -> Color {
         self.progress_bar
@@ -589,7 +611,7 @@ pub const ZUNE_ORIGINAL: Theme = Theme {
     sidebar_text: Color::Rgb(235, 235, 235),
     selection_bg: Color::Rgb(232, 0, 164),
     selection_text: Color::Rgb(255, 255, 255),
-    // Warm chocolate matching the original Zune 30 brown hardware finish.
+    // Warm chocolate matching the original Zune brown hardware finish.
     main_bg: Color::Rgb(92, 51, 23),
     alt_row_bg: Color::Rgb(77, 43, 19),
     // Warm tan so the border reads against the brown main_bg; the old

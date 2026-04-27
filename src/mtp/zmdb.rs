@@ -1,6 +1,6 @@
 //! ZMDB (Zune Metadata Database) parser.
 //!
-//! The Zune 30 stores its media library index in a proprietary binary format
+//! The Zune stores its media library index in a proprietary binary format
 //! called ZMDB, retrievable via vendor MTP operation 0x9217 (param=1).
 //! This returns the entire device library (~700KB) in a single USB transfer,
 //! replacing the need to recursively walk MTP object handles.

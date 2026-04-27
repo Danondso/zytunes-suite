@@ -10,8 +10,9 @@ const MICROSOFT_VENDOR_ID: u16 = 0x045e;
 
 /// Known Zune product IDs.
 ///
-/// The Zune 30 has appeared under multiple product IDs depending on firmware
-/// version and USB mode. This list covers known values; more may exist.
+/// The Zune classic family has appeared under multiple product IDs depending
+/// on firmware version and USB mode. This list covers known values; more may
+/// exist. Zune HD (0x063e) is a separate platform.
 const ZUNE_PRODUCT_IDS: &[(u16, &str)] = &[
     (0x0710, "Zune (media mode)"),
     (0x0711, "Zune (firmware update mode)"),

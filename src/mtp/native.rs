@@ -34,6 +34,9 @@ const FORMAT_WMA: u16 = 0xB901;
 const FORMAT_AAC: u16 = 0xB903;
 const FORMAT_ARTIST: u16 = 0xB218;
 const FORMAT_ABSTRACT_AUDIO_ALBUM: u16 = 0xBA03;
+/// MTP format code for `AbstractAudioVideoPlaylist` — the Zune's playlist
+/// object format. See `docs/zune-playlist-research.md` §1.
+const FORMAT_ABSTRACT_AUDIO_VIDEO_PLAYLIST: u16 = 0xBA05;
 const FORMAT_EXIF_JPEG: u16 = 0x3801;
 const FORMAT_WMV: u16 = 0xB981;
 
@@ -357,6 +360,20 @@ pub struct NativeSession {
     /// session too fragile to keep calling SetObjectPropValue, and each
     /// retry costs a ~45s ReadPipe timeout.
     art_disabled: bool,
+    /// Session-scoped `(artist, album, title) → object_handle` map populated
+    /// by `import_track` at upload time. `import_playlist` consults this
+    /// first so freshly-synced tracks resolve to real handles without
+    /// waiting for ZMDB to surface them. Lowercase keys for case-insensitive
+    /// match against the playlist's track tuples.
+    ///
+    /// Why session-scoped and not persisted: ZMDB and the on-disk track
+    /// cache normalise to "Artist/Album/Title", but the on-disk cache's
+    /// post-`import_track` append uses the audio file's *filename* as the
+    /// third segment. That mismatch means cache restoration via name
+    /// matching can't repair freshly-uploaded handles after a reconnect.
+    /// Caching directly on the import tuple sidesteps the whole name-format
+    /// dance for the lifetime of the connection.
+    recent_imports: HashMap<(String, String, String), u32>,
 }
 
 impl NativeSession {
@@ -503,6 +520,7 @@ impl NativeSession {
             firmware_version,
             zmdb_video_cache: None,
             art_disabled: false,
+            recent_imports: HashMap::new(),
         })
     }
 
@@ -1175,6 +1193,25 @@ impl DeviceSession for NativeSession {
         };
         self.cache.append(&new_entry);
 
+        // Record the (artist, album, title) → handle mapping so a same-session
+        // playlist push can resolve freshly-uploaded tracks without going
+        // through ZMDB (which returns object_id=0 for them).
+        self.recent_imports.insert(
+            (
+                artist.to_lowercase(),
+                album.to_lowercase(),
+                title.to_lowercase(),
+            ),
+            track_id,
+        );
+        self.log_msg(&format!(
+            "  recent_imports: cached handle 0x{track_id:08x} for ({}/{}/{}) — total {} entries",
+            artist,
+            album,
+            title,
+            self.recent_imports.len(),
+        ));
+
         Ok(track_id as u64)
     }
 
@@ -1462,6 +1499,235 @@ impl DeviceSession for NativeSession {
         // Fallback: scan /Videos via MTP handle walk.
         self.log_msg("No ZMDB video data, scanning /Videos...");
         self.collect_all_tracks("/Videos")
+    }
+
+    /// Push a playlist to the Zune over MTP. See
+    /// `docs/zune-playlist-research.md` for the protocol research; the
+    /// flow follows libmtp's `create_new_abstract_list`.
+    ///
+    /// 1. Walk the device's track index to build a `(artist, album,
+    ///    title) → object_handle` map. Tuples that don't resolve are
+    ///    skipped (counted as `skipped` in the summary).
+    /// 2. If a playlist with the same name already exists at the
+    ///    storage root, capture its handle so we can replace in-place
+    ///    via `SetObjectReferences` (libmtp's `update_abstract_list`
+    ///    pattern). Otherwise:
+    ///    - `SendObjectPropList(format=0xBA05, parent=0, size=0,
+    ///      props=[ObjectFileName, Name])` — create a zero-byte
+    ///      playlist object.
+    ///    - `SendObject(&[])` — empty body. The device renders the
+    ///      playlist from references, not the body.
+    /// 3. `SetObjectReferences(playlist_handle, &member_handles)` —
+    ///    attach the resolved track handles in playlist order.
+    ///
+    /// Capability-gates the prop set on
+    /// `get_object_props_supported(0xBA05)` so firmware that doesn't
+    /// advertise the standard props (Zune HD reports a richer set than
+    /// the Zune 30 v1.4) doesn't trip on a write that fails at
+    /// `Get_Object_Prop_Desc`.
+    ///
+    /// Falls back to `parent = music_folder` if `parent = 0` is
+    /// rejected, mirroring libmtp's `default_music_folder` fallback.
+    fn import_playlist(
+        &mut self,
+        name: &str,
+        track_keys: &[(String, String, String)],
+    ) -> Result<super::PlaylistImportSummary, String> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err("Playlist name cannot be empty".into());
+        }
+
+        // Step 0: capability check — firmware-gated.
+        //
+        // v1.4 firmware silently drops `GetObjectPropsSupported(0xBA05)`:
+        // the device never replies, our 30s ReadPipe timeout fires, and
+        // the bulk pipe is left in a half-response state that requires a
+        // physical replug. The `mtp-probe playlist-push` binary discovered
+        // this empirically (see its `--probe-caps` gate at
+        // tools/mtp-probe/src/playlist_push.rs and project memory entry
+        // `project_v14_playcount_via_getobjectproplist`). The probe's
+        // workaround: skip the query on v1.4 and just attempt the create —
+        // SendObjectPropList(0xBA05) with [ObjectFileName, Name] is known
+        // to work on v1.4 hw (validated 2026-04-26) regardless of what
+        // the cap query did or didn't say.
+        //
+        // Firmware 3.0+ handles the query fine, so we still run it there
+        // for the diagnostic log line.
+        if self.supports_modern_vendor_ops() {
+            match self
+                .session
+                .get_object_props_supported(FORMAT_ABSTRACT_AUDIO_VIDEO_PLAYLIST)
+            {
+                Ok(supported) => {
+                    let has_filename = supported.contains(&PROP_OBJECT_FILENAME);
+                    let has_name = supported.contains(&PROP_NAME);
+                    if !has_filename || !has_name {
+                        self.log_msg(&format!(
+                            "warn: Zune doesn't advertise both required 0xBA05 props \
+                             (filename: {has_filename}, name: {has_name}); attempting anyway",
+                        ));
+                    }
+                }
+                Err(e) => {
+                    self.log_msg(&format!(
+                        "warn: GetObjectPropsSupported(0xBA05) failed ({e}); attempting create anyway"
+                    ));
+                }
+            }
+        } else {
+            self.log_msg("Skipping GetObjectPropsSupported(0xBA05) — wedges v1.4 firmware");
+        }
+
+        // Step 1: resolve (artist, album, title) tuples to MTP object
+        // handles. Two-tier lookup:
+        //   1. `recent_imports` — same-session uploads, populated by
+        //      `import_track`. Authoritative because the handle came
+        //      straight from `SendObjectPropList`.
+        //   2. `collect_all_tracks` — ZMDB + on-disk track cache. Covers
+        //      tracks already on the device from a previous connection.
+        //
+        // Order matters: ZMDB returns `object_id = 0` for entries it
+        // synthesises from metadata, and the on-disk cache's name format
+        // ("Artist/Album/filename.ext") doesn't match ZMDB's
+        // ("Artist/Album/Title"), so cache-driven name restoration can
+        // miss freshly-uploaded tracks across a reconnect. The recent_imports
+        // tier sidesteps both issues for any track the user just synced.
+        let device_tracks = self.collect_all_tracks("/Music")?;
+        let resolved = resolve_playlist_handles(track_keys, &self.recent_imports, &device_tracks);
+        let PlaylistResolveResult {
+            member_handles,
+            skipped,
+            from_recent,
+        } = resolved;
+        // Always log the resolver outcome — the invisible-playlist failure
+        // mode is "0 resolved, all skipped", which is silent without this.
+        self.log_msg(&format!(
+            "Playlist resolver: {} resolved ({} from same-session, {} from device), {} skipped of {} tuples",
+            member_handles.len(),
+            from_recent,
+            member_handles.len().saturating_sub(from_recent),
+            skipped,
+            track_keys.len(),
+        ));
+        if member_handles.is_empty() && !track_keys.is_empty() {
+            // Surface the first few unresolvable tuples so the user can see
+            // *why* nothing matched (typo, missing-on-device, etc).
+            let sample: Vec<String> = track_keys
+                .iter()
+                .take(3)
+                .map(|(a, b, t)| format!("\"{a}\" / \"{b}\" / \"{t}\""))
+                .collect();
+            self.log_msg(&format!(
+                "Playlist resolver: no handles matched. recent_imports has {} entries, device has {} tracks. \
+                 Sample unresolved keys: {}",
+                self.recent_imports.len(),
+                device_tracks.len(),
+                sample.join(" | "),
+            ));
+        }
+
+        // Step 2: locate or create the playlist object.
+        let lib = self.lib()?;
+        let music_folder = lib.music_folder;
+
+        // Compute the on-device filename once — used both for matching
+        // existing playlists and (in the create branch below) for the
+        // ObjectFileName property. Match needs `.zpl`-suffixed because
+        // that's what we store on the device; comparing the bare trimmed
+        // name would never match an existing entry and we'd accumulate a
+        // duplicate `<name>.zpl` per sync.
+        let filename = if trimmed.to_lowercase().ends_with(".zpl") {
+            trimmed.to_string()
+        } else {
+            format!("{trimmed}.zpl")
+        };
+
+        // Try to find an existing 0xBA05 with the same filename at storage
+        // root — that's where we put new ones below. Scoping the search
+        // to the storage root keeps it cheap; the Zune tends to keep
+        // playlists there per libmtp conventions. Match is
+        // case-insensitive: filesystem layer treats `Roadtrip.zpl` and
+        // `roadtrip.zpl` as the same file on the device.
+        let existing_handle = self
+            .session
+            .get_object_handles(self.storage_id, MTP_ROOT)
+            .ok()
+            .and_then(|handles| {
+                handles.into_iter().find(|h| {
+                    self.session
+                        .get_object_info(*h)
+                        .ok()
+                        .map(|info| {
+                            info.object_format == FORMAT_ABSTRACT_AUDIO_VIDEO_PLAYLIST
+                                && info.filename.eq_ignore_ascii_case(&filename)
+                        })
+                        .unwrap_or(false)
+                })
+            });
+
+        let (playlist_handle, replaced) = match existing_handle {
+            Some(h) => {
+                self.log_msg(&format!(
+                    "Updating existing playlist \"{trimmed}\" at handle 0x{h:08x}"
+                ));
+                (h, true)
+            }
+            None => {
+                let mut props = PropListBuilder::new();
+                props
+                    .add_string(PROP_OBJECT_FILENAME, &filename)
+                    .add_string(PROP_NAME, trimmed);
+                let prop_list = props.build();
+
+                // libmtp ships parent=0 (let the device decide), with a
+                // documented fallback to `default_music_folder` on
+                // `InvalidParent`. Mirror that.
+                let create = self.session.send_object_prop_list(
+                    self.storage_id,
+                    0,
+                    FORMAT_ABSTRACT_AUDIO_VIDEO_PLAYLIST,
+                    0,
+                    &prop_list,
+                );
+                let (_, _, handle) = match create {
+                    Ok(triple) => triple,
+                    Err(_) => {
+                        self.log_msg("parent=0 rejected; retrying with music folder");
+                        self.session
+                            .send_object_prop_list(
+                                self.storage_id,
+                                music_folder,
+                                FORMAT_ABSTRACT_AUDIO_VIDEO_PLAYLIST,
+                                0,
+                                &prop_list,
+                            )
+                            .map_err(|e| format!("SendObjectPropList(0xBA05) failed: {e}"))?
+                    }
+                };
+
+                // Empty body. The Zune ignores the payload — references
+                // are authoritative — but the create handshake requires
+                // a SendObject to commit the proplist.
+                self.session
+                    .send_object(&[])
+                    .map_err(|e| format!("SendObject(empty) failed: {e}"))?;
+
+                (handle, false)
+            }
+        };
+
+        // Step 3: attach references. Order matters — that becomes the
+        // on-device playlist order.
+        self.session
+            .set_object_references(playlist_handle, &member_handles)
+            .map_err(|e| format!("SetObjectReferences failed: {e}"))?;
+
+        Ok(super::PlaylistImportSummary {
+            resolved: member_handles.len(),
+            skipped,
+            replaced,
+        })
     }
 }
 
@@ -2104,6 +2370,89 @@ fn write_mtp_string(buf: &mut Vec<u8>, s: &str) {
 /// dot-separated segments plus an optional trailing `-BUILD`. We only look
 /// at the first two segments; leading zeros are stripped. Returns `None`
 /// for anything we can't confidently parse (unknown devices).
+/// Result of resolving a playlist's `(artist, album, title)` tuples to MTP
+/// object handles. `from_recent` is informational — used for logging only.
+struct PlaylistResolveResult {
+    member_handles: Vec<u32>,
+    skipped: usize,
+    from_recent: usize,
+}
+
+/// Resolve playlist track tuples to MTP object handles.
+///
+/// Lookup order:
+///   1. `recent_imports` — handles returned by `SendObjectPropList` during
+///      same-session uploads. Authoritative.
+///   2. `device_tracks` — entries from `collect_all_tracks` (ZMDB or
+///      recursive walk). Filters out `object_id == 0` because ZMDB
+///      synthesises entries without a real handle.
+///
+/// Same-session uploads have to win because ZMDB returns `object_id = 0`
+/// for entries it builds from device metadata, and the cross-session cache
+/// recovery path is name-format-sensitive in ways that break for fresh
+/// uploads. Without this layering the resolver returns an empty handle
+/// list immediately after a sync, and `SetObjectReferences` ships an
+/// empty playlist that the device UI doesn't render.
+///
+/// De-duplicates handles by linear contains check — playlist sizes are in
+/// the tens to low hundreds, so the O(n²) is fine and a HashSet would
+/// lose insertion order.
+fn resolve_playlist_handles(
+    track_keys: &[(String, String, String)],
+    recent_imports: &HashMap<(String, String, String), u32>,
+    device_tracks: &[DeviceEntry],
+) -> PlaylistResolveResult {
+    let mut by_key: HashMap<(String, String, String), u32> =
+        HashMap::with_capacity(device_tracks.len());
+    for entry in device_tracks {
+        if entry.object_id == 0 {
+            continue;
+        }
+        let mut parts = entry.name.splitn(3, '/');
+        let (Some(artist), Some(album), Some(title)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        by_key.insert(
+            (
+                artist.to_lowercase(),
+                album.to_lowercase(),
+                title.to_lowercase(),
+            ),
+            entry.object_id as u32,
+        );
+    }
+
+    let mut member_handles: Vec<u32> = Vec::with_capacity(track_keys.len());
+    let mut skipped = 0usize;
+    let mut from_recent = 0usize;
+    for (artist, album, title) in track_keys {
+        let key = (
+            artist.to_lowercase(),
+            album.to_lowercase(),
+            title.to_lowercase(),
+        );
+        let handle = recent_imports
+            .get(&key)
+            .inspect(|_| from_recent += 1)
+            .or_else(|| by_key.get(&key));
+        match handle {
+            Some(h) => {
+                if !member_handles.contains(h) {
+                    member_handles.push(*h);
+                }
+            }
+            None => skipped += 1,
+        }
+    }
+
+    PlaylistResolveResult {
+        member_handles,
+        skipped,
+        from_recent,
+    }
+}
+
 fn parse_firmware_version(raw: &str) -> Option<(u16, u16)> {
     let head = raw.split('-').next().unwrap_or(raw);
     let mut parts = head.split('.');
@@ -3033,5 +3382,136 @@ mod tests {
         if let Some(p) = cache.cache_path() {
             let _ = std::fs::remove_file(p);
         }
+    }
+
+    fn key(artist: &str, album: &str, title: &str) -> (String, String, String) {
+        (
+            artist.to_lowercase(),
+            album.to_lowercase(),
+            title.to_lowercase(),
+        )
+    }
+
+    #[test]
+    fn resolve_playlist_handles_prefers_recent_imports() {
+        // Regression test for the invisible-playlist bug — when a track was
+        // just uploaded in the same session, ZMDB has no real handle for it
+        // (object_id = 0). recent_imports must win.
+        let mut recent = HashMap::new();
+        recent.insert(key("Artist", "Album", "Fresh Track"), 0xDEAD_BEEF);
+        let device_tracks = vec![DeviceEntry {
+            object_id: 0,
+            name: "Artist/Album/Fresh Track".to_string(),
+            ..Default::default()
+        }];
+        let track_keys = vec![(
+            "Artist".to_string(),
+            "Album".to_string(),
+            "Fresh Track".to_string(),
+        )];
+
+        let r = resolve_playlist_handles(&track_keys, &recent, &device_tracks);
+        assert_eq!(r.member_handles, vec![0xDEAD_BEEF]);
+        assert_eq!(r.skipped, 0);
+        assert_eq!(r.from_recent, 1);
+    }
+
+    #[test]
+    fn resolve_playlist_handles_falls_back_to_device_tracks() {
+        // Already-on-device tracks: recent_imports is empty, but the device
+        // track list (from a prior cache) carries a real object_id.
+        let recent = HashMap::new();
+        let device_tracks = vec![DeviceEntry {
+            object_id: 42,
+            name: "Artist/Album/Old Track".to_string(),
+            ..Default::default()
+        }];
+        let track_keys = vec![(
+            "ARTIST".to_string(), // case-insensitive lookup
+            "album".to_string(),
+            "Old Track".to_string(),
+        )];
+
+        let r = resolve_playlist_handles(&track_keys, &recent, &device_tracks);
+        assert_eq!(r.member_handles, vec![42]);
+        assert_eq!(r.skipped, 0);
+        assert_eq!(r.from_recent, 0);
+    }
+
+    #[test]
+    fn resolve_playlist_handles_skips_unresolvable() {
+        // Tracks that aren't in either tier count as skipped — playlist
+        // still creates with the resolved members, summary surfaces the
+        // gap to the user.
+        let recent = HashMap::new();
+        let device_tracks = vec![];
+        let track_keys = vec![(
+            "Ghost".to_string(),
+            "Phantom".to_string(),
+            "Missing".to_string(),
+        )];
+
+        let r = resolve_playlist_handles(&track_keys, &recent, &device_tracks);
+        assert!(r.member_handles.is_empty());
+        assert_eq!(r.skipped, 1);
+        assert_eq!(r.from_recent, 0);
+    }
+
+    #[test]
+    fn resolve_playlist_handles_filters_zmdb_object_id_zero() {
+        // ZMDB returns object_id=0 for entries it synthesised from device
+        // metadata without a real handle. Those must not pollute by_key —
+        // otherwise we'd ship handle=0 to SetObjectReferences.
+        let recent = HashMap::new();
+        let device_tracks = vec![DeviceEntry {
+            object_id: 0,
+            name: "Artist/Album/Title".to_string(),
+            ..Default::default()
+        }];
+        let track_keys = vec![(
+            "Artist".to_string(),
+            "Album".to_string(),
+            "Title".to_string(),
+        )];
+
+        let r = resolve_playlist_handles(&track_keys, &recent, &device_tracks);
+        assert!(r.member_handles.is_empty());
+        assert_eq!(r.skipped, 1);
+    }
+
+    #[test]
+    fn resolve_playlist_handles_dedupes_repeated_tracks() {
+        // A user adding the same track twice to a playlist should produce a
+        // single handle in member_handles. Order is preserved.
+        let mut recent = HashMap::new();
+        recent.insert(key("A", "Alb", "T1"), 1);
+        recent.insert(key("A", "Alb", "T2"), 2);
+        let track_keys = vec![
+            ("A".to_string(), "Alb".to_string(), "T1".to_string()),
+            ("A".to_string(), "Alb".to_string(), "T2".to_string()),
+            ("A".to_string(), "Alb".to_string(), "T1".to_string()),
+        ];
+
+        let r = resolve_playlist_handles(&track_keys, &recent, &[]);
+        assert_eq!(r.member_handles, vec![1, 2]);
+    }
+
+    #[test]
+    fn resolve_playlist_handles_recent_wins_over_device() {
+        // When both tiers have the same key, recent_imports wins because
+        // it carries the authoritative handle from SendObjectPropList. The
+        // device-tracks map could be stale (e.g. an old cache mismatch).
+        let mut recent = HashMap::new();
+        recent.insert(key("A", "Alb", "T"), 100);
+        let device_tracks = vec![DeviceEntry {
+            object_id: 200,
+            name: "A/Alb/T".to_string(),
+            ..Default::default()
+        }];
+        let track_keys = vec![("A".to_string(), "Alb".to_string(), "T".to_string())];
+
+        let r = resolve_playlist_handles(&track_keys, &recent, &device_tracks);
+        assert_eq!(r.member_handles, vec![100]);
+        assert_eq!(r.from_recent, 1);
     }
 }
