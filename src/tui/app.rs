@@ -1,5 +1,7 @@
 #[path = "app/playlists.rs"]
 mod playlists;
+#[path = "app/scan_phrase.rs"]
+mod scan_phrase;
 
 pub use playlists::{
     device_playlist_sync_enabled, AddToPlaylistPicker, GenerationFormState, PendingPlaylistImport,
@@ -8,7 +10,7 @@ pub use playlists::{
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use image::DynamicImage;
 use throbber_widgets_tui::ThrobberState;
@@ -129,78 +131,6 @@ impl std::fmt::Display for SidebarEntry {
             SidebarEntry::Playlist { name, .. } => f.write_str(name),
         }
     }
-}
-
-/// Which field of a track sample a loading phrase refers to.
-#[derive(Copy, Clone)]
-enum ScanField {
-    Artist,
-    Album,
-    Track,
-}
-
-struct ScanPhrase {
-    prefix: &'static str,
-    field: ScanField,
-}
-
-/// Fun loading-phrase prefixes, cycled while the library is scanning.
-const SCAN_PHRASES: &[ScanPhrase] = &[
-    ScanPhrase {
-        prefix: "Scoping",
-        field: ScanField::Album,
-    },
-    ScanPhrase {
-        prefix: "Scanning",
-        field: ScanField::Artist,
-    },
-    ScanPhrase {
-        prefix: "Creepin' on",
-        field: ScanField::Artist,
-    },
-    ScanPhrase {
-        prefix: "Puttin' a spell on",
-        field: ScanField::Track,
-    },
-    ScanPhrase {
-        prefix: "Vibing with",
-        field: ScanField::Artist,
-    },
-    ScanPhrase {
-        prefix: "Peeking at",
-        field: ScanField::Album,
-    },
-    ScanPhrase {
-        prefix: "Digging through",
-        field: ScanField::Artist,
-    },
-    ScanPhrase {
-        prefix: "Unpacking",
-        field: ScanField::Album,
-    },
-    ScanPhrase {
-        prefix: "Snooping on",
-        field: ScanField::Track,
-    },
-    ScanPhrase {
-        prefix: "Cataloging",
-        field: ScanField::Artist,
-    },
-    ScanPhrase {
-        prefix: "Tipping hat to",
-        field: ScanField::Track,
-    },
-];
-
-/// Minimum time a scan phrase stays on screen before rotating (milliseconds).
-const SCAN_PHRASE_MS: u128 = 900;
-
-/// Cheap entropy source for picking phrases and samples; quality doesn't matter.
-fn quick_random() -> usize {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as usize)
-        .unwrap_or(0)
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -3650,22 +3580,15 @@ impl App {
     fn maybe_rotate_scan_phrase(&mut self) {
         let should_rotate = self
             .scan_phrase_rotated_at
-            .map(|t| t.elapsed().as_millis() >= SCAN_PHRASE_MS)
+            .map(|t| t.elapsed().as_millis() >= scan_phrase::SCAN_PHRASE_MS)
             .unwrap_or(true);
-        if !should_rotate || self.scan_samples.is_empty() {
+        if !should_rotate {
             return;
         }
-
-        let seed = quick_random();
-        let phrase = &SCAN_PHRASES[seed % SCAN_PHRASES.len()];
-        let sample = &self.scan_samples[(seed / 7) % self.scan_samples.len()];
-        let target: &str = match phrase.field {
-            ScanField::Artist => &sample.artist,
-            ScanField::Album => &sample.album,
-            ScanField::Track => &sample.name,
-        };
-        self.scan_phrase = Some(format!("{} {}", phrase.prefix, target));
-        self.scan_phrase_rotated_at = Some(Instant::now());
+        if let Some(phrase) = scan_phrase::pick_phrase(&self.scan_samples) {
+            self.scan_phrase = Some(phrase);
+            self.scan_phrase_rotated_at = Some(Instant::now());
+        }
     }
 
     pub fn tick(&mut self) {
