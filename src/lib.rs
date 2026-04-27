@@ -50,7 +50,7 @@ pub mod testing;
 #[path = "tui/theme.rs"]
 pub mod theme;
 #[cfg(feature = "tui-testing")]
-#[path = "tui/ui.rs"]
+#[path = "tui/ui/mod.rs"]
 pub mod ui;
 
 use device::{
