@@ -153,10 +153,17 @@ pub fn build_ffmpeg_command(
     (PathBuf::from("ffmpeg"), args)
 }
 
-/// Append the codec / quality switch for `fidelity` onto `args`. Shared
-/// between [`build_ffmpeg_command`] (libcdio input) and
+/// Append the codec / quality / output-format switch for `fidelity` onto
+/// `args`. Shared between [`build_ffmpeg_command`] (libcdio input) and
 /// [`build_ffmpeg_command_from_file`] (file input) so a fidelity change
 /// can't drift between the two.
+///
+/// The `-f <muxer>` flag is essential because the rip pipeline writes to
+/// a temp filename ending in `.part` (e.g. `track.m4a.part`) — without
+/// `-f`, ffmpeg's filename-based muxer autodetection sees `.part`,
+/// fails to recognise it, and aborts with "Unable to choose an output
+/// format". The `.part` suffix is preserved on the filename so the
+/// dirlib scanner doesn't index partial files mid-rip.
 fn extend_codec_args(args: &mut Vec<String>, fidelity: RipFidelity) {
     match fidelity {
         RipFidelity::Mp3Cbr320 => {
@@ -165,6 +172,8 @@ fn extend_codec_args(args: &mut Vec<String>, fidelity: RipFidelity) {
                 "libmp3lame".into(),
                 "-b:a".into(),
                 "320k".into(),
+                "-f".into(),
+                "mp3".into(),
             ]);
         }
         RipFidelity::Mp3V0 => {
@@ -173,6 +182,8 @@ fn extend_codec_args(args: &mut Vec<String>, fidelity: RipFidelity) {
                 "libmp3lame".into(),
                 "-q:a".into(),
                 "0".into(),
+                "-f".into(),
+                "mp3".into(),
             ]);
         }
         RipFidelity::Mp3V2 => {
@@ -181,30 +192,41 @@ fn extend_codec_args(args: &mut Vec<String>, fidelity: RipFidelity) {
                 "libmp3lame".into(),
                 "-q:a".into(),
                 "2".into(),
+                "-f".into(),
+                "mp3".into(),
             ]);
         }
         RipFidelity::Aac => {
             // ffmpeg's built-in native `aac` encoder (no external libfdk_aac
             // dependency). 256k CBR matches the iTunes Plus standard a lot
-            // of listeners will recognise as "transparent".
+            // of listeners will recognise as "transparent". Output muxer
+            // is `ipod` — same MP4-with-iTunes-tweaks container Picard and
+            // Apple Music produce.
             args.extend([
                 "-codec:a".into(),
                 "aac".into(),
                 "-b:a".into(),
                 "256k".into(),
+                "-f".into(),
+                "ipod".into(),
             ]);
         }
         RipFidelity::Alac => {
             // Native ALAC encoder — same encoder the FLAC→ALAC iPod push
             // branch uses. Bit-exact lossless; the bitrate falls out of
-            // the source signal.
-            args.extend(["-codec:a".into(), "alac".into()]);
+            // the source signal. `-f ipod` for the same reason as AAC.
+            args.extend(["-codec:a".into(), "alac".into(), "-f".into(), "ipod".into()]);
         }
         RipFidelity::Flac => {
-            args.extend(["-codec:a".into(), "flac".into()]);
+            args.extend(["-codec:a".into(), "flac".into(), "-f".into(), "flac".into()]);
         }
         RipFidelity::Wav => {
-            args.extend(["-codec:a".into(), "pcm_s16le".into()]);
+            args.extend([
+                "-codec:a".into(),
+                "pcm_s16le".into(),
+                "-f".into(),
+                "wav".into(),
+            ]);
         }
     }
 }
@@ -691,6 +713,66 @@ mod tests {
         assert!(first.contains("MBIDs"));
         assert!(first.contains("ISRC"));
         assert!(first.contains("AcoustID"));
+    }
+
+    #[test]
+    fn build_command_sets_explicit_output_format_for_every_fidelity() {
+        // ffmpeg's `-f <muxer>` is essential because rip-pipeline temp
+        // filenames end in `.part`, defeating extension-based muxer
+        // autodetection. Each fidelity must emit a matching `-f` flag.
+        for (fidelity, expected_format) in [
+            (RipFidelity::Mp3Cbr320, "mp3"),
+            (RipFidelity::Mp3V0, "mp3"),
+            (RipFidelity::Mp3V2, "mp3"),
+            (RipFidelity::Aac, "ipod"),
+            (RipFidelity::Alac, "ipod"),
+            (RipFidelity::Flac, "flac"),
+            (RipFidelity::Wav, "wav"),
+        ] {
+            // Verify on the file-input path (macOS) — the temp-extension
+            // problem only bit there in the original failure mode.
+            let (_p, args) = build_ffmpeg_command_from_file(
+                Path::new("/tmp/in.aiff"),
+                fidelity,
+                Path::new("/tmp/out.m4a.part"),
+            );
+            // There can be more than one `-f` in the libcdio variant
+            // (`-f libcdio` for input) but for the file path the only
+            // `-f` should be the output muxer.
+            let f_positions: Vec<_> = args
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| *a == "-f")
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(
+                f_positions.len(),
+                1,
+                "file-input path should emit exactly one `-f` (the output muxer); fidelity {fidelity:?}"
+            );
+            assert_eq!(
+                args[f_positions[0] + 1],
+                expected_format,
+                "fidelity {fidelity:?} should use -f {expected_format}"
+            );
+
+            // libcdio path should also carry the output muxer (the input
+            // -f libcdio is still there too).
+            let (_p, libcdio_args) = build_ffmpeg_command(
+                Path::new("/dev/sr0"),
+                1,
+                fidelity,
+                Path::new("/tmp/out.part"),
+            );
+            let output_f_count = libcdio_args
+                .iter()
+                .filter(|a| **a == expected_format)
+                .count();
+            assert!(
+                output_f_count >= 1,
+                "libcdio path should also emit -f {expected_format} for fidelity {fidelity:?}"
+            );
+        }
     }
 
     #[test]
