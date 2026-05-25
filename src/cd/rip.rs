@@ -112,12 +112,18 @@ pub struct RipProgress {
     pub percent: Option<u8>,
 }
 
-/// Build the ffmpeg command line for ripping a single track from a CD.
+/// Build the ffmpeg command line for ripping a single track from a CD via
+/// the `libcdio` input demuxer.
 ///
 /// Returns the program name and argv tail so callers can spawn it or inspect
 /// it for tests. `drive_device` should be a node ffmpeg can open via the
-/// `libcdio` input — on macOS that's typically `/dev/rdiskN`, on Linux
-/// `/dev/srN`.
+/// `libcdio` input — typically `/dev/srN` on Linux.
+///
+/// **macOS note:** stock Homebrew ffmpeg ships without `--enable-libcdio`,
+/// so this command would fail with "Unknown input format: 'libcdio'".
+/// The macOS path goes through [`build_ffmpeg_command_from_file`] instead,
+/// reading the AIFF files macOS auto-mounts under `/Volumes/<title>/`.
+/// [`build_command_for_track`] dispatches between the two.
 pub fn build_ffmpeg_command(
     drive_device: &Path,
     track_number: u8,
@@ -141,6 +147,17 @@ pub fn build_ffmpeg_command(
         format!("0:{}", track_number.saturating_sub(1)),
     ];
 
+    extend_codec_args(&mut args, fidelity);
+
+    args.push(output.to_string_lossy().into_owned());
+    (PathBuf::from("ffmpeg"), args)
+}
+
+/// Append the codec / quality switch for `fidelity` onto `args`. Shared
+/// between [`build_ffmpeg_command`] (libcdio input) and
+/// [`build_ffmpeg_command_from_file`] (file input) so a fidelity change
+/// can't drift between the two.
+fn extend_codec_args(args: &mut Vec<String>, fidelity: RipFidelity) {
     match fidelity {
         RipFidelity::Mp3Cbr320 => {
             args.extend([
@@ -190,9 +207,121 @@ pub fn build_ffmpeg_command(
             args.extend(["-codec:a".into(), "pcm_s16le".into()]);
         }
     }
+}
+
+/// Build the ffmpeg command line for ripping a single track from an
+/// already-resolved audio file path (e.g. a macOS-auto-mounted CDDA AIFF).
+///
+/// Same codec / quality switch as [`build_ffmpeg_command`]. Drops `-f` /
+/// `-map`: ffmpeg infers the format from the file extension, and AIFF
+/// inputs expose one stream so no map selection is needed. `-vn` strips
+/// any incidental video/picture stream (a no-op for CDDA AIFFs, kept
+/// here so this path stays correct if a caller ever passes a tagged
+/// M4A or similar).
+pub fn build_ffmpeg_command_from_file(
+    input: &Path,
+    fidelity: RipFidelity,
+    output: &Path,
+) -> (PathBuf, Vec<String>) {
+    let mut args: Vec<String> = vec![
+        "-hide_banner".into(),
+        "-loglevel".into(),
+        "warning".into(),
+        "-y".into(),
+        "-i".into(),
+        input.to_string_lossy().into_owned(),
+        "-vn".into(),
+    ];
+
+    extend_codec_args(&mut args, fidelity);
 
     args.push(output.to_string_lossy().into_owned());
     (PathBuf::from("ffmpeg"), args)
+}
+
+/// On macOS, audio CDs auto-mount under `/Volumes/<title>/` exposing each
+/// track as `<N> <title>.aiff` alongside a `.TOC.plist` marker file.
+/// Reading these directly with `ffmpeg -i <aiff>` works with stock
+/// Homebrew ffmpeg (which does not ship `--enable-libcdio`).
+#[cfg(target_os = "macos")]
+pub fn find_macos_cd_aiff(track_number: u8) -> Option<PathBuf> {
+    find_aiff_under_volumes_root(Path::new("/Volumes"), track_number)
+}
+
+/// Test seam for [`find_macos_cd_aiff`]: scan `volumes_root/*/` for
+/// directories containing a `.TOC.plist` marker, then for each such
+/// directory return the first `<track_number> ...aiff` file. Exposed
+/// at module visibility so unit tests can point it at a tempdir.
+fn find_aiff_under_volumes_root(volumes_root: &Path, track_number: u8) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(volumes_root).ok()?;
+    for entry in entries.flatten() {
+        let volume = entry.path();
+        if !volume.join(".TOC.plist").exists() {
+            continue;
+        }
+        let Ok(tracks) = std::fs::read_dir(&volume) else {
+            continue;
+        };
+        for t in tracks.flatten() {
+            let name = t.file_name();
+            let name_str = name.to_string_lossy();
+            // CDDA AIFF files use the `.aiff` extension; macOS exposes
+            // the audio as AIFF-C inside that container.
+            let ext_matches = std::path::Path::new(&*name_str)
+                .extension()
+                .is_some_and(|x| x.eq_ignore_ascii_case("aiff"));
+            if !ext_matches {
+                continue;
+            }
+            // Filename shape: `<N> <title>.aiff` (single space after N).
+            // Split on whitespace and parse the first token so "10 …"
+            // doesn't get mis-matched as track 1.
+            let Some(prefix) = name_str.split_whitespace().next() else {
+                continue;
+            };
+            if prefix.parse::<u8>().ok() == Some(track_number) {
+                return Some(t.path());
+            }
+        }
+    }
+    None
+}
+
+/// Build the ffmpeg command appropriate for the host. macOS prefers the
+/// auto-mounted AIFF (stock Homebrew ffmpeg ships without
+/// `--enable-libcdio`); Linux uses the libcdio demuxer addressed by the
+/// device node. Returns `None` on macOS when no audio CD is mounted —
+/// the caller surfaces a clear "insert disc" error rather than handing
+/// off a guaranteed-to-fail libcdio invocation.
+#[cfg(target_os = "macos")]
+pub fn build_command_for_track(
+    drive_device: &Path,
+    track_number: u8,
+    fidelity: RipFidelity,
+    output: &Path,
+) -> Result<(PathBuf, Vec<String>), RipError> {
+    // Linux-only param on this branch — kept on the signature for
+    // cross-platform parity at the call site.
+    let _ = drive_device;
+    match find_macos_cd_aiff(track_number) {
+        Some(aiff) => Ok(build_ffmpeg_command_from_file(&aiff, fidelity, output)),
+        None => Err(RipError::CdNotMounted(track_number)),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn build_command_for_track(
+    drive_device: &Path,
+    track_number: u8,
+    fidelity: RipFidelity,
+    output: &Path,
+) -> Result<(PathBuf, Vec<String>), RipError> {
+    Ok(build_ffmpeg_command(
+        drive_device,
+        track_number,
+        fidelity,
+        output,
+    ))
 }
 
 /// Validate that `toc` actually contains the requested track number.
@@ -243,7 +372,7 @@ pub fn rip_track_cancellable(
     use std::sync::{Arc, Mutex};
 
     require_track(toc, track_number)?;
-    let (program, args) = build_ffmpeg_command(drive_device, track_number, fidelity, output);
+    let (program, args) = build_command_for_track(drive_device, track_number, fidelity, output)?;
     let mut child = std::process::Command::new(&program)
         .args(&args)
         .stdout(std::process::Stdio::null())
@@ -386,6 +515,11 @@ pub enum RipError {
     /// flag. The output file may exist but is incomplete and should be
     /// deleted by the caller.
     Cancelled,
+    /// macOS-only: the audio CD isn't mounted under `/Volumes/<title>/`, so
+    /// no AIFF source file could be located for the requested track. We
+    /// surface this distinctly rather than passing through to libcdio
+    /// because stock Homebrew ffmpeg doesn't ship that demuxer.
+    CdNotMounted(u8),
 }
 
 impl std::fmt::Display for RipError {
@@ -406,6 +540,10 @@ impl std::fmt::Display for RipError {
                 write!(f, "ffmpeg terminated without status: {stderr}")
             }
             RipError::Cancelled => write!(f, "rip cancelled by user"),
+            RipError::CdNotMounted(track) => write!(
+                f,
+                "audio CD not mounted (looked for track {track} under /Volumes/*/.TOC.plist) — insert the disc and wait for macOS to mount it"
+            ),
         }
     }
 }
@@ -597,6 +735,114 @@ mod tests {
         // stderr content (it has neither — those belong to FfmpegFailed).
         assert!(!msg.contains("status"));
         assert!(!msg.contains("ffmpeg"));
+    }
+
+    #[test]
+    fn build_from_file_uses_simple_input_no_libcdio() {
+        let (prog, args) = build_ffmpeg_command_from_file(
+            Path::new("/Volumes/Ray Of Light/1 Drowned World.aiff"),
+            RipFidelity::Flac,
+            Path::new("/tmp/01.flac"),
+        );
+        assert_eq!(prog.to_str(), Some("ffmpeg"));
+        // The libcdio demuxer is NOT requested on this path.
+        assert!(
+            !args.iter().any(|a| a == "libcdio"),
+            "file-input path must not request -f libcdio"
+        );
+        // No -map (single-stream AIFF) and no track-position index.
+        assert!(
+            !args.iter().any(|a| a == "-map"),
+            "file-input path must not pass -map"
+        );
+        // -vn strips any incidental picture stream.
+        assert!(args.iter().any(|a| a == "-vn"));
+        // -i points at the AIFF.
+        let i_idx = args.iter().position(|a| a == "-i").unwrap();
+        assert_eq!(
+            args[i_idx + 1],
+            "/Volumes/Ray Of Light/1 Drowned World.aiff"
+        );
+    }
+
+    #[test]
+    fn build_from_file_carries_codec_args_across_fidelities() {
+        // Same codec branches as build_ffmpeg_command — guard against
+        // the two paths drifting if a future codec change touches only
+        // one of them.
+        for (fidelity, expected_codec) in [
+            (RipFidelity::Mp3Cbr320, "libmp3lame"),
+            (RipFidelity::Aac, "aac"),
+            (RipFidelity::Alac, "alac"),
+            (RipFidelity::Flac, "flac"),
+            (RipFidelity::Wav, "pcm_s16le"),
+        ] {
+            let (_p, args) = build_ffmpeg_command_from_file(
+                Path::new("/tmp/in.aiff"),
+                fidelity,
+                Path::new("/tmp/out"),
+            );
+            let c_idx = args.iter().position(|a| a == "-codec:a").unwrap();
+            assert_eq!(
+                args[c_idx + 1],
+                expected_codec,
+                "fidelity {fidelity:?} should use {expected_codec}"
+            );
+        }
+    }
+
+    #[test]
+    fn find_aiff_under_volumes_root_picks_matching_track_number() {
+        // Synthetic /Volumes/-like layout: one mounted "CD" with a
+        // .TOC.plist marker and a handful of <N> ...aiff files.
+        let root = std::env::temp_dir().join("zytunes-rip-aiff-finder");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let cd = root.join("Ray Of Light");
+        std::fs::create_dir_all(&cd).unwrap();
+        std::fs::write(cd.join(".TOC.plist"), b"<plist/>").unwrap();
+        std::fs::write(cd.join("1 Drowned World.aiff"), b"data").unwrap();
+        std::fs::write(cd.join("10 The Power Of Goodbye.aiff"), b"data").unwrap();
+        std::fs::write(cd.join("13 Mer Girl.aiff"), b"data").unwrap();
+        // Distractor: a regular folder with the same shape but no .TOC.plist
+        // must not be picked up.
+        let distractor = root.join("Random Folder");
+        std::fs::create_dir_all(&distractor).unwrap();
+        std::fs::write(distractor.join("1 Decoy.aiff"), b"data").unwrap();
+
+        // Track 1 matches "1 ..." not "10 ..." — the prefix-parse splits
+        // on whitespace so the integer comparison is exact.
+        let t1 = find_aiff_under_volumes_root(&root, 1).expect("track 1");
+        assert_eq!(t1.file_name().unwrap(), "1 Drowned World.aiff");
+
+        let t10 = find_aiff_under_volumes_root(&root, 10).expect("track 10");
+        assert_eq!(t10.file_name().unwrap(), "10 The Power Of Goodbye.aiff");
+
+        let t13 = find_aiff_under_volumes_root(&root, 13).expect("track 13");
+        assert_eq!(t13.file_name().unwrap(), "13 Mer Girl.aiff");
+
+        // Tracks that aren't on disc → None.
+        assert!(find_aiff_under_volumes_root(&root, 99).is_none());
+    }
+
+    #[test]
+    fn find_aiff_under_volumes_root_returns_none_when_no_cd_volume() {
+        // Volumes root exists but no child has a .TOC.plist marker.
+        let root = std::env::temp_dir().join("zytunes-rip-aiff-no-cd");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(root.join("Macintosh HD")).unwrap();
+        std::fs::write(root.join("Macintosh HD").join("anything"), b"x").unwrap();
+
+        assert!(find_aiff_under_volumes_root(&root, 1).is_none());
+    }
+
+    #[test]
+    fn cd_not_mounted_display_mentions_track_number() {
+        let err = RipError::CdNotMounted(7);
+        let msg = format!("{err}");
+        assert!(msg.contains("not mounted"), "{msg}");
+        assert!(msg.contains("track 7"), "{msg}");
     }
 
     #[test]
