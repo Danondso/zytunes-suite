@@ -1526,12 +1526,18 @@ pub(crate) enum TrackOutcome {
 }
 
 /// Remove any sibling files in the same directory that share `dest`'s
-/// stem but have a different extension. Used as the second half of the
-/// confirm-overwrite flow: the conflict pre-scan in `confirm_import`
+/// stem but have a *different* extension. Used as the second half of
+/// the confirm-overwrite flow: the conflict pre-scan in `confirm_import`
 /// catches cross-extension conflicts (ALAC `.m4a` already on disk while
 /// the user re-rips at FLAC `.flac`), and once the new file has landed
 /// at its canonical path this sweep deletes the leftover copies the
 /// user already opted to replace.
+///
+/// Extensionless same-stem siblings are *preserved* — the intent is to
+/// dedupe lossy/lossless audio copies of one track, and a file with no
+/// extension isn't an audio file by our extension-based scanning model
+/// (see `dirlib.rs`). It's also not "a different extension" — it's no
+/// extension at all.
 ///
 /// Best-effort — read-dir / remove-file errors are swallowed silently:
 /// a failed sweep just means the user has to clean up by hand later,
@@ -1560,8 +1566,7 @@ fn sweep_same_stem_other_extensions(dest: &std::path::Path) {
             .is_some_and(|s| s == target_stem);
         let diff_extension = path
             .extension()
-            .map(|e| e.to_string_lossy() != target_ext)
-            .unwrap_or(true);
+            .is_some_and(|e| e.to_string_lossy() != target_ext);
         if same_stem && diff_extension {
             let _ = std::fs::remove_file(&path);
         }
@@ -1942,6 +1947,25 @@ mod tests {
                 "unrelated sibling {k} should not be removed"
             );
         }
+    }
+
+    #[test]
+    fn sweep_preserves_extensionless_same_stem_sibling() {
+        // An extensionless file at the same stem isn't an audio dupe — by
+        // our extension-based scanning model it isn't an audio file at
+        // all. Don't sweep it: the intent is to dedupe fidelity variants,
+        // not to clean up arbitrary same-stem companions.
+        let dir = fresh_dir("sweep-extensionless");
+        let dest = dir.join("01 - Hung Up.flac");
+        std::fs::write(&dest, b"new flac").unwrap();
+        let bare = dir.join("01 - Hung Up");
+        std::fs::write(&bare, b"some companion file").unwrap();
+        sweep_same_stem_other_extensions(&dest);
+        assert!(dest.exists(), "the file we just ripped must survive");
+        assert!(
+            bare.exists(),
+            "extensionless same-stem sibling must not be swept"
+        );
     }
 
     #[test]

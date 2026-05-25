@@ -638,7 +638,7 @@ fn resolve_library_id_for_device_track(
     None
 }
 
-/// Parse a `default_fidelity` config string into a [`RipFidelity`].
+/// Parse a `default_fidelity` config string into a `RipFidelity`.
 /// Returns `None` for unrecognised input (and the caller falls back to FLAC).
 fn parse_default_fidelity(s: Option<&str>) -> Option<zytunes::cd::rip::RipFidelity> {
     use zytunes::cd::rip::RipFidelity;
@@ -3861,7 +3861,7 @@ impl App {
         self.import_overlay = None;
     }
 
-    /// Confirm import — build a [`RipAndImportRequest`] from the overlay
+    /// Confirm import — build a `RipAndImportRequest` from the overlay
     /// state and queue it for the background worker. Closes the overlay
     /// on success; toasts and stays open on validation failure.
     pub fn confirm_import(&mut self) {

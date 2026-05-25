@@ -281,6 +281,11 @@ pub fn find_macos_cd_aiff(track_number: u8) -> Option<PathBuf> {
 /// directories containing a `.TOC.plist` marker, then for each such
 /// directory return the first `<track_number> ...aiff` file. Exposed
 /// at module visibility so unit tests can point it at a tempdir.
+///
+/// `find_macos_cd_aiff` is the only non-test caller and it's gated to
+/// macOS, so on Linux the function looks dead to clippy in non-test
+/// builds. Allow it — the unit tests do exercise it on all platforms.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn find_aiff_under_volumes_root(volumes_root: &Path, track_number: u8) -> Option<PathBuf> {
     let entries = std::fs::read_dir(volumes_root).ok()?;
     for entry in entries.flatten() {

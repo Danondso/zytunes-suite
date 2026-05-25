@@ -315,7 +315,7 @@ pub(crate) fn show_cd_status_bar(app: &App) -> bool {
 /// emoji-font fallbacks:
 /// - `NoMedia` — "CD {drive name} — no disc"
 /// - `UnknownDisc` — "CD {drive name} — Unknown disc: {reason}"
-/// - `Identified` — "CD {drive name} — {artist} — {album}   [i] import"
+/// - `Identified` — "CD {drive name} — {artist} — {album}   \[i\] import"
 pub(crate) fn draw_cd_status_bar(f: &mut Frame, app: &App, area: Rect) {
     let theme = app.theme;
     let style = Style::default().bg(theme.footer_bg).fg(theme.footer_text);
