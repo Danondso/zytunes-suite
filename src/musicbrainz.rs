@@ -194,12 +194,15 @@ impl MusicBrainzClient {
 
     /// Look up a disc by its MusicBrainz disc ID.
     ///
-    /// Includes recordings, artist credits, and release groups in a single
-    /// round trip so the import overlay can render full track listings
-    /// without follow-up calls.
+    /// Includes recordings, artist credits, release groups, ISRCs and label
+    /// info in a single round trip so the import overlay can render full
+    /// track listings and the rip pipeline can write Picard-equivalent tags
+    /// without follow-up calls. The `isrcs` inc lands per-recording; `labels`
+    /// adds `label-info[*].catalog-number` + `label-info[*].label.name` at
+    /// the release level.
     pub fn lookup_disc(&self, mb_disc_id: &str) -> Result<DiscLookupResponse, MbError> {
         let url = format!(
-            "{}/discid/{}?inc=recordings+artist-credits+release-groups&fmt=json",
+            "{}/discid/{}?inc=recordings+artist-credits+release-groups+isrcs+labels&fmt=json",
             self.base_url,
             url_encode(mb_disc_id),
         );
@@ -272,6 +275,49 @@ pub struct Release {
     pub media: Vec<Medium>,
     #[serde(default, rename = "release-group")]
     pub release_group: Option<ReleaseGroup>,
+    /// Bar/UPC. MB returns empty string when unknown (not null), so the
+    /// rip-time `set_string` early-return on empty values handles that.
+    #[serde(default)]
+    pub barcode: Option<String>,
+    /// Amazon ASIN. Sometimes `null`, sometimes absent — `Option` either way.
+    #[serde(default)]
+    pub asin: Option<String>,
+    /// MB release status: "Official", "Promotion", "Bootleg", "Pseudo-Release".
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Physical packaging: "Jewel Case", "Digipak", "Gatefold Cover", etc.
+    #[serde(default)]
+    pub packaging: Option<String>,
+    #[serde(default, rename = "text-representation")]
+    pub text_representation: Option<TextRepresentation>,
+    /// Label + catalog-number pairs (requires `inc=labels`). May be empty
+    /// for self-releases or labelless promo discs.
+    #[serde(default, rename = "label-info")]
+    pub label_info: Vec<LabelInfo>,
+}
+
+/// Language + script the release's text is in (ISO 639-3 / ISO 15924).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TextRepresentation {
+    #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default)]
+    pub script: Option<String>,
+}
+
+/// One label / catalog-number pairing for a release.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct LabelInfo {
+    #[serde(default, rename = "catalog-number")]
+    pub catalog_number: Option<String>,
+    #[serde(default)]
+    pub label: Option<Label>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Label {
+    pub id: String,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -327,6 +373,10 @@ pub struct Recording {
     pub length: Option<u32>,
     #[serde(default, rename = "artist-credit")]
     pub artist_credit: Vec<ArtistCredit>,
+    /// Phonographic ISRCs. MB stores them on the recording (the canonical
+    /// location) — `track.isrcs` is not populated in practice on disc lookup.
+    #[serde(default)]
+    pub isrcs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -477,6 +527,8 @@ mod tests {
     #[test]
     fn parses_full_disc_lookup_response() {
         // Fixture mirrors the real MB JSON for a small disc, hand-trimmed.
+        // Carries one ISRC + one label-info + barcode/asin/status/packaging
+        // so the Phase A extensions round-trip in a realistic shape.
         let body = r#"{
             "id": "TESTDISCID",
             "releases": [{
@@ -484,6 +536,15 @@ mod tests {
                 "title": "Abbey Road",
                 "date": "1969-09-26",
                 "country": "GB",
+                "barcode": "077774644020",
+                "asin": "B000002UAS",
+                "status": "Official",
+                "packaging": "Jewel Case",
+                "text-representation": {"language": "eng", "script": "Latn"},
+                "label-info": [{
+                    "catalog-number": "PCS 7088",
+                    "label": {"id": "lbl-1", "name": "Apple"}
+                }],
                 "artist-credit": [{
                     "name": "The Beatles",
                     "artist": { "id": "art-1", "name": "The Beatles", "sort-name": "Beatles, The" }
@@ -509,6 +570,7 @@ mod tests {
                                 "id": "rec-1",
                                 "title": "Come Together",
                                 "length": 259000,
+                                "isrcs": ["GBAYE6900001"],
                                 "artist-credit": [{"name":"The Beatles"}]
                             },
                             "artist-credit": [{"name":"The Beatles"}]
@@ -523,6 +585,7 @@ mod tests {
                                 "id": "rec-2",
                                 "title": "Something",
                                 "length": 182000,
+                                "isrcs": [],
                                 "artist-credit": [{"name":"The Beatles"}]
                             },
                             "artist-credit": [{"name":"The Beatles"}]
@@ -536,6 +599,16 @@ mod tests {
         let r = &parsed.releases[0];
         assert_eq!(r.title, "Abbey Road");
         assert_eq!(r.country.as_deref(), Some("GB"));
+        assert_eq!(r.barcode.as_deref(), Some("077774644020"));
+        assert_eq!(r.asin.as_deref(), Some("B000002UAS"));
+        assert_eq!(r.status.as_deref(), Some("Official"));
+        assert_eq!(r.packaging.as_deref(), Some("Jewel Case"));
+        let tr = r.text_representation.as_ref().unwrap();
+        assert_eq!(tr.language.as_deref(), Some("eng"));
+        assert_eq!(tr.script.as_deref(), Some("Latn"));
+        assert_eq!(r.label_info.len(), 1);
+        assert_eq!(r.label_info[0].catalog_number.as_deref(), Some("PCS 7088"));
+        assert_eq!(r.label_info[0].label.as_ref().unwrap().name, "Apple");
         assert_eq!(r.artist_credit.len(), 1);
         assert_eq!(r.artist_credit[0].name, "The Beatles");
         assert_eq!(r.media.len(), 1);
@@ -543,6 +616,114 @@ mod tests {
         assert_eq!(r.media[0].tracks[1].title, "Something");
         let rg = r.release_group.as_ref().unwrap();
         assert_eq!(rg.primary_type.as_deref(), Some("Album"));
+        // Recording-level ISRCs land where MB actually puts them.
+        let rec0 = r.media[0].tracks[0].recording.as_ref().unwrap();
+        assert_eq!(rec0.isrcs, vec!["GBAYE6900001".to_string()]);
+        let rec1 = r.media[0].tracks[1].recording.as_ref().unwrap();
+        assert!(rec1.isrcs.is_empty());
+    }
+
+    #[test]
+    fn parses_isrc_list_on_recording() {
+        let body = r#"{
+            "id": "rec-1",
+            "title": "T",
+            "isrcs": ["USRC17607839", "GBN9Y2200015"],
+            "artist-credit": []
+        }"#;
+        let parsed: Recording = parse_json(body).unwrap();
+        assert_eq!(parsed.isrcs, vec!["USRC17607839", "GBN9Y2200015"]);
+    }
+
+    #[test]
+    fn parses_label_info_with_catalog_number() {
+        let body = r#"{
+            "id": "rel-1",
+            "title": "X",
+            "label-info": [{
+                "catalog-number": "SHVL 804",
+                "label": {"id": "lbl-1", "name": "Harvest"}
+            }]
+        }"#;
+        let parsed: Release = parse_json(body).unwrap();
+        assert_eq!(parsed.label_info.len(), 1);
+        assert_eq!(
+            parsed.label_info[0].catalog_number.as_deref(),
+            Some("SHVL 804")
+        );
+        let lbl = parsed.label_info[0].label.as_ref().unwrap();
+        assert_eq!(lbl.id, "lbl-1");
+        assert_eq!(lbl.name, "Harvest");
+    }
+
+    #[test]
+    fn parses_label_info_without_label_or_catalog_number() {
+        // Some MB releases have an entry with only one or neither field
+        // populated. Both `label` and `catalog_number` are Optional.
+        let body = r#"{
+            "id": "rel-1",
+            "title": "X",
+            "label-info": [{}]
+        }"#;
+        let parsed: Release = parse_json(body).unwrap();
+        assert_eq!(parsed.label_info.len(), 1);
+        assert!(parsed.label_info[0].catalog_number.is_none());
+        assert!(parsed.label_info[0].label.is_none());
+    }
+
+    #[test]
+    fn parses_barcode_asin_status_packaging() {
+        let body = r#"{
+            "id": "rel-1",
+            "title": "X",
+            "barcode": "077774644020",
+            "asin": "B000002UAS",
+            "status": "Official",
+            "packaging": "Gatefold Cover"
+        }"#;
+        let parsed: Release = parse_json(body).unwrap();
+        assert_eq!(parsed.barcode.as_deref(), Some("077774644020"));
+        assert_eq!(parsed.asin.as_deref(), Some("B000002UAS"));
+        assert_eq!(parsed.status.as_deref(), Some("Official"));
+        assert_eq!(parsed.packaging.as_deref(), Some("Gatefold Cover"));
+    }
+
+    #[test]
+    fn parses_text_representation() {
+        let body = r#"{
+            "id": "rel-1",
+            "title": "X",
+            "text-representation": {"language": "eng", "script": "Latn"}
+        }"#;
+        let parsed: Release = parse_json(body).unwrap();
+        let tr = parsed.text_representation.unwrap();
+        assert_eq!(tr.language.as_deref(), Some("eng"));
+        assert_eq!(tr.script.as_deref(), Some("Latn"));
+    }
+
+    #[test]
+    fn parses_release_missing_optional_fields() {
+        // Minimum-shape release: MB can omit barcode/asin/status/packaging/
+        // text-representation/label-info entirely. All must default cleanly
+        // without erroring.
+        let body = r#"{ "id": "rel-1", "title": "X" }"#;
+        let parsed: Release = parse_json(body).unwrap();
+        assert!(parsed.barcode.is_none());
+        assert!(parsed.asin.is_none());
+        assert!(parsed.status.is_none());
+        assert!(parsed.packaging.is_none());
+        assert!(parsed.text_representation.is_none());
+        assert!(parsed.label_info.is_empty());
+    }
+
+    #[test]
+    fn parses_empty_string_barcode_distinct_from_missing() {
+        // MB returns `"barcode": ""` (not null, not omitted) when there's
+        // no barcode for the release. Verify we faithfully preserve the
+        // distinction so the tag writer's empty-string skip works.
+        let body = r#"{ "id": "rel-1", "title": "X", "barcode": "" }"#;
+        let parsed: Release = parse_json(body).unwrap();
+        assert_eq!(parsed.barcode.as_deref(), Some(""));
     }
 
     #[test]

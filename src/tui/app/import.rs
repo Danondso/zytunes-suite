@@ -385,6 +385,12 @@ mod tests {
                     .collect(),
             }],
             release_group: None,
+            barcode: None,
+            asin: None,
+            status: None,
+            packaging: None,
+            text_representation: None,
+            label_info: vec![],
         }
     }
 
