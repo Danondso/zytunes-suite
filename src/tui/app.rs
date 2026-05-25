@@ -940,6 +940,11 @@ pub struct App {
     /// `fingerprinting` so users can disable rip-time without losing
     /// scan-time identity matching.
     pub acoustid_fingerprint: bool,
+    /// Scan-time `fingerprinting` setting cached from config so post-rip
+    /// library reloads can re-issue `BgCommand::LoadLibrary` with the
+    /// same preference. Defaults to `true` when config is silent — matches
+    /// the initial-load behaviour in `tui/main.rs`.
+    pub scan_fingerprint: bool,
     /// Cached music-library directory used as the rip destination. Pulled
     /// from config at startup so `confirm_import` doesn't hit the disk on
     /// every Enter, and so tests can set it directly without env var
@@ -1129,6 +1134,7 @@ impl App {
             default_rip_fidelity: zytunes::cd::rip::RipFidelity::Flac,
             auto_eject_default: true,
             acoustid_fingerprint: true,
+            scan_fingerprint: true,
             music_dir_cache: None, // overwritten below from config
         };
 
@@ -1150,6 +1156,7 @@ impl App {
             app.auto_eject_default = v;
         }
         app.acoustid_fingerprint = cfg.acoustid_fingerprint.unwrap_or(true);
+        app.scan_fingerprint = cfg.fingerprinting.unwrap_or(true);
         app.music_dir_cache = cfg
             .music_dir
             .clone()
@@ -3781,8 +3788,34 @@ impl App {
                 for e in errors {
                     self.sync.log.push(format!("[rip] {e}"));
                 }
+                // Refresh the library so the newly-ripped tracks become
+                // visible in the sidebar/track list. Re-uses the same
+                // `LoadLibrary` path the initial startup load takes — the
+                // dirlib cache is mtime-keyed so the re-scan only re-parses
+                // the new files (existing entries hit the cache). Skipped
+                // when zero tracks landed so a fully-cancelled or fully-
+                // failed rip doesn't trigger a no-op scan.
+                if ripped > 0 {
+                    self.queue_library_reload();
+                }
             }
         }
+    }
+
+    /// Queue a `LoadLibrary` so the sidebar/library views see new
+    /// content. Used after CD rips, and could be reused by any future
+    /// "imported a file" path. No-op if `music_dir_cache` is None
+    /// (no library configured — there's nothing to scan).
+    fn queue_library_reload(&mut self) {
+        let Some(music_dir) = self.music_dir_cache.as_ref() else {
+            return;
+        };
+        let music_dir_str = music_dir.to_string_lossy().into_owned();
+        self.pending_bg_commands
+            .push(crate::background::BgCommand::LoadLibrary {
+                music_dir: Some(music_dir_str),
+                fingerprint: self.scan_fingerprint,
+            });
     }
 
     /// Handle the `i` key — the CD import entry point.
@@ -10248,6 +10281,66 @@ mod tests {
             elapsed_ms: 30_000,
         }));
         assert_eq!(app.cd.rip.as_ref().unwrap().elapsed_ms, 30_000);
+    }
+
+    #[test]
+    fn rip_complete_queues_library_reload_when_ripped_above_zero() {
+        // After a successful rip the sidebar/library views need to see the
+        // new tracks. The handler should queue a fresh `LoadLibrary` so the
+        // dirlib scanner re-runs (mtime cache makes this cheap).
+        use crate::background::RipEvent;
+        let mut app = App::new();
+        app.music_dir_cache = Some(std::path::PathBuf::from("/tmp/zytunes-reload-test"));
+        app.cd.rip = Some(RipProgressState {
+            current: 1,
+            total: 1,
+            track_title: "X".into(),
+            track_length_ms: None,
+            elapsed_ms: 0,
+            errors: vec![],
+        });
+        app.handle_bg_event(BgEvent::RipEvent(RipEvent::Complete {
+            ripped: 1,
+            failed: 0,
+            cancelled: false,
+            ejected: false,
+        }));
+        assert!(
+            app.pending_bg_commands
+                .iter()
+                .any(|c| matches!(c, BgCommand::LoadLibrary { .. })),
+            "successful rip must queue a library reload"
+        );
+    }
+
+    #[test]
+    fn rip_complete_does_not_queue_reload_when_zero_ripped() {
+        // Fully-cancelled or fully-failed rip: nothing landed, no point
+        // re-scanning. Guards against a fast cancel triggering a needless
+        // full-library scan.
+        use crate::background::RipEvent;
+        let mut app = App::new();
+        app.music_dir_cache = Some(std::path::PathBuf::from("/tmp/zytunes-no-reload"));
+        app.cd.rip = Some(RipProgressState {
+            current: 1,
+            total: 3,
+            track_title: "X".into(),
+            track_length_ms: None,
+            elapsed_ms: 0,
+            errors: vec![],
+        });
+        app.handle_bg_event(BgEvent::RipEvent(RipEvent::Complete {
+            ripped: 0,
+            failed: 0,
+            cancelled: true,
+            ejected: false,
+        }));
+        assert!(
+            !app.pending_bg_commands
+                .iter()
+                .any(|c| matches!(c, BgCommand::LoadLibrary { .. })),
+            "cancelled-with-zero-ripped must not trigger a reload"
+        );
     }
 
     #[test]
