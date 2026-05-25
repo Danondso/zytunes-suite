@@ -7,6 +7,7 @@ extern crate self as zytunes;
 
 pub mod art_cache;
 pub mod cache;
+pub mod cd;
 pub mod device;
 pub mod dirlib;
 pub mod fingerprint;
@@ -15,6 +16,7 @@ pub mod library;
 pub mod listen_log;
 pub mod local_plays;
 pub mod mtp;
+pub mod musicbrainz;
 pub mod paths;
 pub mod playlist;
 pub mod playlist_store;

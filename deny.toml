@@ -11,8 +11,9 @@ allow = [
     "BSD-2-Clause",
     "BSD-3-Clause",
     "BSL-1.0",
+    "CDLA-Permissive-2.0", # webpki-roots (transitive via ureq, used by MusicBrainz client)
     "ISC",
-    "LGPL-3.0",
+    "LGPL-3.0", # mp3lame-encoder / mp3lame-sys (audio transcoding, dynamic-linked)
     "MPL-2.0",
     "Unicode-3.0",
     "Zlib",

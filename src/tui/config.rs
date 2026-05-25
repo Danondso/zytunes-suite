@@ -19,6 +19,15 @@ pub struct Config {
     /// scan is fast (lofty tag read only) but Phase 2+ playcount-merge
     /// features that key on `acoustic_id` won't have anything to match on.
     pub fingerprinting: Option<bool>,
+    /// MusicBrainz Web Service base URL. `None` uses the public host
+    /// (`https://musicbrainz.org/ws/2`). Point at a locally hosted mirror
+    /// (e.g. `http://localhost:5000/ws/2`) to skip rate limits.
+    pub musicbrainz_base_url: Option<String>,
+    /// User-Agent string sent on every MusicBrainz request. Required by the
+    /// public host per MB Terms of Service. Format:
+    /// `application/version (contact)` — e.g.
+    /// `zytunes/2.2.0 (you@example.com)`.
+    pub musicbrainz_user_agent: Option<String>,
     /// User-defined custom themes keyed by theme name. Each entry inherits
     /// missing fields from its `base` (or `iTunes 2004` when unset) and merges
     /// into the theme picker alongside the built-ins.
@@ -147,7 +156,7 @@ music_dir = "/home/user/Music"
             album_art_style: Some("ascii".into()),
             show_player: Some(true),
             fingerprinting: Some(false),
-            themes: BTreeMap::new(),
+            ..Config::default()
         };
         let serialized = toml::to_string_pretty(&config).unwrap();
         let deserialized: Config = toml::from_str(&serialized).unwrap();
@@ -168,6 +177,8 @@ music_dir = "/home/user/Music"
         assert!(config.album_art_style.is_none());
         assert!(config.show_player.is_none());
         assert!(config.fingerprinting.is_none());
+        assert!(config.musicbrainz_base_url.is_none());
+        assert!(config.musicbrainz_user_agent.is_none());
         assert!(config.themes.is_empty());
     }
 
@@ -211,6 +222,37 @@ accent_anim = "pulse"
             !serialized.contains("[themes"),
             "empty themes table should be omitted; got:\n{serialized}"
         );
+    }
+
+    #[test]
+    fn config_round_trip_musicbrainz_fields() {
+        let config = Config {
+            musicbrainz_base_url: Some("http://localhost:5000/ws/2".into()),
+            musicbrainz_user_agent: Some("zytunes/2.2.0 (you@example.com)".into()),
+            ..Config::default()
+        };
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let deserialized: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(
+            deserialized.musicbrainz_base_url.as_deref(),
+            Some("http://localhost:5000/ws/2")
+        );
+        assert_eq!(
+            deserialized.musicbrainz_user_agent.as_deref(),
+            Some("zytunes/2.2.0 (you@example.com)")
+        );
+    }
+
+    #[test]
+    fn config_backwards_compatible_without_musicbrainz_fields() {
+        // Existing configs (predating the MB integration) must continue to parse.
+        let toml_str = r#"
+theme = "Gruvbox Dark"
+music_dir = "/home/user/Music"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.musicbrainz_base_url.is_none());
+        assert!(config.musicbrainz_user_agent.is_none());
     }
 
     #[test]
