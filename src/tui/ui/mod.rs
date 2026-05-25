@@ -2730,31 +2730,59 @@ fn draw_import_eject_row(
     f.render_widget(Paragraph::new(line), area);
 }
 
-fn draw_import_footer(f: &mut Frame, app: &App, _overlay: &crate::app::ImportOverlay, area: Rect) {
+fn draw_import_footer(f: &mut Frame, app: &App, overlay: &crate::app::ImportOverlay, area: Rect) {
     let t = app.theme();
-    let line = Line::from(vec![
-        Span::styled(
-            "[Tab]",
-            Style::default()
-                .fg(t.header_text)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" focus  "),
-        Span::styled(
-            "[Enter]",
-            Style::default()
-                .fg(t.header_text)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" import  "),
-        Span::styled(
-            "[Esc]",
-            Style::default()
-                .fg(t.header_text)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" cancel"),
-    ]);
+    // When the overlay is "armed" (Enter pressed against an existing-file
+    // conflict), replace the standard footer with a conspicuous overwrite
+    // prompt. Coloured red so it doesn't blend with the dim hint row.
+    let line = if overlay.overwrite_armed {
+        Line::from(vec![
+            Span::styled(
+                format!("⚠ {} track(s) already exist  ", overlay.conflict_count),
+                Style::default()
+                    .fg(t.error_text)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "[Enter]",
+                Style::default()
+                    .fg(t.header_text)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" overwrite  "),
+            Span::styled(
+                "[Esc]",
+                Style::default()
+                    .fg(t.header_text)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" cancel"),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(
+                "[Tab]",
+                Style::default()
+                    .fg(t.header_text)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" focus  "),
+            Span::styled(
+                "[Enter]",
+                Style::default()
+                    .fg(t.header_text)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" import  "),
+            Span::styled(
+                "[Esc]",
+                Style::default()
+                    .fg(t.header_text)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" cancel"),
+        ])
+    };
     f.render_widget(
         Paragraph::new(line).style(Style::default().fg(t.dim_text).bg(t.main_bg)),
         area,

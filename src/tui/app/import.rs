@@ -87,6 +87,19 @@ pub struct ImportOverlay {
     pub auto_eject: bool,
     /// Currently focused subsection.
     pub focus: ImportField,
+    /// Number of selected tracks whose computed destination paths already
+    /// exist on disk. Populated by `App::confirm_import` *before* it would
+    /// dispatch — when this is `> 0` the first Enter does not dispatch.
+    /// Instead it sets [`Self::overwrite_armed`] and surfaces a footer
+    /// prompt; the second Enter (or `y`) dispatches and overwrites. Any
+    /// state change that could invalidate the count (re-selecting tracks,
+    /// switching release, toggling fidelity) clears the armed flag so the
+    /// user is forced to re-confirm against fresh state.
+    pub conflict_count: usize,
+    /// True when the user has seen the conflict warning and a second
+    /// confirm would dispatch the rip anyway. Reset on any state change
+    /// that touches the conflict-relevant inputs.
+    pub overwrite_armed: bool,
 }
 
 impl ImportOverlay {
@@ -121,6 +134,8 @@ impl ImportOverlay {
             fidelity_idx,
             auto_eject: auto_eject_default,
             focus: ImportField::Tracks,
+            conflict_count: 0,
+            overwrite_armed: false,
         };
         overlay.reset_selection_for_current_release();
         overlay
@@ -190,18 +205,30 @@ impl ImportOverlay {
         };
         let entry = self.track_selection.entry(position).or_insert(false);
         *entry = !*entry;
+        self.disarm_overwrite();
     }
 
     pub fn select_all(&mut self) {
         for v in self.track_selection.values_mut() {
             *v = true;
         }
+        self.disarm_overwrite();
     }
 
     pub fn select_none(&mut self) {
         for v in self.track_selection.values_mut() {
             *v = false;
         }
+        self.disarm_overwrite();
+    }
+
+    /// Reset the conflict / overwrite-armed state. Called whenever the
+    /// user changes something that could invalidate a prior conflict
+    /// count — track selection, release pick, or fidelity (different
+    /// extension = different destination paths).
+    fn disarm_overwrite(&mut self) {
+        self.conflict_count = 0;
+        self.overwrite_armed = false;
     }
 
     /// Move the cursor up by one row (saturating at 0).
@@ -227,6 +254,7 @@ impl ImportOverlay {
         }
         self.release_idx = (self.release_idx + 1) % self.releases.len();
         self.switch_release();
+        self.disarm_overwrite();
     }
 
     pub fn prev_release(&mut self) {
@@ -239,12 +267,14 @@ impl ImportOverlay {
             self.release_idx - 1
         };
         self.switch_release();
+        self.disarm_overwrite();
     }
 
     /// Cycle to the next fidelity option.
     pub fn next_fidelity(&mut self) {
         let n = RipFidelity::all().len();
         self.fidelity_idx = (self.fidelity_idx + 1) % n;
+        self.disarm_overwrite();
     }
 
     pub fn prev_fidelity(&mut self) {
@@ -254,6 +284,7 @@ impl ImportOverlay {
         } else {
             self.fidelity_idx - 1
         };
+        self.disarm_overwrite();
     }
 
     /// Current fidelity selection.

@@ -3857,6 +3857,46 @@ impl App {
             }
         };
 
+        // Conflict pre-scan: walk the planned destination for each selected
+        // track and count files that already exist. We mirror the worker's
+        // `mb_tracks` lookup so a conflict count surfaced to the user matches
+        // what would be written. If any exist and the user hasn't already
+        // confirmed (`overwrite_armed`), hold the dispatch and surface a
+        // footer prompt — the second Enter dispatches and overwrites.
+        let release = overlay.current_release();
+        let active_medium = release.media.iter().find(|m| !m.tracks.is_empty());
+        let mb_tracks: std::collections::BTreeMap<u32, &zytunes::musicbrainz::Track> =
+            active_medium
+                .map(|m| m.tracks.iter())
+                .into_iter()
+                .flatten()
+                .filter_map(|t| t.position.map(|p| (p, t)))
+                .collect();
+        let extension = overlay.current_fidelity().extension();
+        let conflicts = positions
+            .iter()
+            .filter_map(|p| mb_tracks.get(p).map(|t| (*p, *t)))
+            .filter(|(p, t)| {
+                let dest = zytunes::cd::metadata::ripped_track_destination(
+                    &dest_dir, release, t, *p, extension,
+                );
+                dest.exists()
+            })
+            .count();
+        if conflicts > 0 && !overlay.overwrite_armed {
+            if let Some(o) = self.import_overlay.as_mut() {
+                o.conflict_count = conflicts;
+                o.overwrite_armed = true;
+            }
+            self.set_toast(
+                format!(
+                    "{conflicts} track(s) already exist in the library — press Enter again to overwrite, Esc to cancel"
+                ),
+                true,
+            );
+            return;
+        }
+
         let req = RipAndImportRequest {
             drive: overlay.drive.clone(),
             toc: overlay.toc.clone(),
@@ -10060,6 +10100,88 @@ mod tests {
         assert!(msg.contains("Ripping"));
         assert!(msg.contains("2 tracks"));
         assert!(msg.contains("Album"));
+    }
+
+    #[test]
+    fn overlay_enter_with_existing_files_arms_overwrite_then_dispatches_on_second_enter() {
+        // Mirror the existing happy-path test setup, but pre-create the
+        // destination files so the conflict pre-scan in `confirm_import`
+        // trips. First Enter should arm the overlay (no dispatch, toast
+        // warns); second Enter should dispatch with no further check.
+        let tmp = std::env::temp_dir().join("zytunes-overwrite-prompt");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let mut app = App::new();
+        app.music_dir_cache = Some(tmp.clone());
+        app.cd.last_status = Some(make_identified_status("Album"));
+        app.handle_cd_import_key();
+        // make_identified_status produces 2 tracks both selected by default.
+        // Build matching destination files so both conflict.
+        // The fixture release is title="Album", artist="Artist" (see
+        // make_identified_status), default fidelity = FLAC.
+        let dest_dir = tmp.join("Artist").join("Album");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        std::fs::write(dest_dir.join("01 - Song A.flac"), b"existing").unwrap();
+        std::fs::write(dest_dir.join("02 - Song B.flac"), b"existing").unwrap();
+
+        // First Enter: arms overwrite, doesn't dispatch.
+        assert!(app.handle_import_overlay_key(key(crossterm::event::KeyCode::Enter)));
+        assert!(
+            app.import_overlay.is_some(),
+            "overlay stays open on conflict warning"
+        );
+        let overlay = app.import_overlay.as_ref().unwrap();
+        assert_eq!(overlay.conflict_count, 2);
+        assert!(overlay.overwrite_armed);
+        let (msg, _, is_error) = app.toast_message.as_ref().unwrap();
+        assert!(is_error, "warning toast is error-styled");
+        assert!(msg.contains("2 track"), "got: {msg}");
+        assert!(
+            !app.pending_bg_commands
+                .iter()
+                .any(|c| matches!(c, BgCommand::RipAndImport(_))),
+            "no rip queued on first Enter"
+        );
+
+        // Second Enter: dispatches and closes.
+        assert!(app.handle_import_overlay_key(key(crossterm::event::KeyCode::Enter)));
+        assert!(app.import_overlay.is_none(), "overlay closes on confirm");
+        assert!(
+            app.pending_bg_commands
+                .iter()
+                .any(|c| matches!(c, BgCommand::RipAndImport(_))),
+            "RipAndImport queued on second Enter"
+        );
+    }
+
+    #[test]
+    fn overlay_overwrite_armed_resets_on_track_toggle() {
+        // Changing the selection invalidates the conflict count — armed
+        // flag must clear so a new Enter does a fresh pre-scan.
+        let tmp = std::env::temp_dir().join("zytunes-overwrite-disarm");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let mut app = App::new();
+        app.music_dir_cache = Some(tmp.clone());
+        app.cd.last_status = Some(make_identified_status("Album"));
+        app.handle_cd_import_key();
+        let dest_dir = tmp.join("Artist").join("Album");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        std::fs::write(dest_dir.join("01 - Song A.flac"), b"x").unwrap();
+        std::fs::write(dest_dir.join("02 - Song B.flac"), b"x").unwrap();
+
+        // Arm via first Enter.
+        app.handle_import_overlay_key(key(crossterm::event::KeyCode::Enter));
+        assert!(app.import_overlay.as_ref().unwrap().overwrite_armed);
+
+        // Toggle a track — must disarm.
+        app.import_overlay.as_mut().unwrap().toggle_current_track();
+        let overlay = app.import_overlay.as_ref().unwrap();
+        assert!(
+            !overlay.overwrite_armed,
+            "toggling a track must clear overwrite_armed"
+        );
+        assert_eq!(overlay.conflict_count, 0);
     }
 
     #[test]
