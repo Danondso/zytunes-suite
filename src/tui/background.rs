@@ -1339,6 +1339,14 @@ fn run_rip_and_import(
         .collect();
     let total_tracks_on_release =
         active_medium.and_then(|m| m.track_count.or(Some(m.tracks.len() as u32)));
+    // For disc-of-N tags: count of media on the release. Disc number is
+    // carried in the medium itself (`medium.position`) and read off the
+    // active_medium reference inside `tag_ripped_file`.
+    let total_discs_on_release = if req.release.media.is_empty() {
+        None
+    } else {
+        Some(req.release.media.len() as u32)
+    };
 
     for (idx, &position) in req.track_positions.iter().enumerate() {
         if cancel.load(Ordering::SeqCst) {
@@ -1383,6 +1391,8 @@ fn run_rip_and_import(
                 mb_track,
                 dest: &dest,
                 total_tracks: total_tracks_on_release,
+                medium: active_medium,
+                total_discs: total_discs_on_release,
             },
             cancel,
         );
@@ -1463,6 +1473,8 @@ struct SingleTrackRip<'a> {
     mb_track: &'a zytunes::musicbrainz::Track,
     dest: &'a std::path::Path,
     total_tracks: Option<u32>,
+    medium: Option<&'a zytunes::musicbrainz::Medium>,
+    total_discs: Option<u32>,
 }
 
 /// Result of a single-track rip — finer-grained than `Result<_,_>` so
@@ -1494,6 +1506,8 @@ fn run_single_track_rip(params: SingleTrackRip<'_>, cancel: &Arc<AtomicBool>) ->
         mb_track,
         dest,
         total_tracks,
+        medium,
+        total_discs,
     } = params;
 
     if let Some(parent) = dest.parent() {
@@ -1545,7 +1559,16 @@ fn run_single_track_rip(params: SingleTrackRip<'_>, cancel: &Arc<AtomicBool>) ->
     // we keep the file and surface a warning rather than counting the
     // whole track as a failure (the Phase 4 fix-feature roadmap will
     // re-tag library tracks against MB).
-    let tag_warning = tag_ripped_file(&temp_path, release, mb_track, position, total_tracks).err();
+    let tag_warning = tag_ripped_file(
+        &temp_path,
+        release,
+        mb_track,
+        position,
+        total_tracks,
+        medium,
+        total_discs,
+    )
+    .err();
 
     if let Err(e) = std::fs::rename(&temp_path, dest) {
         let _ = std::fs::remove_file(&temp_path);
