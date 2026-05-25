@@ -3906,6 +3906,33 @@ impl App {
                 .filter_map(|t| t.position.map(|p| (p, t)))
                 .collect();
         let extension = overlay.current_fidelity().extension();
+        // Build a set of existing file stems in the destination album
+        // directory once, then match each planned track's stem against
+        // it. Stem-not-path matching catches re-rips at a different
+        // fidelity — same `NN - Title` filename, different extension. A
+        // FLAC re-rip over a prior ALAC pass produces no path-exact
+        // conflict but the user almost always wants to know about the
+        // pre-existing `.m4a` file, not silently double the storage.
+        let existing_stems: std::collections::HashSet<String> = positions
+            .first()
+            .and_then(|p| mb_tracks.get(p))
+            .map(|t| {
+                zytunes::cd::metadata::ripped_track_destination(&dest_dir, release, t, 0, extension)
+            })
+            .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+            .and_then(|album_dir| std::fs::read_dir(&album_dir).ok())
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .filter_map(|e| {
+                        e.path()
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .map(String::from)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let conflicts = positions
             .iter()
             .filter_map(|p| mb_tracks.get(p).map(|t| (*p, *t)))
@@ -3913,7 +3940,11 @@ impl App {
                 let dest = zytunes::cd::metadata::ripped_track_destination(
                     &dest_dir, release, t, *p, extension,
                 );
-                dest.exists()
+                let stem_matches = dest
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|s| existing_stems.contains(s));
+                stem_matches || dest.exists()
             })
             .count();
         if conflicts > 0 && !overlay.overwrite_armed {
@@ -10185,6 +10216,40 @@ mod tests {
                 .any(|c| matches!(c, BgCommand::RipAndImport(_))),
             "RipAndImport queued on second Enter"
         );
+    }
+
+    #[test]
+    fn overlay_enter_warns_when_existing_file_has_different_extension() {
+        // Regression: the original conflict check was path-exact, so a
+        // re-rip at FLAC over a prior ALAC didn't warn (the `.flac` paths
+        // didn't exist). The user's "I already ripped this album" mental
+        // model is per-track-position, not per-file-extension. Verify a
+        // pre-existing `.m4a` at the same `NN - Title` stem triggers the
+        // arm even though the planned destination is `.flac`.
+        let tmp = std::env::temp_dir().join("zytunes-cross-ext-conflict");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let mut app = App::new();
+        app.music_dir_cache = Some(tmp.clone());
+        app.cd.last_status = Some(make_identified_status("Album"));
+        app.handle_cd_import_key();
+        // Default fidelity is FLAC. Pre-create `.m4a` files at the same
+        // stem to simulate a prior ALAC rip — fixture has track titles
+        // "Song A" and "Song B" at positions 1 and 2.
+        let dest_dir = tmp.join("Artist").join("Album");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        std::fs::write(dest_dir.join("01 - Song A.m4a"), b"prior alac").unwrap();
+        std::fs::write(dest_dir.join("02 - Song B.m4a"), b"prior alac").unwrap();
+
+        // First Enter at FLAC fidelity should still arm the overwrite
+        // prompt because the stems collide.
+        assert!(app.handle_import_overlay_key(key(crossterm::event::KeyCode::Enter)));
+        let overlay = app.import_overlay.as_ref().unwrap();
+        assert!(
+            overlay.overwrite_armed,
+            "cross-extension stem conflict must arm the overwrite prompt"
+        );
+        assert_eq!(overlay.conflict_count, 2);
     }
 
     #[test]
