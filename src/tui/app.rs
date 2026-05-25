@@ -747,6 +747,13 @@ pub struct RipProgressState {
     pub current: usize,
     pub total: usize,
     pub track_title: String,
+    /// MB-reported track duration in ms. `None` when MB didn't surface a
+    /// length — the status bar falls back to elapsed-only display.
+    pub track_length_ms: Option<u64>,
+    /// Elapsed audio time in the current track in ms, parsed from
+    /// ffmpeg's `out_time_us` progress lines. Resets on each
+    /// `RipEvent::Started`.
+    pub elapsed_ms: u64,
     /// Track-level errors collected during the rip. Surfaced in the
     /// completion toast so the user can re-attempt failed tracks.
     pub errors: Vec<String>,
@@ -3712,6 +3719,7 @@ impl App {
                 total,
                 track_position: _,
                 track_title,
+                track_length_ms,
             } => {
                 let errors = self
                     .cd
@@ -3723,8 +3731,18 @@ impl App {
                     current,
                     total,
                     track_title,
+                    track_length_ms,
+                    elapsed_ms: 0,
                     errors,
                 });
+            }
+            RipEvent::Progress {
+                track_position: _,
+                elapsed_ms,
+            } => {
+                if let Some(rip) = self.cd.rip.as_mut() {
+                    rip.elapsed_ms = elapsed_ms;
+                }
             }
             RipEvent::TrackDone {
                 track_title, error, ..
@@ -10067,11 +10085,47 @@ mod tests {
             total: 3,
             track_position: 1,
             track_title: "Come Together".into(),
+            track_length_ms: Some(259_000),
         }));
         let rip = app.cd.rip.as_ref().expect("rip state populated");
         assert_eq!(rip.current, 1);
         assert_eq!(rip.total, 3);
         assert_eq!(rip.track_title, "Come Together");
+        assert_eq!(rip.track_length_ms, Some(259_000));
+        assert_eq!(rip.elapsed_ms, 0);
+    }
+
+    #[test]
+    fn rip_progress_event_updates_elapsed_ms() {
+        use crate::background::RipEvent;
+        let mut app = App::new();
+        // No-op if no rip is active.
+        app.handle_bg_event(BgEvent::RipEvent(RipEvent::Progress {
+            track_position: 1,
+            elapsed_ms: 12_345,
+        }));
+        assert!(app.cd.rip.is_none());
+
+        // After Started, Progress events update the elapsed field so the
+        // status bar can compute "elapsed / total — N%".
+        app.handle_bg_event(BgEvent::RipEvent(RipEvent::Started {
+            current: 1,
+            total: 1,
+            track_position: 1,
+            track_title: "T".into(),
+            track_length_ms: Some(60_000),
+        }));
+        app.handle_bg_event(BgEvent::RipEvent(RipEvent::Progress {
+            track_position: 1,
+            elapsed_ms: 15_000,
+        }));
+        let rip = app.cd.rip.as_ref().unwrap();
+        assert_eq!(rip.elapsed_ms, 15_000);
+        app.handle_bg_event(BgEvent::RipEvent(RipEvent::Progress {
+            track_position: 1,
+            elapsed_ms: 30_000,
+        }));
+        assert_eq!(app.cd.rip.as_ref().unwrap().elapsed_ms, 30_000);
     }
 
     #[test]
@@ -10082,6 +10136,8 @@ mod tests {
             current: 3,
             total: 3,
             track_title: "X".into(),
+            track_length_ms: None,
+            elapsed_ms: 0,
             errors: vec![],
         });
         app.handle_bg_event(BgEvent::RipEvent(RipEvent::Complete {
@@ -10105,6 +10161,8 @@ mod tests {
             current: 5,
             total: 5,
             track_title: "X".into(),
+            track_length_ms: None,
+            elapsed_ms: 0,
             errors: vec!["track 3: disk read".into()],
         });
         app.handle_bg_event(BgEvent::RipEvent(RipEvent::Complete {
@@ -10131,6 +10189,8 @@ mod tests {
             current: 1,
             total: 3,
             track_title: "X".into(),
+            track_length_ms: None,
+            elapsed_ms: 0,
             errors: vec![],
         });
         app.cancel_rip();

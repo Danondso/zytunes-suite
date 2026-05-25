@@ -322,6 +322,7 @@ pub(crate) fn draw_cd_status_bar(f: &mut Frame, app: &App, area: Rect) {
 
     // Active rip takes precedence over any other CD status.
     if let Some(rip) = &app.cd.rip {
+        let progress = format_rip_progress(rip.elapsed_ms, rip.track_length_ms);
         let line = Line::from(vec![
             Span::styled(
                 "CD ripping ",
@@ -330,7 +331,7 @@ pub(crate) fn draw_cd_status_bar(f: &mut Frame, app: &App, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(format!(
-                "{}/{}: {}",
+                "{}/{}: {}   {progress}",
                 rip.current, rip.total, rip.track_title
             )),
             Span::styled("   [c] cancel", Style::default().fg(theme.dim_text)),
@@ -373,6 +374,31 @@ pub(crate) fn draw_cd_status_bar(f: &mut Frame, app: &App, area: Rect) {
 
     let para = Paragraph::new(line).style(style);
     f.render_widget(para, area);
+}
+
+/// Render the elapsed / total progress fragment for the rip status bar.
+///
+/// `M:SS / M:SS — NN%` when both fields are known; `M:SS` alone when MB
+/// didn't surface a track length. Floor-divides on the percent so it
+/// never displays 100% while ffmpeg is still encoding the tail.
+fn format_rip_progress(elapsed_ms: u64, total_ms: Option<u64>) -> String {
+    let format_ms = |ms: u64| {
+        let total_secs = ms / 1000;
+        let mins = total_secs / 60;
+        let secs = total_secs % 60;
+        format!("{mins}:{secs:02}")
+    };
+    match total_ms {
+        Some(total) if total > 0 => {
+            let percent = ((elapsed_ms.saturating_mul(100) / total).min(99)) as u8;
+            format!(
+                "[{} / {} — {percent}%]",
+                format_ms(elapsed_ms),
+                format_ms(total),
+            )
+        }
+        _ => format!("[{}]", format_ms(elapsed_ms)),
+    }
 }
 
 fn draw_startup(f: &mut Frame, app: &App, area: Rect) {
@@ -3261,6 +3287,40 @@ fn build_zune_art(screen_line1: &str, screen_line2: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rip_progress_format_with_known_total() {
+        // 65s of 4-minute track → "1:05 / 4:00 — 27%"
+        let s = format_rip_progress(65_000, Some(240_000));
+        assert_eq!(s, "[1:05 / 4:00 — 27%]");
+    }
+
+    #[test]
+    fn rip_progress_format_without_total_falls_back_to_elapsed_only() {
+        // MB didn't supply a length — render just the elapsed time.
+        let s = format_rip_progress(125_000, None);
+        assert_eq!(s, "[2:05]");
+    }
+
+    #[test]
+    fn rip_progress_format_caps_percent_at_99_until_complete() {
+        // ffmpeg's `out_time_us` can briefly outrun the MB-reported
+        // length on the tail end (rounding + encoder priming). Floor-
+        // capping at 99% avoids a flashed "100%" before the encoder
+        // finalises and the rip actually completes.
+        let s = format_rip_progress(241_000, Some(240_000));
+        assert!(s.contains("99%"), "got {s}");
+        let s = format_rip_progress(240_000, Some(240_000));
+        assert!(s.contains("99%"), "got {s}");
+    }
+
+    #[test]
+    fn rip_progress_format_handles_zero_total() {
+        // Edge case: a malformed MB record could surface length=0.
+        // Should fall through to the elapsed-only branch.
+        let s = format_rip_progress(5_000, Some(0));
+        assert_eq!(s, "[0:05]");
+    }
 
     #[test]
     fn sidebar_icon_accent_is_visible_on_selected_row() {

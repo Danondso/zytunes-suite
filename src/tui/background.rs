@@ -242,7 +242,9 @@ pub enum BgEvent {
 #[derive(Debug, Clone)]
 pub enum RipEvent {
     /// A track is starting. `current` is 1-indexed within the selected
-    /// set; `total` is the total selected.
+    /// set; `total` is the total selected. `track_length_ms` is the MB-
+    /// reported duration if known — used by the TUI to render `N:NN / N:NN`
+    /// + percent against the per-track progress events.
     Started {
         current: usize,
         total: usize,
@@ -250,6 +252,15 @@ pub enum RipEvent {
         #[allow(dead_code)]
         track_position: u32,
         track_title: String,
+        track_length_ms: Option<u64>,
+    },
+    /// Per-track progress update. `elapsed_ms` comes from ffmpeg's
+    /// `-progress pipe:1` stream (`out_time_us` ÷ 1000). Roughly every
+    /// ~100 ms while the rip is running.
+    Progress {
+        #[allow(dead_code)]
+        track_position: u32,
+        elapsed_ms: u64,
     },
     /// A track finished. `error` is `Some` on failure (ffmpeg, tagging,
     /// or file move).
@@ -1375,6 +1386,7 @@ fn run_rip_and_import(
             total,
             track_position: position,
             track_title: mb_track.title.clone(),
+            track_length_ms: mb_track.length.map(u64::from),
         }));
 
         let dest = ripped_track_destination(
@@ -1385,6 +1397,16 @@ fn run_rip_and_import(
             req.fidelity.extension(),
         );
 
+        // Forward ffmpeg's elapsed-µs progress to the TUI as RipEvent::Progress
+        // events. The closure is called from the rip thread's polling loop
+        // (~every 100 ms) so the user sees smooth per-track motion.
+        let progress_tx = event_tx.clone();
+        let on_progress = move |elapsed_us: u64| {
+            let _ = progress_tx.send(BgEvent::RipEvent(RipEvent::Progress {
+                track_position: position,
+                elapsed_ms: elapsed_us / 1_000,
+            }));
+        };
         let outcome = run_single_track_rip(
             SingleTrackRip {
                 drive_path: &req.drive.path,
@@ -1400,6 +1422,7 @@ fn run_rip_and_import(
                 compute_fingerprint: req.compute_acoustid_fingerprint,
             },
             cancel,
+            &on_progress,
         );
 
         // Typed outcome from `run_single_track_rip`. Accounting now
@@ -1502,7 +1525,11 @@ pub(crate) enum TrackOutcome {
     Failed(String),
 }
 
-fn run_single_track_rip(params: SingleTrackRip<'_>, cancel: &Arc<AtomicBool>) -> TrackOutcome {
+fn run_single_track_rip<'a>(
+    params: SingleTrackRip<'a>,
+    cancel: &Arc<AtomicBool>,
+    on_progress: &dyn Fn(u64),
+) -> TrackOutcome {
     let SingleTrackRip {
         drive_path,
         toc,
@@ -1546,6 +1573,7 @@ fn run_single_track_rip(params: SingleTrackRip<'_>, cancel: &Arc<AtomicBool>) ->
         fidelity,
         &temp_path,
         &move || cancel_clone.load(Ordering::SeqCst),
+        on_progress,
     );
 
     match rip_result {

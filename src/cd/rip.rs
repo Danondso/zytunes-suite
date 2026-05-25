@@ -136,6 +136,10 @@ pub fn build_ffmpeg_command(
         "warning".into(),
         // Always overwrite — the worker chooses the destination path.
         "-y".into(),
+        // Stream key=value progress lines to stdout so `rip_track_cancellable`
+        // can render per-track progress in the TUI. Doesn't slow the rip.
+        "-progress".into(),
+        "pipe:1".into(),
         // `libcdio` demuxer reads audio CDs track-addressably.
         "-f".into(),
         "libcdio".into(),
@@ -250,6 +254,9 @@ pub fn build_ffmpeg_command_from_file(
         "-loglevel".into(),
         "warning".into(),
         "-y".into(),
+        // Progress on stdout. See `build_ffmpeg_command` for the rationale.
+        "-progress".into(),
+        "pipe:1".into(),
         "-i".into(),
         input.to_string_lossy().into_owned(),
         "-vn".into(),
@@ -364,12 +371,9 @@ pub fn require_track(
 ///
 /// `stderr` is captured into the `RipError::FfmpegFailed` variant on
 /// non-zero exit so callers see what went wrong instead of an opaque exit
-/// code. Per-byte progress streaming is not provided here — Phase 3 emits
-/// progress at per-track granularity from the worker (a 4-minute rip
-/// produces one "started" event and one "done" event), which is sufficient
-/// for the import overlay's status line. Within-track progress would
-/// require an ffmpeg `-progress pipe:2` parser; not worth the complexity
-/// for the user-perceived improvement (a single track rips in 30s-5min).
+/// code. Progress (`out_time_us` from ffmpeg's `-progress pipe:1`) is
+/// streamed to the caller via a no-op callback in this convenience wrapper;
+/// the worker uses [`rip_track_cancellable`] for live per-track progress.
 pub fn rip_track(
     drive_device: &Path,
     toc: &DiscToc,
@@ -377,12 +381,25 @@ pub fn rip_track(
     fidelity: RipFidelity,
     output: &Path,
 ) -> Result<PathBuf, RipError> {
-    rip_track_cancellable(drive_device, toc, track_number, fidelity, output, &|| false)
+    rip_track_cancellable(
+        drive_device,
+        toc,
+        track_number,
+        fidelity,
+        output,
+        &|| false,
+        &|_| {},
+    )
 }
 
 /// Like [`rip_track`] but consults `is_cancelled` between IO operations and
 /// kills the ffmpeg child if it ever returns `true`. Used by the background
 /// worker for `BgCommand::CancelRip` support.
+///
+/// `on_progress` receives the elapsed audio time in microseconds, parsed
+/// from ffmpeg's `-progress pipe:1` `out_time_us` lines. The worker turns
+/// these into `RipEvent::Progress` events so the TUI can render
+/// `M:SS / M:SS — NN%` against the MB-provided track length.
 pub fn rip_track_cancellable(
     drive_device: &Path,
     toc: &DiscToc,
@@ -390,6 +407,7 @@ pub fn rip_track_cancellable(
     fidelity: RipFidelity,
     output: &Path,
     is_cancelled: &dyn Fn() -> bool,
+    on_progress: &dyn Fn(u64),
 ) -> Result<PathBuf, RipError> {
     use std::sync::{Arc, Mutex};
 
@@ -397,10 +415,38 @@ pub fn rip_track_cancellable(
     let (program, args) = build_command_for_track(drive_device, track_number, fidelity, output)?;
     let mut child = std::process::Command::new(&program)
         .args(&args)
-        .stdout(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| RipError::Spawn(e.to_string()))?;
+
+    // Drain ffmpeg stdout on a background thread, parsing the key=value
+    // `-progress` block to surface elapsed audio time. ffmpeg emits
+    // blocks shaped like:
+    //   out_time_us=12345678
+    //   progress=continue
+    //   ...
+    //   progress=end
+    // We only care about `out_time_us`; everything else (frame, fps,
+    // bitrate, total_size, dup_frames, drop_frames) is ignored. The
+    // borrowed `on_progress` callback can't be moved into a thread, so
+    // we forward elapsed-µs values through an mpsc channel and drain
+    // it from the polling loop below — same loop that already polls
+    // `is_cancelled`, so no extra wake-up cost.
+    let (progress_tx, progress_rx) = std::sync::mpsc::channel::<u64>();
+    let stdout_handle = child.stdout.take().map(|stdout| {
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader};
+            let reader = BufReader::new(stdout);
+            for line in reader.lines().map_while(Result::ok) {
+                if let Some(rest) = line.strip_prefix("out_time_us=") {
+                    if let Ok(us) = rest.trim().parse::<u64>() {
+                        let _ = progress_tx.send(us);
+                    }
+                }
+            }
+        })
+    });
 
     // Drain ffmpeg stderr on a background thread. The previous
     // implementation only read stderr *after* `try_wait` reported
@@ -427,8 +473,16 @@ pub fn rip_track_cancellable(
     });
 
     // Poll cancel flag every 100 ms. A track typically takes 30 s-5 min so
-    // we're not burning meaningful CPU here.
+    // we're not burning meaningful CPU here. Same poll services the
+    // progress channel — ffmpeg emits an `out_time_us` line every ~100 ms,
+    // so the user sees smooth updates without a separate timer thread.
+    let drain_progress = |rx: &std::sync::mpsc::Receiver<u64>| {
+        while let Ok(us) = rx.try_recv() {
+            on_progress(us);
+        }
+    };
     let exit_outcome: Result<Option<i32>, RipError> = loop {
+        drain_progress(&progress_rx);
         if is_cancelled() {
             // Cancel-during-completion race: ffmpeg may have already
             // finished in the ~100 ms window before we noticed the
@@ -465,10 +519,17 @@ pub fn rip_track_cancellable(
         }
     };
 
-    // Wait for the drain thread to finish so the buffer is complete.
+    // Wait for the drain threads to finish so the buffers are complete
+    // and the stdout EOF clears any leftover progress lines.
     if let Some(h) = drain_handle {
         let _ = h.join();
     }
+    if let Some(h) = stdout_handle {
+        let _ = h.join();
+    }
+    // Drain any final progress lines that landed between the last poll
+    // and the stdout EOF.
+    drain_progress(&progress_rx);
     let stderr = stderr_buf
         .lock()
         .ok()
