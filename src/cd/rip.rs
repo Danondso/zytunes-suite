@@ -17,8 +17,9 @@ use super::discid::DiscToc;
 ///
 /// FLAC and WAV land in the library at full source quality. On push to a
 /// device they're transcoded to the highest fidelity that device supports
-/// (ALAC for iPod Classic, MP3 320 CBR for Zune) — see Phase 3's
-/// `DeviceCapabilities::lossless_target`.
+/// (ALAC for iPod Classic via the FLAC→ALAC ffmpeg branch; LAME VBR
+/// NearBest (~V0) for Zune since the Zune firmware has no lossless
+/// container) — see `DeviceCapabilities::lossless_target`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RipFidelity {
     /// MP3 CBR 320 kbps.

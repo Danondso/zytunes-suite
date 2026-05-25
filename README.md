@@ -22,6 +22,8 @@ A Rust tool for syncing music (and photos/videos on Zune) to a Microsoft Zune or
 - **Photo & video sync (Zune)** — `photo-sync [dir]` and `video-sync [dir]` push images and videos to the Zune's Pictures/Video stores. Videos are transcoded to WMV2/WMAv2 via ffmpeg; photos are JPEG-normalised
 - **Auto-transcoding (audio)** — non-native formats (FLAC, OGG, WAV, M4A, OPUS, ALAC, AIFF) are transcoded to MP3 via pure-Rust symphonia + LAME, with album art resized to 200x200 (Zune constraint). The M4A/ALAC path trims trailing silence leaked by symphonia's unapplied `elst` edit-list atoms
 - **MP3 passthrough** — native formats (MP3, WMA, AAC) skip transcoding entirely
+- **Per-device lossless promotion** — FLAC library tracks pushed to iPod transcode to ALAC (lossless) instead of dropping to MP3. Zune still falls through to MP3 since its firmware has no lossless container. Controlled by `DeviceCapabilities::lossless_target`
+- **CD import** — insert an audio CD and zytunes shows a status bar with the disc's artist/album (identified via MusicBrainz; libdiscid reads the disc TOC and our pure-Rust `compute_disc_id` derives the MB disc ID from it). Press `i` to open an import overlay: toggle individual tracks, cycle through alternate release matches, pick a fidelity (FLAC, WAV, or MP3 V2 / V0 / 320 CBR), and optionally auto-eject when done. Files land under `{music_dir}/{Artist}/{Album}/01 - Title.{ext}` with full MB metadata (title, artist, album, year, and 6 MusicBrainz IDs — track, recording, release, release-group, release-artist, and track-artist — that the upcoming "fix" feature can key on)
 - **Library browsing** — `library [query]` browses/searches your music library
 - **Directory scanning** — point zytunes at a music folder. It reads tags via lofty (FLAC, M4A, OGG, WAV, MP3, etc.) and infers metadata from the directory structure (`Artist/Album/Track.ext`) for untagged files. Set `ZYTUNES_MUSIC_DIR` or add `music_dir` to `~/.config/zytunes/config.toml`
 - **Interactive TUI** — `zytunes-tui` launches a terminal UI (ratatui) for browsing your music library, connecting to the device, managing a sync queue, and monitoring sync progress. Library scanning runs in the background on startup. TUI shows a device-aware ASCII art panel with loading spinner, track count, syncing spinner, and queue count
@@ -126,6 +128,28 @@ The album detail view shows a ZIP disk ASCII art with album metadata (artist, al
 | `T` | Toggle album-art style (halfblock / ASCII) |
 | `L` | Dump log to `/tmp/zytunes-log.txt` and copy path to clipboard |
 
+**CD import**
+
+| Key | Action |
+|-----|--------|
+| `i` | Always responds — opens the import overlay when a disc is identified, otherwise toasts one of: "No optical drive detected" (no drive on the system) / "Insert a CD to import" (drive empty) / "Cannot import — {reason}" (TOC read but MB lookup failed — common reason: `musicbrainz_user_agent` not configured) |
+| `c` (during rip) | Cancel the active rip (SIGTERMs ffmpeg, skips remaining tracks). Falls through to `c` for connect when no rip is running |
+
+Inside the import overlay:
+
+| Key | Action |
+|-----|--------|
+| `Esc` / `q` | Cancel and close |
+| `Tab` / `Shift+Tab` | Cycle focused field (Tracks → Fidelity → AlternateMatch → AutoEject) |
+| `Up` / `Down` | Move track cursor (when Tracks focused) |
+| `Space` | Toggle track include (Tracks) / Toggle eject preference (AutoEject) |
+| `a` / `n` | Select all / none (Tracks) |
+| `Left` / `Right` | Cycle the focused picker (Fidelity or AlternateMatch) |
+| `[` / `]` | Cycle alternate match (any focus) |
+| `f` / `F` | Cycle fidelity backward / forward (any focus) |
+| `e` | Toggle auto-eject (any focus) |
+| `Enter` | Start the rip |
+
 **General**
 
 | Key | Action |
@@ -166,9 +190,27 @@ The TUI works in any EAW-compliant terminal (Alacritty, kitty, wezterm, Zed's em
 1. Browse your music library and press `a` to add artists, albums, or individual tracks to the sync queue
 2. Press `c` to connect to the device (auto-detects via USB, performs MTPZ handshake on Zune / mounts the iPod volume)
 3. Press `S` or switch to the queue and press `Enter` to start syncing
-4. Non-native formats are auto-transcoded to MP3, album art resized to 200x200
+4. Non-native formats are auto-transcoded to MP3, album art resized to 200x200. FLAC sources push to iPod as ALAC (lossless preserved); the Zune transcoder targets LAME VBR `NearBest` (~V0, ~245 kbps) since the Zune firmware has no lossless container
 5. Progress and results appear in the log panel; device track list auto-refreshes on completion. Tracks already on the device are skipped automatically and noted in the log
 6. If the device disconnects mid-sync (unplug, unrecoverable stall), the TUI aborts remaining items, drops the session, and tells you to replug
+
+### CD import workflow
+
+1. Insert an audio CD. Within ~5 seconds the top status bar shows `CD {drive name} — {artist} — {album}  [i] import` where *drive name* is the friendly label zytunes builds from libdiscid's default-device path (e.g. `Optical Drive (/dev/disk4)`). The artist/album come from MusicBrainz; libdiscid reads the disc TOC and our pure-Rust `compute_disc_id` derives the MB disc ID locally
+2. Press `i` to open the import overlay
+3. Toggle which tracks to import (`Space`), pick fidelity (`f` / `F` cycles MP3 V2 → MP3 V0 → MP3 320 CBR → FLAC → WAV — defaults to FLAC for lossless archival), cycle alternate match candidates if MusicBrainz returned more than one (`[` / `]`), and toggle auto-eject (`e`, defaults to on)
+4. Press `Enter` to start ripping. The status bar takes over with `CD ripping 3/12: {title}  [c] cancel` and updates per-track
+5. Files land at `{music_dir}/{Artist}/{Album}/01 - Title.{ext}` with MusicBrainz metadata tagged in (title, artist, album, year, plus 5 MBIDs: recording, release, release-group, release-artist, and track-artist). A `.part` extension is used while writing so the dirlib scanner never sees a half-formed file
+6. On completion the disc ejects automatically (unless you turned that off in the overlay), and the new tracks appear in your library on the next dirlib refresh
+
+Set `musicbrainz_user_agent` in `~/.config/zytunes/config.toml` before first use (the public MusicBrainz host requires it per their ToS — format `app/version (contact)`, e.g. `zytunes/2.2.0 (you@example.com)`). Point `musicbrainz_base_url` at a local mirror (`http://localhost:5000/ws/2`) to skip rate limits.
+
+Other CD-import config knobs (all optional):
+
+```toml
+default_fidelity   = "flac"  # preselected fidelity in the overlay: "mp3-cbr-320" | "mp3-v0" | "mp3-v2" | "flac" | "wav"
+cd_auto_eject      = true    # eject after a successful rip (defaults to true)
+```
 
 ## Claude Code Skills
 
@@ -185,6 +227,9 @@ Both skills run `cargo fmt` and `cargo clippy -- -D warnings` as part of their f
 
 - **Dump command** — `dump` to pull all music off a device to a local directory
 - **Linux transport parity** — port IOKit's `ClearPipeStall` recovery behaviour to the libusb transport so Linux hosts survive transient pipe errors without a replug
+- **Metadata "fix" feature** — re-tag library tracks against MusicBrainz using the already-cached MBIDs (Phase 3 of CD import seeded these). Backed by the same `MusicBrainzClient` used for disc lookup; reuses the search and lookup-by-mbid endpoints (no auth needed — these are public read APIs)
+- **Submit unknown discs to MusicBrainz** — when a CD's disc-id has no MB match, offer a one-key submission via OAuth (read endpoints don't need auth; writes do — this is the first place we'd need the OAuth flow)
+- **Auto-queue ripped tracks to device** — optional toggle to enqueue freshly-ripped files for sync to a connected device, gated on `auto_queue_ripped_to_device` config
 
 ## Setup
 
@@ -192,8 +237,11 @@ Both skills run `cargo fmt` and `cargo clippy -- -D warnings` as part of their f
 
 ```
 brew install libusb            # required
-brew install ffmpeg            # optional: only needed for `video-sync` and TUI playback of WMA files
+brew install libdiscid         # required for CD detection / import (libdiscid is LGPL, dynamically linked)
+brew install ffmpeg            # required for `video-sync` and CD ripping; optional for TUI playback of WMA files
 ```
+
+On Debian/Ubuntu: `apt install libusb-1.0-0-dev libdiscid-dev ffmpeg`.
 
 ### MTPZ keys (Zune only)
 
