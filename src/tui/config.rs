@@ -19,6 +19,13 @@ pub struct Config {
     /// scan is fast (lofty tag read only) but Phase 2+ playcount-merge
     /// features that key on `acoustic_id` won't have anything to match on.
     pub fingerprinting: Option<bool>,
+    /// Compute and embed a Chromaprint fingerprint into each freshly-ripped
+    /// CD track as an `ACOUSTID_FINGERPRINT` tag. `None` (default) and
+    /// `Some(true)` enable; `Some(false)` skips it. Decoupled from
+    /// `fingerprinting` (scan-time) so a user can opt out of rip-time
+    /// fingerprinting without losing scan-time identity matching. Adds
+    /// ~1–15 s per track during rip (capped at 120 s of audio decode).
+    pub acoustid_fingerprint: Option<bool>,
     /// MusicBrainz Web Service base URL. `None` uses the public host
     /// (`https://musicbrainz.org/ws/2`). Point at a locally hosted mirror
     /// (e.g. `http://localhost:5000/ws/2`) to skip rate limits.
@@ -186,11 +193,25 @@ music_dir = "/home/user/Music"
         assert!(config.album_art_style.is_none());
         assert!(config.show_player.is_none());
         assert!(config.fingerprinting.is_none());
+        assert!(config.acoustid_fingerprint.is_none());
         assert!(config.musicbrainz_base_url.is_none());
         assert!(config.musicbrainz_user_agent.is_none());
         assert!(config.default_fidelity.is_none());
         assert!(config.cd_auto_eject.is_none());
         assert!(config.themes.is_empty());
+    }
+
+    #[test]
+    fn config_round_trip_acoustid_fingerprint() {
+        for pref in [Some(true), Some(false), None] {
+            let config = Config {
+                acoustid_fingerprint: pref,
+                ..Config::default()
+            };
+            let serialized = toml::to_string_pretty(&config).unwrap();
+            let deserialized: Config = toml::from_str(&serialized).unwrap();
+            assert_eq!(deserialized.acoustid_fingerprint, pref);
+        }
     }
 
     #[test]

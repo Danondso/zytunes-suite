@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use zytunes::cd::discid::{compute_disc_id, DiscToc};
 use zytunes::cd::drive::{enumerate_drives, read_disc_toc, CdDrive, DriveError};
-use zytunes::cd::metadata::{ripped_track_destination, tag_ripped_file};
+use zytunes::cd::metadata::{ripped_track_destination, tag_ripped_file, tag_ripped_fingerprint};
 use zytunes::cd::rip::{eject_drive, rip_track_cancellable, RipError, RipFidelity};
 use zytunes::device::{
     DeviceBackend, DeviceCapabilities, DeviceFamily, IpodBackend, ZuneBackend, ZuneDeviceData,
@@ -123,6 +123,10 @@ pub struct RipAndImportRequest {
     pub fidelity: RipFidelity,
     pub dest_dir: PathBuf,
     pub auto_eject: bool,
+    /// When true, the rip pipeline computes a Chromaprint fingerprint per
+    /// track and embeds it as `ACOUSTID_FINGERPRINT`. ~1–15 s extra per
+    /// track (capped at 120 s of audio decode).
+    pub compute_acoustid_fingerprint: bool,
 }
 
 /// A single item to sync (resolved to a file path).
@@ -1393,6 +1397,7 @@ fn run_rip_and_import(
                 total_tracks: total_tracks_on_release,
                 medium: active_medium,
                 total_discs: total_discs_on_release,
+                compute_fingerprint: req.compute_acoustid_fingerprint,
             },
             cancel,
         );
@@ -1475,6 +1480,7 @@ struct SingleTrackRip<'a> {
     total_tracks: Option<u32>,
     medium: Option<&'a zytunes::musicbrainz::Medium>,
     total_discs: Option<u32>,
+    compute_fingerprint: bool,
 }
 
 /// Result of a single-track rip — finer-grained than `Result<_,_>` so
@@ -1508,6 +1514,7 @@ fn run_single_track_rip(params: SingleTrackRip<'_>, cancel: &Arc<AtomicBool>) ->
         total_tracks,
         medium,
         total_discs,
+        compute_fingerprint,
     } = params;
 
     if let Some(parent) = dest.parent() {
@@ -1570,6 +1577,23 @@ fn run_single_track_rip(params: SingleTrackRip<'_>, cancel: &Arc<AtomicBool>) ->
     )
     .err();
 
+    // Chromaprint fingerprint + ACOUSTID_FINGERPRINT tag. Caps at 120 s of
+    // audio decode (FINGERPRINT_SECONDS in fingerprint.rs) so the extra
+    // cost is bounded. Skipped if the user opted out or if we're already
+    // cancelled — no point burning a decode pass on a track the user is
+    // walking away from.
+    let fingerprint_warning = if compute_fingerprint && !cancel.load(Ordering::SeqCst) {
+        match zytunes::fingerprint::compute_fingerprint(&temp_path) {
+            Some(fp) => tag_ripped_fingerprint(&temp_path, &fp).err(),
+            None => Some(
+                "fingerprint compute returned no hashes (file too short or decoder bailed)"
+                    .to_string(),
+            ),
+        }
+    } else {
+        None
+    };
+
     if let Err(e) = std::fs::rename(&temp_path, dest) {
         let _ = std::fs::remove_file(&temp_path);
         return TrackOutcome::Failed(format!(
@@ -1579,12 +1603,20 @@ fn run_single_track_rip(params: SingleTrackRip<'_>, cancel: &Arc<AtomicBool>) ->
         ));
     }
 
-    match tag_warning {
-        Some(e) => TrackOutcome::RippedUntagged {
+    match (tag_warning, fingerprint_warning) {
+        (Some(tag_err), Some(fp_err)) => TrackOutcome::RippedUntagged {
             dest: dest.to_path_buf(),
-            warning: format!("tagging failed: {e}"),
+            warning: format!("tagging failed: {tag_err}; fingerprint failed: {fp_err}"),
         },
-        None => TrackOutcome::Ripped(dest.to_path_buf()),
+        (Some(tag_err), None) => TrackOutcome::RippedUntagged {
+            dest: dest.to_path_buf(),
+            warning: format!("tagging failed: {tag_err}"),
+        },
+        (None, Some(fp_err)) => TrackOutcome::RippedUntagged {
+            dest: dest.to_path_buf(),
+            warning: format!("fingerprint failed: {fp_err}"),
+        },
+        (None, None) => TrackOutcome::Ripped(dest.to_path_buf()),
     }
 }
 

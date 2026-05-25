@@ -246,6 +246,43 @@ fn set_unknown_string(tag: &mut Tag, name: &str, value: &str) {
     ));
 }
 
+/// Write a Chromaprint fingerprint into the file's tag as `ACOUSTID_FINGERPRINT`.
+///
+/// Picard's canonical tag name; `src/fingerprint.rs::read_embedded_fingerprint`
+/// matches both the Vorbis-style upper-case form and the ID3v2 `TXXX:Acoustid
+/// Fingerprint` description case-insensitively, so writing just the upper-case
+/// form is sufficient for the library scanner to pick it up.
+///
+/// Returns Err if lofty can't open the file or fails to save. The caller
+/// treats this as best-effort — a fingerprint write failure shouldn't fail
+/// the rip itself.
+pub fn tag_ripped_fingerprint(path: &Path, fingerprint: &str) -> Result<(), String> {
+    if fingerprint.is_empty() {
+        return Ok(());
+    }
+    let mut tagged = lofty::probe::read_from_path(path)
+        .map_err(|e| format!("lofty probe failed on {}: {e}", path.display()))?;
+
+    let tag_type = match tagged.primary_tag_type() {
+        TagType::RiffInfo => TagType::Id3v2,
+        other => other,
+    };
+    if tagged.tag(tag_type).is_none() {
+        tagged.insert_tag(Tag::new(tag_type));
+    }
+    let tag = tagged
+        .tag_mut(tag_type)
+        .ok_or_else(|| "lofty refused to attach a tag".to_string())?;
+
+    set_unknown_string(tag, "ACOUSTID_FINGERPRINT", fingerprint);
+
+    let _ = tag;
+    tagged
+        .save_to_path(path, WriteOptions::default())
+        .map_err(|e| format!("lofty save failed on {}: {e}", path.display()))?;
+    Ok(())
+}
+
 /// Build a path the rip pipeline writes a finished track to. Returns
 /// `{dest_dir}/{Artist}/{Album}/{TT - Title}.{ext}` with characters that
 /// would break filesystems (slashes, NULs, ASCII control) sanitised out.
@@ -738,5 +775,77 @@ mod tests {
             read_text(&path, &ItemKey::MusicBrainzReleaseArtistId).as_deref(),
             Some("art-1")
         );
+    }
+
+    // -------------------- Phase C fingerprint-write tests --------------------
+
+    #[test]
+    fn tag_ripped_fingerprint_writes_acoustid_unknown_key() {
+        let path = write_test_wav("acoustid-fp-write");
+        // Write the MB tags first so we exercise the typical sequence
+        // `tag_ripped_file` → `tag_ripped_fingerprint`.
+        let rel = release("Album", "Artist", None);
+        tag_ripped_file(&path, &rel, &mb_track("T", 1), 1, Some(1), None, None).unwrap();
+        tag_ripped_fingerprint(&path, "AQADtIqYRYmS_AeOJUuOK0d6_FcOpcePZkePI8eRJD8q5FdyZP9hHB-OH_2P_DhxJEdy_DhyHEdy_NCPI9eR/zhxnEcePOmRH8mPHzmS_ChyHEdy_PiP/8jx48iRHTny47i").unwrap();
+
+        assert!(
+            read_unknown(&path, "ACOUSTID_FINGERPRINT").is_some_and(|v| v.starts_with("AQAD")),
+            "ACOUSTID_FINGERPRINT tag should be present and carry the written value"
+        );
+        // Pre-existing MB tags must still be there — the fingerprint write
+        // re-opens the file and we should not be wiping prior items.
+        assert_eq!(
+            read_text(&path, &ItemKey::MusicBrainzTrackId).as_deref(),
+            Some("trk-1")
+        );
+    }
+
+    #[test]
+    fn tag_ripped_fingerprint_round_trips_through_read_embedded_fingerprint() {
+        // Exercises the same read path the library scanner uses
+        // (`crate::fingerprint::read_embedded_fingerprint`) so a future
+        // tag-name change can't silently disconnect rip-time writes from
+        // scan-time reads.
+        let path = write_test_wav("acoustid-fp-roundtrip");
+        let sentinel = "AQADxIqIRYmS_OdwPDmS40iOoz/+L0fy40jy48hxJD-OI8mPI8eRJD-S/PiR48iRJD-OJEeOIz9-_DiSHEny4z_-Iz-OI_lxJMmRHEny4zh-HMmR_DiOI8eR/Mhx5Eh-HEmO5EeSHzmS_DiOI8mPHEmO5EeOJD_-IzmO5EhyJDmS_MiR_EiOI8mRHMmRJMmRHDmS5MeP/EhyHMmPI8mRHEmOJEeS5EeS5EeS5MePI0eOH8mPJEdy5EiSH8mP/Eh-HEmS5EeSHzmS_EhyHEmO5MiR5MeRJD_-4ziSH8mRJD-O5EeS5EceyZH8KI4cyY8jSY7kyHEkR_LjOJIcyZHkSI4cyZEkRw4=";
+        tag_ripped_fingerprint(&path, sentinel).unwrap();
+
+        let read_back = crate::fingerprint::read_embedded_fingerprint(&path)
+            .expect("scanner should find the embedded fingerprint");
+        assert_eq!(read_back, sentinel);
+    }
+
+    #[test]
+    fn tag_ripped_fingerprint_skips_empty_input() {
+        // Nothing should be written when the fingerprint string is empty;
+        // protects against a `compute_fingerprint() -> Some("")` slip in
+        // the caller from accidentally clearing a previously-written tag.
+        let path = write_test_wav("acoustid-fp-empty");
+        tag_ripped_fingerprint(&path, "").unwrap();
+        assert!(read_unknown(&path, "ACOUSTID_FINGERPRINT").is_none());
+    }
+
+    #[test]
+    fn tag_ripped_fingerprint_end_to_end_with_real_audio() {
+        // Sanity check the full rip-time path: compute a real fingerprint
+        // from a synthetic WAV via the same module the worker uses, write
+        // it, and confirm a non-empty value lands in the tag. 10 s of
+        // audio because Chromaprint's Test2 needs enough signal to emit
+        // hashes (the 1 s WAVs used by other tests in this file return
+        // `None` from compute_fingerprint). Slow but worth covering to
+        // catch shape mismatches between `compute_fingerprint` and
+        // `tag_ripped_fingerprint`.
+        let dir = fresh_dir("acoustid-fp-end-to-end");
+        let path = dir.join("audio.wav");
+        write_sine_wav(&path, 10);
+
+        let fp = crate::fingerprint::compute_fingerprint(&path)
+            .expect("sine wav fingerprints to a non-empty string");
+        assert!(!fp.is_empty());
+        tag_ripped_fingerprint(&path, &fp).unwrap();
+
+        let read_back = crate::fingerprint::read_embedded_fingerprint(&path)
+            .expect("read_embedded_fingerprint should find what we just wrote");
+        assert_eq!(read_back, fp);
     }
 }

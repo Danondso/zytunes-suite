@@ -925,6 +925,12 @@ pub struct App {
     pub default_rip_fidelity: zytunes::cd::rip::RipFidelity,
     /// Default auto-eject preference for new import overlays.
     pub auto_eject_default: bool,
+    /// Whether to compute + embed an `ACOUSTID_FINGERPRINT` tag during the
+    /// rip pipeline. Loaded from `config.toml::acoustid_fingerprint` at
+    /// startup; defaults to `true` when unset. Decoupled from scan-time
+    /// `fingerprinting` so users can disable rip-time without losing
+    /// scan-time identity matching.
+    pub acoustid_fingerprint: bool,
     /// Cached music-library directory used as the rip destination. Pulled
     /// from config at startup so `confirm_import` doesn't hit the disk on
     /// every Enter, and so tests can set it directly without env var
@@ -1113,6 +1119,7 @@ impl App {
             import_overlay: None,
             default_rip_fidelity: zytunes::cd::rip::RipFidelity::Flac,
             auto_eject_default: true,
+            acoustid_fingerprint: true,
             music_dir_cache: None, // overwritten below from config
         };
 
@@ -1133,6 +1140,7 @@ impl App {
         if let Some(v) = cfg.cd_auto_eject {
             app.auto_eject_default = v;
         }
+        app.acoustid_fingerprint = cfg.acoustid_fingerprint.unwrap_or(true);
         app.music_dir_cache = cfg
             .music_dir
             .clone()
@@ -3837,6 +3845,7 @@ impl App {
             fidelity: overlay.current_fidelity(),
             dest_dir,
             auto_eject: overlay.auto_eject,
+            compute_acoustid_fingerprint: self.acoustid_fingerprint,
         };
 
         let count = positions.len();
