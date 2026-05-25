@@ -1525,6 +1525,49 @@ pub(crate) enum TrackOutcome {
     Failed(String),
 }
 
+/// Remove any sibling files in the same directory that share `dest`'s
+/// stem but have a different extension. Used as the second half of the
+/// confirm-overwrite flow: the conflict pre-scan in `confirm_import`
+/// catches cross-extension conflicts (ALAC `.m4a` already on disk while
+/// the user re-rips at FLAC `.flac`), and once the new file has landed
+/// at its canonical path this sweep deletes the leftover copies the
+/// user already opted to replace.
+///
+/// Best-effort — read-dir / remove-file errors are swallowed silently:
+/// a failed sweep just means the user has to clean up by hand later,
+/// not that the rip itself failed. Same-extension overwrites are
+/// handled by `std::fs::rename` and aren't touched here.
+fn sweep_same_stem_other_extensions(dest: &std::path::Path) {
+    let (Some(parent), Some(target_stem), Some(target_ext_os)) = (
+        dest.parent(),
+        dest.file_stem().and_then(|s| s.to_str()),
+        dest.extension(),
+    ) else {
+        return;
+    };
+    let target_ext = target_ext_os.to_string_lossy();
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == dest {
+            continue;
+        }
+        let same_stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s == target_stem);
+        let diff_extension = path
+            .extension()
+            .map(|e| e.to_string_lossy() != target_ext)
+            .unwrap_or(true);
+        if same_stem && diff_extension {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
 fn run_single_track_rip<'a>(
     params: SingleTrackRip<'a>,
     cancel: &Arc<AtomicBool>,
@@ -1630,6 +1673,16 @@ fn run_single_track_rip<'a>(
             dest.display()
         ));
     }
+
+    // Sweep stem-matching files at other extensions in the same album
+    // directory. The conflict pre-scan warned about these and the user
+    // confirmed overwrite; without this sweep, a fidelity change (ALAC
+    // .m4a → FLAC .flac) writes the new file at a new path and leaves
+    // the prior copy on disk. Same-extension overwrites are already
+    // covered by `std::fs::rename`, so this only removes sibling files
+    // whose stem matches the just-written track but whose extension
+    // differs.
+    sweep_same_stem_other_extensions(dest);
 
     match (tag_warning, fingerprint_warning) {
         (Some(tag_err), Some(fp_err)) => TrackOutcome::RippedUntagged {
@@ -1838,6 +1891,79 @@ fn parse_storage_line(line: &str) -> Option<StorageInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fresh_dir(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join("zytunes-sweep-tests").join(name);
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn sweep_removes_other_extension_siblings_at_same_stem() {
+        // The cross-fidelity re-rip scenario: a `.flac` just landed, an
+        // older `.m4a` at the same stem must go too.
+        let dir = fresh_dir("sweep-stem-match");
+        let dest = dir.join("01 - Hung Up.flac");
+        std::fs::write(&dest, b"new flac").unwrap();
+        let stragglers = ["01 - Hung Up.m4a", "01 - Hung Up.mp3"];
+        for s in &stragglers {
+            std::fs::write(dir.join(s), b"old lossy").unwrap();
+        }
+        sweep_same_stem_other_extensions(&dest);
+        assert!(dest.exists(), "the file we just ripped must survive");
+        for s in &stragglers {
+            assert!(
+                !dir.join(s).exists(),
+                "same-stem different-extension straggler {s} should be removed"
+            );
+        }
+    }
+
+    #[test]
+    fn sweep_preserves_unrelated_siblings() {
+        // Different stems (other tracks on the album) must be left alone.
+        let dir = fresh_dir("sweep-other-tracks");
+        let dest = dir.join("01 - Hung Up.flac");
+        std::fs::write(&dest, b"new flac").unwrap();
+        let keepers = [
+            "02 - Get Together.m4a", // different track number
+            "01 Hung Up.m4a",        // different stem (no dash separator)
+            "01 - Hung Up Live.m4a", // different stem (longer title)
+            "cover.jpg",             // entirely different file
+        ];
+        for k in &keepers {
+            std::fs::write(dir.join(k), b"keep me").unwrap();
+        }
+        sweep_same_stem_other_extensions(&dest);
+        for k in &keepers {
+            assert!(
+                dir.join(k).exists(),
+                "unrelated sibling {k} should not be removed"
+            );
+        }
+    }
+
+    #[test]
+    fn sweep_does_not_remove_same_extension_dupe_target() {
+        // Trying to sweep a path that has only same-extension neighbours
+        // is a no-op — those are handled by `std::fs::rename`, never by
+        // the sweep helper. Guards against an off-by-one that would wipe
+        // the file we just renamed onto.
+        let dir = fresh_dir("sweep-same-ext");
+        let dest = dir.join("01 - Track.flac");
+        std::fs::write(&dest, b"keep").unwrap();
+        sweep_same_stem_other_extensions(&dest);
+        assert!(dest.exists());
+    }
+
+    #[test]
+    fn sweep_is_a_noop_when_parent_unreadable() {
+        // Permission/IO errors on read_dir must be swallowed silently —
+        // the rip itself succeeded, the sweep is a courtesy operation.
+        let nonexistent = std::path::Path::new("/this/path/does/not/exist/track.flac");
+        sweep_same_stem_other_extensions(nonexistent); // must not panic
+    }
 
     #[test]
     fn is_device_gone_matches_real_error_string() {
