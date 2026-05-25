@@ -81,6 +81,26 @@ impl RipFidelity {
             RipFidelity::Wav,
         ]
     }
+
+    /// One-line summary of the tags that get embedded in the ripped file
+    /// for this fidelity. Today the set is uniform across all variants
+    /// (`tag_ripped_file` writes the same `ItemKey` items regardless of
+    /// container, and lofty handles the per-container encoding) so every
+    /// arm returns the same `RIP_TAG_SUMMARY` constant. The per-variant
+    /// dispatch exists so future container-specific tag drops (e.g. an
+    /// M4A field lofty doesn't round-trip) can be flagged here without
+    /// changing the caller. Surfaced in the TUI import overlay.
+    pub fn tag_summary(self) -> &'static str {
+        match self {
+            RipFidelity::Mp3Cbr320
+            | RipFidelity::Mp3V0
+            | RipFidelity::Mp3V2
+            | RipFidelity::Aac
+            | RipFidelity::Alac
+            | RipFidelity::Flac
+            | RipFidelity::Wav => crate::cd::metadata::RIP_TAG_SUMMARY,
+        }
+    }
 }
 
 /// Progress update emitted during a rip. Phase 3 turns these into
@@ -514,6 +534,25 @@ mod tests {
         assert_eq!(args[c_idx + 1], "aac");
         let b_idx = args.iter().position(|a| a == "-b:a").unwrap();
         assert_eq!(args[b_idx + 1], "256k");
+    }
+
+    #[test]
+    fn tag_summary_is_uniform_across_fidelities() {
+        // Today every variant maps to the same `RIP_TAG_SUMMARY` const.
+        // If a future container-specific tag drop is added (e.g. an M4A
+        // field lofty doesn't round-trip), this test fails loudly so the
+        // change isn't silent.
+        let summaries: Vec<&str> = RipFidelity::all().iter().map(|f| f.tag_summary()).collect();
+        let first = summaries[0];
+        assert!(!first.is_empty(), "tag_summary must not be empty");
+        for s in &summaries {
+            assert_eq!(*s, first, "all fidelities currently share the same tag set");
+        }
+        // Sanity: the const should mention at least the headliner tags so
+        // a future shortening doesn't silently strip user-visible context.
+        assert!(first.contains("MBIDs"));
+        assert!(first.contains("ISRC"));
+        assert!(first.contains("AcoustID"));
     }
 
     #[test]

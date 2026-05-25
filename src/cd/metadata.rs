@@ -35,6 +35,16 @@ use lofty::tag::{ItemKey, ItemValue, Tag, TagItem, TagType};
 
 use crate::musicbrainz::{render_artist_credit, Medium, Release, Track as MbTrack};
 
+/// One-line summary of the tags `tag_ripped_file` + `tag_ripped_fingerprint`
+/// embed. Lofty handles container-specific encoding (ID3v2 for MP3/WAV,
+/// Vorbis Comments for FLAC, iTunes-style atoms for M4A/ALAC/AAC), so the
+/// *set* of tags is uniform across all `RipFidelity` choices.
+///
+/// Surfaced in the TUI import overlay so users can see what metadata
+/// they'll get before kicking off a rip.
+pub const RIP_TAG_SUMMARY: &str =
+    "title, artist, album, track/disc #, release date, MBIDs (×6), ISRC, barcode, label, catalog #, AcoustID fingerprint";
+
 /// Tag `path` with metadata from the chosen MB release + track.
 ///
 /// `track_position` is the 1-indexed CD track position (also the position

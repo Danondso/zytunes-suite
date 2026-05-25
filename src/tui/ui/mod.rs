@@ -2481,20 +2481,23 @@ fn draw_import_overlay(f: &mut Frame, app: &App) {
     let inner = block.inner(rect);
     f.render_widget(block, rect);
 
-    if inner.height < 8 {
-        // Too cramped — bail with just the frame so we don't render garbage.
+    if inner.height < 9 {
+        // Too cramped for the 6-row layout (match, tracks, fidelity, tags,
+        // eject, footer) — bail with just the frame so we don't render
+        // garbage.
         return;
     }
 
     // Vertical layout: match-line (1), separator+tracks (Min 4), fidelity (1),
-    // eject (1), footer hint (1). Separators are absorbed into the section
-    // titles to keep the constraint list short.
+    // tags-info (1), eject (1), footer hint (1). Separators are absorbed
+    // into the section titles to keep the constraint list short.
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // match picker
             Constraint::Min(4),    // track list
             Constraint::Length(1), // fidelity
+            Constraint::Length(1), // tags info
             Constraint::Length(1), // eject
             Constraint::Length(1), // footer hints
         ])
@@ -2503,8 +2506,9 @@ fn draw_import_overlay(f: &mut Frame, app: &App) {
     draw_import_match_row(f, app, overlay, sections[0]);
     draw_import_track_list(f, app, overlay, sections[1]);
     draw_import_fidelity_row(f, app, overlay, sections[2]);
-    draw_import_eject_row(f, app, overlay, sections[3]);
-    draw_import_footer(f, app, overlay, sections[4]);
+    draw_import_tags_row(f, app, overlay, sections[3]);
+    draw_import_eject_row(f, app, overlay, sections[4]);
+    draw_import_footer(f, app, overlay, sections[5]);
 }
 
 fn import_focus_prefix(focused: bool) -> &'static str {
@@ -2647,6 +2651,31 @@ fn draw_import_fidelity_row(
         ),
         Span::raw(format!("◀ {} ▶", overlay.current_fidelity().label())),
         Span::styled("  (f / F)", Style::default().fg(t.dim_text)),
+    ]);
+    f.render_widget(Paragraph::new(line), area);
+}
+
+/// Render the "Tags written" info line. The summary is fetched from the
+/// currently-selected fidelity via `RipFidelity::tag_summary` so it
+/// updates live as the user cycles through formats with `f` / `F`.
+/// Today every variant returns the same string (the tag set is uniform
+/// across containers — `tag_ripped_file` writes the same `ItemKey`
+/// items regardless), so this is cosmetic motion that sets the stage
+/// for per-format variation if a future container drops some fields.
+fn draw_import_tags_row(f: &mut Frame, app: &App, overlay: &crate::app::ImportOverlay, area: Rect) {
+    let t = app.theme();
+    let line = Line::from(vec![
+        Span::raw("  "), // align with focused-row content (no ▶ prefix; line isn't focusable)
+        Span::styled(
+            "Tags: ",
+            Style::default()
+                .fg(t.header_text)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            overlay.current_fidelity().tag_summary(),
+            Style::default().fg(t.dim_text),
+        ),
     ]);
     f.render_widget(Paragraph::new(line), area);
 }
