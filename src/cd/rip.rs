@@ -15,11 +15,14 @@ use super::discid::DiscToc;
 
 /// Output format / quality target for a ripped track.
 ///
-/// FLAC and WAV land in the library at full source quality. On push to a
-/// device they're transcoded to the highest fidelity that device supports
-/// (ALAC for iPod Classic via the FLAC→ALAC ffmpeg branch; LAME VBR
-/// NearBest (~V0) for Zune since the Zune firmware has no lossless
-/// container) — see `DeviceCapabilities::lossless_target`.
+/// FLAC, ALAC, and WAV land in the library at full source quality. On push
+/// to a device they're transcoded to the highest fidelity that device
+/// supports (ALAC for iPod Classic via the FLAC→ALAC ffmpeg branch; LAME
+/// VBR NearBest (~V0) for Zune since the Zune firmware has no lossless
+/// container) — see `DeviceCapabilities::lossless_target`. ALAC and AAC
+/// both produce `.m4a` files; iPod consumes them as passthrough, Zune
+/// falls back to MP3 transcode since its firmware doesn't read MP4-
+/// containerised audio.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RipFidelity {
     /// MP3 CBR 320 kbps.
@@ -28,6 +31,12 @@ pub enum RipFidelity {
     Mp3V0,
     /// MP3 VBR ~190 kbps (LAME `-V 2` equivalent).
     Mp3V2,
+    /// AAC CBR 256 kbps (iTunes Plus standard). Native ffmpeg encoder —
+    /// no external `libfdk_aac` dependency. Output container is `.m4a`.
+    Aac,
+    /// Apple Lossless. Output container is `.m4a`. Native ffmpeg encoder.
+    /// Passthrough on iPod push; transcoded to MP3 on Zune push.
+    Alac,
     /// Lossless FLAC. Stored in the library and transcoded on device push.
     Flac,
     /// Lossless WAV passthrough. Largest files; useful for archival or
@@ -40,6 +49,7 @@ impl RipFidelity {
     pub fn extension(self) -> &'static str {
         match self {
             RipFidelity::Mp3Cbr320 | RipFidelity::Mp3V0 | RipFidelity::Mp3V2 => "mp3",
+            RipFidelity::Aac | RipFidelity::Alac => "m4a",
             RipFidelity::Flac => "flac",
             RipFidelity::Wav => "wav",
         }
@@ -51,6 +61,8 @@ impl RipFidelity {
             RipFidelity::Mp3Cbr320 => "MP3 320 kbps CBR",
             RipFidelity::Mp3V0 => "MP3 V0 (~245 kbps VBR)",
             RipFidelity::Mp3V2 => "MP3 V2 (~190 kbps VBR)",
+            RipFidelity::Aac => "AAC 256 kbps CBR (iTunes Plus)",
+            RipFidelity::Alac => "ALAC (Apple Lossless)",
             RipFidelity::Flac => "FLAC (lossless)",
             RipFidelity::Wav => "WAV (lossless, uncompressed)",
         }
@@ -62,7 +74,9 @@ impl RipFidelity {
         &[
             RipFidelity::Mp3V2,
             RipFidelity::Mp3V0,
+            RipFidelity::Aac,
             RipFidelity::Mp3Cbr320,
+            RipFidelity::Alac,
             RipFidelity::Flac,
             RipFidelity::Wav,
         ]
@@ -131,6 +145,23 @@ pub fn build_ffmpeg_command(
                 "-q:a".into(),
                 "2".into(),
             ]);
+        }
+        RipFidelity::Aac => {
+            // ffmpeg's built-in native `aac` encoder (no external libfdk_aac
+            // dependency). 256k CBR matches the iTunes Plus standard a lot
+            // of listeners will recognise as "transparent".
+            args.extend([
+                "-codec:a".into(),
+                "aac".into(),
+                "-b:a".into(),
+                "256k".into(),
+            ]);
+        }
+        RipFidelity::Alac => {
+            // Native ALAC encoder — same encoder the FLAC→ALAC iPod push
+            // branch uses. Bit-exact lossless; the bitrate falls out of
+            // the source signal.
+            args.extend(["-codec:a".into(), "alac".into()]);
         }
         RipFidelity::Flac => {
             args.extend(["-codec:a".into(), "flac".into()]);
@@ -452,6 +483,8 @@ mod tests {
         assert_eq!(RipFidelity::Mp3Cbr320.extension(), "mp3");
         assert_eq!(RipFidelity::Mp3V0.extension(), "mp3");
         assert_eq!(RipFidelity::Mp3V2.extension(), "mp3");
+        assert_eq!(RipFidelity::Aac.extension(), "m4a");
+        assert_eq!(RipFidelity::Alac.extension(), "m4a");
         assert_eq!(RipFidelity::Flac.extension(), "flac");
         assert_eq!(RipFidelity::Wav.extension(), "wav");
     }
@@ -461,10 +494,43 @@ mod tests {
         // Order matters for the picker — keep it ascending by storage size so
         // a future test fails loudly if the order is shuffled.
         let labels: Vec<_> = RipFidelity::all().iter().map(|f| f.label()).collect();
-        assert_eq!(labels.len(), 5);
+        assert_eq!(labels.len(), 7);
         assert!(labels[0].contains("V2"));
-        assert!(labels[3].contains("FLAC"));
-        assert!(labels[4].contains("WAV"));
+        assert!(labels[2].contains("AAC"));
+        assert!(labels[4].contains("ALAC"));
+        assert!(labels[5].contains("FLAC"));
+        assert!(labels[6].contains("WAV"));
+    }
+
+    #[test]
+    fn build_command_aac_sets_256k_cbr() {
+        let (_p, args) = build_ffmpeg_command(
+            Path::new("/dev/sr0"),
+            1,
+            RipFidelity::Aac,
+            Path::new("/tmp/t.m4a"),
+        );
+        let c_idx = args.iter().position(|a| a == "-codec:a").unwrap();
+        assert_eq!(args[c_idx + 1], "aac");
+        let b_idx = args.iter().position(|a| a == "-b:a").unwrap();
+        assert_eq!(args[b_idx + 1], "256k");
+    }
+
+    #[test]
+    fn build_command_alac_uses_alac_codec_and_no_bitrate() {
+        let (_p, args) = build_ffmpeg_command(
+            Path::new("/dev/sr0"),
+            1,
+            RipFidelity::Alac,
+            Path::new("/tmp/t.m4a"),
+        );
+        let c_idx = args.iter().position(|a| a == "-codec:a").unwrap();
+        assert_eq!(args[c_idx + 1], "alac");
+        // Lossless — no bitrate flag should appear.
+        assert!(
+            !args.iter().any(|a| a == "-b:a"),
+            "lossless ALAC must not carry a target bitrate"
+        );
     }
 
     #[test]

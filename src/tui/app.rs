@@ -646,6 +646,8 @@ fn parse_default_fidelity(s: Option<&str>) -> Option<zytunes::cd::rip::RipFideli
         "mp3-cbr-320" | "mp3-320" => Some(RipFidelity::Mp3Cbr320),
         "mp3-v0" => Some(RipFidelity::Mp3V0),
         "mp3-v2" => Some(RipFidelity::Mp3V2),
+        "aac" | "aac-256" => Some(RipFidelity::Aac),
+        "alac" | "apple-lossless" => Some(RipFidelity::Alac),
         "flac" => Some(RipFidelity::Flac),
         "wav" => Some(RipFidelity::Wav),
         _ => None,
@@ -10196,6 +10198,19 @@ mod tests {
         assert_eq!(
             parse_default_fidelity(Some("mp3-320")),
             Some(RipFidelity::Mp3Cbr320)
+        );
+        assert_eq!(parse_default_fidelity(Some("aac")), Some(RipFidelity::Aac));
+        assert_eq!(
+            parse_default_fidelity(Some("aac-256")),
+            Some(RipFidelity::Aac)
+        );
+        assert_eq!(
+            parse_default_fidelity(Some("alac")),
+            Some(RipFidelity::Alac)
+        );
+        assert_eq!(
+            parse_default_fidelity(Some("apple-lossless")),
+            Some(RipFidelity::Alac)
         );
         assert_eq!(parse_default_fidelity(Some("garbage")), None);
         assert_eq!(parse_default_fidelity(None), None);
