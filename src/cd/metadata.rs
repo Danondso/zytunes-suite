@@ -29,8 +29,9 @@
 
 use std::path::Path;
 
-use lofty::config::WriteOptions;
+use lofty::config::{ParseOptions, WriteOptions};
 use lofty::file::{AudioFile, TaggedFileExt};
+use lofty::probe::Probe;
 use lofty::tag::{ItemKey, ItemValue, Tag, TagItem, TagType};
 
 use crate::musicbrainz::{render_artist_credit, Medium, Release, Track as MbTrack};
@@ -61,8 +62,7 @@ pub fn tag_ripped_file(
     medium: Option<&Medium>,
     total_discs: Option<u32>,
 ) -> Result<(), String> {
-    let mut tagged = lofty::probe::read_from_path(path)
-        .map_err(|e| format!("lofty probe failed on {}: {e}", path.display()))?;
+    let mut tagged = probe_by_content(path)?;
 
     // Promote WAV's primary from RIFF INFO to ID3v2. RIFF INFO uses 4-char
     // FourCC keys and silently drops both Unknown-keyed Picard tags and
@@ -270,8 +270,7 @@ pub fn tag_ripped_fingerprint(path: &Path, fingerprint: &str) -> Result<(), Stri
     if fingerprint.is_empty() {
         return Ok(());
     }
-    let mut tagged = lofty::probe::read_from_path(path)
-        .map_err(|e| format!("lofty probe failed on {}: {e}", path.display()))?;
+    let mut tagged = probe_by_content(path)?;
 
     let tag_type = match tagged.primary_tag_type() {
         TagType::RiffInfo => TagType::Id3v2,
@@ -291,6 +290,31 @@ pub fn tag_ripped_fingerprint(path: &Path, fingerprint: &str) -> Result<(), Stri
         .save_to_path(path, WriteOptions::default())
         .map_err(|e| format!("lofty save failed on {}: {e}", path.display()))?;
     Ok(())
+}
+
+/// Open `path` for tag I/O using content-based format detection.
+///
+/// Why not `lofty::probe::read_from_path`: that function picks the
+/// backend purely by file extension and returns `UnknownFormat` for
+/// anything it can't match. The rip pipeline tags through a temp
+/// filename ending in `.part` (`track.m4a.part` etc.) so the dirlib
+/// scanner doesn't index incomplete files mid-rip — and `.part` is
+/// not a recognised audio extension, so `read_from_path` aborts and
+/// the rip's tag step silently drops everything as a `RippedUntagged`
+/// warning.
+///
+/// `Probe::open().guess_file_type().read()` ignores the extension and
+/// sniffs the file's magic bytes. The returned `TaggedFile` carries
+/// the correctly-identified `FileType`, and the subsequent
+/// `tagged.save_to_path` then writes through the matching backend.
+fn probe_by_content(path: &Path) -> Result<lofty::file::TaggedFile, String> {
+    Probe::open(path)
+        .map_err(|e| format!("lofty open failed on {}: {e}", path.display()))?
+        .options(ParseOptions::new())
+        .guess_file_type()
+        .map_err(|e| format!("lofty content sniff failed on {}: {e}", path.display()))?
+        .read()
+        .map_err(|e| format!("lofty read failed on {}: {e}", path.display()))
 }
 
 /// Build a path the rip pipeline writes a finished track to. Returns
@@ -756,6 +780,55 @@ mod tests {
         // Script has no ID3v2 enum mapping — Picard writes it as TXXX:SCRIPT.
         assert_eq!(read_unknown(&path, "SCRIPT").as_deref(), Some("Latn"));
         assert_eq!(read_text(&path, &ItemKey::Language).as_deref(), Some("eng"));
+    }
+
+    #[test]
+    fn tags_round_trip_through_part_temp_extension() {
+        // Regression: the rip pipeline tags through a temp filename
+        // ending in `.part` (`track.m4a.part`, `track.flac.part`, ...).
+        // Lofty's old `read_from_path` returned `UnknownFormat` for any
+        // unrecognised extension, the tag write silently became a
+        // RippedUntagged warning, and the renamed `.m4a` file shipped
+        // with zero tags. `probe_by_content` sniffs the magic bytes
+        // instead so the extension doesn't matter — verified here with
+        // a `.wav.part` substrate (WAV→ID3v2 promotion path).
+        let dir = fresh_dir("part-extension-roundtrip");
+        let path = dir.join("audio.wav.part");
+        write_sine_wav(&path, 1);
+        let rel = release("Album", "Artist", Some("1998-02-22"));
+        tag_ripped_file(&path, &rel, &mb_track("T", 1), 1, Some(1), None, None).unwrap();
+        // Re-read also goes through content-sniff so the .part extension
+        // doesn't break the assertion.
+        let tagged = lofty::probe::Probe::open(&path)
+            .unwrap()
+            .guess_file_type()
+            .unwrap()
+            .read()
+            .unwrap();
+        let tag = tagged
+            .tag(TagType::Id3v2)
+            .expect("id3v2 tag landed on the .part file");
+        assert_eq!(
+            tag.get(&ItemKey::TrackTitle)
+                .and_then(|i| i.value().text())
+                .map(str::to_string)
+                .as_deref(),
+            Some("T")
+        );
+        assert_eq!(
+            tag.get(&ItemKey::AlbumTitle)
+                .and_then(|i| i.value().text())
+                .map(str::to_string)
+                .as_deref(),
+            Some("Album")
+        );
+        assert_eq!(
+            tag.get(&ItemKey::MusicBrainzTrackId)
+                .and_then(|i| i.value().text())
+                .map(str::to_string)
+                .as_deref(),
+            Some("trk-1")
+        );
     }
 
     #[test]
