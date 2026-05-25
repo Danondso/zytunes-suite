@@ -28,6 +28,15 @@ pub struct Config {
     /// `application/version (contact)` — e.g.
     /// `zytunes/2.2.0 (you@example.com)`.
     pub musicbrainz_user_agent: Option<String>,
+    /// Default rip fidelity preselected in the CD import overlay.
+    /// Accepts `mp3-cbr-320` (alias `mp3-320`), `mp3-v0`, `mp3-v2`,
+    /// `flac`, `wav`. Unset / unparseable defaults to FLAC (lossless
+    /// archival).
+    pub default_fidelity: Option<String>,
+    /// Default auto-eject preference for the CD import overlay. The
+    /// overlay's own checkbox can override per-import. Unset defaults
+    /// to `true` so a successful rip ejects the disc.
+    pub cd_auto_eject: Option<bool>,
     /// User-defined custom themes keyed by theme name. Each entry inherits
     /// missing fields from its `base` (or `iTunes 2004` when unset) and merges
     /// into the theme picker alongside the built-ins.
@@ -179,6 +188,8 @@ music_dir = "/home/user/Music"
         assert!(config.fingerprinting.is_none());
         assert!(config.musicbrainz_base_url.is_none());
         assert!(config.musicbrainz_user_agent.is_none());
+        assert!(config.default_fidelity.is_none());
+        assert!(config.cd_auto_eject.is_none());
         assert!(config.themes.is_empty());
     }
 

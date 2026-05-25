@@ -203,6 +203,10 @@ impl DeviceBackend for ZuneBackend {
             family: DeviceFamily::Zune,
             supported_formats: &["mp3", "wma", "aac"],
             transcode_target: "mp3",
+            // Zune firmware has no lossless container — sources always fall
+            // through to MP3 (no pure-Rust WMA encoder either, and WMA is
+            // lossy anyway). MP3 320 CBR is the ceiling for this device.
+            lossless_target: None,
             music_root: "/Music",
             max_art_dimensions: Some((200, 200)),
         }

@@ -1,8 +1,11 @@
+#[path = "app/import.rs"]
+mod import;
 #[path = "app/playlists.rs"]
 mod playlists;
 #[path = "app/scan_phrase.rs"]
 mod scan_phrase;
 
+pub use import::{effective_position, ImportField, ImportOverlay};
 pub use playlists::{
     device_playlist_sync_enabled, AddToPlaylistPicker, GenerationFormState, PendingPlaylistImport,
 };
@@ -10,7 +13,7 @@ pub use playlists::{
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use image::DynamicImage;
 use throbber_widgets_tui::ThrobberState;
@@ -635,6 +638,20 @@ fn resolve_library_id_for_device_track(
     None
 }
 
+/// Parse a `default_fidelity` config string into a [`RipFidelity`].
+/// Returns `None` for unrecognised input (and the caller falls back to FLAC).
+fn parse_default_fidelity(s: Option<&str>) -> Option<zytunes::cd::rip::RipFidelity> {
+    use zytunes::cd::rip::RipFidelity;
+    match s?.trim().to_ascii_lowercase().as_str() {
+        "mp3-cbr-320" | "mp3-320" => Some(RipFidelity::Mp3Cbr320),
+        "mp3-v0" => Some(RipFidelity::Mp3V0),
+        "mp3-v2" => Some(RipFidelity::Mp3V2),
+        "flac" => Some(RipFidelity::Flac),
+        "wav" => Some(RipFidelity::Wav),
+        _ => None,
+    }
+}
+
 fn parse_device_track_parts(name: &str) -> (String, String, String) {
     let parts: Vec<&str> = name.splitn(3, '/').collect();
     let (artist, album, filename) = match parts.len() {
@@ -694,6 +711,53 @@ impl SyncState {
     /// Scroll the log down by `n` lines (toward the bottom).
     pub fn log_scroll_down(&mut self, n: usize) {
         self.log_scroll = self.log_scroll.saturating_sub(n);
+    }
+}
+
+/// CD-import state tracked by the TUI.
+///
+/// Updated from a single [`crate::background::BgEvent::CdStatus`] per detection
+/// round-trip. The periodic poll lives on the App tick (see
+/// `App::maybe_request_cd_detect`) rather than in the background worker so
+/// the worker stays purely command-driven.
+pub struct CdState {
+    /// Last status received from the background worker.
+    pub last_status: Option<crate::background::CdStatusEvent>,
+    /// When the most recent `DetectCd` command was sent. `Default` seeds
+    /// this to `Some(Instant::now())` at startup so the first tick
+    /// doesn't fire libdiscid + a public-MB round-trip before the user
+    /// has done anything — that would delay first-render by 1-3 s on
+    /// slow links. The 5 s throttle in `maybe_request_cd_detect` then
+    /// fires the first real `DetectCd` 5 s after launch.
+    pub last_request: Option<Instant>,
+    /// True while a `DetectCd` is in flight. Cleared when a `CdStatus`
+    /// event arrives. Prevents stacking duplicate commands.
+    pub detect_in_flight: bool,
+    /// Active rip progress. `Some` while a `RipAndImport` is running;
+    /// cleared on `RipEvent::Complete`.
+    pub rip: Option<RipProgressState>,
+}
+
+/// Live state for an in-flight rip. Rendered by the status bar so the
+/// user sees current-track + per-track progress.
+#[derive(Debug, Clone)]
+pub struct RipProgressState {
+    pub current: usize,
+    pub total: usize,
+    pub track_title: String,
+    /// Track-level errors collected during the rip. Surfaced in the
+    /// completion toast so the user can re-attempt failed tracks.
+    pub errors: Vec<String>,
+}
+
+impl Default for CdState {
+    fn default() -> Self {
+        Self {
+            last_status: None,
+            last_request: Some(Instant::now()),
+            detect_in_flight: false,
+            rip: None,
+        }
     }
 }
 
@@ -840,6 +904,32 @@ pub struct App {
     /// disk path entirely (no `with_save_path`) so they don't pick up
     /// developer-machine state.
     pub listen_log: ListenLog,
+    /// CD import state — drive enumeration, identification, and the
+    /// last-seen MusicBrainz match. Driven by periodic `DetectCd` commands
+    /// issued from the TUI tick.
+    pub cd: CdState,
+    /// MusicBrainz base URL pulled from config at startup. Sent on each
+    /// `DetectCd` so the worker stays config-free. `None` uses the public
+    /// host; set to e.g. `http://localhost:5000/ws/2` for a local mirror.
+    pub mb_base_url: Option<String>,
+    /// MusicBrainz User-Agent pulled from config at startup. Required by
+    /// the public host per MB ToS; format `app/version (contact)`.
+    pub mb_user_agent: Option<String>,
+    /// Open import overlay. `Some` while the user is configuring a rip;
+    /// `None` otherwise. All key events route into the overlay's own
+    /// dispatcher when this is set.
+    pub import_overlay: Option<ImportOverlay>,
+    /// Default fidelity for new import overlays. Pulled from config at
+    /// startup; the overlay's `Left`/`Right` keys mutate the active
+    /// overlay copy only.
+    pub default_rip_fidelity: zytunes::cd::rip::RipFidelity,
+    /// Default auto-eject preference for new import overlays.
+    pub auto_eject_default: bool,
+    /// Cached music-library directory used as the rip destination. Pulled
+    /// from config at startup so `confirm_import` doesn't hit the disk on
+    /// every Enter, and so tests can set it directly without env var
+    /// gymnastics.
+    pub music_dir_cache: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone)]
@@ -947,7 +1037,7 @@ impl TrackInfo {
 impl App {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
-        App {
+        let mut app = App {
             active_panel: Panel::Library,
             library: None,
             sidebar_mode: SidebarMode::Artists,
@@ -999,14 +1089,8 @@ impl App {
             album_art_key: String::new(),
             album_art_cache: None,
             album_art_size: (0, 0),
-            album_art_style: {
-                let cfg = crate::config::load();
-                cfg.album_art_style
-                    .as_deref()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(AlbumArtStyle::Halfblock)
-            },
-            show_player: crate::config::load().show_player,
+            album_art_style: AlbumArtStyle::Halfblock, // overwritten below from config
+            show_player: None,                         // overwritten below from config
             pending_bg_commands: Vec::new(),
             // Disk state is loaded explicitly by `load_local_plays_from_disk`
             // so unit tests get a clean default `App` without inheriting
@@ -1023,7 +1107,38 @@ impl App {
             pending_playlist_imports: Vec::new(),
             experimental_playlist_sync: device_playlist_sync_enabled(),
             listen_log: ListenLog::new(),
+            cd: CdState::default(),
+            mb_base_url: None,   // overwritten below from config
+            mb_user_agent: None, // overwritten below from config
+            import_overlay: None,
+            default_rip_fidelity: zytunes::cd::rip::RipFidelity::Flac,
+            auto_eject_default: true,
+            music_dir_cache: None, // overwritten below from config
+        };
+
+        // Read config once at the end of construction and apply all the
+        // config-derived fields together. Avoids 4 separate disk reads
+        // during App::new() and keeps config plumbing in one place.
+        let cfg = crate::config::load();
+        app.album_art_style = cfg
+            .album_art_style
+            .as_deref()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(AlbumArtStyle::Halfblock);
+        app.show_player = cfg.show_player;
+        app.mb_base_url = cfg.musicbrainz_base_url;
+        app.mb_user_agent = cfg.musicbrainz_user_agent;
+        app.default_rip_fidelity = parse_default_fidelity(cfg.default_fidelity.as_deref())
+            .unwrap_or(zytunes::cd::rip::RipFidelity::Flac);
+        if let Some(v) = cfg.cd_auto_eject {
+            app.auto_eject_default = v;
         }
+        app.music_dir_cache = cfg
+            .music_dir
+            .clone()
+            .or_else(|| std::env::var("ZYTUNES_MUSIC_DIR").ok())
+            .map(std::path::PathBuf::from);
+        app
     }
 
     /// Load the listen log from `~/.cache/zytunes/listen-log.jsonl` and
@@ -3569,7 +3684,317 @@ impl App {
                     self.set_toast(msg, true);
                 }
             },
+            BgEvent::CdStatus(status) => {
+                self.cd.detect_in_flight = false;
+                self.cd.last_status = Some(status);
+            }
+            BgEvent::RipEvent(event) => {
+                self.handle_rip_event(event);
+            }
         }
+    }
+
+    fn handle_rip_event(&mut self, event: crate::background::RipEvent) {
+        use crate::background::RipEvent;
+        match event {
+            RipEvent::Started {
+                current,
+                total,
+                track_position: _,
+                track_title,
+            } => {
+                let errors = self
+                    .cd
+                    .rip
+                    .as_ref()
+                    .map(|r| r.errors.clone())
+                    .unwrap_or_default();
+                self.cd.rip = Some(RipProgressState {
+                    current,
+                    total,
+                    track_title,
+                    errors,
+                });
+            }
+            RipEvent::TrackDone {
+                track_title, error, ..
+            } => {
+                if let Some(rip) = self.cd.rip.as_mut() {
+                    if let Some(e) = error {
+                        rip.errors.push(format!("{track_title}: {e}"));
+                    }
+                }
+            }
+            RipEvent::Complete {
+                ripped,
+                failed,
+                cancelled,
+                ejected,
+            } => {
+                let errors = self
+                    .cd
+                    .rip
+                    .as_ref()
+                    .map(|r| r.errors.clone())
+                    .unwrap_or_default();
+                self.cd.rip = None;
+                let mut msg = if cancelled {
+                    format!("Rip cancelled: {ripped} ripped, {failed} failed")
+                } else if failed > 0 {
+                    format!("Rip done: {ripped} ripped, {failed} failed")
+                } else {
+                    format!("Rip complete: {ripped} tracks ripped")
+                };
+                if ejected {
+                    msg.push_str(", disc ejected");
+                }
+                let is_error = failed > 0 || cancelled;
+                self.set_toast(msg, is_error);
+                for e in errors {
+                    self.sync.log.push(format!("[rip] {e}"));
+                }
+            }
+        }
+    }
+
+    /// Handle the `i` key — the CD import entry point.
+    ///
+    /// Phase 1 surfaces the current detection state as a toast so the
+    /// keybinding works end-to-end. Phase 2 swaps the toasts for the import
+    /// overlay; the toast for "no disc" / "unknown disc" still applies since
+    /// those states can't open an overlay.
+    pub fn handle_cd_import_key(&mut self) {
+        use crate::background::CdStatusEvent;
+        match &self.cd.last_status {
+            None | Some(CdStatusEvent::NoDrive) => {
+                self.set_toast("No optical drive detected".into(), true);
+            }
+            Some(CdStatusEvent::NoMedia { .. }) => {
+                self.set_toast("Insert a CD to import".into(), true);
+            }
+            Some(CdStatusEvent::UnknownDisc { reason, .. }) => {
+                self.set_toast(format!("Cannot import — {reason}"), true);
+            }
+            Some(CdStatusEvent::Identified {
+                drive,
+                toc,
+                mb_disc_id,
+                primary,
+                alternates,
+            }) => {
+                self.import_overlay = Some(ImportOverlay::new(
+                    drive.clone(),
+                    toc.clone(),
+                    mb_disc_id.clone(),
+                    (**primary).clone(),
+                    alternates.clone(),
+                    self.default_rip_fidelity,
+                    self.auto_eject_default,
+                ));
+            }
+        }
+    }
+
+    /// Close the import overlay without starting a rip.
+    pub fn close_import_overlay(&mut self) {
+        self.import_overlay = None;
+    }
+
+    /// Confirm import — build a [`RipAndImportRequest`] from the overlay
+    /// state and queue it for the background worker. Closes the overlay
+    /// on success; toasts and stays open on validation failure.
+    pub fn confirm_import(&mut self) {
+        use crate::background::RipAndImportRequest;
+        let Some(overlay) = &self.import_overlay else {
+            return;
+        };
+        let positions = overlay.selected_track_positions();
+        if positions.is_empty() {
+            self.set_toast("Select at least one track before importing".into(), true);
+            return;
+        }
+        // Need a destination directory. Read from `music_dir` (config
+        // file or `ZYTUNES_MUSIC_DIR` env). No dedicated
+        // `import_destination` config field exists today — if a future
+        // rip-to-staging-area feature adds one, the toast text below
+        // should grow to mention it.
+        let dest_dir = match self.import_destination() {
+            Some(d) => d,
+            None => {
+                self.set_toast(
+                    "No music directory configured — set `music_dir` in ~/.config/zytunes/config.toml or `ZYTUNES_MUSIC_DIR`".into(),
+                    true,
+                );
+                return;
+            }
+        };
+
+        let req = RipAndImportRequest {
+            drive: overlay.drive.clone(),
+            toc: overlay.toc.clone(),
+            release: overlay.current_release().clone(),
+            track_positions: positions.clone(),
+            fidelity: overlay.current_fidelity(),
+            dest_dir,
+            auto_eject: overlay.auto_eject,
+        };
+
+        let count = positions.len();
+        let label = overlay.current_release_label();
+        self.pending_bg_commands
+            .push(crate::background::BgCommand::RipAndImport(Box::new(req)));
+        self.set_toast(format!("Ripping {count} tracks from {label}…"), false);
+        self.close_import_overlay();
+    }
+
+    /// Resolve the directory ripped tracks land in. Returns the
+    /// `music_dir` from config cached at `App::new()`. Tests can override
+    /// `music_dir_cache` directly without env var games.
+    fn import_destination(&self) -> Option<std::path::PathBuf> {
+        self.music_dir_cache.clone()
+    }
+
+    /// Cancel an in-flight rip. Sends `BgCommand::CancelRip`. The worker
+    /// trips its cancel flag between tracks and `rip_track_cancellable`
+    /// kills the active ffmpeg child.
+    pub fn cancel_rip(&mut self) {
+        if self.cd.rip.is_none() {
+            return;
+        }
+        self.pending_bg_commands
+            .push(crate::background::BgCommand::CancelRip);
+        self.set_toast("Cancelling rip…".into(), false);
+    }
+
+    /// Dispatch a key event when the import overlay is open. Returns
+    /// `true` if the key was handled (the main dispatcher should not
+    /// process it further); `false` falls through.
+    pub fn handle_import_overlay_key(&mut self, key: crossterm::event::KeyEvent) -> bool {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        // Let `Ctrl-C` fall through to the main dispatcher's quit hatch
+        // before the modal's catch-all swallows it. Without this guard the
+        // user can't quit while the overlay is open without first hitting
+        // `Esc`.
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return false;
+        }
+        let Some(overlay) = self.import_overlay.as_mut() else {
+            return false;
+        };
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.close_import_overlay();
+                true
+            }
+            KeyCode::Enter => {
+                self.confirm_import();
+                true
+            }
+            KeyCode::Tab => {
+                overlay.focus = overlay.focus.next();
+                true
+            }
+            KeyCode::BackTab => {
+                overlay.focus = overlay.focus.prev();
+                true
+            }
+            KeyCode::Up => {
+                if overlay.focus == ImportField::Tracks {
+                    overlay.cursor_up();
+                }
+                true
+            }
+            KeyCode::Down => {
+                if overlay.focus == ImportField::Tracks {
+                    overlay.cursor_down();
+                }
+                true
+            }
+            KeyCode::Left => {
+                match overlay.focus {
+                    ImportField::Fidelity => overlay.prev_fidelity(),
+                    ImportField::AlternateMatch => overlay.prev_release(),
+                    _ => {}
+                }
+                true
+            }
+            KeyCode::Right => {
+                match overlay.focus {
+                    ImportField::Fidelity => overlay.next_fidelity(),
+                    ImportField::AlternateMatch => overlay.next_release(),
+                    _ => {}
+                }
+                true
+            }
+            KeyCode::Char(' ') => {
+                match overlay.focus {
+                    ImportField::Tracks => overlay.toggle_current_track(),
+                    ImportField::AutoEject => overlay.auto_eject = !overlay.auto_eject,
+                    _ => {}
+                }
+                true
+            }
+            KeyCode::Char('a') => {
+                if overlay.focus == ImportField::Tracks {
+                    overlay.select_all();
+                }
+                true
+            }
+            KeyCode::Char('n') => {
+                if overlay.focus == ImportField::Tracks {
+                    overlay.select_none();
+                }
+                true
+            }
+            KeyCode::Char('[') => {
+                overlay.prev_release();
+                true
+            }
+            KeyCode::Char(']') => {
+                overlay.next_release();
+                true
+            }
+            KeyCode::Char('f') => {
+                overlay.prev_fidelity();
+                true
+            }
+            KeyCode::Char('F') => {
+                overlay.next_fidelity();
+                true
+            }
+            KeyCode::Char('e') => {
+                overlay.auto_eject = !overlay.auto_eject;
+                true
+            }
+            // Swallow other keys so background panel keys (e.g. `q` already
+            // matched above; `t` for theme picker; `/` for search) don't
+            // mutate the underlying TUI while the modal is open.
+            _ => true,
+        }
+    }
+
+    /// Request a CD detection if we haven't recently and one isn't in
+    /// flight. Called from the TUI tick loop. Polls every ~5 s — fast enough
+    /// to notice a disc insert, slow enough to not spam libdiscid or the
+    /// MusicBrainz host.
+    pub fn maybe_request_cd_detect(&mut self) {
+        const POLL_INTERVAL: Duration = Duration::from_secs(5);
+        if self.cd.detect_in_flight {
+            return;
+        }
+        let due = match self.cd.last_request {
+            None => true,
+            Some(t) => t.elapsed() >= POLL_INTERVAL,
+        };
+        if !due {
+            return;
+        }
+        self.cd.last_request = Some(Instant::now());
+        self.cd.detect_in_flight = true;
+        self.pending_bg_commands.push(BgCommand::DetectCd {
+            mb_base_url: self.mb_base_url.clone(),
+            mb_user_agent: self.mb_user_agent.clone(),
+        });
     }
 
     pub fn set_toast(&mut self, msg: String, is_error: bool) {
@@ -3621,6 +4046,12 @@ impl App {
         cmd_tx: &mpsc::Sender<BgCommand>,
         audio_tx: &mpsc::Sender<AudioCommand>,
     ) -> KeyOutcome {
+        // CD import overlay. Takes priority over every other modal so the
+        // user can dismiss with Esc and reach the rest of the TUI again.
+        if self.import_overlay.is_some() && self.handle_import_overlay_key(key) {
+            return KeyOutcome::Continue;
+        }
+
         // Playlist name input modal — handles both create-new and rename.
         if self.playlist_name_input.is_some() {
             match key.code {
@@ -3901,6 +4332,18 @@ impl App {
                 // only two modes — drop it so users can reach Playlists
                 // without plugging anything in.
                 self.toggle_browse_mode();
+            }
+            KeyCode::Char('i') => {
+                // CD import entry point. The import overlay arrives in
+                // Phase 2; for now, surface the current detection status
+                // so the keybinding is discoverable and the wiring is
+                // exercised end-to-end.
+                self.handle_cd_import_key();
+            }
+            // Cancel an active rip. Takes priority over the device-connect
+            // binding so the user doesn't need a separate key to abort.
+            KeyCode::Char('c') if self.cd.rip.is_some() => {
+                self.cancel_rip();
             }
             KeyCode::Char('c') if self.device.status == DeviceStatus::Disconnected => {
                 self.device.status = DeviceStatus::Detecting;
@@ -9353,4 +9796,398 @@ mod tests {
         );
         assert!(app.toast_message.as_ref().unwrap().2);
     }
+
+    // -- CD import (Phase 1) --
+
+    fn mock_cd_drive() -> crate::background::CdStatusEvent {
+        use crate::background::CdStatusEvent;
+        use zytunes::cd::drive::CdDrive;
+        CdStatusEvent::NoMedia {
+            drive: CdDrive {
+                path: std::path::PathBuf::from("/dev/disk4"),
+                name: "Optical Drive (/dev/disk4)".into(),
+                media_present: Some(false),
+            },
+        }
+    }
+
+    #[test]
+    fn cd_detect_request_is_throttled_to_one_per_window() {
+        let mut app = App::new();
+        // Default::default seeds `last_request = Some(Instant::now())` so
+        // the first poll waits 5s — null it out to simulate the
+        // post-startup state where the first throttled poll has elapsed.
+        app.cd.last_request = None;
+
+        // First call queues a command.
+        app.maybe_request_cd_detect();
+        assert_eq!(app.pending_bg_commands.len(), 1);
+        assert!(app.cd.detect_in_flight);
+        // Second call while in-flight is suppressed.
+        app.maybe_request_cd_detect();
+        assert_eq!(app.pending_bg_commands.len(), 1);
+        // Even if we mark the in-flight bit cleared, the 5s throttle holds.
+        app.cd.detect_in_flight = false;
+        app.maybe_request_cd_detect();
+        assert_eq!(app.pending_bg_commands.len(), 1);
+    }
+
+    /// Regression: a fresh `App` must NOT fire `DetectCd` on its first
+    /// tick. The agent review noted this triggers libdiscid + a public
+    /// MB round-trip before the user has interacted, delaying startup.
+    #[test]
+    fn cd_detect_does_not_fire_on_first_tick_after_startup() {
+        let mut app = App::new();
+        app.maybe_request_cd_detect();
+        assert_eq!(
+            app.pending_bg_commands.len(),
+            0,
+            "first poll should be gated by the seeded `last_request`"
+        );
+        assert!(!app.cd.detect_in_flight);
+    }
+
+    #[test]
+    fn cd_detect_passes_config_to_worker() {
+        let mut app = App::new();
+        app.cd.last_request = None; // bypass the first-tick throttle
+        app.mb_base_url = Some("http://localhost:5000/ws/2".into());
+        app.mb_user_agent = Some("test/1 (a@b)".into());
+        app.maybe_request_cd_detect();
+        match &app.pending_bg_commands[0] {
+            BgCommand::DetectCd {
+                mb_base_url,
+                mb_user_agent,
+            } => {
+                assert_eq!(mb_base_url.as_deref(), Some("http://localhost:5000/ws/2"));
+                assert_eq!(mb_user_agent.as_deref(), Some("test/1 (a@b)"));
+            }
+            _ => panic!("expected DetectCd command"),
+        }
+    }
+
+    #[test]
+    fn cd_status_event_updates_state_and_clears_in_flight_bit() {
+        let mut app = App::new();
+        app.cd.detect_in_flight = true;
+        app.handle_bg_event(BgEvent::CdStatus(mock_cd_drive()));
+        assert!(!app.cd.detect_in_flight);
+        assert!(app.cd.last_status.is_some());
+    }
+
+    #[test]
+    fn cd_import_key_with_no_status_toasts_no_drive() {
+        let mut app = App::new();
+        app.handle_cd_import_key();
+        let (msg, _, is_error) = app.toast_message.as_ref().expect("toast set");
+        assert!(msg.contains("No optical drive"));
+        assert!(*is_error);
+    }
+
+    #[test]
+    fn cd_import_key_with_no_media_prompts_insert() {
+        let mut app = App::new();
+        app.cd.last_status = Some(mock_cd_drive());
+        app.handle_cd_import_key();
+        let (msg, _, is_error) = app.toast_message.as_ref().unwrap();
+        assert!(msg.contains("Insert"));
+        assert!(*is_error);
+    }
+
+    fn make_identified_status(release_title: &str) -> crate::background::CdStatusEvent {
+        use crate::background::CdStatusEvent;
+        use zytunes::cd::discid::DiscToc;
+        use zytunes::cd::drive::CdDrive;
+        use zytunes::musicbrainz::{ArtistCredit, Medium, Release, Track as MbTrack};
+        CdStatusEvent::Identified {
+            drive: CdDrive {
+                path: std::path::PathBuf::from("/dev/disk4"),
+                name: "Optical".into(),
+                media_present: Some(true),
+            },
+            toc: DiscToc {
+                first_track: 1,
+                last_track: 2,
+                lead_out_lba: 100,
+                tracks: vec![],
+            },
+            mb_disc_id: "abc".into(),
+            primary: Box::new(Release {
+                id: "r1".into(),
+                title: release_title.into(),
+                date: None,
+                country: None,
+                artist_credit: vec![ArtistCredit {
+                    name: "Artist".into(),
+                    joinphrase: None,
+                    artist: None,
+                }],
+                media: vec![Medium {
+                    position: Some(1),
+                    format: Some("CD".into()),
+                    track_count: Some(2),
+                    tracks: vec![
+                        MbTrack {
+                            id: "t1".into(),
+                            number: "1".into(),
+                            position: Some(1),
+                            title: "Song A".into(),
+                            length: Some(120_000),
+                            recording: None,
+                            artist_credit: vec![],
+                        },
+                        MbTrack {
+                            id: "t2".into(),
+                            number: "2".into(),
+                            position: Some(2),
+                            title: "Song B".into(),
+                            length: Some(180_000),
+                            recording: None,
+                            artist_credit: vec![],
+                        },
+                    ],
+                }],
+                release_group: None,
+            }),
+            alternates: vec![],
+        }
+    }
+
+    fn key(code: crossterm::event::KeyCode) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::empty())
+    }
+
+    #[test]
+    fn cd_import_key_with_identified_disc_opens_overlay() {
+        let mut app = App::new();
+        app.cd.last_status = Some(make_identified_status("Abbey Road"));
+        app.handle_cd_import_key();
+        assert!(app.import_overlay.is_some(), "overlay should open");
+        let o = app.import_overlay.as_ref().unwrap();
+        assert!(o.current_release_label().contains("Abbey Road"));
+        assert_eq!(o.selected_count(), 2);
+    }
+
+    #[test]
+    fn overlay_esc_closes() {
+        let mut app = App::new();
+        app.cd.last_status = Some(make_identified_status("X"));
+        app.handle_cd_import_key();
+        assert!(app.handle_import_overlay_key(key(crossterm::event::KeyCode::Esc)));
+        assert!(app.import_overlay.is_none());
+    }
+
+    #[test]
+    fn overlay_tab_cycles_focus() {
+        use crate::app::ImportField;
+        let mut app = App::new();
+        app.cd.last_status = Some(make_identified_status("X"));
+        app.handle_cd_import_key();
+        let start = app.import_overlay.as_ref().unwrap().focus;
+        assert!(app.handle_import_overlay_key(key(crossterm::event::KeyCode::Tab)));
+        let after = app.import_overlay.as_ref().unwrap().focus;
+        assert_eq!(after, start.next());
+        assert_ne!(after, ImportField::Tracks); // Tracks is the default
+    }
+
+    #[test]
+    fn overlay_enter_with_empty_selection_blocks_with_toast() {
+        let mut app = App::new();
+        app.cd.last_status = Some(make_identified_status("X"));
+        app.handle_cd_import_key();
+        // Deselect all then submit.
+        app.handle_import_overlay_key(key(crossterm::event::KeyCode::Char('n')));
+        assert!(app.handle_import_overlay_key(key(crossterm::event::KeyCode::Enter)));
+        // Overlay stays open with an error toast.
+        assert!(app.import_overlay.is_some());
+        let (msg, _, is_error) = app.toast_message.as_ref().unwrap();
+        assert!(is_error);
+        assert!(msg.contains("Select at least one"));
+    }
+
+    #[test]
+    fn overlay_enter_with_selection_queues_rip_and_closes() {
+        let mut app = App::new();
+        app.music_dir_cache = Some(std::path::PathBuf::from("/tmp/test-music"));
+        app.cd.last_status = Some(make_identified_status("Album"));
+        app.handle_cd_import_key();
+        assert!(app.handle_import_overlay_key(key(crossterm::event::KeyCode::Enter)));
+        assert!(app.import_overlay.is_none(), "overlay closes on confirm");
+        // A RipAndImport command should be queued for the worker.
+        assert!(
+            app.pending_bg_commands
+                .iter()
+                .any(|c| matches!(c, BgCommand::RipAndImport(_))),
+            "RipAndImport queued"
+        );
+        let (msg, _, is_error) = app.toast_message.as_ref().unwrap();
+        assert!(!*is_error);
+        assert!(msg.contains("Ripping"));
+        assert!(msg.contains("2 tracks"));
+        assert!(msg.contains("Album"));
+    }
+
+    #[test]
+    fn overlay_enter_without_music_dir_blocks_with_error_toast() {
+        let mut app = App::new();
+        app.music_dir_cache = None;
+        app.cd.last_status = Some(make_identified_status("Album"));
+        app.handle_cd_import_key();
+        assert!(app.handle_import_overlay_key(key(crossterm::event::KeyCode::Enter)));
+        // Overlay stays open so the user can either configure or cancel.
+        assert!(app.import_overlay.is_some());
+        let (msg, _, is_error) = app.toast_message.as_ref().unwrap();
+        assert!(is_error);
+        assert!(msg.contains("music"));
+    }
+
+    #[test]
+    fn rip_started_event_populates_state() {
+        use crate::background::RipEvent;
+        let mut app = App::new();
+        app.handle_bg_event(BgEvent::RipEvent(RipEvent::Started {
+            current: 1,
+            total: 3,
+            track_position: 1,
+            track_title: "Come Together".into(),
+        }));
+        let rip = app.cd.rip.as_ref().expect("rip state populated");
+        assert_eq!(rip.current, 1);
+        assert_eq!(rip.total, 3);
+        assert_eq!(rip.track_title, "Come Together");
+    }
+
+    #[test]
+    fn rip_complete_event_clears_state_and_toasts() {
+        use crate::background::RipEvent;
+        let mut app = App::new();
+        app.cd.rip = Some(RipProgressState {
+            current: 3,
+            total: 3,
+            track_title: "X".into(),
+            errors: vec![],
+        });
+        app.handle_bg_event(BgEvent::RipEvent(RipEvent::Complete {
+            ripped: 3,
+            failed: 0,
+            cancelled: false,
+            ejected: true,
+        }));
+        assert!(app.cd.rip.is_none());
+        let (msg, _, is_error) = app.toast_message.as_ref().unwrap();
+        assert!(!is_error);
+        assert!(msg.contains("3 tracks"));
+        assert!(msg.contains("ejected"));
+    }
+
+    #[test]
+    fn rip_complete_with_failures_is_an_error_toast() {
+        use crate::background::RipEvent;
+        let mut app = App::new();
+        app.cd.rip = Some(RipProgressState {
+            current: 5,
+            total: 5,
+            track_title: "X".into(),
+            errors: vec!["track 3: disk read".into()],
+        });
+        app.handle_bg_event(BgEvent::RipEvent(RipEvent::Complete {
+            ripped: 4,
+            failed: 1,
+            cancelled: false,
+            ejected: false,
+        }));
+        let (_, _, is_error) = app.toast_message.as_ref().unwrap();
+        assert!(*is_error);
+    }
+
+    #[test]
+    fn cancel_rip_emits_cancel_command_only_when_rip_active() {
+        let mut app = App::new();
+        // No active rip — no command queued.
+        app.cancel_rip();
+        assert!(app
+            .pending_bg_commands
+            .iter()
+            .all(|c| !matches!(c, BgCommand::CancelRip)));
+        // Active rip — command queued.
+        app.cd.rip = Some(RipProgressState {
+            current: 1,
+            total: 3,
+            track_title: "X".into(),
+            errors: vec![],
+        });
+        app.cancel_rip();
+        assert!(app
+            .pending_bg_commands
+            .iter()
+            .any(|c| matches!(c, BgCommand::CancelRip)));
+    }
+
+    /// Regression: Ctrl-C must bubble through the overlay to the main
+    /// dispatcher's quit hatch. The modal's catch-all swallowed it before.
+    #[test]
+    fn overlay_does_not_swallow_ctrl_c() {
+        let mut app = App::new();
+        app.cd.last_status = Some(make_identified_status("X"));
+        app.handle_cd_import_key();
+        let ev = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('c'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        assert!(
+            !app.handle_import_overlay_key(ev),
+            "Ctrl-C should fall through (not handled by overlay)"
+        );
+    }
+
+    #[test]
+    fn overlay_swallows_keys_so_underlying_panel_doesnt_react() {
+        let mut app = App::new();
+        app.cd.last_status = Some(make_identified_status("X"));
+        app.handle_cd_import_key();
+        // `t` would open the theme picker in the main dispatcher — must NOT
+        // bubble through while the overlay is up.
+        assert!(app.handle_import_overlay_key(key(crossterm::event::KeyCode::Char('t'))));
+        assert!(!app.show_theme_picker);
+    }
+
+    #[test]
+    fn overlay_space_toggles_track_when_tracks_focused() {
+        let mut app = App::new();
+        app.cd.last_status = Some(make_identified_status("X"));
+        app.handle_cd_import_key();
+        // Default focus = Tracks, default cursor = 0 → track 1.
+        let before = app.import_overlay.as_ref().unwrap().selected_count();
+        app.handle_import_overlay_key(key(crossterm::event::KeyCode::Char(' ')));
+        let after = app.import_overlay.as_ref().unwrap().selected_count();
+        assert_eq!(after, before - 1);
+    }
+
+    #[test]
+    fn parse_default_fidelity_cases() {
+        use zytunes::cd::rip::RipFidelity;
+        assert_eq!(
+            parse_default_fidelity(Some("flac")),
+            Some(RipFidelity::Flac)
+        );
+        assert_eq!(
+            parse_default_fidelity(Some("FLAC")),
+            Some(RipFidelity::Flac)
+        );
+        assert_eq!(
+            parse_default_fidelity(Some("mp3-cbr-320")),
+            Some(RipFidelity::Mp3Cbr320)
+        );
+        assert_eq!(
+            parse_default_fidelity(Some("mp3-320")),
+            Some(RipFidelity::Mp3Cbr320)
+        );
+        assert_eq!(parse_default_fidelity(Some("garbage")), None);
+        assert_eq!(parse_default_fidelity(None), None);
+    }
+
+    // The Phase 1 "identified disc → non-error toast" test was removed:
+    // Phase 2 changes the success path to open the overlay (no toast on
+    // success). `cd_import_key_with_identified_disc_opens_overlay` above
+    // is the replacement assertion.
 }

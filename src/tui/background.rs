@@ -22,12 +22,21 @@ fn is_device_gone(err: &str) -> bool {
         || err.contains("read_bulk timed out")
 }
 
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use zytunes::cd::discid::{compute_disc_id, DiscToc};
+use zytunes::cd::drive::{enumerate_drives, read_disc_toc, CdDrive, DriveError};
+use zytunes::cd::metadata::{ripped_track_destination, tag_ripped_file};
+use zytunes::cd::rip::{eject_drive, rip_track_cancellable, RipError, RipFidelity};
 use zytunes::device::{
     DeviceBackend, DeviceCapabilities, DeviceFamily, IpodBackend, ZuneBackend, ZuneDeviceData,
 };
 use zytunes::mtp::native::NativeSession;
 use zytunes::mtp::parse::DeviceEntry;
 use zytunes::mtp::DeviceSession;
+use zytunes::musicbrainz::{MbError, MusicBrainzClient, Release};
 use zytunes::{
     collect_photo_files_with_logger, collect_video_files_with_logger, make_transcode_temp_dir,
     needs_transcoding, needs_video_transcoding, resize_photo_for_zune, transcode_and_import_video,
@@ -74,6 +83,46 @@ pub enum BgCommand {
         album: String,
         paths: Vec<String>,
     },
+    /// One-shot CD detection + identification: enumerates optical drives,
+    /// reads the TOC from the first drive that has media, and looks the
+    /// disc up on MusicBrainz. Result is delivered as a single
+    /// [`BgEvent::CdStatus`] event covering all the success/failure modes.
+    ///
+    /// MB connection parameters are sent on the command rather than read
+    /// from a worker-side config so the worker stays config-agnostic — the
+    /// TUI is the source of truth.
+    DetectCd {
+        mb_base_url: Option<String>,
+        mb_user_agent: Option<String>,
+    },
+    /// Rip the selected tracks from `drive_path` to `dest_dir`, applying
+    /// MB metadata via lofty, optionally ejecting on completion. Progress
+    /// is reported per-track (not per-byte) — a single track produces one
+    /// "started" and one "done" event.
+    ///
+    /// Cancellation: the TUI sends [`BgCommand::CancelRip`] which trips
+    /// an `AtomicBool`; the worker checks it between tracks and
+    /// `rip_track_cancellable` checks it while ffmpeg is running.
+    ///
+    /// Boxed because the payload is ~384 bytes (full MB release with
+    /// nested track list); `BgCommand` is otherwise <100 bytes — clippy's
+    /// `large_enum_variant` fires otherwise.
+    RipAndImport(Box<RipAndImportRequest>),
+    /// Cancel the active rip. No-op if no rip is in flight.
+    CancelRip,
+}
+
+/// Payload for [`BgCommand::RipAndImport`]. Constructed by the TUI from
+/// the import overlay state when the user hits Enter.
+#[derive(Clone)]
+pub struct RipAndImportRequest {
+    pub drive: CdDrive,
+    pub toc: DiscToc,
+    pub release: zytunes::musicbrainz::Release,
+    pub track_positions: Vec<u32>,
+    pub fidelity: RipFidelity,
+    pub dest_dir: PathBuf,
+    pub auto_eject: bool,
 }
 
 /// A single item to sync (resolved to a file path).
@@ -177,6 +226,93 @@ pub enum BgEvent {
         name: String,
         summary: Result<zytunes::mtp::PlaylistImportSummary, String>,
     },
+    /// Outcome of a [`BgCommand::DetectCd`].
+    CdStatus(CdStatusEvent),
+    /// Per-track lifecycle event for an active rip. Emitted at start of
+    /// each track, on completion (success or failure), and once at the
+    /// end with the aggregate totals.
+    RipEvent(RipEvent),
+}
+
+/// Phase 3 per-track and end-of-rip events.
+#[derive(Debug, Clone)]
+pub enum RipEvent {
+    /// A track is starting. `current` is 1-indexed within the selected
+    /// set; `total` is the total selected.
+    Started {
+        current: usize,
+        total: usize,
+        // Reserved for the eventual auto-queue-to-device flow.
+        #[allow(dead_code)]
+        track_position: u32,
+        track_title: String,
+    },
+    /// A track finished. `error` is `Some` on failure (ffmpeg, tagging,
+    /// or file move).
+    TrackDone {
+        // `track_position` and `dest_path` are surfaced for the eventual
+        // auto-queue-to-device flow (queue the just-ripped file for a
+        // connected device); the Phase 3 commit doesn't wire that path yet.
+        #[allow(dead_code)]
+        track_position: u32,
+        track_title: String,
+        #[allow(dead_code)]
+        dest_path: Option<PathBuf>,
+        error: Option<String>,
+    },
+    /// All tracks in the request have been processed. `ejected` reflects
+    /// whether the auto-eject actually ran (best-effort).
+    Complete {
+        ripped: usize,
+        failed: usize,
+        cancelled: bool,
+        ejected: bool,
+    },
+}
+
+/// The full state machine the TUI cares about for CD detection — populated
+/// from one `DetectCd` round-trip and sufficient to render the status line
+/// without follow-up queries.
+#[derive(Debug, Clone)]
+pub enum CdStatusEvent {
+    /// No optical drive present (libdiscid returned an empty default device).
+    NoDrive,
+    /// Optical drive present but empty (or unreadable media).
+    NoMedia { drive: CdDrive },
+    /// TOC read but MusicBrainz could not (or refused to) identify the disc.
+    /// `reason` is short and human-readable so the status line can render
+    /// it directly.
+    UnknownDisc {
+        drive: CdDrive,
+        // `toc` and `mb_disc_id` are populated for Phase 2's "submit this
+        // disc to MusicBrainz" flow and for letting the user inspect the
+        // raw disc-id when reporting issues. Phase 1 surfaces only `reason`.
+        #[allow(dead_code)]
+        toc: DiscToc,
+        #[allow(dead_code)]
+        mb_disc_id: String,
+        reason: String,
+    },
+    /// Full success: TOC read and MB returned at least one release.
+    /// `primary` is the first release MB returned; `alternates` carries any
+    /// others for the Phase 2 alternate-match picker.
+    ///
+    /// `primary` is boxed because [`Release`] is ~376 bytes inline, large
+    /// enough that clippy's `large_enum_variant` lint fires across the
+    /// `BgEvent::CdStatus(CdStatusEvent)` chain. Boxing keeps the
+    /// hot-path event enum small without forcing all variants to box.
+    Identified {
+        drive: CdDrive,
+        // `toc`, `mb_disc_id`, and `alternates` are written to App state in
+        // Phase 1 and consumed by the import overlay in Phase 2.
+        #[allow(dead_code)]
+        toc: DiscToc,
+        #[allow(dead_code)]
+        mb_disc_id: String,
+        primary: Box<Release>,
+        #[allow(dead_code)]
+        alternates: Vec<Release>,
+    },
 }
 
 /// Spawn the background worker thread. Returns a sender for commands.
@@ -191,6 +327,11 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
         // reusing it keeps `LoadAlbumArt` hot-path allocations down to the
         // two strings we actually need (artist, album).
         let art_cache = zytunes::art_cache::ArtCache::default_location();
+
+        // Shared cancel flag for `RipAndImport`. Tripped by `CancelRip`,
+        // cleared at the start of each new rip. Lives outside the rip
+        // dispatch arm so it survives across cmd_rx.recv() turns.
+        let rip_cancel = Arc::new(AtomicBool::new(false));
 
         while let Ok(cmd) = cmd_rx.recv() {
             match cmd {
@@ -1148,11 +1289,367 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                         });
                     }
                 }
+                BgCommand::DetectCd {
+                    mb_base_url,
+                    mb_user_agent,
+                } => {
+                    let event = detect_cd(mb_base_url, mb_user_agent);
+                    let _ = event_tx.send(BgEvent::CdStatus(event));
+                }
+                BgCommand::RipAndImport(req) => {
+                    rip_cancel.store(false, Ordering::SeqCst);
+                    run_rip_and_import(*req, &event_tx, &rip_cancel);
+                }
+                BgCommand::CancelRip => {
+                    rip_cancel.store(true, Ordering::SeqCst);
+                }
             }
         }
     });
 
     cmd_tx
+}
+
+/// Drive the multi-track rip flow: for each selected track, emit a
+/// `Started` event, rip to a temp path, tag with MB metadata, move into
+/// the library tree, emit `TrackDone`. Wraps up with a `Complete` event.
+fn run_rip_and_import(
+    req: RipAndImportRequest,
+    event_tx: &mpsc::Sender<BgEvent>,
+    cancel: &Arc<AtomicBool>,
+) {
+    let total = req.track_positions.len();
+    let mut ripped = 0usize;
+    let mut failed = 0usize;
+    let mut cancelled = false;
+
+    // Build a quick lookup from track position → MB Track so we can pull
+    // the title (for events) and metadata (for tagging) without re-scanning.
+    // ONLY scan the first medium with tracks, mirroring the overlay's
+    // `ImportOverlay::current_tracks` behaviour. Flattening across all
+    // media would cause multi-disc box sets to collide on position
+    // (disc 2 track 1 has `position = 1`, same as disc 1 track 1, and a
+    // BTreeMap overwrite would tag disc 1's rip with disc 2's metadata).
+    let active_medium = req.release.media.iter().find(|m| !m.tracks.is_empty());
+    let mb_tracks: std::collections::BTreeMap<u32, zytunes::musicbrainz::Track> = active_medium
+        .map(|m| m.tracks.iter().cloned())
+        .into_iter()
+        .flatten()
+        .filter_map(|t| t.position.map(|p| (p, t)))
+        .collect();
+    let total_tracks_on_release =
+        active_medium.and_then(|m| m.track_count.or(Some(m.tracks.len() as u32)));
+
+    for (idx, &position) in req.track_positions.iter().enumerate() {
+        if cancel.load(Ordering::SeqCst) {
+            cancelled = true;
+            break;
+        }
+        let Some(mb_track) = mb_tracks.get(&position) else {
+            failed += 1;
+            let _ = event_tx.send(BgEvent::RipEvent(RipEvent::TrackDone {
+                track_position: position,
+                track_title: format!("track {position}"),
+                dest_path: None,
+                error: Some(format!(
+                    "track {position} not present in MusicBrainz release"
+                )),
+            }));
+            continue;
+        };
+
+        let _ = event_tx.send(BgEvent::RipEvent(RipEvent::Started {
+            current: idx + 1,
+            total,
+            track_position: position,
+            track_title: mb_track.title.clone(),
+        }));
+
+        let dest = ripped_track_destination(
+            &req.dest_dir,
+            &req.release,
+            mb_track,
+            position,
+            req.fidelity.extension(),
+        );
+
+        let outcome = run_single_track_rip(
+            SingleTrackRip {
+                drive_path: &req.drive.path,
+                toc: &req.toc,
+                position,
+                fidelity: req.fidelity,
+                release: &req.release,
+                mb_track,
+                dest: &dest,
+                total_tracks: total_tracks_on_release,
+            },
+            cancel,
+        );
+
+        // Typed outcome from `run_single_track_rip`. Accounting now
+        // matches the user's mental model:
+        // - `Ripped` and `RippedUntagged` both count as `ripped` (the
+        //   audio is on disk; tagging issues surface as warnings).
+        // - `Cancelled` doesn't increment anything; the `Complete
+        //   { cancelled: true }` event tells the user why.
+        // - `Failed` increments `failed`.
+        let (dest_path, error_for_event) = match &outcome {
+            TrackOutcome::Ripped(p) => {
+                ripped += 1;
+                (Some(p.clone()), None)
+            }
+            TrackOutcome::RippedUntagged { dest, warning } => {
+                ripped += 1;
+                let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                    "[rip] {} — {warning}",
+                    mb_track.title
+                )));
+                (Some(dest.clone()), None)
+            }
+            TrackOutcome::Cancelled => (None, None),
+            TrackOutcome::Failed(e) => {
+                failed += 1;
+                (None, Some(e.clone()))
+            }
+        };
+
+        let _ = event_tx.send(BgEvent::RipEvent(RipEvent::TrackDone {
+            track_position: position,
+            track_title: mb_track.title.clone(),
+            dest_path,
+            error: error_for_event,
+        }));
+
+        if cancel.load(Ordering::SeqCst) {
+            cancelled = true;
+            break;
+        }
+    }
+
+    // Auto-eject is best-effort; a rip that succeeded with an eject
+    // failure shouldn't read as a failed rip.
+    let ejected = if req.auto_eject && ripped > 0 && !cancelled {
+        match eject_drive(&req.drive.path) {
+            Ok(()) => true,
+            Err(e) => {
+                let _ = event_tx.send(BgEvent::SyncMessage(format!("rip ok, eject failed: {e}")));
+                false
+            }
+        }
+    } else {
+        false
+    };
+
+    let _ = event_tx.send(BgEvent::RipEvent(RipEvent::Complete {
+        ripped,
+        failed,
+        cancelled,
+        ejected,
+    }));
+}
+
+/// One-track wrapper: ensure dest directory exists, rip to a temp file,
+/// tag via lofty, atomically move into place. Returns the final path on
+/// success.
+/// Per-track rip parameters bundled to keep the function signature
+/// readable (clippy's `too_many_arguments` fires at 8).
+struct SingleTrackRip<'a> {
+    drive_path: &'a std::path::Path,
+    toc: &'a DiscToc,
+    position: u32,
+    fidelity: RipFidelity,
+    release: &'a zytunes::musicbrainz::Release,
+    mb_track: &'a zytunes::musicbrainz::Track,
+    dest: &'a std::path::Path,
+    total_tracks: Option<u32>,
+}
+
+/// Result of a single-track rip — finer-grained than `Result<_,_>` so
+/// the caller can distinguish full success, success-with-non-fatal-warning
+/// (audio ripped but tagging failed), cancellation, and outright failure
+/// for accounting purposes.
+pub(crate) enum TrackOutcome {
+    /// Audio ripped and tagged. Counts as `ripped`.
+    Ripped(PathBuf),
+    /// Audio ripped and on disk, but tagging failed — file is still in
+    /// the library so it counts as `ripped`; the warning is logged so
+    /// the user knows their tags are missing.
+    RippedUntagged { dest: PathBuf, warning: String },
+    /// User cancelled mid-track. Doesn't count as `ripped` or `failed`;
+    /// `.part` temp file is cleaned up before returning.
+    Cancelled,
+    /// Rip never produced a usable file. Counts as `failed`. `.part`
+    /// temp file is cleaned up before returning.
+    Failed(String),
+}
+
+fn run_single_track_rip(params: SingleTrackRip<'_>, cancel: &Arc<AtomicBool>) -> TrackOutcome {
+    let SingleTrackRip {
+        drive_path,
+        toc,
+        position,
+        fidelity,
+        release,
+        mb_track,
+        dest,
+        total_tracks,
+    } = params;
+
+    if let Some(parent) = dest.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return TrackOutcome::Failed(format!("create dest dir {}: {e}", parent.display()));
+        }
+    }
+
+    // Rip to a temp file next to the destination so a partial rip (cancel
+    // or ffmpeg crash) doesn't leave a half-formed file at the canonical
+    // path. The dirlib scanner picks tracks up by extension, so we don't
+    // want it to see incomplete files.
+    let temp_path = dest.with_extension(format!("{}.part", fidelity.extension()));
+
+    let track_position_u8: u8 = match position.try_into() {
+        Ok(v) => v,
+        Err(_) => {
+            return TrackOutcome::Failed(format!(
+                "track position {position} out of u8 range for ffmpeg libcdio -map index"
+            ));
+        }
+    };
+
+    let cancel_clone = Arc::clone(cancel);
+    let rip_result = rip_track_cancellable(
+        drive_path,
+        toc,
+        track_position_u8,
+        fidelity,
+        &temp_path,
+        &move || cancel_clone.load(Ordering::SeqCst),
+    );
+
+    match rip_result {
+        Err(RipError::Cancelled) => {
+            // Clean up the partial `.part` file so repeated cancel-retry
+            // cycles don't accumulate orphans next to the canonical path.
+            let _ = std::fs::remove_file(&temp_path);
+            return TrackOutcome::Cancelled;
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&temp_path);
+            return TrackOutcome::Failed(e.to_string());
+        }
+        Ok(_) => {}
+    }
+
+    // Tagging is best-effort. If it fails, the audio is still correct —
+    // we keep the file and surface a warning rather than counting the
+    // whole track as a failure (the Phase 4 fix-feature roadmap will
+    // re-tag library tracks against MB).
+    let tag_warning = tag_ripped_file(&temp_path, release, mb_track, position, total_tracks).err();
+
+    if let Err(e) = std::fs::rename(&temp_path, dest) {
+        let _ = std::fs::remove_file(&temp_path);
+        return TrackOutcome::Failed(format!(
+            "rename {} → {}: {e}",
+            temp_path.display(),
+            dest.display()
+        ));
+    }
+
+    match tag_warning {
+        Some(e) => TrackOutcome::RippedUntagged {
+            dest: dest.to_path_buf(),
+            warning: format!("tagging failed: {e}"),
+        },
+        None => TrackOutcome::Ripped(dest.to_path_buf()),
+    }
+}
+
+/// CD detection: enumerate optical drives, read the first one's TOC, and
+/// look up the disc on MusicBrainz. Extracted from the worker `match` arm
+/// for readability — note that it does real IO (libdiscid + network) so
+/// it's not unit-testable without dependency injection; coverage of the
+/// state-machine output lives in `App`-level tests that feed synthetic
+/// [`CdStatusEvent`] values.
+fn detect_cd(mb_base_url: Option<String>, mb_user_agent: Option<String>) -> CdStatusEvent {
+    let Some(mut drive) = enumerate_drives().into_iter().next() else {
+        return CdStatusEvent::NoDrive;
+    };
+
+    let toc = match read_disc_toc(&drive) {
+        Ok(toc) => {
+            drive.media_present = Some(true);
+            toc
+        }
+        Err(DriveError::NoMedia) => {
+            drive.media_present = Some(false);
+            return CdStatusEvent::NoMedia { drive };
+        }
+        Err(e) => {
+            // Treat IO and unsupported-platform errors as "unknown" so the
+            // status line carries the reason for the user; we still have a
+            // (possibly empty) TOC to display.
+            return CdStatusEvent::UnknownDisc {
+                drive,
+                toc: DiscToc {
+                    first_track: 0,
+                    last_track: 0,
+                    lead_out_lba: 0,
+                    tracks: Vec::new(),
+                },
+                mb_disc_id: String::new(),
+                reason: e.to_string(),
+            };
+        }
+    };
+
+    let mb_disc_id = compute_disc_id(&toc);
+
+    let mut client = MusicBrainzClient::new(mb_user_agent);
+    if let Some(url) = mb_base_url {
+        client = client.with_base_url(url);
+    }
+
+    match client.lookup_disc(&mb_disc_id) {
+        Ok(resp) => {
+            let mut releases = resp.releases;
+            if releases.is_empty() {
+                CdStatusEvent::UnknownDisc {
+                    drive,
+                    toc,
+                    mb_disc_id,
+                    reason: "no MusicBrainz match for this disc".into(),
+                }
+            } else {
+                let primary = releases.remove(0);
+                CdStatusEvent::Identified {
+                    drive,
+                    toc,
+                    mb_disc_id,
+                    primary: Box::new(primary),
+                    alternates: releases,
+                }
+            }
+        }
+        Err(MbError::NotFound) => CdStatusEvent::UnknownDisc {
+            drive,
+            toc,
+            mb_disc_id,
+            reason: "disc ID not in MusicBrainz".into(),
+        },
+        Err(MbError::MissingUserAgent) => CdStatusEvent::UnknownDisc {
+            drive,
+            toc,
+            mb_disc_id,
+            reason: "set musicbrainz_user_agent in config".into(),
+        },
+        Err(e) => CdStatusEvent::UnknownDisc {
+            drive,
+            toc,
+            mb_disc_id,
+            reason: format!("MusicBrainz lookup failed: {e}"),
+        },
+    }
 }
 
 /// Extract the first embedded picture from any of `paths` via lofty (handles

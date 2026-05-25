@@ -27,6 +27,21 @@ offsets) and algorithmic descriptions are facts, not copyrightable expression.
   documentation (`mtpz.md`) informed the handshake implementation in
   `zune-mtp/src/mtpz.rs`. Source of the `.mtpz-data` key file format.
 
+## Dynamically linked LGPL libraries
+
+zytunes dynamically links against the following LGPL libraries. No LGPL
+source is included or modified in the zytunes tree. Per LGPL §6, dynamic
+linking imposes no copyleft on the calling application, and users can
+substitute their own builds of these libraries by setting `PKG_CONFIG_PATH`
+or `LD_LIBRARY_PATH` (Linux) / `DYLD_LIBRARY_PATH` (macOS) at runtime.
+
+- **[libdiscid](https://musicbrainz.org/doc/libdiscid)** (LGPL-2.1+) — used
+  by `src/cd/drive.rs` via the [`discid`](https://crates.io/crates/discid)
+  Rust crate for reading audio-CD tables of contents. Install via
+  `brew install libdiscid` (macOS) or `apt install libdiscid-dev` (Debian/
+  Ubuntu). Upstream source:
+  <https://github.com/metabrainz/libdiscid>.
+
 ## Trademarks
 
 "Zune" is a trademark of Microsoft Corporation. "iPod" and "iTunes" are

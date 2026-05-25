@@ -315,12 +315,96 @@ pub fn transcode_and_import(
     caps: &DeviceCapabilities,
     meta: Option<&mtp::TrackMeta>,
 ) -> Result<u64, String> {
-    let upload_path = if needs_transcoding(local_path, caps.supported_formats) {
-        transcode_to_mp3(local_path, temp_dir, caps.max_art_dimensions)?
-    } else {
-        local_path.to_string()
-    };
+    let upload_path = transcode_for_device(local_path, temp_dir, caps)?;
     session.import_track(&upload_path, meta)
+}
+
+/// Pick the right transcode path for a source file → device. Three tiers,
+/// in order:
+///
+/// 1. **Lossless promotion** — when the device declares
+///    `lossless_target = Some("alac")` and the source is a FLAC, transcode
+///    to ALAC via ffmpeg so the lossless tier is preserved on device.
+/// 2. **Lossy fallback** — when the source is in a non-native lossy
+///    format, the existing pure-Rust `transcode_to_mp3` path kicks in.
+/// 3. **Passthrough** — when the source is already in a format the device
+///    accepts, no work happens.
+///
+/// Extracted from `transcode_and_import` for testability and so the
+/// command-line `push` path can reuse it.
+pub fn transcode_for_device(
+    local_path: &str,
+    temp_dir: &Path,
+    caps: &DeviceCapabilities,
+) -> Result<String, String> {
+    if let Some(lossless_target) = caps.lossless_target {
+        if is_flac(local_path) && lossless_target == "alac" {
+            return transcode_flac_to_alac(local_path, temp_dir);
+        }
+    }
+    if needs_transcoding(local_path, caps.supported_formats) {
+        return transcode_to_mp3(local_path, temp_dir, caps.max_art_dimensions);
+    }
+    Ok(local_path.to_string())
+}
+
+fn is_flac(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("flac"))
+}
+
+/// Transcode FLAC to ALAC via ffmpeg, preserving metadata.
+///
+/// Output container is `.m4a` (ALAC inside MP4) — that's the form iPod
+/// firmware expects. Uses `-c:a alac` (ffmpeg's native ALAC encoder; no
+/// external library required). `-vn` strips embedded artwork from the
+/// transcoded copy — the iPod doesn't read embedded art (artwork goes via
+/// ArtworkDB, populated separately).
+pub fn transcode_flac_to_alac(input: &str, temp_dir: &Path) -> Result<String, String> {
+    if !check_ffmpeg_available() {
+        return Err("ffmpeg is required for FLAC→ALAC transcoding".into());
+    }
+    let input_path = std::path::Path::new(input);
+    let stem = input_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("track");
+    let output = temp_dir.join(format!("{stem}.m4a"));
+
+    let status = std::process::Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "warning",
+            "-y",
+            "-i",
+            input,
+            "-c:a",
+            "alac",
+            "-vn", // drop embedded art — iPod uses ArtworkDB
+            output.to_str().ok_or("output path not UTF-8")?,
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| format!("failed to spawn ffmpeg: {e}"))?;
+
+    if !status.status.success() {
+        let stderr = String::from_utf8_lossy(&status.stderr);
+        return Err(format!(
+            "ffmpeg FLAC→ALAC failed ({:?}): {}",
+            status.status.code(),
+            stderr
+                .lines()
+                .filter(|l| !l.is_empty())
+                .collect::<Vec<_>>()
+                .join(" / ")
+        ));
+    }
+
+    Ok(output.to_string_lossy().into_owned())
 }
 
 /// Byte index of the end of the last frame in `samples` that contains any
@@ -910,6 +994,7 @@ mod tests {
             family: DeviceFamily::Zune,
             supported_formats: ZUNE_FORMATS,
             transcode_target: "mp3",
+            lossless_target: None,
             music_root: "/Music",
             max_art_dimensions: Some((200, 200)),
         }
@@ -1455,6 +1540,75 @@ mod tests {
     }
 
     // -- Transcoding decision tests --
+
+    fn ipod_caps_with_lossless() -> DeviceCapabilities {
+        DeviceCapabilities {
+            family: DeviceFamily::Ipod,
+            supported_formats: &["mp3", "m4a", "aac", "alac", "wav", "aiff"],
+            transcode_target: "mp3",
+            lossless_target: Some("alac"),
+            music_root: ":iPod_Control:Music",
+            max_art_dimensions: None,
+        }
+    }
+
+    #[test]
+    fn is_flac_recognises_extension_case_insensitively() {
+        assert!(is_flac("song.flac"));
+        assert!(is_flac("/abs/path/song.FLAC"));
+        assert!(is_flac("song.Flac"));
+        assert!(!is_flac("song.mp3"));
+        assert!(!is_flac("noext"));
+        assert!(!is_flac(""));
+    }
+
+    #[test]
+    fn transcode_for_device_passes_through_native_format() {
+        let caps = test_caps();
+        let temp = std::env::temp_dir();
+        let path = "/somewhere/song.mp3";
+        assert_eq!(transcode_for_device(path, &temp, &caps).unwrap(), path);
+    }
+
+    #[test]
+    fn transcode_for_device_no_lossless_target_falls_through_to_mp3_for_flac() {
+        // Zune has no lossless_target → FLAC should hit the MP3 path. We
+        // can't run the real transcode without a sample FLAC, but we can
+        // exercise the dispatch by pointing at a missing file and
+        // confirming the error message comes from `transcode_to_mp3`, not
+        // the ALAC branch.
+        let caps = test_caps();
+        let temp = std::env::temp_dir();
+        let err = transcode_for_device("/nope/missing.flac", &temp, &caps).unwrap_err();
+        // Hits the MP3 path → error mentions decode/open of the file
+        assert!(
+            !err.contains("ALAC") && !err.contains("alac"),
+            "should not have hit the ALAC branch; got {err:?}"
+        );
+    }
+
+    #[test]
+    fn transcode_for_device_ipod_routes_flac_through_alac_branch() {
+        // iPod has `lossless_target = Some("alac")`. With no ffmpeg in
+        // the test env, the ALAC branch fails fast with a recognisable
+        // error so we know we dispatched correctly.
+        let caps = ipod_caps_with_lossless();
+        let temp = std::env::temp_dir();
+        let result = transcode_for_device("/nope/missing.flac", &temp, &caps);
+        match result {
+            Err(e) if e.contains("ffmpeg") => {} // expected — either spawn-fail or process-fail
+            Err(other) => panic!("expected ffmpeg-related error, got {other:?}"),
+            Ok(p) => panic!("unexpectedly succeeded with {p:?}"),
+        }
+    }
+
+    #[test]
+    fn transcode_for_device_ipod_passes_through_native_mp3() {
+        let caps = ipod_caps_with_lossless();
+        let temp = std::env::temp_dir();
+        let path = "/somewhere/song.mp3";
+        assert_eq!(transcode_for_device(path, &temp, &caps).unwrap(), path);
+    }
 
     #[test]
     fn needs_transcoding_native_formats() {

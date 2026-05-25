@@ -46,6 +46,10 @@ impl DeviceBackend for IpodBackend {
             // We list the ones our transcoder can target or pass through.
             supported_formats: &["mp3", "m4a", "aac", "alac", "wav", "aiff"],
             transcode_target: "mp3",
+            // iPod firmware accepts ALAC natively — FLAC library sources
+            // transcode to ALAC on push (via ffmpeg) instead of falling
+            // through to lossy MP3, preserving the lossless tier.
+            lossless_target: Some("alac"),
             music_root: ":iPod_Control:Music",
             max_art_dimensions: None, // Artwork handled via ArtworkDB, not embedded
         }

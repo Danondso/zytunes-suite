@@ -22,6 +22,12 @@ pub struct DeviceCapabilities {
     pub transcode_target: &'static str,
     pub music_root: &'static str,
     pub max_art_dimensions: Option<(u32, u32)>,
+    /// Highest-fidelity *lossless* container the device's firmware accepts
+    /// natively. `Some("alac")` for iPod Classic (FLAC sources transcode
+    /// up to lossless ALAC on push instead of falling through to lossy
+    /// MP3); `None` for the Zune (no native lossless support — sources
+    /// always go through the lossy `transcode_target` path).
+    pub lossless_target: Option<&'static str>,
 }
 
 /// A detected (but not yet connected) device, with backend-specific data

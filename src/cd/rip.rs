@@ -159,13 +159,14 @@ pub fn require_track(
 
 /// Rip a single track, blocking until ffmpeg exits.
 ///
-/// Phase 3 will add progress emission (parsing ffmpeg stderr `out_time_ms=`
-/// lines) and cancellation. For Phase 0 this is a thin synchronous wrapper
-/// so the call site shape stabilises early.
-///
 /// `stderr` is captured into the `RipError::FfmpegFailed` variant on
 /// non-zero exit so callers see what went wrong instead of an opaque exit
-/// code. Phase 3 will additionally stream it for progress parsing.
+/// code. Per-byte progress streaming is not provided here — Phase 3 emits
+/// progress at per-track granularity from the worker (a 4-minute rip
+/// produces one "started" event and one "done" event), which is sufficient
+/// for the import overlay's status line. Within-track progress would
+/// require an ffmpeg `-progress pipe:2` parser; not worth the complexity
+/// for the user-perceived improvement (a single track rips in 30s-5min).
 pub fn rip_track(
     drive_device: &Path,
     toc: &DiscToc,
@@ -173,26 +174,148 @@ pub fn rip_track(
     fidelity: RipFidelity,
     output: &Path,
 ) -> Result<PathBuf, RipError> {
+    rip_track_cancellable(drive_device, toc, track_number, fidelity, output, &|| false)
+}
+
+/// Like [`rip_track`] but consults `is_cancelled` between IO operations and
+/// kills the ffmpeg child if it ever returns `true`. Used by the background
+/// worker for `BgCommand::CancelRip` support.
+pub fn rip_track_cancellable(
+    drive_device: &Path,
+    toc: &DiscToc,
+    track_number: u8,
+    fidelity: RipFidelity,
+    output: &Path,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<PathBuf, RipError> {
+    use std::sync::{Arc, Mutex};
+
     require_track(toc, track_number)?;
     let (program, args) = build_ffmpeg_command(drive_device, track_number, fidelity, output);
-    let output_handle = std::process::Command::new(&program)
+    let mut child = std::process::Command::new(&program)
         .args(&args)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
-        .output()
+        .spawn()
         .map_err(|e| RipError::Spawn(e.to_string()))?;
-    if !output_handle.status.success() {
-        let stderr = String::from_utf8_lossy(&output_handle.stderr)
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
-        return Err(RipError::FfmpegFailed {
-            exit_code: output_handle.status.code(),
-            stderr,
-        });
+
+    // Drain ffmpeg stderr on a background thread. The previous
+    // implementation only read stderr *after* `try_wait` reported
+    // completion, which deadlocks if ffmpeg fills the ~64 KB pipe buffer
+    // before exiting (scratched discs produce many recoverable-error
+    // warnings). Now we read continuously into a shared `Vec<u8>`.
+    let stderr_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let drain_handle = child.stderr.take().map(|mut stderr| {
+        let buf = Arc::clone(&stderr_buf);
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut chunk = [0u8; 4096];
+            loop {
+                match stderr.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if let Ok(mut b) = buf.lock() {
+                            b.extend_from_slice(&chunk[..n]);
+                        }
+                    }
+                }
+            }
+        })
+    });
+
+    // Poll cancel flag every 100 ms. A track typically takes 30 s-5 min so
+    // we're not burning meaningful CPU here.
+    let exit_outcome: Result<Option<i32>, RipError> = loop {
+        if is_cancelled() {
+            // Cancel-during-completion race: ffmpeg may have already
+            // finished in the ~100 ms window before we noticed the
+            // cancel flag. Poll one more time before killing — if the
+            // child has already exited successfully, accept it instead
+            // of pretending the user-cancelled-and-deleted a completed
+            // rip.
+            if let Ok(Some(status)) = child.try_wait() {
+                if status.success() {
+                    break Ok(status.code());
+                }
+                break Err(RipError::FfmpegFailed {
+                    exit_code: status.code(),
+                    stderr: String::new(),
+                });
+            }
+            // Truly cancelled mid-rip — best-effort kill.
+            let _ = child.kill();
+            let _ = child.wait();
+            break Err(RipError::Cancelled);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if status.success() {
+                    break Ok(status.code());
+                }
+                break Err(RipError::FfmpegFailed {
+                    exit_code: status.code(),
+                    stderr: String::new(), // populated below from drained buffer
+                });
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
+            Err(e) => break Err(RipError::Spawn(e.to_string())),
+        }
+    };
+
+    // Wait for the drain thread to finish so the buffer is complete.
+    if let Some(h) = drain_handle {
+        let _ = h.join();
     }
-    Ok(output.to_path_buf())
+    let stderr = stderr_buf
+        .lock()
+        .ok()
+        .map(|b| {
+            String::from_utf8_lossy(&b)
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+
+    match exit_outcome {
+        Ok(_) => Ok(output.to_path_buf()),
+        Err(RipError::FfmpegFailed { exit_code, .. }) => {
+            Err(RipError::FfmpegFailed { exit_code, stderr })
+        }
+        Err(other) => Err(other),
+    }
+}
+
+/// Eject the disc in `drive_device`. Shells out to `drutil` on macOS and
+/// `eject` on Linux. Errors surface as a string but the caller is
+/// expected to treat ejection as best-effort — a rip that succeeded
+/// followed by an eject failure shouldn't be reported as a failed rip.
+///
+/// **macOS:** `drutil eject` operates on the system default optical drive
+/// (no per-device path argument). This is fine in practice — Mac hardware
+/// has at most one internal optical drive and external USB drives are
+/// universally addressed through the same DriverServices API. If a future
+/// user reports a multi-drive Mac (e.g. external + Thunderbolt dock),
+/// switch to `diskutil eject <device>` which is `drive_device`-aware.
+pub fn eject_drive(drive_device: &Path) -> Result<(), String> {
+    let (program, args): (&str, Vec<String>) = if cfg!(target_os = "macos") {
+        // See doc comment — `drive_device` intentionally unused here.
+        let _ = drive_device;
+        ("drutil", vec!["eject".into()])
+    } else {
+        ("eject", vec![drive_device.to_string_lossy().into_owned()])
+    };
+    let status = std::process::Command::new(program)
+        .args(&args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| format!("failed to spawn {program}: {e}"))?;
+    if !status.success() {
+        return Err(format!("{program} exited with {:?}", status.code()));
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -207,6 +330,10 @@ pub enum RipError {
         exit_code: Option<i32>,
         stderr: String,
     },
+    /// User cancelled the rip via [`rip_track_cancellable`]'s `is_cancelled`
+    /// flag. The output file may exist but is incomplete and should be
+    /// deleted by the caller.
+    Cancelled,
 }
 
 impl std::fmt::Display for RipError {
@@ -226,6 +353,7 @@ impl std::fmt::Display for RipError {
             } => {
                 write!(f, "ffmpeg terminated without status: {stderr}")
             }
+            RipError::Cancelled => write!(f, "rip cancelled by user"),
         }
     }
 }
@@ -343,6 +471,26 @@ mod tests {
         let toc = small_toc();
         let t = require_track(&toc, 2).unwrap();
         assert_eq!(t.offset_lba, 50_000);
+    }
+
+    /// The cancel-flag plumbing isn't testable in pure unit-test
+    /// scope (it requires a live ffmpeg child to kill), so the
+    /// real-hardware verification lives in the manual rip workflow.
+    /// What we *can* unit-test is the error display surface — useful
+    /// because the worker pattern-matches on the Display output to
+    /// distinguish cancel from other failure modes in earlier revs.
+    #[test]
+    fn rip_error_cancelled_display_uses_lowercase_cancelled() {
+        let err = RipError::Cancelled;
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("cancelled"),
+            "expected 'cancelled' in Display output, got {msg:?}"
+        );
+        // Make sure the variant doesn't pretend it has an exit code or
+        // stderr content (it has neither — those belong to FfmpegFailed).
+        assert!(!msg.contains("status"));
+        assert!(!msg.contains("ffmpeg"));
     }
 
     #[test]

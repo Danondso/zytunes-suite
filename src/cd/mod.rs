@@ -13,8 +13,10 @@
 
 pub mod discid;
 pub mod drive;
+pub mod metadata;
 pub mod rip;
 
 pub use discid::{compute_disc_id, DiscToc, TocTrack};
 pub use drive::{enumerate_drives, read_disc_toc, CdDrive};
+pub use metadata::{ripped_track_destination, tag_ripped_file};
 pub use rip::{rip_track, RipFidelity, RipProgress};

@@ -21,7 +21,9 @@ use crate::app::{
     DeviceStatus, GenerationFormState, NowPlaying, Panel, PlaybackState, SidebarEntry, SidebarMode,
     SortColumn, SyncStatus,
 };
+use crate::background::CdStatusEvent;
 use crate::theme;
+use zytunes::musicbrainz::render_artist_credit;
 
 /// Responsive layout dimensions computed from terminal size.
 ///
@@ -124,12 +126,25 @@ fn throbber_symbol(state: &ThrobberState, theme: &theme::Theme) -> String {
 }
 
 pub fn draw(f: &mut Frame, app: &App) {
-    let size = f.area();
+    let full = f.area();
 
     if app.loading_library {
-        draw_startup(f, app, size);
+        draw_startup(f, app, full);
         return;
     }
+
+    // Slice a 1-row CD status bar off the top when there's something CD-related
+    // to report. `NoDrive` (and `None`) collapse the row so the existing layout
+    // is undisturbed on machines without an optical drive.
+    let (cd_bar_area, size) = if show_cd_status_bar(app) {
+        let s = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(0)])
+            .split(full);
+        (Some(s[0]), s[1])
+    } else {
+        (None, full)
+    };
 
     let m = LayoutMetrics::new(
         size,
@@ -137,6 +152,10 @@ pub fn draw(f: &mut Frame, app: &App) {
         app.has_album_browser(),
         app.should_show_player(size.height),
     );
+
+    if let Some(area) = cd_bar_area {
+        draw_cd_status_bar(f, app, area);
+    }
 
     // Outer horizontal: device left | middle content | keys right
     let outer = Layout::default()
@@ -237,6 +256,11 @@ pub fn draw(f: &mut Frame, app: &App) {
         draw_track_info_overlay(f, app);
     }
 
+    // CD import overlay — drawn last so it sits on top of everything.
+    if app.import_overlay.is_some() {
+        draw_import_overlay(f, app);
+    }
+
     // Search overlay.
     if app.search_active {
         draw_search_overlay(f, app);
@@ -262,6 +286,93 @@ pub fn draw(f: &mut Frame, app: &App) {
     if app.generation_form.is_some() {
         draw_generation_form_overlay(f, app);
     }
+}
+
+/// Predicate: should the CD status bar render at the top of the screen?
+///
+/// `NoDrive` and `None` both collapse the bar so users without an optical
+/// drive see the unaltered layout. Any other state — disc loaded, disc
+/// identified, lookup failed, OR an active rip — surfaces a one-line bar
+/// so the user always sees CD-related activity.
+pub(crate) fn show_cd_status_bar(app: &App) -> bool {
+    if app.cd.rip.is_some() {
+        return true;
+    }
+    matches!(
+        app.cd.last_status,
+        Some(
+            CdStatusEvent::NoMedia { .. }
+                | CdStatusEvent::UnknownDisc { .. }
+                | CdStatusEvent::Identified { .. }
+        )
+    )
+}
+
+/// Render the one-row CD status bar at the top of the screen.
+///
+/// Format per state. Prefix is the literal ASCII `"CD "` (not an emoji)
+/// so the bar renders consistently across terminals without depending on
+/// emoji-font fallbacks:
+/// - `NoMedia` — "CD {drive name} — no disc"
+/// - `UnknownDisc` — "CD {drive name} — Unknown disc: {reason}"
+/// - `Identified` — "CD {drive name} — {artist} — {album}   [i] import"
+pub(crate) fn draw_cd_status_bar(f: &mut Frame, app: &App, area: Rect) {
+    let theme = app.theme;
+    let style = Style::default().bg(theme.footer_bg).fg(theme.footer_text);
+
+    // Active rip takes precedence over any other CD status.
+    if let Some(rip) = &app.cd.rip {
+        let line = Line::from(vec![
+            Span::styled(
+                "CD ripping ",
+                Style::default()
+                    .fg(theme.accent_secondary)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(
+                "{}/{}: {}",
+                rip.current, rip.total, rip.track_title
+            )),
+            Span::styled("   [c] cancel", Style::default().fg(theme.dim_text)),
+        ]);
+        f.render_widget(Paragraph::new(line).style(style), area);
+        return;
+    }
+
+    let Some(status) = &app.cd.last_status else {
+        return;
+    };
+
+    let line = match status {
+        // `NoDrive` is filtered out by `show_cd_status_bar`, so this arm
+        // shouldn't run — return early rather than render an empty row.
+        CdStatusEvent::NoDrive => return,
+        CdStatusEvent::NoMedia { drive } => Line::from(vec![
+            Span::styled("CD ", Style::default().fg(theme.accent_secondary)),
+            Span::raw(format!("{} — no disc", drive.name)),
+        ]),
+        CdStatusEvent::UnknownDisc { drive, reason, .. } => Line::from(vec![
+            Span::styled("CD ", Style::default().fg(theme.accent_secondary)),
+            Span::raw(format!("{} — Unknown disc: {reason}", drive.name)),
+        ]),
+        CdStatusEvent::Identified { drive, primary, .. } => {
+            let artist = render_artist_credit(&primary.artist_credit);
+            Line::from(vec![
+                Span::styled("CD ", Style::default().fg(theme.accent_secondary)),
+                Span::raw(format!("{} — {} — {}", drive.name, artist, primary.title)),
+                Span::raw("   "),
+                Span::styled(
+                    "[i] import",
+                    Style::default()
+                        .fg(theme.header_text)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ])
+        }
+    };
+
+    let para = Paragraph::new(line).style(style);
+    f.render_widget(para, area);
 }
 
 fn draw_startup(f: &mut Frame, app: &App, area: Rect) {
@@ -2334,6 +2445,273 @@ fn draw_track_info_overlay(f: &mut Frame, app: &App) {
 
     let table = Table::new(rows, widths).header(header);
     f.render_widget(table, inner);
+}
+
+/// Render the CD import overlay — a centred modal with track-toggle list,
+/// alternate-match picker, fidelity picker, and auto-eject toggle. Focus is
+/// tracked on `App::import_overlay.focus`; the focused section gets a
+/// `▶ ` prefix on its header.
+fn draw_import_overlay(f: &mut Frame, app: &App) {
+    let Some(overlay) = app.import_overlay.as_ref() else {
+        return;
+    };
+    let t = app.theme();
+    let area = f.area();
+
+    let width = (area.width * 80 / 100)
+        .clamp(50, 100)
+        .min(area.width.saturating_sub(4));
+    let height = (area.height * 80 / 100)
+        .clamp(14, 36)
+        .min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(width)) / 2;
+    let y = (area.height.saturating_sub(height)) / 2;
+    let rect = Rect::new(x, y, width, height);
+
+    f.render_widget(Clear, rect);
+
+    let block = t
+        .block()
+        .border_style(Style::default().fg(t.selection_bg))
+        .title(format!(
+            " Import disc — {} (Esc to cancel) ",
+            overlay.current_release_label()
+        ))
+        .style(Style::default().bg(t.main_bg));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    if inner.height < 8 {
+        // Too cramped — bail with just the frame so we don't render garbage.
+        return;
+    }
+
+    // Vertical layout: match-line (1), separator+tracks (Min 4), fidelity (1),
+    // eject (1), footer hint (1). Separators are absorbed into the section
+    // titles to keep the constraint list short.
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // match picker
+            Constraint::Min(4),    // track list
+            Constraint::Length(1), // fidelity
+            Constraint::Length(1), // eject
+            Constraint::Length(1), // footer hints
+        ])
+        .split(inner);
+
+    draw_import_match_row(f, app, overlay, sections[0]);
+    draw_import_track_list(f, app, overlay, sections[1]);
+    draw_import_fidelity_row(f, app, overlay, sections[2]);
+    draw_import_eject_row(f, app, overlay, sections[3]);
+    draw_import_footer(f, app, overlay, sections[4]);
+}
+
+fn import_focus_prefix(focused: bool) -> &'static str {
+    if focused {
+        "▶ "
+    } else {
+        "  "
+    }
+}
+
+fn draw_import_match_row(
+    f: &mut Frame,
+    app: &App,
+    overlay: &crate::app::ImportOverlay,
+    area: Rect,
+) {
+    let t = app.theme();
+    let total = overlay.release_count();
+    let prefix = import_focus_prefix(overlay.focus == crate::app::ImportField::AlternateMatch);
+    let nav = if total > 1 {
+        format!(
+            "  ([) prev  next (])  {}/{}",
+            overlay.release_idx + 1,
+            total
+        )
+    } else {
+        String::new()
+    };
+    let line = Line::from(vec![
+        Span::styled(prefix, Style::default().fg(t.accent_secondary)),
+        Span::styled(
+            "Match: ",
+            Style::default()
+                .fg(t.header_text)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(overlay.current_release_label()),
+        Span::styled(nav, Style::default().fg(t.dim_text)),
+    ]);
+    f.render_widget(Paragraph::new(line), area);
+}
+
+fn draw_import_track_list(
+    f: &mut Frame,
+    app: &App,
+    overlay: &crate::app::ImportOverlay,
+    area: Rect,
+) {
+    let t = app.theme();
+    let focused = overlay.focus == crate::app::ImportField::Tracks;
+    let title_prefix = import_focus_prefix(focused);
+    let selected = overlay.selected_count();
+    let total = overlay.current_tracks().len();
+    let title = format!(
+        " {title_prefix}Tracks — {selected}/{total} selected   [Space] toggle  [a] all  [n] none "
+    );
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(t.border))
+        .title(title)
+        .style(Style::default().bg(t.main_bg));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.height == 0 {
+        return;
+    }
+
+    let visible = inner.height as usize;
+    let cursor = overlay.track_cursor;
+    // Window the cursor so it's always in view, biased toward top.
+    let scroll = if cursor >= visible {
+        cursor + 1 - visible
+    } else {
+        0
+    };
+
+    let rows: Vec<ListItem> = overlay
+        .current_tracks()
+        .iter()
+        .enumerate()
+        .skip(scroll)
+        .take(visible)
+        .map(|(i, track)| {
+            // Share the position fallback with the cursor handler so
+            // both render and click-target agree on what "the track at
+            // row N" is. See `app::import::effective_position`.
+            let position = crate::app::effective_position(track, i);
+            let selected_box = if overlay
+                .track_selection
+                .get(&position)
+                .copied()
+                .unwrap_or(false)
+            {
+                "[x]"
+            } else {
+                "[ ]"
+            };
+            let duration = track
+                .length
+                .map(|ms| format_duration_ms(ms as u64))
+                .unwrap_or_else(|| "    ".into());
+            // Title column uses `pad_right_to_width` (display-width-aware)
+            // instead of `{:<40}` (Rust char count) so CJK titles —
+            // each glyph counts as 2 cells — don't overflow the column.
+            let title_col = pad_right_to_width(&truncate(&track.title, 40), 40);
+            let row_text = format!("{selected_box} {position:>2}. {title_col}  {duration}");
+            let style = if i == cursor && focused {
+                Style::default()
+                    .bg(t.selection_bg)
+                    .fg(t.selection_text)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(t.sidebar_text)
+            };
+            ListItem::new(Line::from(Span::styled(row_text, style)))
+        })
+        .collect();
+
+    let list = List::new(rows).style(Style::default().bg(t.main_bg));
+    f.render_widget(list, inner);
+}
+
+fn draw_import_fidelity_row(
+    f: &mut Frame,
+    app: &App,
+    overlay: &crate::app::ImportOverlay,
+    area: Rect,
+) {
+    let t = app.theme();
+    let focused = overlay.focus == crate::app::ImportField::Fidelity;
+    let prefix = import_focus_prefix(focused);
+    let line = Line::from(vec![
+        Span::styled(prefix, Style::default().fg(t.accent_secondary)),
+        Span::styled(
+            "Fidelity: ",
+            Style::default()
+                .fg(t.header_text)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!("◀ {} ▶", overlay.current_fidelity().label())),
+        Span::styled("  (f / F)", Style::default().fg(t.dim_text)),
+    ]);
+    f.render_widget(Paragraph::new(line), area);
+}
+
+fn draw_import_eject_row(
+    f: &mut Frame,
+    app: &App,
+    overlay: &crate::app::ImportOverlay,
+    area: Rect,
+) {
+    let t = app.theme();
+    let focused = overlay.focus == crate::app::ImportField::AutoEject;
+    let prefix = import_focus_prefix(focused);
+    let checkbox = if overlay.auto_eject { "[x]" } else { "[ ]" };
+    let line = Line::from(vec![
+        Span::styled(prefix, Style::default().fg(t.accent_secondary)),
+        Span::styled(
+            "Eject after import: ",
+            Style::default()
+                .fg(t.header_text)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(checkbox),
+        Span::styled("  (e)", Style::default().fg(t.dim_text)),
+    ]);
+    f.render_widget(Paragraph::new(line), area);
+}
+
+fn draw_import_footer(f: &mut Frame, app: &App, _overlay: &crate::app::ImportOverlay, area: Rect) {
+    let t = app.theme();
+    let line = Line::from(vec![
+        Span::styled(
+            "[Tab]",
+            Style::default()
+                .fg(t.header_text)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" focus  "),
+        Span::styled(
+            "[Enter]",
+            Style::default()
+                .fg(t.header_text)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" import  "),
+        Span::styled(
+            "[Esc]",
+            Style::default()
+                .fg(t.header_text)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" cancel"),
+    ]);
+    f.render_widget(
+        Paragraph::new(line).style(Style::default().fg(t.dim_text).bg(t.main_bg)),
+        area,
+    );
+}
+
+/// `mm:ss` formatter for the import overlay's track-length column.
+/// Lives here (not in `util.rs`) because it's currently the only caller —
+/// extract on the second use.
+fn format_duration_ms(ms: u64) -> String {
+    let total = ms / 1000;
+    format!("{:>2}:{:02}", total / 60, total % 60)
 }
 
 fn draw_search_overlay(f: &mut Frame, app: &App) {
