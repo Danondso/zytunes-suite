@@ -4,11 +4,14 @@ mod import;
 mod playlists;
 #[path = "app/scan_phrase.rs"]
 mod scan_phrase;
+#[path = "tag_manager.rs"]
+pub mod tag_manager;
 
 pub use import::{effective_position, ImportField, ImportOverlay};
 pub use playlists::{
     device_playlist_sync_enabled, AddToPlaylistPicker, GenerationFormState, PendingPlaylistImport,
 };
+pub use tag_manager::{SearchInputField, SelectionAnchor, TagManagerOverlay, TagManagerPhase};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::mpsc;
@@ -654,6 +657,92 @@ fn parse_default_fidelity(s: Option<&str>) -> Option<zytunes::cd::rip::RipFideli
     }
 }
 
+/// Flatten AcoustID hits into the `ReleaseSearchHit` shape so the existing
+/// tag-manager SearchResults UI can render them and the Enter→pick path
+/// dispatches `MbReleaseDetails` for the chosen release.
+///
+/// One AcoustID hit can carry multiple recordings (different MB recordings
+/// matching the same fingerprint) and each recording can appear on multiple
+/// MB releases. We emit one synthetic row per (recording → release) pair so
+/// the user picks the specific release. Score is the parent AcoustID
+/// match score (0–100 scale matching MB's).
+/// When the AcoustID hits carry recording matches but none of them list any
+/// releases, pick a recording MBID to follow up on via MB's
+/// `/recording/{mbid}?inc=releases`. We take the first recording on the
+/// highest-scored hit — the recording itself is the same audio whichever
+/// hit we picked it from, and MB knows the release links AcoustID didn't.
+fn pick_recording_mbid_for_followup(hits: &[zytunes::acoustid::AcoustIdHit]) -> Option<String> {
+    let top = hits.iter().max_by(|a, b| {
+        a.score
+            .partial_cmp(&b.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    })?;
+    top.recordings.first().map(|r| r.id.clone())
+}
+
+/// Convert a `RecordingLookupResponse` into the same `ReleaseSearchHit`
+/// shape the tag-manager UI renders for SearchResults. Score is fixed at
+/// the top of the visible range (90) since these come from a direct MB
+/// lookup, not a fuzzy match — the user is picking which release of a
+/// known recording to tag against.
+fn recording_releases_to_search_hits(
+    rec: &zytunes::musicbrainz::RecordingLookupResponse,
+) -> Vec<zytunes::musicbrainz::ReleaseSearchHit> {
+    use zytunes::musicbrainz::ReleaseSearchHit;
+    rec.releases
+        .iter()
+        .map(|rel| ReleaseSearchHit {
+            id: rel.id.clone(),
+            score: 90,
+            title: rel.title.clone(),
+            date: rel.date.clone(),
+            country: rel.country.clone(),
+            artist_credit: rec.artist_credit.clone(),
+            release_group: rel.release_group.clone(),
+            media: vec![],
+            track_count: None,
+            label_info: vec![],
+        })
+        .collect()
+}
+
+fn acoustid_hits_to_release_hits(
+    hits: &[zytunes::acoustid::AcoustIdHit],
+) -> Vec<zytunes::musicbrainz::ReleaseSearchHit> {
+    use zytunes::musicbrainz::{ArtistCredit, ReleaseSearchHit};
+    let mut out: Vec<ReleaseSearchHit> = Vec::new();
+    for hit in hits {
+        let score = (hit.score * 100.0).round().clamp(0.0, 100.0) as u32;
+        for rec in &hit.recordings {
+            let rec_title = rec.title.clone().unwrap_or_default();
+            let rec_artists: Vec<ArtistCredit> = rec
+                .artists
+                .iter()
+                .map(|a| ArtistCredit {
+                    name: a.name.clone(),
+                    joinphrase: None,
+                    artist: None,
+                })
+                .collect();
+            for rel in &rec.releases {
+                out.push(ReleaseSearchHit {
+                    id: rel.id.clone(),
+                    score,
+                    title: rel.title.clone().unwrap_or_else(|| rec_title.clone()),
+                    date: None,
+                    country: None,
+                    artist_credit: rec_artists.clone(),
+                    release_group: None,
+                    media: vec![],
+                    track_count: None,
+                    label_info: vec![],
+                });
+            }
+        }
+    }
+    out
+}
+
 fn parse_device_track_parts(name: &str) -> (String, String, String) {
     let parts: Vec<&str> = name.splitn(3, '/').collect();
     let (artist, album, filename) = match parts.len() {
@@ -924,6 +1013,10 @@ pub struct App {
     /// MusicBrainz User-Agent pulled from config at startup. Required by
     /// the public host per MB ToS; format `app/version (contact)`.
     pub mb_user_agent: Option<String>,
+    /// AcoustID application API key pulled from config at startup. When
+    /// `None`, the tag-manager skips AcoustID dispatch entirely and falls
+    /// through to MB search. Register a free key at acoustid.org.
+    pub acoustid_app_key: Option<String>,
     /// Open import overlay. `Some` while the user is configuring a rip;
     /// `None` otherwise. All key events route into the overlay's own
     /// dispatcher when this is set.
@@ -950,6 +1043,10 @@ pub struct App {
     /// every Enter, and so tests can set it directly without env var
     /// gymnastics.
     pub music_dir_cache: Option<std::path::PathBuf>,
+    /// Tag-manager overlay state. `Some(_)` while the user is fixing tags
+    /// from MusicBrainz; key events route into the overlay's dispatcher
+    /// when this is set, similar to `import_overlay`.
+    pub tag_manager: Option<TagManagerOverlay>,
 }
 
 #[derive(Clone)]
@@ -1128,14 +1225,16 @@ impl App {
             experimental_playlist_sync: device_playlist_sync_enabled(),
             listen_log: ListenLog::new(),
             cd: CdState::default(),
-            mb_base_url: None,   // overwritten below from config
-            mb_user_agent: None, // overwritten below from config
+            mb_base_url: None,      // overwritten below from config
+            mb_user_agent: None,    // overwritten below from config
+            acoustid_app_key: None, // overwritten below from config
             import_overlay: None,
             default_rip_fidelity: zytunes::cd::rip::RipFidelity::Flac,
             auto_eject_default: true,
             acoustid_fingerprint: true,
             scan_fingerprint: true,
             music_dir_cache: None, // overwritten below from config
+            tag_manager: None,
         };
 
         // Read config once at the end of construction and apply all the
@@ -1150,6 +1249,7 @@ impl App {
         app.show_player = cfg.show_player;
         app.mb_base_url = cfg.musicbrainz_base_url;
         app.mb_user_agent = cfg.musicbrainz_user_agent;
+        app.acoustid_app_key = cfg.acoustid_app_key;
         app.default_rip_fidelity = parse_default_fidelity(cfg.default_fidelity.as_deref())
             .unwrap_or(zytunes::cd::rip::RipFidelity::Flac);
         if let Some(v) = cfg.cd_auto_eject {
@@ -1897,6 +1997,859 @@ impl App {
 
     pub fn track_info_end(&mut self) {
         self.track_info_scroll = usize::MAX;
+    }
+
+    // -- Tag-manager overlay --
+
+    /// Open the tag-manager overlay for the current selection.
+    ///
+    /// Scope is determined by the focused panel: `Albums` → `DiffScope::Album`
+    /// (every track on the selected album), `TrackList` → `DiffScope::Track`
+    /// (just the focused row). No-op outside Library mode, when no album/track
+    /// is selected, or when the library hasn't loaded.
+    pub fn open_tag_manager(&mut self, cmd_tx: &mpsc::Sender<BgCommand>) {
+        if self.browse_mode != BrowseMode::Library {
+            return;
+        }
+        if self.library.is_none() {
+            return;
+        }
+        let scope = match self.active_panel {
+            Panel::Albums => zytunes::tag_ops::DiffScope::Album,
+            Panel::TrackList => zytunes::tag_ops::DiffScope::Track,
+            _ => return,
+        };
+        let (artist, album, track_name) = match scope {
+            zytunes::tag_ops::DiffScope::Album => {
+                let Some(info) = self.album_list.get(self.album_selected) else {
+                    return;
+                };
+                (info.artist.clone(), info.name.clone(), None)
+            }
+            zytunes::tag_ops::DiffScope::Track => {
+                let Some(t) = self.track_list.get(self.track_selected) else {
+                    return;
+                };
+                (t.artist.clone(), t.album.clone(), Some(t.name.clone()))
+            }
+        };
+
+        let anchor = SelectionAnchor {
+            artist: artist.clone(),
+            album: Some(album.clone()),
+            track_name: track_name.clone(),
+        };
+
+        // Resolution chain:
+        //   1. library has mb_release_id  → direct MB lookup
+        //   2. library has acoustic_id + acoustid_app_key configured
+        //                                  → AcoustID fingerprint lookup,
+        //                                    surfaced as SearchResults
+        //   3. fallback                    → MB search (needs Solr — fails
+        //                                    on un-indexed mirrors but we
+        //                                    try anyway).
+        let known_release_mbid = self.resolve_known_release_mbid(&artist, &album, &track_name);
+        let acoustid_input = if known_release_mbid.is_none() {
+            self.acoustid_app_key
+                .as_deref()
+                .filter(|k| !k.is_empty())
+                .and_then(|key| {
+                    self.resolve_acoustid_input(&artist, &album, &track_name)
+                        .map(|(fp, secs)| (key.to_string(), fp, secs))
+                })
+        } else {
+            None
+        };
+
+        let mut overlay =
+            TagManagerOverlay::new(scope, artist.clone(), album.clone(), track_name, anchor);
+        let token = overlay.next_request_token();
+        if let Some(mbid) = known_release_mbid.clone() {
+            overlay.phase = TagManagerPhase::LoadingRelease;
+            self.tag_manager = Some(overlay);
+            let _ = cmd_tx.send(BgCommand::MbReleaseDetails {
+                token,
+                mbid,
+                mb_base_url: self.mb_base_url.clone(),
+                mb_user_agent: self.mb_user_agent.clone(),
+            });
+        } else if let Some((app_key, fingerprint, duration_secs)) = acoustid_input {
+            // AcoustID resolves to a list of release candidates the user
+            // picks from — overlay phase stays SearchPending so the
+            // pending-spinner UI is reused; results land in `search_hits`
+            // via `handle_acoustid_resolved` and the phase advances to
+            // SearchResults.
+            self.tag_manager = Some(overlay);
+            let _ = cmd_tx.send(BgCommand::AcoustIdLookup {
+                token,
+                fingerprint,
+                duration_secs,
+                app_key,
+            });
+        } else {
+            self.tag_manager = Some(overlay);
+            let _ = cmd_tx.send(BgCommand::MbSearchReleases {
+                token,
+                artist,
+                album,
+                mb_base_url: self.mb_base_url.clone(),
+                mb_user_agent: self.mb_user_agent.clone(),
+            });
+        }
+    }
+
+    /// Pull the first library track in this selection that carries both an
+    /// `acoustic_id` (Chromaprint fingerprint) and a positive `total_time_ms`.
+    /// Returns `(fingerprint, duration_in_seconds)`. AcoustID needs both:
+    /// the fingerprint identifies the audio, the duration disambiguates
+    /// similar matches (different mixes of the same track).
+    fn resolve_acoustid_input(
+        &self,
+        artist: &str,
+        album: &str,
+        track_name: &Option<String>,
+    ) -> Option<(String, u32)> {
+        let lib = self.library.as_ref()?;
+        for t in lib.album_tracks_by_artist(artist, album) {
+            if let Some(name) = track_name.as_ref() {
+                if !t.name.eq_ignore_ascii_case(name) {
+                    continue;
+                }
+            }
+            if let (Some(fp), Some(ms)) = (t.acoustic_id.as_deref(), t.total_time_ms) {
+                if !fp.is_empty() && ms > 0 {
+                    return Some((fp.to_string(), (ms / 1000) as u32));
+                }
+            }
+        }
+        None
+    }
+
+    /// Walk the library tracks scoped to this selection and return the
+    /// most-common `mb_release_id`, if any track carries one.
+    ///
+    /// Ties between MBIDs are broken in iteration order — for an album with
+    /// mixed tagging (some tracks from one release, some from another) this
+    /// just picks whichever the iterator landed on first. The user can still
+    /// Esc back to SearchInput if the auto-picked release is wrong.
+    fn resolve_known_release_mbid(
+        &self,
+        artist: &str,
+        album: &str,
+        track_name: &Option<String>,
+    ) -> Option<String> {
+        let lib = self.library.as_ref()?;
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for t in lib.album_tracks_by_artist(artist, album) {
+            if let Some(name) = track_name.as_ref() {
+                if !t.name.eq_ignore_ascii_case(name) {
+                    continue;
+                }
+            }
+            if let Some(mbid) = t.mb_release_id.as_ref() {
+                if !mbid.is_empty() {
+                    *counts.entry(mbid.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+        counts.into_iter().max_by_key(|(_, n)| *n).map(|(m, _)| m)
+    }
+
+    pub fn close_tag_manager(&mut self) {
+        self.tag_manager = None;
+    }
+
+    /// Worker returned a recording lookup with its release list — used as
+    /// the recovery path when the AcoustID hit named a recording but had
+    /// no releases attached. Convert each release into a
+    /// `ReleaseSearchHit`-shaped row and present as `SearchResults` so
+    /// the user picks, matching the rest of the UI.
+    fn handle_mb_recording_releases(
+        &mut self,
+        token: u64,
+        result: Result<Box<zytunes::musicbrainz::RecordingLookupResponse>, String>,
+    ) {
+        let Some(overlay) = self.tag_manager.as_mut() else {
+            self.sync.log.push(format!(
+                "tag-manager: dropped MB recording response (token={token}) — overlay closed"
+            ));
+            return;
+        };
+        if !overlay.accepts_token(token) {
+            let expected = overlay.pending_request_token;
+            self.sync.log.push(format!(
+                "tag-manager: dropped MB recording response (token={token} expected={expected})"
+            ));
+            return;
+        }
+        match result {
+            Ok(rec) => {
+                let hits = recording_releases_to_search_hits(&rec);
+                if hits.is_empty() {
+                    overlay.error = Some(
+                        "AcoustID + MB both confirm the recording but no releases are linked. \
+                         The recording stands alone — there's nothing to tag against."
+                            .into(),
+                    );
+                    overlay.phase = TagManagerPhase::Error;
+                } else {
+                    overlay.search_hits = hits;
+                    overlay.hit_idx = 0;
+                    overlay.phase = TagManagerPhase::SearchResults;
+                }
+            }
+            Err(e) => {
+                overlay.error = Some(format!("MB recording lookup failed: {e}"));
+                overlay.phase = TagManagerPhase::Error;
+            }
+        }
+    }
+
+    /// Worker returned AcoustID hits. We flatten the recording→release tree
+    /// into one synthesized `ReleaseSearchHit` per release candidate and
+    /// re-use the existing `SearchResults` UI for the user pick. Score is
+    /// the AcoustID match score scaled to 0–100 to match MB's score range.
+    fn handle_acoustid_resolved(
+        &mut self,
+        token: u64,
+        result: Result<Vec<zytunes::acoustid::AcoustIdHit>, String>,
+    ) {
+        let Some(overlay) = self.tag_manager.as_mut() else {
+            self.sync.log.push(format!(
+                "tag-manager: dropped AcoustID response (token={token}) — overlay closed"
+            ));
+            return;
+        };
+        if !overlay.accepts_token(token) {
+            let expected = overlay.pending_request_token;
+            self.sync.log.push(format!(
+                "tag-manager: dropped AcoustID response (token={token} expected={expected})"
+            ));
+            return;
+        }
+        match result {
+            Ok(hits) if !hits.is_empty() => {
+                // Capture the top-scored hit's AcoustID UUID so the eventual
+                // diff can write it back as ACOUSTID_ID. Picking the top is
+                // pragmatic — multiple AcoustID UUIDs only happen on edge
+                // cases (mashups, mispressings) and the user's release pick
+                // doesn't change which UUID identifies the audio itself.
+                overlay.acoustid_uuid = hits
+                    .iter()
+                    .max_by(|a, b| {
+                        a.score
+                            .partial_cmp(&b.score)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|h| h.id.clone());
+                let release_hits = acoustid_hits_to_release_hits(&hits);
+                if !release_hits.is_empty() {
+                    overlay.search_hits = release_hits;
+                    overlay.hit_idx = 0;
+                    overlay.phase = TagManagerPhase::SearchResults;
+                } else if let Some(recording_mbid) = pick_recording_mbid_for_followup(&hits) {
+                    // AcoustID matched a recording but didn't include any
+                    // releases. MB itself usually knows the recording→release
+                    // links — fire `MbRecordingReleases` and stay on the
+                    // pending phase. Skips dropping the user into an Error
+                    // dead-end for the common case of a sparse AcoustID
+                    // submission. Use `pending_bg_commands` because event
+                    // handlers don't get a direct `cmd_tx` handle.
+                    let next_token = overlay.next_request_token();
+                    let mb_base_url = self.mb_base_url.clone();
+                    let mb_user_agent = self.mb_user_agent.clone();
+                    self.sync.log.push(format!(
+                        "tag-manager: AcoustID hit had no releases; asking MB for recording {recording_mbid}"
+                    ));
+                    self.pending_bg_commands
+                        .push(BgCommand::MbRecordingReleases {
+                            token: next_token,
+                            recording_mbid,
+                            mb_base_url,
+                            mb_user_agent,
+                        });
+                } else {
+                    overlay.error = Some(
+                        "AcoustID matched the fingerprint but returned no MB recording \
+                         to follow up on. The audio is in AcoustID but isn't linked to MB."
+                            .into(),
+                    );
+                    overlay.phase = TagManagerPhase::Error;
+                }
+            }
+            Ok(_) => {
+                overlay.error = Some(
+                    "AcoustID had no matches — this file may not be in the AcoustID database. \
+                     Submit it via Picard if you'd like it to be."
+                        .into(),
+                );
+                overlay.phase = TagManagerPhase::Error;
+            }
+            Err(e) => {
+                overlay.error = Some(format!("AcoustID lookup failed: {e}"));
+                overlay.phase = TagManagerPhase::Error;
+            }
+        }
+    }
+
+    /// Worker returned MB search hits. Either advance to `SearchResults` or
+    /// surface an error. Stale responses (mismatched token) are dropped so
+    /// a search fired by a previous overlay open can't bleed into a freshly
+    /// reopened overlay.
+    fn handle_mb_search_results(
+        &mut self,
+        token: u64,
+        result: Result<Vec<zytunes::musicbrainz::ReleaseSearchHit>, String>,
+    ) {
+        // Capture this before grabbing `&mut overlay` so the hint message
+        // can reference it without re-borrowing self.
+        let on_mirror = self
+            .mb_base_url
+            .as_deref()
+            .map(|u| !u.contains("musicbrainz.org"))
+            .unwrap_or(false);
+        let Some(overlay) = self.tag_manager.as_mut() else {
+            self.sync.log.push(format!(
+                "tag-manager: dropped MB search response (token={token}) — overlay closed"
+            ));
+            return;
+        };
+        if !overlay.accepts_token(token) {
+            let expected = overlay.pending_request_token;
+            self.sync.log.push(format!(
+                "tag-manager: dropped MB search response (token={token} expected={expected})"
+            ));
+            return;
+        }
+        match result {
+            Ok(hits) => {
+                let empty = hits.is_empty();
+                overlay.search_hits = hits;
+                overlay.hit_idx = 0;
+                overlay.phase = TagManagerPhase::SearchResults;
+                // Empty result on a local mirror is almost always a missing
+                // Solr search index — the DB has the data but `/release/?query=`
+                // returns nothing. Surface a hint in the sync log so the user
+                // knows where to look without having to diagnose the API.
+                if empty && on_mirror {
+                    self.sync.log.push(
+                        "tag-manager: 0 hits from your local MB mirror — check that the search-server (Solr) container is running and indexed. Direct MBID lookups (auto-resolved from library tags) still work."
+                            .to_string(),
+                    );
+                }
+            }
+            Err(e) => {
+                overlay.error = Some(e);
+                overlay.phase = TagManagerPhase::Error;
+            }
+        }
+    }
+
+    /// Worker returned a full MB release. Build the diff against the
+    /// currently-selected library tracks and advance to `DiffPreview`.
+    /// Same staleness guard as `handle_mb_search_results`.
+    fn handle_mb_release_loaded(
+        &mut self,
+        token: u64,
+        result: Result<Box<zytunes::musicbrainz::Release>, String>,
+    ) {
+        let Some(overlay) = self.tag_manager.as_mut() else {
+            return;
+        };
+        if !overlay.accepts_token(token) {
+            return;
+        }
+        let release = match result {
+            Ok(r) => r,
+            Err(e) => {
+                overlay.error = Some(e);
+                overlay.phase = TagManagerPhase::Error;
+                return;
+            }
+        };
+        let lib = match self.library.as_ref() {
+            Some(l) => l,
+            None => {
+                overlay.error = Some("library not loaded".into());
+                overlay.phase = TagManagerPhase::Error;
+                return;
+            }
+        };
+
+        // Resolve library tracks scoped to (artist, album).
+        let lib_tracks: Vec<zytunes::library::Track> = match overlay.scope {
+            zytunes::tag_ops::DiffScope::Album => lib
+                .album_tracks_by_artist(&overlay.source_artist, &overlay.source_album)
+                .cloned()
+                .collect(),
+            zytunes::tag_ops::DiffScope::Track => {
+                let Some(name) = overlay.source_track_name.as_ref() else {
+                    overlay.error = Some("track-scope overlay missing track name".into());
+                    overlay.phase = TagManagerPhase::Error;
+                    return;
+                };
+                lib.album_tracks_by_artist(&overlay.source_artist, &overlay.source_album)
+                    .filter(|t| t.name.eq_ignore_ascii_case(name))
+                    .cloned()
+                    .collect()
+            }
+        };
+
+        if lib_tracks.is_empty() {
+            overlay.error = Some("no library tracks matched the source selection".into());
+            overlay.phase = TagManagerPhase::Error;
+            return;
+        }
+
+        let music_root_path = match self.music_dir_cache.clone().or_else(|| {
+            self.library
+                .as_ref()
+                .and_then(|l| l.music_folder().map(std::path::PathBuf::from))
+        }) {
+            Some(p) => p,
+            None => {
+                // Without a known music root the proposed filename diff
+                // would land tracks in `./` (the process cwd) — almost
+                // never what the user wants. Surface as a hard error.
+                overlay.error = Some("music root unknown — set music_dir in config".into());
+                overlay.phase = TagManagerPhase::Error;
+                return;
+            }
+        };
+        let diff = zytunes::tag_ops::build_release_diff(
+            &lib_tracks,
+            &release,
+            &music_root_path,
+            overlay.scope,
+            overlay.acoustid_uuid.as_deref(),
+        );
+
+        overlay.diff = Some(diff);
+        overlay.rebuild_flattened_paths();
+        overlay.focused_row = 0;
+        overlay.phase = TagManagerPhase::DiffPreview;
+    }
+
+    fn handle_tags_applied(
+        &mut self,
+        token: u64,
+        results: Vec<Result<(), String>>,
+        rename_map: std::collections::HashMap<PathBuf, PathBuf>,
+    ) {
+        // Per-track failures are surfaced via the sync log so the user sees
+        // *which* tracks failed without sifting through the diff view. We log
+        // them even on a stale token (the writes happened — the user
+        // deserves to know), but src_path resolution falls back to "<unknown
+        // track>" when the matching overlay is gone.
+        let stale = self
+            .tag_manager
+            .as_ref()
+            .is_some_and(|o| !o.accepts_token(token));
+        for (i, res) in results.iter().enumerate() {
+            if let Err(e) = res {
+                let path = (!stale)
+                    .then_some(self.tag_manager.as_ref())
+                    .flatten()
+                    .and_then(|o| o.diff.as_ref())
+                    .and_then(|d| d.tracks.get(i))
+                    .map(|t| t.src_path.display().to_string())
+                    .unwrap_or_else(|| "<unknown track>".into());
+                self.sync.log.push(format!("tag-manager: {path}: {e}"));
+            }
+        }
+        if let Some(overlay) = self.tag_manager.as_mut() {
+            if overlay.accepts_token(token) {
+                overlay.last_rename_map = rename_map;
+            }
+        }
+    }
+
+    fn handle_library_reread_complete(
+        &mut self,
+        token: u64,
+        result: Result<Box<dyn MusicLibrary + Send>, String>,
+    ) {
+        // Token-match decides whether the *currently open* overlay (if any)
+        // gets its anchor rewritten / phase advanced. The library swap on
+        // success is unconditional — those file writes are real, the cache
+        // is now stale, swap regardless of who's looking.
+        let overlay_matches = self
+            .tag_manager
+            .as_ref()
+            .is_some_and(|o| o.accepts_token(token));
+        match result {
+            Ok(lib) => {
+                self.library = Some(lib);
+                self.refresh_track_info_lib();
+                self.rebuild_artist_device_status();
+                self.refresh_sidebar();
+                if overlay_matches {
+                    // Rewrite the anchor's album/track name to the proposed
+                    // target so post-rename navigation finds the renamed row.
+                    self.rewrite_anchor_post_rename();
+                    self.restore_selection_anchor();
+                    if let Some(overlay) = self.tag_manager.as_mut() {
+                        overlay.phase = TagManagerPhase::Done;
+                    }
+                }
+            }
+            Err(e) => {
+                if overlay_matches {
+                    if let Some(overlay) = self.tag_manager.as_mut() {
+                        overlay.error = Some(e);
+                        overlay.phase = TagManagerPhase::Error;
+                    }
+                } else {
+                    self.set_toast(format!("library reread failed: {e}"), true);
+                }
+            }
+        }
+    }
+
+    /// Update `tag_manager.anchor` to point at the post-rename artist/album/
+    /// title using the (enabled) proposed fields from the active diff. Runs
+    /// before `restore_selection_anchor` so the navigation lands on the new
+    /// row rather than the (now-renamed) source row.
+    fn rewrite_anchor_post_rename(&mut self) {
+        let Some(overlay) = self.tag_manager.as_mut() else {
+            return;
+        };
+        let Some(diff) = overlay.diff.as_ref() else {
+            return;
+        };
+
+        // Find the track diff that maps to the anchor source selection.
+        let anchor_target: Option<&zytunes::tag_ops::TrackTagDiff> = match overlay.scope {
+            zytunes::tag_ops::DiffScope::Track => {
+                let name = overlay.source_track_name.clone().unwrap_or_default();
+                diff.tracks
+                    .iter()
+                    .find(|t| {
+                        // Compare by current Title field if present; otherwise
+                        // fall back to the source name itself.
+                        let cur_title = t
+                            .fields
+                            .iter()
+                            .find(|f| f.name == "Title")
+                            .and_then(|f| f.current.as_ref())
+                            .cloned()
+                            .unwrap_or_else(|| name.clone());
+                        cur_title.eq_ignore_ascii_case(&name)
+                    })
+                    .or_else(|| diff.tracks.first())
+            }
+            zytunes::tag_ops::DiffScope::Album => diff.tracks.first(),
+        };
+
+        // Album rename: if any enabled Album diff exists, take its proposed
+        // value (all enabled Album diffs agree by construction — they all
+        // come from the same release).
+        let proposed_album = diff
+            .tracks
+            .iter()
+            .find_map(|t| {
+                t.fields
+                    .iter()
+                    .find(|f| f.name == "Album" && f.enabled && f.proposed.is_some())
+            })
+            .and_then(|f| f.proposed.clone());
+
+        let proposed_album_artist = diff
+            .tracks
+            .iter()
+            .find_map(|t| {
+                t.fields
+                    .iter()
+                    .find(|f| f.name == "Album Artist" && f.enabled && f.proposed.is_some())
+            })
+            .and_then(|f| f.proposed.clone());
+
+        if let Some(album) = proposed_album {
+            overlay.anchor.album = Some(album);
+        }
+        if let Some(aa) = proposed_album_artist {
+            overlay.anchor.artist = aa;
+        }
+
+        if matches!(overlay.scope, zytunes::tag_ops::DiffScope::Track) {
+            let proposed_title = anchor_target
+                .and_then(|t| {
+                    t.fields
+                        .iter()
+                        .find(|f| f.name == "Title" && f.enabled && f.proposed.is_some())
+                })
+                .and_then(|f| f.proposed.clone());
+            if let Some(title) = proposed_title {
+                overlay.anchor.track_name = Some(title);
+            }
+        }
+    }
+
+    /// Walk sidebar → albums → track list to find the saved anchor target,
+    /// falling back to `0` at each level when the target is gone.
+    fn restore_selection_anchor(&mut self) {
+        let Some(overlay) = self.tag_manager.as_ref() else {
+            return;
+        };
+        let anchor = overlay.anchor.clone();
+        // Sidebar
+        let lower_artist = anchor.artist.to_lowercase();
+        let sidebar_idx = self
+            .sidebar_items
+            .iter()
+            .position(|e| match e {
+                SidebarEntry::Artist(a) => a.to_lowercase() == lower_artist,
+                SidebarEntry::Album { artist, .. } => artist.to_lowercase() == lower_artist,
+                SidebarEntry::Playlist { .. } => false,
+            })
+            .unwrap_or(0);
+        self.sidebar_selected = sidebar_idx;
+        self.select_sidebar_item();
+
+        if let Some(album_name) = anchor.album.as_ref() {
+            let lower_album = album_name.to_lowercase();
+            let album_idx = self
+                .album_list
+                .iter()
+                .position(|a| a.name.to_lowercase() == lower_album)
+                .unwrap_or(0);
+            self.album_selected = album_idx;
+            self.select_album();
+        }
+
+        if let Some(track_name) = anchor.track_name.as_ref() {
+            let lower_track = track_name.to_lowercase();
+            let track_idx = self
+                .track_list
+                .iter()
+                .position(|t| t.name.to_lowercase() == lower_track)
+                .unwrap_or(0);
+            self.track_selected = track_idx;
+        }
+    }
+
+    /// Dispatch a key event when the tag-manager overlay is open. Mirrors
+    /// the dispatcher shape of `import_overlay` / `show_track_info` — when
+    /// the overlay is `Some`, all key events route here and the rest of the
+    /// TUI is read-only behind it.
+    pub fn handle_tag_manager_key(&mut self, key: KeyEvent, cmd_tx: &mpsc::Sender<BgCommand>) {
+        let Some(overlay) = self.tag_manager.as_mut() else {
+            return;
+        };
+        // Phase-independent: q always closes (matches the help/track-info
+        // overlays). Esc handling is per-phase.
+        if matches!(key.code, KeyCode::Char('q')) {
+            // Don't allow closing mid-Apply — the worker is still mutating
+            // disk state. Wait for the finishing event.
+            if !matches!(overlay.phase, TagManagerPhase::Applying) {
+                self.close_tag_manager();
+            }
+            return;
+        }
+        match overlay.phase {
+            TagManagerPhase::SearchInput => {
+                self.handle_tag_manager_key_search_input(key, cmd_tx);
+            }
+            TagManagerPhase::SearchResults => {
+                self.handle_tag_manager_key_search_results(key, cmd_tx);
+            }
+            TagManagerPhase::DiffPreview => {
+                self.handle_tag_manager_key_diff_preview(key, cmd_tx);
+            }
+            TagManagerPhase::SearchPending | TagManagerPhase::LoadingRelease => {
+                // Only Esc cancels (closes overlay) — Apply-in-flight can't
+                // be cancelled safely.
+                if matches!(key.code, KeyCode::Esc) {
+                    self.close_tag_manager();
+                }
+            }
+            TagManagerPhase::Applying => {
+                // Block all keys; phase will advance on LibraryRereadComplete.
+            }
+            TagManagerPhase::Error => {
+                // Esc drops to SearchInput so the user can recover (e.g. an
+                // auto-resolved mb_release_id was stale and produced an
+                // error — going through manual search lets them pick a new
+                // release). Any other key closes.
+                if matches!(key.code, KeyCode::Esc) {
+                    overlay.error = None;
+                    overlay.phase = TagManagerPhase::SearchInput;
+                } else {
+                    self.close_tag_manager();
+                }
+            }
+            TagManagerPhase::Done => {
+                // Any key closes.
+                self.close_tag_manager();
+            }
+        }
+    }
+
+    fn handle_tag_manager_key_search_input(
+        &mut self,
+        key: KeyEvent,
+        cmd_tx: &mpsc::Sender<BgCommand>,
+    ) {
+        let Some(overlay) = self.tag_manager.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                // Esc from SearchInput closes the overlay.
+                self.close_tag_manager();
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                overlay.search_input_field = match overlay.search_input_field {
+                    SearchInputField::Artist => SearchInputField::Album,
+                    SearchInputField::Album => SearchInputField::Artist,
+                };
+            }
+            KeyCode::Backspace => {
+                let target = match overlay.search_input_field {
+                    SearchInputField::Artist => &mut overlay.query_artist,
+                    SearchInputField::Album => &mut overlay.query_album,
+                };
+                target.pop();
+            }
+            KeyCode::Enter => {
+                overlay.phase = TagManagerPhase::SearchPending;
+                let artist = overlay.query_artist.clone();
+                let album = overlay.query_album.clone();
+                let token = overlay.next_request_token();
+                let _ = cmd_tx.send(BgCommand::MbSearchReleases {
+                    token,
+                    artist,
+                    album,
+                    mb_base_url: self.mb_base_url.clone(),
+                    mb_user_agent: self.mb_user_agent.clone(),
+                });
+            }
+            KeyCode::Char(c) => {
+                let target = match overlay.search_input_field {
+                    SearchInputField::Artist => &mut overlay.query_artist,
+                    SearchInputField::Album => &mut overlay.query_album,
+                };
+                target.push(c);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_tag_manager_key_search_results(
+        &mut self,
+        key: KeyEvent,
+        cmd_tx: &mpsc::Sender<BgCommand>,
+    ) {
+        let Some(overlay) = self.tag_manager.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                overlay.phase = TagManagerPhase::SearchInput;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                overlay.hit_idx = overlay.hit_idx.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') if !overlay.search_hits.is_empty() => {
+                overlay.hit_idx = (overlay.hit_idx + 1).min(overlay.search_hits.len() - 1);
+            }
+            KeyCode::Enter => {
+                let Some(hit) = overlay.search_hits.get(overlay.hit_idx) else {
+                    return;
+                };
+                let mbid = hit.id.clone();
+                overlay.phase = TagManagerPhase::LoadingRelease;
+                let token = overlay.next_request_token();
+                let _ = cmd_tx.send(BgCommand::MbReleaseDetails {
+                    token,
+                    mbid,
+                    mb_base_url: self.mb_base_url.clone(),
+                    mb_user_agent: self.mb_user_agent.clone(),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_tag_manager_key_diff_preview(
+        &mut self,
+        key: KeyEvent,
+        cmd_tx: &mpsc::Sender<BgCommand>,
+    ) {
+        let Some(overlay) = self.tag_manager.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                overlay.phase = TagManagerPhase::SearchResults;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                overlay.move_focus(-1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                overlay.move_focus(1);
+            }
+            // Page-sized jumps. 10 is a reasonable approximation of one
+            // screenful for the overlay's typical 70% × terminal-height
+            // sizing on a normal terminal — doesn't need to be exact since
+            // the table auto-scrolls to keep focus visible.
+            KeyCode::PageUp => {
+                overlay.move_focus(-10);
+            }
+            KeyCode::PageDown => {
+                overlay.move_focus(10);
+            }
+            KeyCode::Home => {
+                overlay.focus_first();
+            }
+            KeyCode::End => {
+                overlay.focus_last();
+            }
+            KeyCode::Char(' ') => {
+                overlay.toggle_focused_field();
+            }
+            KeyCode::Char('a') => {
+                overlay.set_all_enabled(true);
+            }
+            KeyCode::Char('n') => {
+                overlay.set_all_enabled(false);
+            }
+            KeyCode::Enter => {
+                let Some(diff) = overlay.diff.clone() else {
+                    return;
+                };
+                if !diff.has_any_enabled() {
+                    // Nothing to apply — close instead of leaving a no-op
+                    // Applying phase the user can't escape.
+                    self.close_tag_manager();
+                    return;
+                }
+                let music_dir = self
+                    .music_dir_cache
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .or_else(|| {
+                        self.library
+                            .as_ref()
+                            .and_then(|l| l.music_folder().map(String::from))
+                    });
+                let Some(music_dir) = music_dir else {
+                    overlay.error = Some("music directory unknown".into());
+                    overlay.phase = TagManagerPhase::Error;
+                    return;
+                };
+                overlay.phase = TagManagerPhase::Applying;
+                let token = overlay.next_request_token();
+                let fingerprint = self.scan_fingerprint;
+                let _ = cmd_tx.send(BgCommand::ApplyTagDiff {
+                    token,
+                    diff: Box::new(diff),
+                    music_dir,
+                    fingerprint,
+                });
+            }
+            _ => {}
+        }
     }
 
     // -- Playback controls --
@@ -3715,6 +4668,28 @@ impl App {
             BgEvent::RipEvent(event) => {
                 self.handle_rip_event(event);
             }
+            BgEvent::MbSearchResults { token, result } => {
+                self.handle_mb_search_results(token, result);
+            }
+            BgEvent::MbReleaseLoaded { token, result } => {
+                self.handle_mb_release_loaded(token, result);
+            }
+            BgEvent::TagsApplied {
+                token,
+                results,
+                rename_map,
+            } => {
+                self.handle_tags_applied(token, results, rename_map);
+            }
+            BgEvent::LibraryRereadComplete { token, result } => {
+                self.handle_library_reread_complete(token, result);
+            }
+            BgEvent::AcoustIdResolved { token, result } => {
+                self.handle_acoustid_resolved(token, result);
+            }
+            BgEvent::MbRecordingReleases { token, result } => {
+                self.handle_mb_recording_releases(token, result);
+            }
         }
     }
 
@@ -4380,6 +5355,11 @@ impl App {
             return KeyOutcome::Continue;
         }
 
+        if self.tag_manager.is_some() {
+            self.handle_tag_manager_key(key, cmd_tx);
+            return KeyOutcome::Continue;
+        }
+
         if self.show_track_info {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('I') => {
@@ -4452,6 +5432,13 @@ impl App {
             }
             KeyCode::Char('I') if self.active_panel == Panel::TrackList => {
                 self.open_track_info();
+            }
+            KeyCode::Char('m')
+                if self.browse_mode == BrowseMode::Library
+                    && matches!(self.active_panel, Panel::Albums | Panel::TrackList)
+                    && self.library.is_some() =>
+            {
+                self.open_tag_manager(cmd_tx);
             }
             KeyCode::Char('P') => {
                 let label = self.cycle_show_player();
@@ -6877,10 +7864,16 @@ mod tests {
         }
         fn album_tracks_by_artist<'a>(
             &'a self,
-            _: &str,
-            _: &str,
+            artist: &str,
+            album: &str,
         ) -> Box<dyn Iterator<Item = &'a zytunes::library::Track> + 'a> {
-            Box::new(std::iter::empty())
+            let a = artist.to_string();
+            let b = album.to_string();
+            Box::new(
+                self.tracks
+                    .iter()
+                    .filter(move |t| t.artist == a && t.album == b),
+            )
         }
         fn tracks_by_name<'a>(
             &'a self,
@@ -10087,6 +11080,7 @@ mod tests {
                 packaging: None,
                 text_representation: None,
                 label_info: vec![],
+                genres: vec![],
             }),
             alternates: vec![],
         }
@@ -10560,4 +11554,530 @@ mod tests {
     // Phase 2 changes the success path to open the overlay (no toast on
     // success). `cd_import_key_with_identified_disc_opens_overlay` above
     // is the replacement assertion.
+
+    // -------- Tag-manager overlay tests --------
+
+    fn make_app_with_library_for_tagmgr() -> App {
+        let mut app = App::new();
+        // Seed an AlbumInfo + TrackInfo so open_tag_manager has something
+        // to grab regardless of which panel is focused.
+        app.album_list.push(AlbumInfo {
+            name: "Album X".into(),
+            artist: "Artist X".into(),
+            year: Some(1969),
+            track_count: 2,
+        });
+        app.album_selected = 0;
+        app.track_list.push(TrackInfo::new(
+            "Track Y".into(),
+            "Artist X".into(),
+            "Album X".into(),
+            None,
+            None,
+            Some("/music/Artist X/Album X/01 - Track Y.mp3".into()),
+            None,
+            None,
+            None,
+            false,
+        ));
+        app.track_selected = 0;
+        app.library = Some(make_minimal_library());
+        app
+    }
+
+    fn dummy_cmd_channel() -> mpsc::Sender<BgCommand> {
+        let (tx, _rx) = mpsc::channel::<BgCommand>();
+        tx
+    }
+
+    #[test]
+    fn hotkey_m_opens_tag_manager_for_album_scope() {
+        let mut app = make_app_with_library_for_tagmgr();
+        app.browse_mode = BrowseMode::Library;
+        app.active_panel = Panel::Albums;
+        app.open_tag_manager(&dummy_cmd_channel());
+        let overlay = app.tag_manager.as_ref().expect("overlay should be open");
+        assert_eq!(overlay.scope, zytunes::tag_ops::DiffScope::Album);
+        assert_eq!(overlay.query_artist, "Artist X");
+        assert_eq!(overlay.query_album, "Album X");
+        assert!(overlay.source_track_name.is_none());
+    }
+
+    #[test]
+    fn hotkey_m_opens_tag_manager_for_track_scope() {
+        let mut app = make_app_with_library_for_tagmgr();
+        app.browse_mode = BrowseMode::Library;
+        app.active_panel = Panel::TrackList;
+        app.open_tag_manager(&dummy_cmd_channel());
+        let overlay = app.tag_manager.as_ref().expect("overlay should be open");
+        assert_eq!(overlay.scope, zytunes::tag_ops::DiffScope::Track);
+        assert_eq!(overlay.source_track_name.as_deref(), Some("Track Y"));
+    }
+
+    #[test]
+    fn hotkey_m_ignored_outside_library_mode() {
+        let mut app = make_app_with_library_for_tagmgr();
+        app.browse_mode = BrowseMode::Device;
+        app.active_panel = Panel::Albums;
+        app.open_tag_manager(&dummy_cmd_channel());
+        assert!(app.tag_manager.is_none());
+    }
+
+    #[test]
+    fn hotkey_m_ignored_when_library_missing() {
+        let mut app = make_app_with_library_for_tagmgr();
+        app.library = None;
+        app.browse_mode = BrowseMode::Library;
+        app.active_panel = Panel::Albums;
+        app.open_tag_manager(&dummy_cmd_channel());
+        assert!(app.tag_manager.is_none());
+    }
+
+    #[test]
+    fn tag_manager_phase_advances_on_mb_search_results() {
+        let mut app = make_app_with_library_for_tagmgr();
+        app.browse_mode = BrowseMode::Library;
+        app.active_panel = Panel::Albums;
+        app.open_tag_manager(&dummy_cmd_channel());
+        // SearchPending immediately after open (command was sent to a dummy
+        // channel — we drive the worker side manually below).
+        assert_eq!(
+            app.tag_manager.as_ref().unwrap().phase,
+            TagManagerPhase::SearchPending
+        );
+        let token = app.tag_manager.as_ref().unwrap().pending_request_token;
+        // Feed simulated results.
+        app.handle_bg_event(BgEvent::MbSearchResults {
+            token,
+            result: Ok(vec![zytunes::musicbrainz::ReleaseSearchHit {
+                id: "rel-1".into(),
+                score: 100,
+                title: "Album X".into(),
+                date: Some("1969".into()),
+                country: Some("GB".into()),
+                artist_credit: vec![],
+                release_group: None,
+                media: vec![],
+                track_count: Some(10),
+                label_info: vec![],
+            }]),
+        });
+        let overlay = app.tag_manager.as_ref().unwrap();
+        assert_eq!(overlay.phase, TagManagerPhase::SearchResults);
+        assert_eq!(overlay.search_hits.len(), 1);
+    }
+
+    #[test]
+    fn tag_manager_search_failure_moves_to_error_phase() {
+        let mut app = make_app_with_library_for_tagmgr();
+        app.browse_mode = BrowseMode::Library;
+        app.active_panel = Panel::Albums;
+        app.open_tag_manager(&dummy_cmd_channel());
+        let token = app.tag_manager.as_ref().unwrap().pending_request_token;
+        app.handle_bg_event(BgEvent::MbSearchResults {
+            token,
+            result: Err("network down".into()),
+        });
+        let overlay = app.tag_manager.as_ref().unwrap();
+        assert_eq!(overlay.phase, TagManagerPhase::Error);
+        assert_eq!(overlay.error.as_deref(), Some("network down"));
+    }
+
+    #[test]
+    fn open_tag_manager_uses_lookup_when_library_has_release_mbid() {
+        // When the library already knows the mb_release_id (e.g. Picard-tagged
+        // file) we skip search and go directly to MbReleaseDetails. This is
+        // both a perf win and the only thing that works on local MB mirrors
+        // that have the DB populated but no Solr search index running.
+        use zytunes::library::Track as LibTrack;
+        let (tx, rx) = mpsc::channel::<BgCommand>();
+        let mut app = make_app_with_library_for_tagmgr();
+        app.browse_mode = BrowseMode::Library;
+        app.active_panel = Panel::Albums;
+        // Replace the empty library with one that carries an mb_release_id
+        // for the album the test selects.
+        app.library = Some(Box::new(VecLibrary {
+            tracks: vec![LibTrack {
+                id: 1,
+                name: "Track Y".into(),
+                artist: "Artist X".into(),
+                album: "Album X".into(),
+                mb_release_id: Some("rel-known-mbid".into()),
+                ..Default::default()
+            }],
+        }));
+        app.open_tag_manager(&tx);
+
+        // Phase should be LoadingRelease, not SearchPending.
+        let overlay = app.tag_manager.as_ref().unwrap();
+        assert_eq!(overlay.phase, TagManagerPhase::LoadingRelease);
+
+        // The command on the wire should be MbReleaseDetails with the known MBID,
+        // not MbSearchReleases.
+        let cmd = rx.try_recv().expect("a command should have been sent");
+        match cmd {
+            BgCommand::MbReleaseDetails { mbid, .. } => {
+                assert_eq!(mbid, "rel-known-mbid");
+            }
+            _ => panic!("expected MbReleaseDetails on the channel"),
+        }
+    }
+
+    #[test]
+    fn open_tag_manager_dispatches_acoustid_when_no_mbid_but_fingerprint_and_key() {
+        // No mb_release_id, but the library track carries acoustic_id +
+        // total_time_ms AND the user has acoustid_app_key configured →
+        // AcoustIdLookup is the right next step, not MbSearchReleases.
+        use zytunes::library::Track as LibTrack;
+        let (tx, rx) = mpsc::channel::<BgCommand>();
+        let mut app = make_app_with_library_for_tagmgr();
+        app.browse_mode = BrowseMode::Library;
+        app.active_panel = Panel::Albums;
+        app.acoustid_app_key = Some("test-key".into());
+        app.library = Some(Box::new(VecLibrary {
+            tracks: vec![LibTrack {
+                id: 1,
+                name: "Track Y".into(),
+                artist: "Artist X".into(),
+                album: "Album X".into(),
+                acoustic_id: Some("AQADtBRsomething".into()),
+                total_time_ms: Some(240_000),
+                ..Default::default()
+            }],
+        }));
+        app.open_tag_manager(&tx);
+        let cmd = rx.try_recv().expect("a command should have been sent");
+        match cmd {
+            BgCommand::AcoustIdLookup {
+                fingerprint,
+                duration_secs,
+                app_key,
+                ..
+            } => {
+                assert_eq!(fingerprint, "AQADtBRsomething");
+                assert_eq!(duration_secs, 240);
+                assert_eq!(app_key, "test-key");
+            }
+            _ => panic!("expected AcoustIdLookup on the channel"),
+        }
+    }
+
+    #[test]
+    fn open_tag_manager_skips_acoustid_when_app_key_unset() {
+        // Same library setup but no app_key → fall through to MB search.
+        use zytunes::library::Track as LibTrack;
+        let (tx, rx) = mpsc::channel::<BgCommand>();
+        let mut app = make_app_with_library_for_tagmgr();
+        app.browse_mode = BrowseMode::Library;
+        app.active_panel = Panel::Albums;
+        app.acoustid_app_key = None;
+        app.library = Some(Box::new(VecLibrary {
+            tracks: vec![LibTrack {
+                id: 1,
+                name: "Track Y".into(),
+                artist: "Artist X".into(),
+                album: "Album X".into(),
+                acoustic_id: Some("AQADfp".into()),
+                total_time_ms: Some(240_000),
+                ..Default::default()
+            }],
+        }));
+        app.open_tag_manager(&tx);
+        let cmd = rx.try_recv().expect("a command should have been sent");
+        assert!(
+            matches!(cmd, BgCommand::MbSearchReleases { .. }),
+            "expected MbSearchReleases when no AcoustID key"
+        );
+    }
+
+    #[test]
+    fn open_tag_manager_falls_back_to_search_when_no_mbid() {
+        // No mb_release_id on any library track → fall back to search-first.
+        let (tx, rx) = mpsc::channel::<BgCommand>();
+        let mut app = make_app_with_library_for_tagmgr();
+        app.browse_mode = BrowseMode::Library;
+        app.active_panel = Panel::Albums;
+        app.open_tag_manager(&tx);
+
+        let overlay = app.tag_manager.as_ref().unwrap();
+        assert_eq!(overlay.phase, TagManagerPhase::SearchPending);
+        let cmd = rx.try_recv().expect("a command should have been sent");
+        assert!(
+            matches!(cmd, BgCommand::MbSearchReleases { .. }),
+            "expected MbSearchReleases when library has no MBID"
+        );
+    }
+
+    #[test]
+    fn tag_manager_drops_stale_mb_search_response() {
+        // Regression: closing+reopening the overlay used to deliver the
+        // previous open's MB search hits into the freshly-reopened overlay.
+        // With request tokens, mismatched responses must be dropped without
+        // advancing the phase.
+        let mut app = make_app_with_library_for_tagmgr();
+        app.browse_mode = BrowseMode::Library;
+        app.active_panel = Panel::Albums;
+        app.open_tag_manager(&dummy_cmd_channel());
+        let stale_token = app.tag_manager.as_ref().unwrap().pending_request_token;
+        // Simulate close + reopen — both increment the token.
+        app.close_tag_manager();
+        app.open_tag_manager(&dummy_cmd_channel());
+        let current_token = app.tag_manager.as_ref().unwrap().pending_request_token;
+        assert_ne!(stale_token, current_token);
+
+        // Feed the stale token — should be ignored, phase must remain Pending.
+        app.handle_bg_event(BgEvent::MbSearchResults {
+            token: stale_token,
+            result: Ok(vec![zytunes::musicbrainz::ReleaseSearchHit {
+                id: "rel-stale".into(),
+                score: 0,
+                title: "STALE".into(),
+                date: None,
+                country: None,
+                artist_credit: vec![],
+                release_group: None,
+                media: vec![],
+                track_count: None,
+                label_info: vec![],
+            }]),
+        });
+        let overlay = app.tag_manager.as_ref().unwrap();
+        assert_eq!(
+            overlay.phase,
+            TagManagerPhase::SearchPending,
+            "stale response must not advance the phase"
+        );
+        assert!(
+            overlay.search_hits.is_empty(),
+            "stale hits must not populate the overlay"
+        );
+    }
+
+    #[test]
+    fn acoustid_resolved_with_hits_advances_to_search_results() {
+        use zytunes::acoustid::{AcoustIdArtist, AcoustIdHit, AcoustIdRecording, AcoustIdRelease};
+        let mut app = make_app_with_library_for_tagmgr();
+        app.browse_mode = BrowseMode::Library;
+        app.active_panel = Panel::Albums;
+        app.acoustid_app_key = Some("test-key".into());
+        app.library = Some(Box::new(VecLibrary {
+            tracks: vec![zytunes::library::Track {
+                id: 1,
+                name: "Track Y".into(),
+                artist: "Artist X".into(),
+                album: "Album X".into(),
+                acoustic_id: Some("fp1".into()),
+                total_time_ms: Some(240_000),
+                ..Default::default()
+            }],
+        }));
+        app.open_tag_manager(&dummy_cmd_channel());
+        let token = app.tag_manager.as_ref().unwrap().pending_request_token;
+        app.handle_bg_event(BgEvent::AcoustIdResolved {
+            token,
+            result: Ok(vec![AcoustIdHit {
+                id: "ac1".into(),
+                score: 0.95,
+                recordings: vec![AcoustIdRecording {
+                    id: "rec1".into(),
+                    title: Some("Track Y".into()),
+                    duration: Some(240),
+                    artists: vec![AcoustIdArtist {
+                        id: "art1".into(),
+                        name: "Artist X".into(),
+                    }],
+                    releases: vec![
+                        AcoustIdRelease {
+                            id: "rel-a".into(),
+                            title: Some("Album X".into()),
+                        },
+                        AcoustIdRelease {
+                            id: "rel-b".into(),
+                            title: Some("Compilation X".into()),
+                        },
+                    ],
+                }],
+            }]),
+        });
+        let overlay = app.tag_manager.as_ref().unwrap();
+        assert_eq!(overlay.phase, TagManagerPhase::SearchResults);
+        // Two releases → two synthesized search hits, both at the
+        // recording's score scaled to 0–100.
+        assert_eq!(overlay.search_hits.len(), 2);
+        assert_eq!(overlay.search_hits[0].score, 95);
+        assert!(overlay
+            .search_hits
+            .iter()
+            .any(|h| h.id == "rel-a" && h.title == "Album X"));
+        assert!(overlay
+            .search_hits
+            .iter()
+            .any(|h| h.id == "rel-b" && h.title == "Compilation X"));
+    }
+
+    #[test]
+    fn acoustid_resolved_empty_hits_lands_on_error_phase() {
+        let mut app = make_app_with_library_for_tagmgr();
+        app.browse_mode = BrowseMode::Library;
+        app.active_panel = Panel::Albums;
+        app.acoustid_app_key = Some("test-key".into());
+        app.library = Some(Box::new(VecLibrary {
+            tracks: vec![zytunes::library::Track {
+                id: 1,
+                name: "Track Y".into(),
+                artist: "Artist X".into(),
+                album: "Album X".into(),
+                acoustic_id: Some("fp1".into()),
+                total_time_ms: Some(240_000),
+                ..Default::default()
+            }],
+        }));
+        app.open_tag_manager(&dummy_cmd_channel());
+        let token = app.tag_manager.as_ref().unwrap().pending_request_token;
+        app.handle_bg_event(BgEvent::AcoustIdResolved {
+            token,
+            result: Ok(vec![]),
+        });
+        let overlay = app.tag_manager.as_ref().unwrap();
+        assert_eq!(overlay.phase, TagManagerPhase::Error);
+        assert!(overlay
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("no matches")));
+    }
+
+    #[test]
+    fn acoustid_hits_without_releases_dispatch_mb_recording_lookup() {
+        // Regression: AcoustID hits that name a recording but carry no
+        // releases used to dead-end on the Error phase. We now follow up
+        // with an MB recording-releases lookup, since MB itself knows the
+        // links AcoustID didn't include.
+        use zytunes::acoustid::{AcoustIdHit, AcoustIdRecording};
+        let mut app = make_app_with_library_for_tagmgr();
+        app.browse_mode = BrowseMode::Library;
+        app.active_panel = Panel::Albums;
+        app.acoustid_app_key = Some("test-key".into());
+        app.library = Some(Box::new(VecLibrary {
+            tracks: vec![zytunes::library::Track {
+                id: 1,
+                name: "Track Y".into(),
+                artist: "Artist X".into(),
+                album: "Album X".into(),
+                acoustic_id: Some("fp1".into()),
+                total_time_ms: Some(240_000),
+                ..Default::default()
+            }],
+        }));
+        app.open_tag_manager(&dummy_cmd_channel());
+        let token = app.tag_manager.as_ref().unwrap().pending_request_token;
+        app.handle_bg_event(BgEvent::AcoustIdResolved {
+            token,
+            result: Ok(vec![AcoustIdHit {
+                id: "ac1".into(),
+                score: 0.9,
+                recordings: vec![AcoustIdRecording {
+                    id: "rec-no-releases".into(),
+                    title: Some("Track Y".into()),
+                    duration: Some(240),
+                    artists: vec![],
+                    releases: vec![],
+                }],
+            }]),
+        });
+        let overlay = app.tag_manager.as_ref().unwrap();
+        // Phase stays in SearchPending while the follow-up is in flight
+        // (we never wrote a new phase — the MB recording lookup is the
+        // current outstanding work).
+        assert_eq!(overlay.phase, TagManagerPhase::SearchPending);
+        // A MbRecordingReleases command should be pending dispatch.
+        let recording_cmd = app
+            .pending_bg_commands
+            .iter()
+            .find_map(|c| match c {
+                BgCommand::MbRecordingReleases { recording_mbid, .. } => {
+                    Some(recording_mbid.clone())
+                }
+                _ => None,
+            })
+            .expect("MbRecordingReleases command should be queued");
+        assert_eq!(recording_cmd, "rec-no-releases");
+    }
+
+    #[test]
+    fn mb_recording_releases_lands_releases_into_search_results() {
+        // Once the recording-releases lookup completes, the response
+        // turns into a SearchResults row list the user picks from.
+        use zytunes::musicbrainz::{ArtistCredit, RecordingLookupResponse, RecordingReleaseRef};
+        let mut app = make_app_with_library_for_tagmgr();
+        app.browse_mode = BrowseMode::Library;
+        app.active_panel = Panel::Albums;
+        // Open the overlay so there's an overlay to deliver into. We
+        // don't actually go through the AcoustID dispatch — just simulate
+        // the second-leg event by stamping the matching token.
+        app.open_tag_manager(&dummy_cmd_channel());
+        let token = app.tag_manager.as_ref().unwrap().pending_request_token;
+        app.handle_bg_event(BgEvent::MbRecordingReleases {
+            token,
+            result: Ok(Box::new(RecordingLookupResponse {
+                id: "rec1".into(),
+                title: "Track Y".into(),
+                artist_credit: vec![ArtistCredit {
+                    name: "Artist X".into(),
+                    joinphrase: None,
+                    artist: None,
+                }],
+                releases: vec![
+                    RecordingReleaseRef {
+                        id: "rel-x".into(),
+                        title: "Album X".into(),
+                        date: Some("1977".into()),
+                        country: Some("GB".into()),
+                        status: Some("Official".into()),
+                        release_group: None,
+                    },
+                    RecordingReleaseRef {
+                        id: "rel-y".into(),
+                        title: "Compilation Y".into(),
+                        date: Some("1988".into()),
+                        country: Some("US".into()),
+                        status: Some("Official".into()),
+                        release_group: None,
+                    },
+                ],
+            })),
+        });
+        let overlay = app.tag_manager.as_ref().unwrap();
+        assert_eq!(overlay.phase, TagManagerPhase::SearchResults);
+        assert_eq!(overlay.search_hits.len(), 2);
+        assert!(overlay.search_hits.iter().any(|h| h.id == "rel-x"));
+        assert!(overlay.search_hits.iter().any(|h| h.id == "rel-y"));
+        // Score is fixed at 90 for MB-direct fallback rows (per
+        // recording_releases_to_search_hits).
+        assert!(overlay.search_hits.iter().all(|h| h.score == 90));
+    }
+
+    #[test]
+    fn mb_recording_releases_with_no_releases_errors_cleanly() {
+        use zytunes::musicbrainz::RecordingLookupResponse;
+        let mut app = make_app_with_library_for_tagmgr();
+        app.browse_mode = BrowseMode::Library;
+        app.active_panel = Panel::Albums;
+        app.open_tag_manager(&dummy_cmd_channel());
+        let token = app.tag_manager.as_ref().unwrap().pending_request_token;
+        app.handle_bg_event(BgEvent::MbRecordingReleases {
+            token,
+            result: Ok(Box::new(RecordingLookupResponse {
+                id: "rec1".into(),
+                title: "Track Y".into(),
+                artist_credit: vec![],
+                releases: vec![],
+            })),
+        });
+        let overlay = app.tag_manager.as_ref().unwrap();
+        assert_eq!(overlay.phase, TagManagerPhase::Error);
+        assert!(overlay
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("no releases")));
+    }
 }

@@ -110,6 +110,69 @@ pub enum BgCommand {
     RipAndImport(Box<RipAndImportRequest>),
     /// Cancel the active rip. No-op if no rip is in flight.
     CancelRip,
+    /// Search MusicBrainz for releases matching `artist` + `album`. Result
+    /// is delivered as [`BgEvent::MbSearchResults`]. MB connection params
+    /// arrive on the command for the same reason as `DetectCd`.
+    ///
+    /// `token` is echoed back on the response so the TUI can fence stale
+    /// results when the overlay is closed+reopened before a response lands.
+    MbSearchReleases {
+        token: u64,
+        artist: String,
+        album: String,
+        mb_base_url: Option<String>,
+        mb_user_agent: Option<String>,
+    },
+    /// Fetch a full MB release by MBID. Result is delivered as
+    /// [`BgEvent::MbReleaseLoaded`]. `token` is echoed back, same as above.
+    MbReleaseDetails {
+        token: u64,
+        mbid: String,
+        mb_base_url: Option<String>,
+        mb_user_agent: Option<String>,
+    },
+    /// Apply an approved tag diff to disk, then surgically re-read the
+    /// affected files into the library. Emits [`BgEvent::TagsApplied`]
+    /// followed by [`BgEvent::LibraryRereadComplete`].
+    ///
+    /// Boxed because `ReleaseTagDiff` carries a `Vec<TrackTagDiff>` whose
+    /// per-track inline size (PathBuf + `Vec<FieldDiff>`) easily exceeds the
+    /// rest of `BgCommand`'s footprint.
+    ///
+    /// `token` is echoed back on both response events so the overlay can
+    /// drop stale results when the user closes-then-reopens mid-apply. The
+    /// library swap on success is unconditional (the files really changed),
+    /// but anchor/phase mutation is gated by the token match.
+    ApplyTagDiff {
+        token: u64,
+        diff: Box<zytunes::tag_ops::ReleaseTagDiff>,
+        music_dir: String,
+        fingerprint: bool,
+    },
+    /// Look up a Chromaprint fingerprint against the AcoustID web service.
+    /// Result is delivered as [`BgEvent::AcoustIdResolved`]. The tag-manager
+    /// uses this when the library carries an `acoustic_id` but no
+    /// `mb_release_id`. Results are cached on disk; cache hits skip the
+    /// network round-trip entirely.
+    ///
+    /// `token` is echoed back, same fencing as the MB requests.
+    AcoustIdLookup {
+        token: u64,
+        fingerprint: String,
+        duration_secs: u32,
+        app_key: String,
+    },
+    /// Look up an MB recording by MBID, returning the releases it appears
+    /// on. Used as a follow-up when the AcoustID response carried a
+    /// recording match but no inline releases — MB itself usually knows
+    /// the recording→release links. Result is delivered as
+    /// [`BgEvent::MbRecordingReleases`].
+    MbRecordingReleases {
+        token: u64,
+        recording_mbid: String,
+        mb_base_url: Option<String>,
+        mb_user_agent: Option<String>,
+    },
 }
 
 /// Payload for [`BgCommand::RipAndImport`]. Constructed by the TUI from
@@ -236,6 +299,50 @@ pub enum BgEvent {
     /// each track, on completion (success or failure), and once at the
     /// end with the aggregate totals.
     RipEvent(RipEvent),
+    /// Outcome of [`BgCommand::MbSearchReleases`]. `token` echoes the value
+    /// from the matching command so the TUI can drop responses for queries
+    /// it no longer cares about (e.g. overlay closed+reopened while a
+    /// search was in flight).
+    MbSearchResults {
+        token: u64,
+        result: Result<Vec<zytunes::musicbrainz::ReleaseSearchHit>, String>,
+    },
+    /// Outcome of [`BgCommand::MbReleaseDetails`]. Boxed because the
+    /// `Release` payload is comparable in size to the cd `Identified`
+    /// variant; clippy's `large_enum_variant` would fire otherwise.
+    MbReleaseLoaded {
+        token: u64,
+        result: Result<Box<zytunes::musicbrainz::Release>, String>,
+    },
+    /// Phase 1 of `ApplyTagDiff`: tag writes + renames are done. Per-track
+    /// `results` lines up with the diff's `tracks` vec; `rename_map` carries
+    /// only successful renames. `token` matches the originating command.
+    TagsApplied {
+        token: u64,
+        results: Vec<Result<(), String>>,
+        rename_map: std::collections::HashMap<std::path::PathBuf, std::path::PathBuf>,
+    },
+    /// Phase 2 of `ApplyTagDiff`: surgical re-scan complete. Replaces
+    /// `App.library` and (when the token still matches the open overlay)
+    /// triggers the post-rename selection restore.
+    LibraryRereadComplete {
+        token: u64,
+        result: Result<Box<dyn zytunes::library::MusicLibrary + Send>, String>,
+    },
+    /// Outcome of [`BgCommand::AcoustIdLookup`]. `hits` is sorted highest
+    /// score first by the worker. Empty vec = no AcoustID match (the
+    /// fingerprint is fine but no one's submitted this track to AcoustID
+    /// yet); Err = HTTP/parse/API error.
+    AcoustIdResolved {
+        token: u64,
+        result: Result<Vec<zytunes::acoustid::AcoustIdHit>, String>,
+    },
+    /// Outcome of [`BgCommand::MbRecordingReleases`]. Used to recover from
+    /// AcoustID hits that named a recording but had no releases attached.
+    MbRecordingReleases {
+        token: u64,
+        result: Result<Box<zytunes::musicbrainz::RecordingLookupResponse>, String>,
+    },
 }
 
 /// Phase 3 per-track and end-of-rip events.
@@ -347,6 +454,11 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
         // cleared at the start of each new rip. Lives outside the rip
         // dispatch arm so it survives across cmd_rx.recv() turns.
         let rip_cancel = Arc::new(AtomicBool::new(false));
+
+        // AcoustID disk cache, lazily initialised on first `AcoustIdLookup`.
+        // Kept across the worker's lifetime so all lookups in one session
+        // share one disk read + the in-memory map.
+        let mut acoustid_cache: Option<zytunes::acoustid::AcoustIdCache> = None;
 
         while let Ok(cmd) = cmd_rx.recv() {
             match cmd {
@@ -1318,11 +1430,256 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                 BgCommand::CancelRip => {
                     rip_cancel.store(true, Ordering::SeqCst);
                 }
+                BgCommand::MbSearchReleases {
+                    token,
+                    artist,
+                    album,
+                    mb_base_url,
+                    mb_user_agent,
+                } => {
+                    let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                        "tag-manager: MB search artist={artist:?} album={album:?} (token={token})"
+                    )));
+                    let result = run_mb_search_releases_with_log(
+                        &artist,
+                        &album,
+                        mb_base_url,
+                        mb_user_agent,
+                        &event_tx,
+                    );
+                    match &result {
+                        Ok(hits) => {
+                            let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                                "tag-manager: MB returned {} hit(s) (token={token})",
+                                hits.len()
+                            )));
+                        }
+                        Err(e) => {
+                            let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                                "tag-manager: MB search failed (token={token}): {e}"
+                            )));
+                        }
+                    }
+                    let _ = event_tx.send(BgEvent::MbSearchResults { token, result });
+                }
+                BgCommand::MbReleaseDetails {
+                    token,
+                    mbid,
+                    mb_base_url,
+                    mb_user_agent,
+                } => {
+                    let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                        "tag-manager: MB release lookup mbid={mbid} (token={token})"
+                    )));
+                    let result = run_mb_release_details(&mbid, mb_base_url, mb_user_agent);
+                    if let Err(e) = &result {
+                        let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                            "tag-manager: MB lookup failed (token={token}): {e}"
+                        )));
+                    }
+                    let _ = event_tx.send(BgEvent::MbReleaseLoaded { token, result });
+                }
+                BgCommand::ApplyTagDiff {
+                    token,
+                    diff,
+                    music_dir,
+                    fingerprint,
+                } => {
+                    let (results, rename_map) = zytunes::tag_ops::apply_release_diff(&diff);
+                    // Collect every src/dest path so the surgical re-read
+                    // covers both the original locations (now stale) and the
+                    // post-rename locations (now fresh).
+                    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+                    for track in &diff.tracks {
+                        paths.push(track.src_path.clone());
+                    }
+                    for new in rename_map.values() {
+                        paths.push(new.clone());
+                    }
+                    let _ = event_tx.send(BgEvent::TagsApplied {
+                        token,
+                        results,
+                        rename_map,
+                    });
+
+                    let log_tx = event_tx.clone();
+                    let scan_log: zytunes::cache::Logger = std::sync::Arc::new(move |msg: &str| {
+                        let _ = log_tx.send(BgEvent::SyncMessage(msg.to_string()));
+                    });
+                    let lib_result = zytunes::dirlib::DirectoryLibrary::reread_paths(
+                        &music_dir,
+                        &paths,
+                        fingerprint,
+                        &scan_log,
+                    )
+                    .map(|l| Box::new(l) as Box<dyn zytunes::library::MusicLibrary + Send>);
+                    let _ = event_tx.send(BgEvent::LibraryRereadComplete {
+                        token,
+                        result: lib_result,
+                    });
+                }
+                BgCommand::AcoustIdLookup {
+                    token,
+                    fingerprint,
+                    duration_secs,
+                    app_key,
+                } => {
+                    // Lazily open the cache on first use so workers that
+                    // never invoke AcoustID don't touch disk.
+                    if acoustid_cache.is_none() {
+                        let base = zytunes::paths::device_cache_base()
+                            .unwrap_or_else(|| std::path::PathBuf::from("."));
+                        let log_tx = event_tx.clone();
+                        let log: zytunes::cache::Logger = std::sync::Arc::new(move |msg: &str| {
+                            let _ = log_tx.send(BgEvent::SyncMessage(msg.to_string()));
+                        });
+                        acoustid_cache = Some(zytunes::acoustid::AcoustIdCache::open(&base, log));
+                    }
+                    let cache = acoustid_cache.as_mut().unwrap();
+
+                    let result = if let Some(hits) = cache.get(&fingerprint, duration_secs) {
+                        let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                            "tag-manager: AcoustID cache hit ({} hit(s), token={token})",
+                            hits.len()
+                        )));
+                        Ok(hits.clone())
+                    } else {
+                        let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                            "tag-manager: AcoustID lookup duration={duration_secs}s (token={token})"
+                        )));
+                        let client = zytunes::acoustid::AcoustIdClient::new(app_key);
+                        match client.lookup(&fingerprint, duration_secs) {
+                            Ok(mut hits) => {
+                                hits.sort_by(|a, b| {
+                                    b.score
+                                        .partial_cmp(&a.score)
+                                        .unwrap_or(std::cmp::Ordering::Equal)
+                                });
+                                cache.insert(&fingerprint, duration_secs, hits.clone());
+                                let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                                    "tag-manager: AcoustID returned {} hit(s) (token={token})",
+                                    hits.len()
+                                )));
+                                Ok(hits)
+                            }
+                            Err(e) => {
+                                let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                                    "tag-manager: AcoustID failed (token={token}): {e}"
+                                )));
+                                Err(e.to_string())
+                            }
+                        }
+                    };
+                    let _ = event_tx.send(BgEvent::AcoustIdResolved { token, result });
+                }
+                BgCommand::MbRecordingReleases {
+                    token,
+                    recording_mbid,
+                    mb_base_url,
+                    mb_user_agent,
+                } => {
+                    let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                        "tag-manager: MB recording→releases lookup mbid={recording_mbid} (token={token})"
+                    )));
+                    let result =
+                        run_mb_recording_releases(&recording_mbid, mb_base_url, mb_user_agent);
+                    match &result {
+                        Ok(rec) => {
+                            let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                                "tag-manager: MB returned {} release(s) for recording (token={token})",
+                                rec.releases.len()
+                            )));
+                        }
+                        Err(e) => {
+                            let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                                "tag-manager: MB recording lookup failed (token={token}): {e}"
+                            )));
+                        }
+                    }
+                    let _ = event_tx.send(BgEvent::MbRecordingReleases { token, result });
+                }
             }
         }
     });
 
     cmd_tx
+}
+
+fn run_mb_recording_releases(
+    mbid: &str,
+    base_url: Option<String>,
+    user_agent: Option<String>,
+) -> Result<Box<zytunes::musicbrainz::RecordingLookupResponse>, String> {
+    let mut client = MusicBrainzClient::new(user_agent);
+    if let Some(url) = base_url {
+        client = client.with_base_url(url);
+    }
+    client
+        .lookup_recording_with_releases(mbid)
+        .map(Box::new)
+        .map_err(|e| e.to_string())
+}
+
+fn run_mb_search_releases_with_log(
+    artist: &str,
+    album: &str,
+    base_url: Option<String>,
+    user_agent: Option<String>,
+    log: &mpsc::Sender<BgEvent>,
+) -> Result<Vec<zytunes::musicbrainz::ReleaseSearchHit>, String> {
+    let mut client = MusicBrainzClient::new(user_agent.clone());
+    if let Some(url) = &base_url {
+        client = client.with_base_url(url.clone());
+    }
+    let url = client.search_releases_url(artist, album, 12);
+    // Log artist/album bytes in hex too — if the library scanner produced
+    // visually-identical-but-different unicode (Cyrillic 'u' in "Rumours",
+    // BOM, NBSP, etc), the search returns 0 hits and only the raw bytes
+    // tell you what went wrong.
+    let _ = log.send(BgEvent::SyncMessage(format!(
+        "tag-manager: MB host={} ua={:?}",
+        base_url.as_deref().unwrap_or("<default canonical>"),
+        user_agent.as_deref().unwrap_or("<none>"),
+    )));
+    let _ = log.send(BgEvent::SyncMessage(format!(
+        "tag-manager: artist bytes={}",
+        bytes_hex(artist)
+    )));
+    let _ = log.send(BgEvent::SyncMessage(format!(
+        "tag-manager: album bytes={}",
+        bytes_hex(album)
+    )));
+    let _ = log.send(BgEvent::SyncMessage(format!("tag-manager: URL={}", url)));
+    client
+        .search_releases(artist, album, 12)
+        .map(|r| r.releases)
+        .map_err(|e| e.to_string())
+}
+
+fn bytes_hex(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for (i, b) in s.as_bytes().iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+fn run_mb_release_details(
+    mbid: &str,
+    base_url: Option<String>,
+    user_agent: Option<String>,
+) -> Result<Box<zytunes::musicbrainz::Release>, String> {
+    let mut client = MusicBrainzClient::new(user_agent);
+    if let Some(url) = base_url {
+        client = client.with_base_url(url);
+    }
+    client
+        .lookup_release_full(mbid)
+        .map(Box::new)
+        .map_err(|e| e.to_string())
 }
 
 /// Drive the multi-track rip flow: for each selected track, emit a

@@ -35,6 +35,13 @@ pub struct Config {
     /// `application/version (contact)` — e.g.
     /// `zytunes/2.2.0 (you@example.com)`.
     pub musicbrainz_user_agent: Option<String>,
+    /// AcoustID application API key — required by api.acoustid.org for the
+    /// fingerprint → MBID lookup the tag-manager uses as a fallback when
+    /// the library has no MBID and search-by-text isn't available.
+    /// Register one for free at <https://acoustid.org/new-application>;
+    /// without a key the tag-manager skips AcoustID dispatch silently and
+    /// falls through to MB search.
+    pub acoustid_app_key: Option<String>,
     /// Default rip fidelity preselected in the CD import overlay.
     /// Accepts `mp3-cbr-320` (alias `mp3-320`), `mp3-v0`, `mp3-v2`,
     /// `flac`, `wav`. Unset / unparseable defaults to FLAC (lossless

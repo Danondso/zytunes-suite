@@ -234,14 +234,14 @@ fn write_release_identifiers(
     }
 }
 
-fn set_string(tag: &mut Tag, key: ItemKey, value: &str) {
+pub(crate) fn set_string(tag: &mut Tag, key: ItemKey, value: &str) {
     if value.is_empty() {
         return;
     }
     tag.insert(TagItem::new(key, ItemValue::Text(value.to_string())));
 }
 
-fn set_unknown_string(tag: &mut Tag, name: &str, value: &str) {
+pub(crate) fn set_unknown_string(tag: &mut Tag, name: &str, value: &str) {
     if value.is_empty() {
         return;
     }
@@ -307,7 +307,7 @@ pub fn tag_ripped_fingerprint(path: &Path, fingerprint: &str) -> Result<(), Stri
 /// sniffs the file's magic bytes. The returned `TaggedFile` carries
 /// the correctly-identified `FileType`, and the subsequent
 /// `tagged.save_to_path` then writes through the matching backend.
-fn probe_by_content(path: &Path) -> Result<lofty::file::TaggedFile, String> {
+pub(crate) fn probe_by_content(path: &Path) -> Result<lofty::file::TaggedFile, String> {
     Probe::open(path)
         .map_err(|e| format!("lofty open failed on {}: {e}", path.display()))?
         .options(ParseOptions::new())
@@ -397,6 +397,7 @@ mod tests {
             packaging: None,
             text_representation: None,
             label_info: vec![],
+            genres: vec![],
         }
     }
 
@@ -578,6 +579,7 @@ mod tests {
             title: "Album".into(),
             primary_type: Some("Album".into()),
             first_release_date: Some("1973-03-24".into()),
+            genres: vec![],
         });
         tag_ripped_file(&path, &rel, &mb_track("T", 1), 1, Some(1), None, None).unwrap();
 
@@ -715,6 +717,7 @@ mod tests {
             title: "Album".into(),
             primary_type: Some("Album".into()),
             first_release_date: None,
+            genres: vec![],
         });
         tag_ripped_file(&path, &rel, &mb_track("T", 1), 1, Some(1), None, None).unwrap();
 

@@ -5,6 +5,7 @@
 #[cfg(feature = "tui-testing")]
 extern crate self as zytunes;
 
+pub mod acoustid;
 pub mod art_cache;
 pub mod cache;
 pub mod cd;
@@ -21,6 +22,7 @@ pub mod paths;
 pub mod playlist;
 pub mod playlist_store;
 pub mod recommender;
+pub mod tag_ops;
 
 #[cfg(test)]
 mod test_audio;

@@ -202,12 +202,92 @@ impl MusicBrainzClient {
     /// the release level.
     pub fn lookup_disc(&self, mb_disc_id: &str) -> Result<DiscLookupResponse, MbError> {
         let url = format!(
-            "{}/discid/{}?inc=recordings+artist-credits+release-groups+isrcs+labels&fmt=json",
+            "{}/discid/{}?inc=recordings+artist-credits+release-groups+isrcs+labels+genres&fmt=json",
             self.base_url,
             url_encode(mb_disc_id),
         );
         self.get_json(&url)
     }
+
+    /// Search MB releases by artist + album.
+    ///
+    /// Builds a Lucene query of the form `release:"<album>" AND artist:"<artist>"`
+    /// with the special characters that the Lucene parser treats as operators
+    /// escaped (so `AC/DC` doesn't blow up). Returns up to `limit` hits ranked
+    /// by MB's relevance score.
+    pub fn search_releases(
+        &self,
+        artist: &str,
+        album: &str,
+        limit: u32,
+    ) -> Result<ReleaseSearchResponse, MbError> {
+        self.get_json(&self.search_releases_url(artist, album, limit))
+    }
+
+    /// The URL that [`Self::search_releases`] would request. Exposed so callers
+    /// can log it for diagnostics without having to reconstruct it
+    /// themselves (and risk drifting out of sync with the real impl).
+    pub fn search_releases_url(&self, artist: &str, album: &str, limit: u32) -> String {
+        let query = format!(
+            "release:\"{}\" AND artist:\"{}\"",
+            lucene_escape(album),
+            lucene_escape(artist),
+        );
+        format!(
+            "{}/release/?query={}&limit={}&fmt=json",
+            self.base_url,
+            url_encode(&query),
+            limit,
+        )
+    }
+
+    /// Full release lookup by MBID.
+    ///
+    /// Includes the same `inc` set as `lookup_disc` so callers get track
+    /// listings, artist credits, release groups, per-recording ISRCs, and
+    /// label info in one round trip.
+    pub fn lookup_release_full(&self, mbid: &str) -> Result<Release, MbError> {
+        let url = format!(
+            "{}/release/{}?inc=recordings+artist-credits+release-groups+isrcs+labels+genres&fmt=json",
+            self.base_url,
+            url_encode(mbid),
+        );
+        self.get_json(&url)
+    }
+
+    /// Look up a recording by MBID, including the releases it appears on
+    /// (`inc=releases+artist-credits`). Used as a fallback for AcoustID
+    /// hits where the recording matched but the AcoustID response's
+    /// `recordings[].releases[]` list was empty — MB itself usually knows
+    /// the recording→release links the AcoustID submission didn't include.
+    pub fn lookup_recording_with_releases(
+        &self,
+        mbid: &str,
+    ) -> Result<RecordingLookupResponse, MbError> {
+        let url = format!(
+            "{}/recording/{}?inc=releases+artist-credits&fmt=json",
+            self.base_url,
+            url_encode(mbid),
+        );
+        self.get_json(&url)
+    }
+}
+
+/// Escape a string for use inside a Lucene quoted phrase. We always wrap the
+/// user value in double quotes in the query, so only the two characters that
+/// terminate or escape inside a quoted phrase need escaping: `"` and `\`.
+fn lucene_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' | '"' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 fn parse_json<T: for<'de> Deserialize<'de>>(body: &str) -> Result<T, MbError> {
@@ -261,6 +341,55 @@ pub struct DiscLookupResponse {
     pub releases: Vec<Release>,
 }
 
+/// Top-level release-search response (`/release/?query=...`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ReleaseSearchResponse {
+    #[serde(default)]
+    pub releases: Vec<ReleaseSearchHit>,
+}
+
+/// A single hit in `ReleaseSearchResponse::releases`. The search endpoint
+/// returns a leaner shape than the full release lookup (no `media[*].tracks`),
+/// so this is a distinct struct rather than reusing [`Release`].
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ReleaseSearchHit {
+    pub id: String,
+    /// MB relevance score (0-100). Higher = better match.
+    #[serde(default)]
+    pub score: u32,
+    pub title: String,
+    #[serde(default)]
+    pub date: Option<String>,
+    #[serde(default)]
+    pub country: Option<String>,
+    #[serde(default, rename = "artist-credit")]
+    pub artist_credit: Vec<ArtistCredit>,
+    #[serde(default, rename = "release-group")]
+    pub release_group: Option<ReleaseGroup>,
+    /// Per-medium metadata WITHOUT track listings. The search endpoint surfaces
+    /// `track-count` here but not the full `tracks` array.
+    #[serde(default)]
+    pub media: Vec<MediumSummary>,
+    /// Aggregate track count across all media — present on hits where MB has
+    /// computed it. Display falls back to summing `media[*].track_count`.
+    #[serde(default, rename = "track-count")]
+    pub track_count: Option<u32>,
+    #[serde(default, rename = "label-info")]
+    pub label_info: Vec<LabelInfo>,
+}
+
+/// Search-endpoint medium shape: just position/format/track-count. The full
+/// release lookup uses [`Medium`] which carries `tracks: Vec<Track>`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MediumSummary {
+    #[serde(default)]
+    pub position: Option<u32>,
+    #[serde(default)]
+    pub format: Option<String>,
+    #[serde(default, rename = "track-count")]
+    pub track_count: Option<u32>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Release {
     pub id: String,
@@ -294,6 +423,11 @@ pub struct Release {
     /// for self-releases or labelless promo discs.
     #[serde(default, rename = "label-info")]
     pub label_info: Vec<LabelInfo>,
+    /// Release-level genres (requires `inc=genres`). Usually empty —
+    /// release-group genres are the populated source. Kept as a fallback
+    /// for the rare case where only the release carries genre votes.
+    #[serde(default)]
+    pub genres: Vec<MbGenre>,
 }
 
 /// Language + script the release's text is in (ISO 639-3 / ISO 15924).
@@ -379,6 +513,43 @@ pub struct Recording {
     pub isrcs: Vec<String>,
 }
 
+/// Top-level shape of `/recording/{mbid}?inc=releases+artist-credits`.
+/// Matches the search-hit shape closely so the tag-manager can convert
+/// the contained releases into the same `ReleaseSearchHit` rows as the
+/// AcoustID and MB-search paths.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RecordingLookupResponse {
+    pub id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default, rename = "artist-credit")]
+    pub artist_credit: Vec<ArtistCredit>,
+    /// Releases this recording appears on. Each release here carries the
+    /// lighter "search hit" shape (no `media[*].tracks`), so the
+    /// tag-manager round-trips through `lookup_release_full` for the
+    /// user-picked one.
+    #[serde(default)]
+    pub releases: Vec<RecordingReleaseRef>,
+}
+
+/// Release entry inside a `RecordingLookupResponse`. Strictly less data
+/// than a full `Release` — the recording-lookup endpoint omits `media[*]`
+/// and `artist-credit` at the release level even with `inc=artist-credits`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RecordingReleaseRef {
+    pub id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub date: Option<String>,
+    #[serde(default)]
+    pub country: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default, rename = "release-group")]
+    pub release_group: Option<ReleaseGroup>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ReleaseGroup {
     pub id: String,
@@ -387,6 +558,21 @@ pub struct ReleaseGroup {
     pub primary_type: Option<String>,
     #[serde(default, rename = "first-release-date")]
     pub first_release_date: Option<String>,
+    /// Crowd-curated genres for the release group (requires `inc=genres`).
+    /// Ranked by `count` — the most-voted genre is generally what Picard
+    /// would write. Picard prefers release-group genres over release-level
+    /// because they aggregate across all releases in the group.
+    #[serde(default)]
+    pub genres: Vec<MbGenre>,
+}
+
+/// One MB genre. Score by `count` (number of users who tagged the entity
+/// with this genre) when picking a single representative.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MbGenre {
+    pub name: String,
+    #[serde(default)]
+    pub count: u32,
 }
 
 /// Join an artist-credit list into a single display string honouring `joinphrase`.
@@ -744,6 +930,131 @@ mod tests {
             render_artist_credit(&credits),
             "Daft Punk feat. Pharrell Williams"
         );
+    }
+
+    #[test]
+    fn lucene_escape_handles_quotes_and_backslashes() {
+        assert_eq!(lucene_escape(r#"AC/DC"#), r#"AC/DC"#);
+        assert_eq!(lucene_escape(r#"a"b"#), r#"a\"b"#);
+        assert_eq!(lucene_escape(r#"a\b"#), r#"a\\b"#);
+        // Lucene operators inside quoted phrases are taken literally so they
+        // don't need escaping — only the two phrase-terminators do.
+        assert_eq!(lucene_escape("a + b - c"), "a + b - c");
+    }
+
+    #[test]
+    fn search_releases_parses_typical_response() {
+        let body = r#"{
+            "created": "2024-01-01T00:00:00.000Z",
+            "count": 2,
+            "offset": 0,
+            "releases": [
+                {
+                    "id": "rel-1",
+                    "score": 100,
+                    "title": "Abbey Road",
+                    "date": "1969-09-26",
+                    "country": "GB",
+                    "track-count": 17,
+                    "artist-credit": [{"name": "The Beatles"}],
+                    "media": [{"position": 1, "format": "CD", "track-count": 17}]
+                },
+                {
+                    "id": "rel-2",
+                    "score": 95,
+                    "title": "Abbey Road",
+                    "date": "1987",
+                    "country": "US",
+                    "artist-credit": [{"name": "The Beatles"}],
+                    "media": [{"position": 1, "format": "CD", "track-count": 17}]
+                }
+            ]
+        }"#;
+        let parsed: ReleaseSearchResponse = parse_json(body).unwrap();
+        assert_eq!(parsed.releases.len(), 2);
+        assert_eq!(parsed.releases[0].score, 100);
+        assert_eq!(parsed.releases[0].country.as_deref(), Some("GB"));
+        assert_eq!(parsed.releases[0].track_count, Some(17));
+        assert_eq!(parsed.releases[0].media[0].track_count, Some(17));
+    }
+
+    #[test]
+    fn search_releases_handles_no_results() {
+        let body =
+            r#"{"created": "2024-01-01T00:00:00.000Z", "count": 0, "offset": 0, "releases": []}"#;
+        let parsed: ReleaseSearchResponse = parse_json(body).unwrap();
+        assert!(parsed.releases.is_empty());
+    }
+
+    #[test]
+    fn search_releases_parses_live_mb_response() {
+        // Regression: the search was returning 0 hits in the TUI for queries
+        // that MB serves 90 hits to via curl. The culprit was a struct shape
+        // mismatch we missed in the unit fixtures — the live MB shape for a
+        // search hit's `media[0]` lacks a `position` field, includes an `id`
+        // we don't model, and adds `disc-count`. If any required field is
+        // missing or any type mismatches, `parse_json` errors and the entire
+        // response (all 90 hits) is dropped, surfacing as 0 hits in the UI.
+        //
+        // This fixture is captured verbatim from a live MB search
+        // (release:"Rumours" AND artist:"Fleetwood Mac", limit=1).
+        let body = r#"{"created":"2026-05-26T01:37:12.691Z","count":90,"offset":0,"releases":[{"id":"7ec069c0-4424-3169-8ed0-d5e2473e0e84","score":100,"status-id":"4e304316-386d-3409-af2e-78857eec5cfe","packaging-id":"f7101ce3-0384-39ce-9fde-fbbd0044d35f","artist-credit-id":"594d8902-324d-39fb-8c34-ebe2fbb5a8d7","count":1,"title":"Rumours","status":"Official","packaging":"Cardboard/Paper Sleeve","text-representation":{"language":"eng","script":"Latn"},"artist-credit":[{"name":"Fleetwood Mac","artist":{"id":"bd13909f-1c29-4c27-a874-d4aaf27c5b1a","name":"Fleetwood Mac","sort-name":"Fleetwood Mac"}}],"release-group":{"id":"416bb5e5-c7d1-3977-8fd7-7c9daf6c2be6","type-id":"f529b476-6e62-324f-b0aa-1f3e33d313fc","primary-type-id":"f529b476-6e62-324f-b0aa-1f3e33d313fc","title":"Rumours","primary-type":"Album"},"date":"1977","country":"GB","release-events":[{"date":"1977","area":{"id":"8a754a16-0027-3a29-b6d7-2b40ea0481ed","name":"United Kingdom","sort-name":"United Kingdom","iso-3166-1-codes":["GB"]}}],"label-info":[{"catalog-number":"K 56344","label":{"id":"c595c289-47ce-4fba-b999-b87503e8cb71","name":"Warner Bros. Records"}}],"track-count":11,"media":[{"id":"e82a3532-6d1c-3fd2-b8a9-5790783f8a18","format":"12\" Vinyl","disc-count":0,"track-count":11}]}]}"#;
+        let parsed: ReleaseSearchResponse = parse_json(body).unwrap();
+        assert_eq!(parsed.releases.len(), 1);
+        let r = &parsed.releases[0];
+        assert_eq!(r.title, "Rumours");
+        assert_eq!(r.score, 100);
+        assert_eq!(r.country.as_deref(), Some("GB"));
+        assert_eq!(r.track_count, Some(11));
+        assert_eq!(r.media.len(), 1);
+        assert_eq!(r.media[0].format.as_deref(), Some("12\" Vinyl"));
+        assert_eq!(r.media[0].track_count, Some(11));
+        assert_eq!(r.label_info.len(), 1);
+        assert_eq!(r.label_info[0].catalog_number.as_deref(), Some("K 56344"));
+        assert_eq!(
+            r.label_info[0].label.as_ref().unwrap().name,
+            "Warner Bros. Records"
+        );
+    }
+
+    #[test]
+    fn lookup_release_full_round_trips_tracks() {
+        // The full release lookup carries the same shape as a disc lookup's
+        // `releases[0]`. Use a minimal fixture with one track + recording to
+        // confirm `inc=recordings+...` round-trips into our `Release` type.
+        let body = r#"{
+            "id": "rel-1",
+            "title": "X",
+            "date": "2000",
+            "country": "US",
+            "artist-credit": [{"name": "A"}],
+            "media": [{
+                "position": 1,
+                "format": "CD",
+                "track-count": 1,
+                "tracks": [{
+                    "id": "trk-1",
+                    "number": "1",
+                    "position": 1,
+                    "title": "T",
+                    "length": 100000,
+                    "recording": {
+                        "id": "rec-1",
+                        "title": "T",
+                        "length": 100000,
+                        "isrcs": ["USRC17600001"],
+                        "artist-credit": [{"name": "A"}]
+                    },
+                    "artist-credit": [{"name": "A"}]
+                }]
+            }]
+        }"#;
+        let parsed: Release = parse_json(body).unwrap();
+        assert_eq!(parsed.id, "rel-1");
+        assert_eq!(parsed.media.len(), 1);
+        assert_eq!(parsed.media[0].tracks.len(), 1);
+        let rec = parsed.media[0].tracks[0].recording.as_ref().unwrap();
+        assert_eq!(rec.isrcs, vec!["USRC17600001".to_string()]);
     }
 
     #[test]

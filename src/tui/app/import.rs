@@ -422,6 +422,7 @@ mod tests {
             packaging: None,
             text_representation: None,
             label_info: vec![],
+            genres: vec![],
         }
     }
 

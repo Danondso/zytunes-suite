@@ -185,23 +185,92 @@ built-in.
 
 ## Future features
 
-### MusicBrainz / AcoustID online lookup
-Now that every library track carries a Chromaprint `acoustic_id` (see
-`src/fingerprint.rs`), we have half of what's needed to identify
-poorly-tagged or untagged files against the AcoustID web service and
-pull canonical MusicBrainz metadata. Scope:
+### Tag manager: composer / lyricist / performer fields
+`build_track_fields` in `src/tag_ops.rs` currently emits all Picard-standard
+release-level fields (Title/Artist/Album/Year/Genre/MUSICBRAINZ_ALBUMTYPE/
+Media/Country/Status/Packaging/Script/Language/ISRC/Barcode/Catalog#/Label
+plus all six MBIDs and Filename), but **track-level credit fields** like
+composer, lyricist, conductor, and performers are still absent. MB models
+these as recording–artist relationships, not as fields on the recording
+itself. Scope:
 
-1. Add a `musicbrainz` (or `acoustid`) module that POSTs `(duration,
-   acoustic_id)` to `https://api.acoustid.org/v2/lookup` and parses the
-   MBID + recording/release metadata in the response.
-2. Rate-limit to 3 req/sec (AcoustID's published ceiling) and cache
-   lookup results locally — fingerprints are stable, so the response
-   doesn't need to be re-fetched on every launch.
-3. Expose a TUI action ("identify track" / "identify album") that
-   writes the discovered tags back via lofty, updates the library
-   cache, and surfaces a diff for the user to accept/reject.
-4. User-supplied AcoustID application key in
-   `~/.config/zytunes/config.toml` — required by the API ToS; the
-   feature stays dark until configured.
+1. Extend the `lookup_release_full` / `lookup_disc` `inc` set with
+   `work-rels+recording-rels+artist-rels` (already requesting
+   `+recordings+artist-credits+release-groups+isrcs+labels+genres`).
+2. Add a `relations: Vec<Relation>` field to `Recording` in `musicbrainz.rs`,
+   where each `Relation` carries the relation type (`composer`/`lyricist`/
+   `conductor`/`performer`/`vocal`/`instrument`) and the linked artist's
+   name + MBID.
+3. Walk each track's `recording.relations` in `build_track_fields` and
+   join multi-artist credits with `; ` (Picard's convention) before
+   pushing the diff field.
+4. Map to `ItemKey::Composer`, `ItemKey::Lyricist`, `ItemKey::Conductor`,
+   `ItemKey::Performer` in `apply_field`. Picard also writes per-instrument
+   TXXX frames (`Performer:Lead Guitar` etc.) — start with the bare
+   `Performer` aggregate, defer per-instrument splits.
+5. Add a `Credits` `FieldKind` variant (or reuse `Identity`) so the diff
+   UI sections them together. The track-header summary in `ui/mod.rs`
+   should not regress for credit-only diffs.
 
-Out of scope for the playcount work that introduced fingerprinting.
+The MB inc-set change is harmless to other call sites (CD import / overlay
+rendering both ignore unknown fields), so the work is contained to
+`musicbrainz.rs` + `tag_ops.rs` + tests.
+
+### AcoustID lookup as tag-manager fallback (next up)
+The tag-manager overlay's resolution chain is currently:
+`mb_release_id` → direct lookup, else MB search (Solr-only). For files
+with no MBIDs at all, neither path works on a Solr-less mirror — and
+search-by-text is unreliable even with Solr. Library tracks already
+carry a Chromaprint `acoustic_id` and `total_time_ms` (see
+`src/fingerprint.rs`), so we have everything the AcoustID web service
+needs to identify a bare audio file from scratch.
+
+Integration point is `App::resolve_known_release_mbid` in
+`src/tui/app.rs` — extend it with an async-but-blocking-on-worker call
+that, when no library MBID exists, dispatches AcoustID lookup and
+treats the returned recording MBID as the starting point for an MB
+`/recording/{mbid}?inc=releases` round-trip to pick a release.
+
+Scope:
+
+1. **`src/acoustid.rs` client.** GET `https://api.acoustid.org/v2/lookup`
+   (NOT POST — the API takes `client`, `fingerprint`, `duration`,
+   `meta` as query params or form-encoded body. GET is simpler and
+   their docs are explicit it's supported). `meta=recordings+releases`
+   returns enough to skip the follow-up MB call for the common case.
+   Rate-limit to 3 req/sec per their ToS. Return
+   `Result<Vec<AcoustIdHit>, AcoustIdError>` where each hit carries
+   recording MBID + score + optional release IDs.
+2. **Config field.** Add `acoustid_app_key: Option<String>` to
+   `~/.config/zytunes/config.toml` (parallel to
+   `musicbrainz_user_agent`). Without it, the lookup-first chain
+   skips AcoustID silently — the feature stays dark until configured.
+   Plumb through `App.acoustid_app_key` like `mb_user_agent`.
+3. **Disk cache.** Fingerprints are stable input, so cache responses
+   keyed on `(acoustic_id, duration_secs_rounded)` at
+   `$ZYTUNES_CACHE_DIR/.zytunes-acoustid-cache`. Re-launches reuse
+   without re-hitting the API. Match the dirlib cache's logger
+   forwarding so warnings land in the TUI sync log rather than stderr.
+4. **Worker integration.** New `BgCommand::AcoustIdLookup {
+   token, fingerprint, duration_ms, app_key }` and matching
+   `BgEvent::AcoustIdResolved { token, result: Result<Vec<AcoustIdHit>,
+   String> }`. Token-fenced same as the existing MB requests.
+5. **Tag-manager dispatch.** When `resolve_known_release_mbid` returns
+   None AND the library track carries `acoustic_id`, dispatch
+   `AcoustIdLookup` instead of `MbSearchReleases`. On a single
+   high-confidence hit (score > 0.9), auto-advance to
+   `MbReleaseDetails` for the first release on the matched recording;
+   on ambiguous hits, present them as a `SearchResults`-like list so
+   the user picks. The overlay needs a small enum extension to track
+   "we resolved via AcoustID" so error recovery (Esc from Error phase
+   currently goes to SearchInput) routes back somewhere useful.
+6. **Tests.** Live-fixture JSON test for the AcoustID response parser
+   (catches struct-shape drift). Mock worker test asserting that an
+   empty library MBID + present `acoustic_id` triggers `AcoustIdLookup`
+   not `MbSearchReleases`. Cache-hit test (second call with same
+   fingerprint doesn't hit the network).
+
+Out of scope: AcoustID submission of new fingerprints (we read, we
+don't contribute). Per-track batch lookup for an entire untagged
+album — let the user invoke per-track for now; a "scan untagged"
+batch mode is its own follow-up.

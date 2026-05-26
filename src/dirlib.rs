@@ -328,6 +328,68 @@ impl DirectoryLibrary {
             root: path.to_string(),
         })
     }
+
+    /// Rebuild a `DirectoryLibrary` by re-reading only the listed paths,
+    /// keeping every other cached entry untouched.
+    ///
+    /// Used by the tag-manager flow after `apply_release_diff` writes tags
+    /// and renames files: we know exactly which paths changed, so a full
+    /// directory walk would be wasted work. The cache is updated in place
+    /// (old paths whose files no longer exist drop out, new paths land
+    /// fresh) and persisted back to disk via [`crate::cache::save_dirlib_cache`].
+    ///
+    /// Invariant: must run on the worker thread (single-threaded), as it
+    /// shares the cache file with the full `scan` path and the file write
+    /// itself is not atomic across concurrent writers.
+    pub fn reread_paths(
+        root: &str,
+        paths: &[PathBuf],
+        fingerprint: bool,
+        log: &crate::cache::Logger,
+    ) -> Result<Self, String> {
+        if !Path::new(root).is_dir() {
+            return Err(format!("Not a directory: {root}"));
+        }
+        let mut cached = crate::cache::load_dirlib_cache(root, log);
+
+        for p in paths {
+            let key = p.to_string_lossy().to_string();
+            let fp = match crate::cache::FileFingerprint::from_path(p) {
+                Some(f) => f,
+                None => {
+                    // File doesn't exist (e.g. old path of a rename) — drop it.
+                    cached.remove(&key);
+                    continue;
+                }
+            };
+            let mut track = match track_from_lofty(p, hash_path(p)) {
+                Some(t) => t,
+                None => track_from_path(p, hash_path(p)),
+            };
+            if fingerprint && track.acoustic_id.is_none() {
+                track.acoustic_id = crate::fingerprint::compute_fingerprint(p);
+            }
+            cached.insert(
+                key,
+                crate::cache::CachedFile {
+                    fingerprint: fp,
+                    track,
+                },
+            );
+        }
+
+        let tracks: HashMap<u64, Track> = cached
+            .values()
+            .map(|cf| (cf.track.id, cf.track.clone()))
+            .collect();
+
+        crate::cache::save_dirlib_cache(root, cached, log);
+
+        Ok(DirectoryLibrary {
+            tracks,
+            root: root.to_string(),
+        })
+    }
 }
 
 /// Recursively collect audio file paths, walking each subdirectory in parallel.
@@ -381,7 +443,7 @@ fn build_track(path: &Path, id: u64) -> Track {
 /// Reading properties is slow for MP3 VBR files because lofty has to sample
 /// frames across the whole file to compute duration, but the per-file cache
 /// makes sure we only pay that cost once per file per change.
-fn track_from_lofty(path: &Path, id: u64) -> Option<Track> {
+pub(crate) fn track_from_lofty(path: &Path, id: u64) -> Option<Track> {
     use lofty::file::{AudioFile, TaggedFileExt};
     use lofty::prelude::ItemKey;
     use lofty::tag::Accessor;
@@ -1134,5 +1196,107 @@ mod tests {
         assert_eq!(track.artist, "Radiohead");
         assert_eq!(track.album, "OK Computer");
         assert_eq!(track.name, "Subterranean Homesick Alien");
+    }
+
+    #[test]
+    fn reread_paths_updates_only_listed_entries() {
+        // Two files, scan once to populate cache, then reread one and confirm
+        // the other entry is untouched.
+        let dir = std::env::temp_dir().join("zytunes-dirlib-reread-listed");
+        let _ = fs::remove_dir_all(&dir);
+        let album = dir.join("ArtistR").join("AlbumR");
+        fs::create_dir_all(&album).unwrap();
+        let f1 = album.join("01 Alpha.mp3");
+        let f2 = album.join("02 Beta.mp3");
+        fs::write(&f1, b"fake").unwrap();
+        fs::write(&f2, b"fake").unwrap();
+        let lib1 = DirectoryLibrary::scan_with_options(
+            dir.to_str().unwrap(),
+            ScanOptions::default(),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(lib1.track_count(), 2);
+
+        // Reread only f1; f2's cached entry must survive byte-for-byte.
+        let log = crate::cache::default_logger();
+        let lib2 = DirectoryLibrary::reread_paths(
+            dir.to_str().unwrap(),
+            std::slice::from_ref(&f1),
+            false,
+            &log,
+        )
+        .unwrap();
+        assert_eq!(lib2.track_count(), 2);
+        let f2_track = lib2
+            .all_tracks()
+            .find(|t| t.location.as_deref() == Some(f2.to_str().unwrap()))
+            .expect("f2 should still be present after reread of f1");
+        // Path-derived fallback (no tags in the fake file) so name comes from
+        // stem; if either lofty pass produced different output between scans
+        // the assertion below would fire.
+        assert_eq!(f2_track.album, "AlbumR");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reread_paths_handles_missing_file() {
+        let dir = std::env::temp_dir().join("zytunes-dirlib-reread-missing");
+        let _ = fs::remove_dir_all(&dir);
+        let album = dir.join("ArtistM").join("AlbumM");
+        fs::create_dir_all(&album).unwrap();
+        let f1 = album.join("01 Gone.mp3");
+        fs::write(&f1, b"fake").unwrap();
+        let _ = DirectoryLibrary::scan_with_options(
+            dir.to_str().unwrap(),
+            ScanOptions::default(),
+            |_| {},
+        )
+        .unwrap();
+        fs::remove_file(&f1).unwrap();
+        let log = crate::cache::default_logger();
+        let lib2 = DirectoryLibrary::reread_paths(
+            dir.to_str().unwrap(),
+            std::slice::from_ref(&f1),
+            false,
+            &log,
+        )
+        .unwrap();
+        assert_eq!(lib2.track_count(), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reread_paths_inserts_renamed_path() {
+        let dir = std::env::temp_dir().join("zytunes-dirlib-reread-renamed");
+        let _ = fs::remove_dir_all(&dir);
+        let album = dir.join("ArtistN").join("AlbumN");
+        fs::create_dir_all(&album).unwrap();
+        let old = album.join("01 Old.mp3");
+        let new = album.join("01 New.mp3");
+        fs::write(&old, b"fake").unwrap();
+        let _ = DirectoryLibrary::scan_with_options(
+            dir.to_str().unwrap(),
+            ScanOptions::default(),
+            |_| {},
+        )
+        .unwrap();
+        fs::rename(&old, &new).unwrap();
+        let log = crate::cache::default_logger();
+        let lib2 = DirectoryLibrary::reread_paths(
+            dir.to_str().unwrap(),
+            &[old.clone(), new.clone()],
+            false,
+            &log,
+        )
+        .unwrap();
+        let paths: Vec<String> = lib2
+            .all_tracks()
+            .filter_map(|t| t.location.clone())
+            .collect();
+        assert!(!paths.iter().any(|p| p == old.to_str().unwrap()));
+        assert!(paths.iter().any(|p| p == new.to_str().unwrap()));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

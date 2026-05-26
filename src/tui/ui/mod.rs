@@ -10,7 +10,7 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Cell, Clear, List, ListItem, Padding, Paragraph, Row, Table, Wrap,
+    Block, Borders, Cell, Clear, List, ListItem, Padding, Paragraph, Row, Table, TableState, Wrap,
 };
 use ratatui::Frame;
 use throbber_widgets_tui::{Throbber, ThrobberState, WhichUse};
@@ -254,6 +254,12 @@ pub fn draw(f: &mut Frame, app: &App) {
     // sits on top, matching the precedence in the input dispatcher.
     if app.show_track_info {
         draw_track_info_overlay(f, app);
+    }
+
+    // Tag-manager overlay. Drawn on top of the track-info popup because the
+    // `m` key dispatcher routes around the track-info guard.
+    if app.tag_manager.is_some() {
+        draw_tag_manager_overlay(f, app);
     }
 
     // CD import overlay — drawn last so it sits on top of everything.
@@ -3312,9 +3318,578 @@ fn build_zune_art(screen_line1: &str, screen_line2: &str) -> Vec<String> {
     ]
 }
 
+fn draw_tag_manager_overlay(f: &mut Frame, app: &App) {
+    use crate::app::TagManagerPhase;
+
+    let Some(overlay) = app.tag_manager.as_ref() else {
+        return;
+    };
+    let t = app.theme();
+    let area = f.area();
+
+    let width = (area.width * 70 / 100)
+        .clamp(40, 100)
+        .min(area.width.saturating_sub(4));
+    let height = (area.height * 70 / 100)
+        .clamp(8, 36)
+        .min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(width)) / 2;
+    let y = (area.height.saturating_sub(height)) / 2;
+    let rect = Rect::new(x, y, width, height);
+
+    f.render_widget(Clear, rect);
+
+    let title = match overlay.phase {
+        TagManagerPhase::SearchInput => {
+            " Tag manager — edit query (Enter to search, Esc to close) "
+        }
+        TagManagerPhase::SearchPending => " Tag manager — searching MusicBrainz… ",
+        TagManagerPhase::SearchResults => " Tag manager — pick a release (Enter / Esc) ",
+        TagManagerPhase::LoadingRelease => " Tag manager — loading release… ",
+        TagManagerPhase::DiffPreview => {
+            " Tag manager — j/k scroll · PgUp/PgDn · Space toggle · Enter apply · Esc back "
+        }
+        TagManagerPhase::Applying => " Tag manager — applying… ",
+        TagManagerPhase::Done => " Tag manager — done (any key to close) ",
+        TagManagerPhase::Error => " Tag manager — error (any key to close) ",
+    };
+    let block = t
+        .block()
+        .border_style(Style::default().fg(t.selection_bg))
+        .title(title)
+        .style(Style::default().bg(t.main_bg));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    if inner.height < 2 || inner.width < 30 {
+        return;
+    }
+
+    match overlay.phase {
+        TagManagerPhase::SearchInput => draw_tag_manager_search_input(f, app, overlay, inner),
+        TagManagerPhase::SearchPending => {
+            draw_centered_line(f, inner, "Searching MusicBrainz…", t.dim_text);
+        }
+        TagManagerPhase::SearchResults => draw_tag_manager_search_results(f, app, overlay, inner),
+        TagManagerPhase::LoadingRelease => {
+            draw_centered_line(f, inner, "Loading release details…", t.dim_text);
+        }
+        TagManagerPhase::DiffPreview | TagManagerPhase::Applying => {
+            draw_tag_manager_diff(f, app, overlay, inner);
+        }
+        TagManagerPhase::Done => {
+            draw_centered_line(f, inner, "Done. Press any key to close.", t.success_text);
+        }
+        TagManagerPhase::Error => {
+            let msg = overlay
+                .error
+                .clone()
+                .unwrap_or_else(|| "Unknown error".into());
+            draw_centered_line(f, inner, &msg, t.error_text);
+        }
+    }
+}
+
+fn draw_centered_line(f: &mut Frame, area: Rect, msg: &str, color: Color) {
+    let para = Paragraph::new(msg)
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(color));
+    f.render_widget(para, area);
+}
+
+fn draw_tag_manager_search_input(
+    f: &mut Frame,
+    app: &App,
+    overlay: &crate::app::TagManagerOverlay,
+    inner: Rect,
+) {
+    use crate::app::SearchInputField;
+    let t = app.theme();
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ])
+        .split(inner);
+
+    let artist_prefix = if overlay.search_input_field == SearchInputField::Artist {
+        "▶ "
+    } else {
+        "  "
+    };
+    let album_prefix = if overlay.search_input_field == SearchInputField::Album {
+        "▶ "
+    } else {
+        "  "
+    };
+
+    let artist_line = Line::from(vec![
+        Span::styled(artist_prefix, Style::default().fg(t.accent_secondary)),
+        Span::styled(
+            "Artist: ",
+            Style::default()
+                .fg(t.header_text)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(overlay.query_artist.clone()),
+    ]);
+    let album_line = Line::from(vec![
+        Span::styled(album_prefix, Style::default().fg(t.accent_secondary)),
+        Span::styled(
+            "Album:  ",
+            Style::default()
+                .fg(t.header_text)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(overlay.query_album.clone()),
+    ]);
+    let hint = Line::from(vec![Span::styled(
+        "Tab switch field · Enter search · Esc cancel",
+        Style::default().fg(t.dim_text),
+    )]);
+
+    f.render_widget(Paragraph::new(artist_line), rows[0]);
+    f.render_widget(Paragraph::new(album_line), rows[1]);
+    f.render_widget(Paragraph::new(hint), rows[2]);
+}
+
+fn draw_tag_manager_search_results(
+    f: &mut Frame,
+    app: &App,
+    overlay: &crate::app::TagManagerOverlay,
+    inner: Rect,
+) {
+    let t = app.theme();
+    if overlay.search_hits.is_empty() {
+        draw_centered_line(
+            f,
+            inner,
+            "No MusicBrainz matches. Esc to revise query.",
+            t.dim_text,
+        );
+        return;
+    }
+    let rows: Vec<Row> = overlay
+        .search_hits
+        .iter()
+        .enumerate()
+        .map(|(i, hit)| {
+            let artist = render_artist_credit(&hit.artist_credit);
+            let year = hit
+                .date
+                .as_deref()
+                .and_then(|d| d.get(..4))
+                .unwrap_or("----");
+            let country = hit.country.as_deref().unwrap_or("");
+            let tracks = hit
+                .track_count
+                .or_else(|| hit.media.iter().filter_map(|m| m.track_count).max())
+                .map(|n| n.to_string())
+                .unwrap_or_default();
+            let score = hit.score.to_string();
+            let mut row = Row::new(vec![
+                Cell::from(format!("{}.", i + 1)),
+                Cell::from(score),
+                Cell::from(hit.title.clone()),
+                Cell::from(artist),
+                Cell::from(year.to_string()),
+                Cell::from(country.to_string()),
+                Cell::from(tracks),
+            ]);
+            if i == overlay.hit_idx {
+                row = row.style(Style::default().bg(t.selection_bg).fg(t.selection_text));
+            }
+            row
+        })
+        .collect();
+    let header = Row::new(["#", "Score", "Title", "Artist", "Year", "Country", "Tracks"])
+        .style(t.header())
+        .height(1);
+    let widths = [
+        Constraint::Length(3),
+        Constraint::Length(6),
+        Constraint::Min(20),
+        Constraint::Min(15),
+        Constraint::Length(6),
+        Constraint::Length(8),
+        Constraint::Length(7),
+    ];
+    let table = Table::new(rows, widths).header(header);
+    f.render_widget(table, inner);
+}
+
+fn draw_tag_manager_diff(
+    f: &mut Frame,
+    app: &App,
+    overlay: &crate::app::TagManagerOverlay,
+    inner: Rect,
+) {
+    let t = app.theme();
+    let Some(diff) = overlay.diff.as_ref() else {
+        return;
+    };
+
+    // Layout: 2-line summary header (release match + counts), then table.
+    let total_tracks = diff.tracks.iter().filter(|t| !t.fields.is_empty()).count();
+    let total_changes: usize = diff
+        .tracks
+        .iter()
+        .flat_map(|t| t.fields.iter())
+        .filter(|f| f.enabled)
+        .count();
+    let total_renames = diff
+        .tracks
+        .iter()
+        .filter(|t| {
+            t.dest_path.is_some()
+                && t.fields
+                    .iter()
+                    .any(|f| f.kind == zytunes::tag_ops::FieldKind::Filename && f.enabled)
+        })
+        .count();
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ])
+        .split(inner);
+    let header_line = Line::from(vec![
+        Span::styled(
+            "Match: ",
+            Style::default()
+                .fg(t.header_text)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(diff.summary.clone()),
+    ]);
+    f.render_widget(Paragraph::new(header_line), rows[0]);
+    let counts_line = Line::from(vec![
+        Span::styled(
+            format!(
+                "{total_tracks} track{}",
+                if total_tracks == 1 { "" } else { "s" }
+            ),
+            Style::default().fg(t.accent_secondary),
+        ),
+        Span::raw(" · "),
+        Span::styled(
+            format!(
+                "{total_changes} change{}",
+                if total_changes == 1 { "" } else { "s" }
+            ),
+            Style::default().fg(if total_changes == 0 {
+                t.dim_text
+            } else {
+                t.success_text
+            }),
+        ),
+        Span::raw(" · "),
+        Span::styled(
+            format!(
+                "{total_renames} rename{}",
+                if total_renames == 1 { "" } else { "s" }
+            ),
+            Style::default().fg(if total_renames == 0 {
+                t.dim_text
+            } else {
+                t.success_text
+            }),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(counts_line), rows[1]);
+
+    // Flatten the per-track field list into one table, with per-track divider
+    // rows so the user sees structure.
+    struct DisplayRow<'a> {
+        kind: DisplayKind<'a>,
+        focused: bool,
+    }
+    enum DisplayKind<'a> {
+        TrackHeader(&'a zytunes::tag_ops::TrackTagDiff),
+        Field(&'a zytunes::tag_ops::FieldDiff),
+    }
+
+    let mut display_rows: Vec<DisplayRow> = Vec::new();
+    // Pre-resolve the focus path to mark the row visually.
+    let focused_path = overlay
+        .flattened_field_paths
+        .get(overlay.focused_row)
+        .copied();
+
+    for (ti, track) in diff.tracks.iter().enumerate() {
+        if track.fields.is_empty() {
+            continue;
+        }
+        display_rows.push(DisplayRow {
+            kind: DisplayKind::TrackHeader(track),
+            focused: false,
+        });
+        for (fi, field) in track.fields.iter().enumerate() {
+            display_rows.push(DisplayRow {
+                kind: DisplayKind::Field(field),
+                focused: focused_path == Some((ti, fi)),
+            });
+        }
+    }
+
+    if display_rows.is_empty() {
+        draw_centered_line(
+            f,
+            rows[2],
+            "No fields differ between library and release.",
+            t.dim_text,
+        );
+        return;
+    }
+
+    let table_rows: Vec<Row> = display_rows
+        .iter()
+        .map(|dr| match &dr.kind {
+            DisplayKind::TrackHeader(track) => {
+                // Build a rich header: "Track N · <current title> → <proposed
+                // title> · (k changes)". Pulls from the Title and Track #
+                // fields so the user can scan per-track without diving into
+                // every row. The change count counts ENABLED fields only.
+                let label = render_track_header(track);
+                Row::new(vec![
+                    Cell::from("──"),
+                    Cell::from(label).style(Style::default().add_modifier(Modifier::BOLD)),
+                    Cell::from(""),
+                    Cell::from(""),
+                ])
+                .style(Style::default().fg(t.accent_secondary).bg(t.main_bg))
+            }
+            DisplayKind::Field(field) => {
+                let mark = if field.enabled { "[x]" } else { "[ ]" };
+                // Filename diffs come in as full paths; collapse to basenames
+                // so the column doesn't blow out and the actual delta (the
+                // filename) is what the user sees.
+                let (current, proposed) = if field.kind == zytunes::tag_ops::FieldKind::Filename {
+                    (
+                        basename_of(field.current.as_deref()),
+                        basename_of(field.proposed.as_deref()),
+                    )
+                } else {
+                    (
+                        field.current.clone().unwrap_or_default(),
+                        field.proposed.clone().unwrap_or_default(),
+                    )
+                };
+                let style = if dr.focused {
+                    Style::default().bg(t.selection_bg).fg(t.selection_text)
+                } else if field.enabled {
+                    Style::default().fg(t.sidebar_text)
+                } else {
+                    Style::default().fg(t.dim_text)
+                };
+                Row::new(vec![
+                    Cell::from(mark),
+                    Cell::from(field.name),
+                    Cell::from(current),
+                    Cell::from(proposed),
+                ])
+                .style(style)
+            }
+        })
+        .collect();
+    let header = Row::new(["", "Field", "Current", "Proposed"])
+        .style(t.header())
+        .height(1);
+    let value_w = (rows[2].width as usize).saturating_sub(4 + 22 + 4);
+    let half = (value_w / 2) as u16;
+    let widths = [
+        Constraint::Length(3),
+        Constraint::Length(22),
+        Constraint::Length(half),
+        Constraint::Min(10),
+    ];
+    // Render via TableState so ratatui auto-scrolls to keep the focused row
+    // visible. `selected()` drives the offset adjustment internally; visual
+    // highlight stays on the per-row `style` we already set (no
+    // `highlight_style` here on purpose — we don't want to double-mark
+    // the focused row).
+    let focused_display_idx = display_rows.iter().position(|dr| dr.focused);
+    let mut table_state = TableState::default();
+    table_state.select(focused_display_idx);
+    let table = Table::new(table_rows, widths).header(header);
+    f.render_stateful_widget(table, rows[2], &mut table_state);
+}
+
+/// Render the per-track header label used in the diff table.
+///
+/// Pulls the Title and Track # fields out of the diff so a long album diff
+/// is scannable without expanding every row. When the title/number don't
+/// change, only the *current* value is shown to keep the line short.
+fn render_track_header(track: &zytunes::tag_ops::TrackTagDiff) -> String {
+    let title_field = track
+        .fields
+        .iter()
+        .find(|f| f.kind == zytunes::tag_ops::FieldKind::Identity && f.name == "Title");
+    let trknum_field = track
+        .fields
+        .iter()
+        .find(|f| f.kind == zytunes::tag_ops::FieldKind::Numbering && f.name == "Track #");
+
+    let trknum_str = trknum_field.and_then(|f| {
+        let cur = f.current.as_deref();
+        let prop = f.proposed.as_deref();
+        match (cur, prop) {
+            (Some(c), Some(p)) if c != p => Some(format!("Track {c} → {p}")),
+            (_, Some(p)) => Some(format!("Track {p}")),
+            (Some(c), None) => Some(format!("Track {c}")),
+            (None, None) => None,
+        }
+    });
+
+    let title_str: String = match title_field {
+        Some(f) => {
+            let cur = f.current.as_deref().unwrap_or("");
+            let prop = f.proposed.as_deref().unwrap_or("");
+            if cur == prop {
+                format!("\"{cur}\"")
+            } else {
+                format!("\"{cur}\" → \"{prop}\"")
+            }
+        }
+        None => track
+            .src_path
+            .file_stem()
+            .map(|s| format!("\"{}\"", s.to_string_lossy()))
+            .unwrap_or_default(),
+    };
+
+    let changes = track.fields.iter().filter(|f| f.enabled).count();
+    let renaming = track
+        .fields
+        .iter()
+        .any(|f| f.kind == zytunes::tag_ops::FieldKind::Filename && f.enabled);
+
+    let mut suffix = format!("({} change{}", changes, if changes == 1 { "" } else { "s" });
+    if renaming {
+        suffix.push_str(", rename");
+    }
+    suffix.push(')');
+
+    match trknum_str {
+        Some(n) => format!("{n} · {title_str} · {suffix}"),
+        None => format!("{title_str} · {suffix}"),
+    }
+}
+
+fn basename_of(s: Option<&str>) -> String {
+    match s {
+        Some(p) => std::path::Path::new(p)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| p.to_string()),
+        None => String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zytunes::tag_ops::{FieldDiff, FieldKind, TrackTagDiff};
+
+    fn header_track(fields: Vec<FieldDiff>) -> TrackTagDiff {
+        TrackTagDiff {
+            src_path: std::path::PathBuf::from("/m/A/B/01.mp3"),
+            dest_path: None,
+            library_id: 1,
+            fields,
+        }
+    }
+
+    fn field(kind: FieldKind, name: &'static str, cur: &str, prop: &str) -> FieldDiff {
+        FieldDiff {
+            kind,
+            name,
+            current: Some(cur.into()),
+            proposed: Some(prop.into()),
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn render_track_header_shows_title_change_and_track_number() {
+        let track = header_track(vec![
+            field(FieldKind::Identity, "Title", "Old Title", "The Chain"),
+            field(FieldKind::Numbering, "Track #", "1", "1"),
+            field(FieldKind::Identity, "Album", "old album", "Rumours"),
+        ]);
+        let label = render_track_header(&track);
+        assert!(label.contains("Track 1"));
+        assert!(label.contains("\"Old Title\" → \"The Chain\""));
+        assert!(label.contains("(3 changes"));
+    }
+
+    #[test]
+    fn render_track_header_omits_arrow_when_title_unchanged() {
+        let track = header_track(vec![
+            FieldDiff {
+                kind: FieldKind::Identity,
+                name: "Title",
+                current: Some("Dreams".into()),
+                proposed: Some("Dreams".into()),
+                enabled: false,
+            },
+            field(FieldKind::Numbering, "Track #", "1", "1"),
+        ]);
+        let label = render_track_header(&track);
+        assert!(label.contains("\"Dreams\""));
+        assert!(!label.contains("→"));
+    }
+
+    #[test]
+    fn render_track_header_singular_change() {
+        let track = header_track(vec![field(FieldKind::Identity, "Title", "old", "new")]);
+        let label = render_track_header(&track);
+        assert!(label.contains("(1 change)"), "got: {label}");
+        assert!(!label.contains("changes"));
+    }
+
+    #[test]
+    fn render_track_header_flags_rename() {
+        let track = header_track(vec![
+            field(FieldKind::Identity, "Title", "a", "b"),
+            FieldDiff {
+                kind: FieldKind::Filename,
+                name: "Filename",
+                current: Some("/m/A/B/01 old.mp3".into()),
+                proposed: Some("/m/A/B/01 new.mp3".into()),
+                enabled: true,
+            },
+        ]);
+        let label = render_track_header(&track);
+        assert!(label.contains("rename"));
+    }
+
+    #[test]
+    fn render_track_header_skips_rename_when_filename_disabled() {
+        let mut filename = FieldDiff {
+            kind: FieldKind::Filename,
+            name: "Filename",
+            current: Some("/m/A/B/01 old.mp3".into()),
+            proposed: Some("/m/A/B/01 new.mp3".into()),
+            enabled: false,
+        };
+        let _ = &mut filename;
+        let track = header_track(vec![filename]);
+        let label = render_track_header(&track);
+        assert!(!label.contains("rename"));
+    }
+
+    #[test]
+    fn basename_of_strips_path() {
+        assert_eq!(basename_of(Some("/m/A/B/01.mp3")), "01.mp3");
+        assert_eq!(basename_of(Some("just.flac")), "just.flac");
+        assert_eq!(basename_of(None), "");
+    }
 
     #[test]
     fn rip_progress_format_with_known_total() {
