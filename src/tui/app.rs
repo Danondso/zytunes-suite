@@ -11,7 +11,9 @@ pub use import::{effective_position, ImportField, ImportOverlay};
 pub use playlists::{
     device_playlist_sync_enabled, AddToPlaylistPicker, GenerationFormState, PendingPlaylistImport,
 };
-pub use tag_manager::{SearchInputField, SelectionAnchor, TagManagerOverlay, TagManagerPhase};
+pub use tag_manager::{
+    FocusRow, SearchInputField, SelectionAnchor, TagManagerOverlay, TagManagerPhase,
+};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::mpsc;
@@ -687,8 +689,21 @@ fn pick_recording_mbid_for_followup(hits: &[zytunes::acoustid::AcoustIdHit]) -> 
 /// known recording to tag against.
 fn recording_releases_to_search_hits(
     rec: &zytunes::musicbrainz::RecordingLookupResponse,
+    fallback_artist: &str,
 ) -> Vec<zytunes::musicbrainz::ReleaseSearchHit> {
-    use zytunes::musicbrainz::ReleaseSearchHit;
+    use zytunes::musicbrainz::{ArtistCredit, ReleaseSearchHit};
+    // Recording-followup responses occasionally come back with an empty
+    // artist-credit at the recording level. Mirror the AcoustID-path fallback
+    // so the picker doesn't show blank Artist cells.
+    let artist_credit = if rec.artist_credit.is_empty() && !fallback_artist.is_empty() {
+        vec![ArtistCredit {
+            name: fallback_artist.to_string(),
+            joinphrase: None,
+            artist: None,
+        }]
+    } else {
+        rec.artist_credit.clone()
+    };
     rec.releases
         .iter()
         .map(|rel| ReleaseSearchHit {
@@ -697,7 +712,7 @@ fn recording_releases_to_search_hits(
             title: rel.title.clone(),
             date: rel.date.clone(),
             country: rel.country.clone(),
-            artist_credit: rec.artist_credit.clone(),
+            artist_credit: artist_credit.clone(),
             release_group: rel.release_group.clone(),
             media: vec![],
             track_count: None,
@@ -708,6 +723,7 @@ fn recording_releases_to_search_hits(
 
 fn acoustid_hits_to_release_hits(
     hits: &[zytunes::acoustid::AcoustIdHit],
+    fallback_artist: &str,
 ) -> Vec<zytunes::musicbrainz::ReleaseSearchHit> {
     use zytunes::musicbrainz::{ArtistCredit, ReleaseSearchHit};
     let mut out: Vec<ReleaseSearchHit> = Vec::new();
@@ -715,15 +731,31 @@ fn acoustid_hits_to_release_hits(
         let score = (hit.score * 100.0).round().clamp(0.0, 100.0) as u32;
         for rec in &hit.recordings {
             let rec_title = rec.title.clone().unwrap_or_default();
-            let rec_artists: Vec<ArtistCredit> = rec
-                .artists
-                .iter()
-                .map(|a| ArtistCredit {
-                    name: a.name.clone(),
-                    joinphrase: None,
-                    artist: None,
-                })
-                .collect();
+            // AcoustID's recording shape can omit `artists` entirely for some
+            // matches (data quality varies). Without a fallback the picker
+            // shows blank in the Artist column, which reads as "[unknown]"
+            // to the user — fall back to the library's artist for the
+            // selection so each row still says *something*.
+            let rec_artists: Vec<ArtistCredit> = if rec.artists.is_empty() {
+                if fallback_artist.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![ArtistCredit {
+                        name: fallback_artist.to_string(),
+                        joinphrase: None,
+                        artist: None,
+                    }]
+                }
+            } else {
+                rec.artists
+                    .iter()
+                    .map(|a| ArtistCredit {
+                        name: a.name.clone(),
+                        joinphrase: None,
+                        artist: None,
+                    })
+                    .collect()
+            };
             for rel in &rec.releases {
                 out.push(ReleaseSearchHit {
                     id: rel.id.clone(),
@@ -2033,6 +2065,17 @@ impl App {
                 (t.artist.clone(), t.album.clone(), Some(t.name.clone()))
             }
         };
+        // Defensive trim against stale-cache padding. Dirlib normalises
+        // these at scan time now, but a v2 cache may still hold padded
+        // values until the CACHE_SCHEMA_VERSION bump forces a re-scan.
+        // Trimming here means the MB search / library lookup / anchor
+        // restoration all agree on the canonical (trimmed) form right
+        // away.
+        let artist = artist.trim().to_string();
+        let album = album.trim().to_string();
+        let track_name = track_name
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
 
         let anchor = SelectionAnchor {
             artist: artist.clone(),
@@ -2184,7 +2227,7 @@ impl App {
         }
         match result {
             Ok(rec) => {
-                let hits = recording_releases_to_search_hits(&rec);
+                let hits = recording_releases_to_search_hits(&rec, &overlay.source_artist);
                 if hits.is_empty() {
                     overlay.error = Some(
                         "AcoustID + MB both confirm the recording but no releases are linked. \
@@ -2242,7 +2285,7 @@ impl App {
                             .unwrap_or(std::cmp::Ordering::Equal)
                     })
                     .map(|h| h.id.clone());
-                let release_hits = acoustid_hits_to_release_hits(&hits);
+                let release_hits = acoustid_hits_to_release_hits(&hits, &overlay.source_artist);
                 if !release_hits.is_empty() {
                     overlay.search_hits = release_hits;
                     overlay.hit_idx = 0;
@@ -2269,12 +2312,36 @@ impl App {
                             mb_user_agent,
                         });
                 } else {
-                    overlay.error = Some(
-                        "AcoustID matched the fingerprint but returned no MB recording \
-                         to follow up on. The audio is in AcoustID but isn't linked to MB."
-                            .into(),
+                    // AcoustID matched the audio but provided neither
+                    // releases nor a recording MBID we can follow up on
+                    // (every recording slot was empty). Rather than dead-
+                    // ending the user on an Error screen, fall through to
+                    // a plain MB artist+album search — same path the
+                    // overlay would have taken if the user had no AcoustID
+                    // key configured. They at least get a list to pick
+                    // from instead of having to manually re-open and edit
+                    // the query.
+                    let next_token = overlay.next_request_token();
+                    let mb_base_url = self.mb_base_url.clone();
+                    let mb_user_agent = self.mb_user_agent.clone();
+                    let artist = overlay.source_artist.clone();
+                    let album = overlay.source_album.clone();
+                    self.sync.log.push(
+                        "tag-manager: AcoustID hit had no MB links; falling back to MB \
+                         artist+album search"
+                            .to_string(),
                     );
-                    overlay.phase = TagManagerPhase::Error;
+                    self.pending_bg_commands.push(BgCommand::MbSearchReleases {
+                        token: next_token,
+                        artist,
+                        album,
+                        mb_base_url,
+                        mb_user_agent,
+                    });
+                    // Phase already at SearchPending (set when the overlay
+                    // first dispatched AcoustIdLookup). The MB search hits
+                    // will arrive via `MbSearchResults` and the existing
+                    // handler advances to SearchResults / Error.
                 }
             }
             Ok(_) => {
@@ -2744,7 +2811,7 @@ impl App {
             return;
         };
         match key.code {
-            KeyCode::Esc => {
+            KeyCode::Esc | KeyCode::Char('s') => {
                 overlay.phase = TagManagerPhase::SearchInput;
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -2781,7 +2848,23 @@ impl App {
         };
         match key.code {
             KeyCode::Esc => {
-                overlay.phase = TagManagerPhase::SearchResults;
+                // If we got here via the auto-resolved-MBID fast path
+                // (library carried `mb_release_id`), there are no search
+                // hits behind us — dropping back to SearchResults would
+                // strand the user on an empty list. Skip straight to
+                // SearchInput so they can pick a different release.
+                overlay.phase = if overlay.search_hits.is_empty() {
+                    TagManagerPhase::SearchInput
+                } else {
+                    TagManagerPhase::SearchResults
+                };
+            }
+            // Explicit "search MusicBrainz instead". Useful when the
+            // auto-resolved release is wrong (e.g. file is tagged against
+            // MB's `[unknown]` special-purpose artist and the user wants
+            // to retag against a real release).
+            KeyCode::Char('s') => {
+                overlay.phase = TagManagerPhase::SearchInput;
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 overlay.move_focus(-1);
@@ -2813,6 +2896,20 @@ impl App {
             }
             KeyCode::Char('n') => {
                 overlay.set_all_enabled(false);
+            }
+            // `c` folds/unfolds the focused track. Works from either the
+            // track header or any of its field rows — the user shouldn't
+            // have to scroll back to the header to collapse a track they're
+            // looking at. Shift-C collapses every track at once
+            // (header-only summary view); Shift-X / Shift-E expands.
+            KeyCode::Char('c') => {
+                overlay.toggle_collapse_focused_track();
+            }
+            KeyCode::Char('C') => {
+                overlay.collapse_all_tracks();
+            }
+            KeyCode::Char('X') | KeyCode::Char('E') => {
+                overlay.expand_all_tracks();
             }
             KeyCode::Enter => {
                 let Some(diff) = overlay.diff.clone() else {
@@ -12004,6 +12101,62 @@ mod tests {
     }
 
     #[test]
+    fn acoustid_with_no_recordings_falls_back_to_mb_search() {
+        // The "audio is in AcoustID but isn't linked to MB" case: AcoustID
+        // returned a hit but every recording slot is empty, so there's no
+        // MBID to follow up on. Instead of dead-ending the user on the
+        // Error screen, the overlay should fall through to a plain MB
+        // artist+album search — same path the user would have taken if
+        // they had no AcoustID key at all.
+        use zytunes::acoustid::AcoustIdHit;
+        let mut app = make_app_with_library_for_tagmgr();
+        app.browse_mode = BrowseMode::Library;
+        app.active_panel = Panel::Albums;
+        app.acoustid_app_key = Some("k".into());
+        app.library = Some(Box::new(VecLibrary {
+            tracks: vec![zytunes::library::Track {
+                id: 1,
+                name: "Track Y".into(),
+                artist: "Artist X".into(),
+                album: "Album X".into(),
+                acoustic_id: Some("fp1".into()),
+                total_time_ms: Some(240_000),
+                ..Default::default()
+            }],
+        }));
+        app.open_tag_manager(&dummy_cmd_channel());
+        let token = app.tag_manager.as_ref().unwrap().pending_request_token;
+        app.handle_bg_event(BgEvent::AcoustIdResolved {
+            token,
+            result: Ok(vec![AcoustIdHit {
+                id: "ac1".into(),
+                score: 0.9,
+                recordings: vec![], // no MBID at all to follow up on
+            }]),
+        });
+        let overlay = app.tag_manager.as_ref().unwrap();
+        assert_ne!(
+            overlay.phase,
+            TagManagerPhase::Error,
+            "fallback path must not dead-end the user on Error"
+        );
+        // The fallback search command should be queued, scoped to the
+        // overlay's source artist/album.
+        let search = app
+            .pending_bg_commands
+            .iter()
+            .find_map(|c| match c {
+                BgCommand::MbSearchReleases { artist, album, .. } => {
+                    Some((artist.clone(), album.clone()))
+                }
+                _ => None,
+            })
+            .expect("MbSearchReleases fallback should be queued");
+        assert_eq!(search.0, "Artist X");
+        assert_eq!(search.1, "Album X");
+    }
+
+    #[test]
     fn mb_recording_releases_lands_releases_into_search_results() {
         // Once the recording-releases lookup completes, the response
         // turns into a SearchResults row list the user picks from.
@@ -12054,6 +12207,121 @@ mod tests {
         // Score is fixed at 90 for MB-direct fallback rows (per
         // recording_releases_to_search_hits).
         assert!(overlay.search_hits.iter().all(|h| h.score == 90));
+    }
+
+    #[test]
+    fn acoustid_hits_to_release_hits_falls_back_to_source_artist_when_artists_empty() {
+        // AcoustID legitimately returns recordings with no `artists` field
+        // populated (data-quality variance). Without a fallback the picker
+        // shows a blank Artist column for every row, which reads as
+        // "[unknown]" to the user. The library's known artist is the best
+        // signal we have at this point, so verify it gets dropped in.
+        use zytunes::acoustid::{AcoustIdHit, AcoustIdRecording, AcoustIdRelease};
+        let hits = vec![AcoustIdHit {
+            id: "ai1".into(),
+            score: 0.95,
+            recordings: vec![AcoustIdRecording {
+                id: "rec1".into(),
+                title: Some("Track Z".into()),
+                duration: Some(240),
+                artists: vec![], // <-- the crash-test case
+                releases: vec![AcoustIdRelease {
+                    id: "rel-z".into(),
+                    title: Some("Album Z".into()),
+                }],
+            }],
+        }];
+        let out = acoustid_hits_to_release_hits(&hits, "Library Artist");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].artist_credit.len(), 1);
+        assert_eq!(out[0].artist_credit[0].name, "Library Artist");
+
+        // Empty fallback still maps to empty (don't fabricate text out of
+        // thin air — the UI layer has its own "(unknown artist)" placeholder
+        // that's clearly a placeholder rather than a misleading real value).
+        let out = acoustid_hits_to_release_hits(&hits, "");
+        assert!(out[0].artist_credit.is_empty());
+    }
+
+    #[test]
+    fn recording_releases_to_search_hits_falls_back_to_source_artist_when_credit_empty() {
+        use zytunes::musicbrainz::{RecordingLookupResponse, RecordingReleaseRef};
+        let rec = RecordingLookupResponse {
+            id: "rec1".into(),
+            title: "Track".into(),
+            artist_credit: vec![],
+            releases: vec![RecordingReleaseRef {
+                id: "rel1".into(),
+                title: "Album".into(),
+                date: None,
+                country: None,
+                status: None,
+                release_group: None,
+            }],
+        };
+        let out = recording_releases_to_search_hits(&rec, "Library Artist");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].artist_credit.len(), 1);
+        assert_eq!(out[0].artist_credit[0].name, "Library Artist");
+    }
+
+    #[test]
+    fn diff_preview_s_key_drops_to_search_input() {
+        // Re-tagging flow: user lands on the diff via the auto-resolved
+        // MBID, sees the proposed values are junk (the existing MBID points
+        // at a stale or `[unknown]`-artist release), and wants to search MB
+        // for a different release. Pressing `s` must drop to SearchInput.
+        let (tx, _rx) = mpsc::channel::<BgCommand>();
+        let mut app = make_app_with_library_for_tagmgr();
+        app.browse_mode = BrowseMode::Library;
+        app.active_panel = Panel::Albums;
+        app.open_tag_manager(&tx);
+        // Force the overlay into DiffPreview as if a release loaded.
+        let overlay = app.tag_manager.as_mut().unwrap();
+        overlay.phase = TagManagerPhase::DiffPreview;
+        app.handle_tag_manager_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE), &tx);
+        assert_eq!(
+            app.tag_manager.as_ref().unwrap().phase,
+            TagManagerPhase::SearchInput,
+        );
+    }
+
+    #[test]
+    fn diff_preview_esc_with_no_hits_skips_empty_picker() {
+        // When the user arrives at the diff via the direct-MBID fast path,
+        // there are zero search hits behind them. Esc must not strand them
+        // on an empty SearchResults page — drop straight to SearchInput.
+        let (tx, _rx) = mpsc::channel::<BgCommand>();
+        let mut app = make_app_with_library_for_tagmgr();
+        app.browse_mode = BrowseMode::Library;
+        app.active_panel = Panel::Albums;
+        app.open_tag_manager(&tx);
+        let overlay = app.tag_manager.as_mut().unwrap();
+        overlay.phase = TagManagerPhase::DiffPreview;
+        assert!(overlay.search_hits.is_empty());
+        app.handle_tag_manager_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+        assert_eq!(
+            app.tag_manager.as_ref().unwrap().phase,
+            TagManagerPhase::SearchInput,
+        );
+    }
+
+    #[test]
+    fn search_results_s_key_drops_to_search_input() {
+        // From the picker, `s` should re-open the query so the user can
+        // adjust artist/album and run another search.
+        let (tx, _rx) = mpsc::channel::<BgCommand>();
+        let mut app = make_app_with_library_for_tagmgr();
+        app.browse_mode = BrowseMode::Library;
+        app.active_panel = Panel::Albums;
+        app.open_tag_manager(&tx);
+        let overlay = app.tag_manager.as_mut().unwrap();
+        overlay.phase = TagManagerPhase::SearchResults;
+        app.handle_tag_manager_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE), &tx);
+        assert_eq!(
+            app.tag_manager.as_ref().unwrap().phase,
+            TagManagerPhase::SearchInput,
+        );
     }
 
     #[test]

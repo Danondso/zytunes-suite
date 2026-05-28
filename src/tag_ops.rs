@@ -12,16 +12,129 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use lofty::config::WriteOptions;
+use lofty::config::{ParseOptions, WriteOptions};
 use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::prelude::ItemKey;
-use lofty::tag::{Tag, TagType};
+use lofty::probe::Probe;
+use lofty::tag::{ItemValue, Tag, TagType};
 
 use crate::cd::metadata::{
     probe_by_content, ripped_track_destination, set_string, set_unknown_string,
 };
 use crate::library::Track;
 use crate::musicbrainz::{render_artist_credit, Medium, Release, Track as MbTrack};
+
+/// Tag-side values the library `Track` schema doesn't model — but the diff
+/// still wants to surface. Read directly from the audio file once per
+/// diff-build so the `current` side reflects what's actually on disk.
+///
+/// Without this, every Picard TXXX field (MUSICBRAINZ_*, RELEASECOUNTRY,
+/// SCRIPT) and the OriginalMediaType frame would perpetually show as a
+/// delta — even immediately after the user applied them — because the
+/// library's `Track` has no slot for them and the diff comparator was
+/// hardcoding `current: None`. Reread-aware: lofty reopens the file, so a
+/// freshly-written tag is visible on the next diff build.
+#[derive(Default)]
+struct OnDiskExtras {
+    media: Option<String>,
+    musicbrainz_album_type: Option<String>,
+    musicbrainz_album_status: Option<String>,
+    musicbrainz_album_packaging: Option<String>,
+    release_country: Option<String>,
+    script: Option<String>,
+    /// Picard's `ACOUSTID_FINGERPRINT` TXXX value, if present. Read here so
+    /// the ACOUSTID_FINGERPRINT row doesn't pay a second lofty probe of the
+    /// same file — `fingerprint::read_embedded_fingerprint` does its own
+    /// `Probe::open` + `read()`, and on a 20-track release that doubled
+    /// the file-open count for no benefit.
+    acoustid_fingerprint: Option<String>,
+}
+
+fn read_on_disk_extras(path: &Path) -> OnDiskExtras {
+    // `read_properties(false)` skips lofty's audio-properties parse,
+    // which scans frames across the whole file for VBR MP3 / FLAC duration
+    // estimates. The diff-build path only needs tag items, not bitrate /
+    // sample-rate / etc. — disabling the parse drops per-track cost from
+    // tens of milliseconds to sub-millisecond on a typical library and is
+    // the difference between an instant `m` and a noticeable stall on a
+    // 20-track album. Mirrors `fingerprint::read_embedded_fingerprint`.
+    let Ok(probe) = Probe::open(path) else {
+        return OnDiskExtras::default();
+    };
+    let Ok(probe) = probe
+        .options(ParseOptions::new().read_properties(false))
+        .guess_file_type()
+    else {
+        return OnDiskExtras::default();
+    };
+    let Ok(tagged) = probe.read() else {
+        return OnDiskExtras::default();
+    };
+    let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) else {
+        return OnDiskExtras::default();
+    };
+    let media = tag
+        .get_string(&ItemKey::OriginalMediaType)
+        .map(|s| s.to_string());
+    // Picard TXXX fields are stored as `ItemKey::Unknown(description)`.
+    // Match case-insensitively because some legacy taggers used title-cased
+    // descriptions ("MusicBrainz Album Type" vs "MUSICBRAINZ_ALBUMTYPE")
+    // and lofty surfaces both verbatim.
+    let mut musicbrainz_album_type = None;
+    let mut musicbrainz_album_status = None;
+    let mut musicbrainz_album_packaging = None;
+    let mut release_country = None;
+    let mut script = None;
+    let mut acoustid_fingerprint = None;
+    for item in tag.items() {
+        let ItemKey::Unknown(name) = item.key() else {
+            continue;
+        };
+        let ItemValue::Text(value) = item.value() else {
+            continue;
+        };
+        if value.is_empty() {
+            continue;
+        }
+        let slot = if name.eq_ignore_ascii_case("MUSICBRAINZ_ALBUMTYPE")
+            || name.eq_ignore_ascii_case("MusicBrainz Album Type")
+        {
+            &mut musicbrainz_album_type
+        } else if name.eq_ignore_ascii_case("MUSICBRAINZ_ALBUMSTATUS")
+            || name.eq_ignore_ascii_case("MusicBrainz Album Status")
+        {
+            &mut musicbrainz_album_status
+        } else if name.eq_ignore_ascii_case("MUSICBRAINZ_ALBUMPACKAGING")
+            || name.eq_ignore_ascii_case("MusicBrainz Album Packaging")
+        {
+            &mut musicbrainz_album_packaging
+        } else if name.eq_ignore_ascii_case("RELEASECOUNTRY")
+            || name.eq_ignore_ascii_case("MusicBrainz Album Release Country")
+        {
+            &mut release_country
+        } else if name.eq_ignore_ascii_case("SCRIPT") {
+            &mut script
+        } else if name.eq_ignore_ascii_case("ACOUSTID_FINGERPRINT")
+            || name.eq_ignore_ascii_case("Acoustid Fingerprint")
+        {
+            &mut acoustid_fingerprint
+        } else {
+            continue;
+        };
+        if slot.is_none() {
+            *slot = Some(value.to_string());
+        }
+    }
+    OnDiskExtras {
+        media,
+        musicbrainz_album_type,
+        musicbrainz_album_status,
+        musicbrainz_album_packaging,
+        release_country,
+        script,
+        acoustid_fingerprint,
+    }
+}
 
 /// Whether the diff covers an entire release or a single track.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -274,21 +387,53 @@ fn build_track_fields(
     acoustid_uuid: Option<&str>,
 ) -> Vec<FieldDiff> {
     let mut fields: Vec<FieldDiff> = Vec::new();
+    // Read on-disk values for tag fields the library `Track` schema doesn't
+    // carry (Picard TXXX, Media). Done once per track so the `current` side
+    // of the diff stays accurate after an apply — without this, those rows
+    // would re-appear as deltas on every `m` press regardless of what the
+    // file actually holds.
+    let extras = read_on_disk_extras(src_path);
     let mut push =
         |kind: FieldKind, name: &'static str, current: Option<String>, proposed: Option<String>| {
             // Treat empty strings as None for diff purposes so a "" → None
             // proposed value doesn't appear as a no-op change.
             let cur = current.filter(|s| !s.is_empty());
             let prop = proposed.filter(|s| !s.is_empty());
-            if cur != prop {
-                fields.push(FieldDiff {
-                    kind,
-                    name,
-                    current: cur,
-                    proposed: prop,
-                    enabled: true,
-                });
+            // Skip rows where MB has nothing AND the file has nothing — they
+            // carry no information and would just bloat the diff. Every
+            // other case (changed, or unchanged-but-present-on-at-least-one-
+            // side) is surfaced so the user can audit the full tag set,
+            // including fields that MB has no opinion on.
+            if cur.is_none() && prop.is_none() {
+                return;
             }
+            // Picard-style "don't blank what MB has no opinion on": when the
+            // file has a value and MB doesn't, propose to KEEP the existing
+            // value (proposed = current). Without this, the row would show
+            // "<existing> → (empty)" and default to enabled, which looks
+            // like we're about to clear the tag — alarming for tags like
+            // Genre / BPM that the user curates themselves. `set_string`
+            // already skips on empty value, so the file wasn't actually
+            // being blanked, but the visual delta was wrong and a future
+            // tweak to set_string could turn the lie into a real bug.
+            //
+            // Consequence: this closure cannot express an explicit "MB
+            // proposes blanking this tag". If a future caller needs that,
+            // it must push the `FieldDiff` directly rather than route
+            // through `push`.
+            let prop = if prop.is_none() && cur.is_some() {
+                cur.clone()
+            } else {
+                prop
+            };
+            let enabled = cur != prop;
+            fields.push(FieldDiff {
+                kind,
+                name,
+                current: cur,
+                proposed: prop,
+                enabled,
+            });
         };
 
     // -- Identity --
@@ -385,36 +530,41 @@ fn build_track_fields(
         .release_group
         .as_ref()
         .and_then(|rg| rg.primary_type.clone());
-    push(FieldKind::Picard, "MUSICBRAINZ_ALBUMTYPE", None, album_type);
+    push(
+        FieldKind::Picard,
+        "MUSICBRAINZ_ALBUMTYPE",
+        extras.musicbrainz_album_type.clone(),
+        album_type,
+    );
 
     // Media format ("CD", "12\" Vinyl"). Picard writes to ID3v2's
     // OriginalMediaType frame, which lofty exposes as ItemKey::OriginalMediaType.
     let media = medium.and_then(|m| m.format.clone());
-    push(FieldKind::Identifier, "Media", None, media);
+    push(FieldKind::Identifier, "Media", extras.media.clone(), media);
 
     // Release-level Picard TXXX fields.
     push(
         FieldKind::Picard,
         "MUSICBRAINZ_ALBUMSTATUS",
-        None,
+        extras.musicbrainz_album_status.clone(),
         release.status.clone(),
     );
     push(
         FieldKind::Picard,
         "MUSICBRAINZ_ALBUMPACKAGING",
-        None,
+        extras.musicbrainz_album_packaging.clone(),
         release.packaging.clone(),
     );
     push(
         FieldKind::Picard,
         "RELEASECOUNTRY",
-        None,
+        extras.release_country.clone(),
         release.country.clone(),
     );
     push(
         FieldKind::Picard,
         "SCRIPT",
-        None,
+        extras.script.clone(),
         release
             .text_representation
             .as_ref()
@@ -527,16 +677,17 @@ fn build_track_fields(
     // is already on disk: if it matches, pushing the row would trigger
     // an unnecessary full lofty rewrite for a no-op.
     if let Some(fp) = lib.acoustic_id.as_deref().filter(|s| !s.is_empty()) {
-        let on_disk = crate::fingerprint::read_embedded_fingerprint(src_path);
-        if on_disk.as_deref() != Some(fp) {
-            fields.push(FieldDiff {
-                kind: FieldKind::Picard,
-                name: "ACOUSTID_FINGERPRINT",
-                current: on_disk,
-                proposed: Some(fp.to_string()),
-                enabled: true,
-            });
-        }
+        // Sourced from the same probe as `extras` above — `read_on_disk_extras`
+        // matches the same Picard TXXX names as `fingerprint::read_embedded_fingerprint`.
+        let on_disk = extras.acoustid_fingerprint.clone();
+        let enabled = on_disk.as_deref() != Some(fp);
+        fields.push(FieldDiff {
+            kind: FieldKind::Picard,
+            name: "ACOUSTID_FINGERPRINT",
+            current: on_disk,
+            proposed: Some(fp.to_string()),
+            enabled,
+        });
     }
 
     // -- Filename rename --
@@ -551,6 +702,15 @@ fn build_track_fields(
             });
         }
     }
+
+    // Float deltas to the top of each track's field list while preserving
+    // the original kind-grouped ordering within each subset. Without this,
+    // a track with one Title change buried after 25 unchanged identifiers
+    // would force the user to scroll past the noise to find the action.
+    // Stable sort keeps the carefully-ordered Identity / Numbering / Date /
+    // MbId / Identifier / Picard / Filename sequence intact within both
+    // halves of the partition.
+    fields.sort_by_key(|f| u8::from(!f.enabled));
 
     fields
 }
@@ -935,13 +1095,13 @@ mod tests {
     }
 
     #[test]
-    fn build_release_diff_emits_only_changed_fields() {
-        // Library track already matches MB on every field the library *can*
-        // express. The remaining diff entries (Media, RELEASECOUNTRY) are
-        // release-level facts the library Track schema doesn't carry, so
-        // they always appear as None → Some additions even when the user
-        // wouldn't perceive them as a change.
-        let dir = fresh_dir("only-changed");
+    fn build_release_diff_includes_unchanged_fields_but_marks_them_disabled() {
+        // The diff now carries every field — changed AND unchanged — so the
+        // user can audit existing tags rather than only seeing deltas. A
+        // library track that already matches MB on Title/Artist/Album/etc.
+        // must still surface those rows, but with `enabled=false` so the
+        // apply path skips them and the UI can render them as no-ops.
+        let dir = fresh_dir("includes-unchanged");
         let path = dir.join("Artist").join("Album").join("01 - First.wav");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         write_sine_wav(&path, 1);
@@ -963,16 +1123,96 @@ mod tests {
         let rel = make_release("Album", "Artist");
         let diff = build_release_diff(&[lib], &rel, &dir, DiffScope::Track, None);
         assert_eq!(diff.tracks.len(), 1);
-        // The only fields in the diff should be the release-level Picard
-        // ones the lib has no field for (set on `make_release`'s default
-        // medium + country). No Title/Track #/Album/etc. churn.
-        let names: Vec<&str> = diff.tracks[0].fields.iter().map(|f| f.name).collect();
-        for unexpected in ["Title", "Artist", "Album", "Track #", "Year"] {
+        let track = &diff.tracks[0];
+
+        // Identity fields that already match must be present but disabled.
+        for matched in ["Title", "Artist", "Album", "Track #", "Year"] {
+            let field = track.fields.iter().find(|f| f.name == matched);
             assert!(
-                !names.contains(&unexpected),
-                "did not expect {unexpected:?} in diff: {names:?}"
+                field.is_some(),
+                "expected {matched:?} in diff so the user can see the current value: {:?}",
+                track.fields.iter().map(|f| f.name).collect::<Vec<_>>()
+            );
+            let f = field.unwrap();
+            assert!(
+                !f.enabled,
+                "{matched:?} matches MB but came back enabled — apply path would rewrite a no-op",
+            );
+            assert_eq!(
+                f.current, f.proposed,
+                "{matched:?} should have current == proposed when no change",
             );
         }
+
+        // The only fields that should come back enabled are release-level
+        // Picard fields the library Track schema doesn't model (Media,
+        // RELEASECOUNTRY, etc.) — those legitimately diff from None →
+        // Some(...). Library-expressible fields should all be disabled.
+        let library_expressible_enabled: Vec<&str> = track
+            .fields
+            .iter()
+            .filter(|f| {
+                f.enabled
+                    && matches!(
+                        f.name,
+                        "Title"
+                            | "Artist"
+                            | "Album"
+                            | "Album Artist"
+                            | "Track #"
+                            | "Track Total"
+                            | "Disc #"
+                            | "Disc Total"
+                            | "Year"
+                            | "MB Track ID"
+                            | "MB Recording ID"
+                            | "MB Release ID"
+                            | "MB Release Artist ID"
+                            | "MB Artist ID"
+                            | "ISRC"
+                    )
+            })
+            .map(|f| f.name)
+            .collect();
+        assert!(
+            library_expressible_enabled.is_empty(),
+            "library-expressible fields all match — none should be enabled, got: {library_expressible_enabled:?}",
+        );
+    }
+
+    #[test]
+    fn build_release_diff_floats_changed_fields_to_the_top() {
+        // Deltas must come first within a track's field list so the user
+        // doesn't have to scroll past matching rows to find the changes.
+        let dir = fresh_dir("delta-sort");
+        let path = dir.join("Artist").join("Album").join("01 - First.wav");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        write_sine_wav(&path, 1);
+
+        // Title and Artist match, but Album differs — the Album row should
+        // land ahead of the unchanged Title/Artist rows.
+        let mut lib = make_lib_track(&path, "First", 1);
+        lib.album = "Stale Album".into();
+
+        let rel = make_release("Album", "Artist");
+        let diff = build_release_diff(&[lib], &rel, &dir, DiffScope::Track, None);
+        let track = &diff.tracks[0];
+        let first_enabled = track
+            .fields
+            .iter()
+            .position(|f| f.enabled)
+            .expect("at least one delta expected");
+        let first_unchanged = track
+            .fields
+            .iter()
+            .position(|f| !f.enabled && f.current == f.proposed)
+            .expect("at least one unchanged row expected");
+        assert!(
+            first_enabled < first_unchanged,
+            "changed fields must sort ahead of unchanged ones (enabled={}, unchanged={})",
+            first_enabled,
+            first_unchanged,
+        );
     }
 
     #[test]
@@ -1468,12 +1708,145 @@ mod tests {
     }
 
     #[test]
-    fn build_release_diff_skips_acoustid_fingerprint_when_already_on_disk() {
-        // Regression: previously the ACOUSTID_FINGERPRINT row was pushed
-        // unconditionally whenever `lib.acoustic_id` was Some, which made
-        // re-opening tag-manager on an already-fingerprinted album rewrite
-        // every track for a no-op. Now we read the file's existing tag and
-        // skip the row when it matches.
+    fn genre_stays_when_mb_has_no_genre() {
+        // Picard-style preservation: the file has Genre="Easy Listening", MB
+        // has no genre on this release. The diff should NOT propose to
+        // clear the tag — it should show the row as unchanged (current ==
+        // proposed) with enabled=false, so the user can see the existing
+        // value but `a` / Enter won't blank it.
+        let dir = fresh_dir("genre-preserve");
+        let path = dir.join("Artist").join("Album").join("01 - First.wav");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        write_sine_wav(&path, 1);
+
+        let mut lib = make_lib_track(&path, "First", 1);
+        lib.genre = Some("Easy Listening".into());
+
+        // make_release returns a release with no genres anywhere.
+        let rel = make_release("Album", "Artist");
+        assert!(pick_top_genre(&rel).is_none(), "test setup precondition");
+
+        let diff = build_release_diff(
+            std::slice::from_ref(&lib),
+            &rel,
+            &dir,
+            DiffScope::Track,
+            None,
+        );
+        let genre = diff.tracks[0]
+            .fields
+            .iter()
+            .find(|f| f.name == "Genre")
+            .expect("Genre row should be present so the user sees the existing value");
+        assert_eq!(genre.current.as_deref(), Some("Easy Listening"));
+        assert_eq!(
+            genre.proposed.as_deref(),
+            Some("Easy Listening"),
+            "MB has nothing to propose — keep the existing tag",
+        );
+        assert!(
+            !genre.enabled,
+            "Genre row must default to disabled so an unsuspecting Apply doesn't blank a curated tag",
+        );
+    }
+
+    #[test]
+    fn picard_extras_become_unchanged_after_apply() {
+        // Regression: `current` for Picard TXXX fields (RELEASECOUNTRY,
+        // MUSICBRAINZ_*, etc.) and the Media row used to be hardcoded to
+        // `None`. After applying the diff, those fields would re-appear as
+        // deltas on the next `m` press even though the writes succeeded —
+        // the diff comparator simply wasn't reading them back from disk.
+        // This test exercises the full apply → rebuild round trip and
+        // asserts that the second diff sees the fields as unchanged.
+        let dir = fresh_dir("picard-extras-roundtrip");
+        let path = dir.join("Artist").join("Album").join("01 - First.wav");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        write_sine_wav(&path, 1);
+
+        let lib = make_lib_track(&path, "First", 1);
+        let mut rel = make_release("Album", "Artist");
+        rel.country = Some("US".into());
+        rel.status = Some("Official".into());
+        rel.packaging = Some("Jewel Case".into());
+        rel.text_representation = Some(crate::musicbrainz::TextRepresentation {
+            language: Some("eng".into()),
+            script: Some("Latn".into()),
+        });
+        rel.release_group = Some(crate::musicbrainz::ReleaseGroup {
+            id: "rg-1".into(),
+            title: "Album".into(),
+            primary_type: Some("Album".into()),
+            first_release_date: Some("1969".into()),
+            genres: vec![],
+        });
+
+        // Round 1: build + apply.
+        let diff1 = build_release_diff(
+            std::slice::from_ref(&lib),
+            &rel,
+            &dir,
+            DiffScope::Track,
+            None,
+        );
+        // Sanity: the Picard rows should be deltas on the first pass —
+        // file is freshly-written WAV with no tags.
+        for name in [
+            "MUSICBRAINZ_ALBUMTYPE",
+            "MUSICBRAINZ_ALBUMSTATUS",
+            "MUSICBRAINZ_ALBUMPACKAGING",
+            "RELEASECOUNTRY",
+            "SCRIPT",
+            "Media",
+        ] {
+            let f = diff1.tracks[0]
+                .fields
+                .iter()
+                .find(|f| f.name == name)
+                .unwrap_or_else(|| panic!("{name:?} missing on first diff"));
+            assert!(f.enabled, "{name:?} should be a real delta on first build");
+            assert!(f.current.is_none());
+        }
+        let (results, _renames) = apply_release_diff(&diff1);
+        for r in &results {
+            r.as_ref().expect("apply should succeed");
+        }
+
+        // Round 2: rebuild against the same release. After the apply, the
+        // file carries every Picard extra MB proposed — they should now
+        // round-trip as `current == proposed` and come back disabled.
+        let diff2 = build_release_diff(&[lib], &rel, &dir, DiffScope::Track, None);
+        for name in [
+            "MUSICBRAINZ_ALBUMTYPE",
+            "MUSICBRAINZ_ALBUMSTATUS",
+            "MUSICBRAINZ_ALBUMPACKAGING",
+            "RELEASECOUNTRY",
+            "SCRIPT",
+            "Media",
+        ] {
+            let f = diff2.tracks[0]
+                .fields
+                .iter()
+                .find(|f| f.name == name)
+                .unwrap_or_else(|| panic!("{name:?} missing on second diff"));
+            assert_eq!(
+                f.current, f.proposed,
+                "{name:?} should round-trip to unchanged after apply (current={:?}, proposed={:?})",
+                f.current, f.proposed,
+            );
+            assert!(
+                !f.enabled,
+                "{name:?} should be disabled on the second diff — the value is already on disk",
+            );
+        }
+    }
+
+    #[test]
+    fn build_release_diff_marks_acoustid_fingerprint_disabled_when_already_on_disk() {
+        // The row is surfaced unconditionally (the user wants visibility into
+        // existing metadata), but when the on-disk fingerprint already matches
+        // the library value, the row must come back disabled so the apply
+        // path doesn't rewrite the file for a no-op.
         // Write a WAV with an ID3v2 `ACOUSTID_FINGERPRINT` extended-text
         // frame already on disk. (WAV permits an embedded `id3` chunk;
         // lofty/symphonia both honour it. Mirrors the
@@ -1497,13 +1870,16 @@ mod tests {
 
         let rel = make_release("Album", "Artist");
         let diff = build_release_diff(&[lib], &rel, &dir, DiffScope::Track, None);
+        let fp_row = diff.tracks[0]
+            .fields
+            .iter()
+            .find(|f| f.name == "ACOUSTID_FINGERPRINT")
+            .expect("fingerprint row should be present so the user can see the tag");
         assert!(
-            !diff.tracks[0]
-                .fields
-                .iter()
-                .any(|f| f.name == "ACOUSTID_FINGERPRINT"),
-            "should skip row when file already has matching tag"
+            !fp_row.enabled,
+            "ACOUSTID_FINGERPRINT should be disabled when on-disk value matches the library",
         );
+        assert_eq!(fp_row.current, fp_row.proposed);
     }
 
     #[test]

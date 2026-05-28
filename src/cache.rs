@@ -69,7 +69,12 @@ pub struct CachedFile {
 /// Bump history:
 ///   1 → 2 (2026-04): added extended lofty metadata + audio properties
 ///   (composer, isrc, mb_*, replaygain_*, sample_rate, channels, …).
-const CACHE_SCHEMA_VERSION: u32 = 2;
+///   2 → 3 (2026-05): identity-like string fields now trim leading/trailing
+///   whitespace at scan time (legacy taggers space-pad ID3v2 frames). Stale
+///   v2 entries hold "311                           " which would still
+///   poison MB searches and sidebar grouping until re-tagged — force a
+///   re-scan instead.
+const CACHE_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Serialize, Deserialize, Default)]
 struct CachedLibrary {
@@ -208,19 +213,131 @@ pub fn load_dirlib_cache(dir_path: &str, log: &Logger) -> HashMap<String, Cached
             HashMap::new()
         }
         Some(c) if c.schema_version != CACHE_SCHEMA_VERSION => {
-            // A stale schema means newer `Track` fields would silently sit
-            // at `None` for every cached entry until each file's mtime
-            // changed. One forced re-scan is the smaller wart.
-            log(&format!(
-                "zytunes: cache: stored schema {} != current {} — discarding {} cached entries to force re-scan",
-                c.schema_version,
-                CACHE_SCHEMA_VERSION,
-                c.files.len()
-            ));
-            HashMap::new()
+            // Schema-version mismatch: prefer an in-memory migration over a
+            // full re-scan whenever possible. Re-parsing tens of thousands
+            // of audio files takes minutes — orders of magnitude worse than
+            // walking the cached Tracks in RAM. The migration path runs
+            // only the transformation the new version needs; if it can't
+            // express the migration, we fall through to a discard.
+            match migrate_cache(c.schema_version, c.files, log) {
+                Some(files) => {
+                    log(&format!(
+                        "zytunes: cache: migrated {} entries from schema {} to {}",
+                        files.len(),
+                        c.schema_version,
+                        CACHE_SCHEMA_VERSION,
+                    ));
+                    files
+                }
+                None => {
+                    log(&format!(
+                        "zytunes: cache: schema {} not migratable to {} — discarding entries to force re-scan",
+                        c.schema_version, CACHE_SCHEMA_VERSION,
+                    ));
+                    HashMap::new()
+                }
+            }
         }
         Some(c) => c.files,
         None => HashMap::new(),
+    }
+}
+
+/// Best-effort in-memory upgrade of cached entries between schema versions.
+/// Avoids the multi-minute full re-scan that an outright discard would
+/// trigger on a tens-of-thousands-of-files library.
+///
+/// Returns `Some(files)` when every step from `from_version` to
+/// `CACHE_SCHEMA_VERSION` could be applied to the existing data; `None`
+/// when the gap is too large or the version is unknown (caller discards).
+///
+/// Migration steps run in order so multi-version jumps compose. Each step
+/// must be pure RAM work — no disk reads of the source audio. If a future
+/// schema bump genuinely needs to re-read files, return `None` here and
+/// fall back to the rescan path.
+fn migrate_cache(
+    from_version: u32,
+    mut files: HashMap<String, CachedFile>,
+    log: &Logger,
+) -> Option<HashMap<String, CachedFile>> {
+    let mut current = from_version;
+
+    // Step 2 → 3: trim whitespace on identity-like string fields. v2
+    // entries from legacy taggers hold values like Artist="311           "
+    // that poison MB queries and sidebar grouping. Mirror the canonical
+    // list in `dirlib::track_from_lofty` — free-form fields (comment,
+    // description, lyrics) keep their whitespace.
+    if current == 2 {
+        let mut trimmed = 0u64;
+        for entry in files.values_mut() {
+            let t = &mut entry.track;
+            let trim_string = |s: &mut String, dirty: &mut bool| {
+                let stripped = s.trim();
+                if stripped.len() != s.len() {
+                    *s = stripped.to_string();
+                    *dirty = true;
+                }
+            };
+            let trim_opt = |o: &mut Option<String>, dirty: &mut bool| {
+                if let Some(s) = o.as_mut() {
+                    trim_string(s, dirty);
+                    if s.is_empty() {
+                        *o = None;
+                        *dirty = true;
+                    }
+                }
+            };
+            let mut dirty = false;
+            trim_string(&mut t.name, &mut dirty);
+            trim_string(&mut t.artist, &mut dirty);
+            trim_string(&mut t.album, &mut dirty);
+            for field in [
+                &mut t.album_artist,
+                &mut t.composer,
+                &mut t.conductor,
+                &mut t.lyricist,
+                &mut t.genre,
+                &mut t.initial_key,
+                &mut t.mood,
+                &mut t.language,
+                &mut t.isrc,
+                &mut t.barcode,
+                &mut t.catalog_number,
+                &mut t.publisher,
+                &mut t.copyright,
+                &mut t.encoder,
+                &mut t.encoder_settings,
+                &mut t.original_artist,
+                &mut t.original_album,
+                &mut t.original_release_date,
+                &mut t.mb_track_id,
+                &mut t.mb_recording_id,
+                &mut t.mb_release_id,
+                &mut t.mb_release_group_id,
+                &mut t.mb_artist_id,
+                &mut t.mb_release_artist_id,
+                &mut t.mb_work_id,
+                &mut t.replaygain_track_gain,
+                &mut t.replaygain_track_peak,
+                &mut t.replaygain_album_gain,
+                &mut t.replaygain_album_peak,
+            ] {
+                trim_opt(field, &mut dirty);
+            }
+            if dirty {
+                trimmed += 1;
+            }
+        }
+        log(&format!(
+            "zytunes: cache: v2→v3 trimmed whitespace on {trimmed} entries (no file reads needed)"
+        ));
+        current = 3;
+    }
+
+    if current == CACHE_SCHEMA_VERSION {
+        Some(files)
+    } else {
+        None
     }
 }
 
@@ -275,6 +392,68 @@ mod tests {
             Some(v) => std::env::set_var("ZYTUNES_CACHE_DIR", v),
             None => std::env::remove_var("ZYTUNES_CACHE_DIR"),
         }
+    }
+
+    #[test]
+    fn cached_library_v2_to_v3_migrates_in_memory_without_rescan() {
+        // Regression: bumping the schema used to nuke the cache and force a
+        // full lofty re-scan of every file, which takes minutes on a real
+        // library. v2 → v3 only changed how identity strings are trimmed,
+        // so the migration runs entirely in RAM — verify the migrated
+        // cache survives the load and the padded values come out trimmed.
+        let dir_path = "/tmp/zytunes-cache-v2-to-v3-test";
+        let cache_name = dirlib_cache_name(dir_path);
+        let Some(_) = cache_path(&cache_name) else {
+            return; // HOME not set — skip.
+        };
+
+        let v2 = CachedLibrary {
+            root: dir_path.to_string(),
+            schema_version: 2,
+            files: HashMap::from([(
+                format!("{dir_path}/padded.m4a"),
+                CachedFile {
+                    fingerprint: FileFingerprint {
+                        mtime_secs: 0,
+                        size: 0,
+                    },
+                    track: crate::library::Track {
+                        id: 1,
+                        name: "Title  ".into(),
+                        artist: "311                           ".into(),
+                        album: "  Album Name  ".into(),
+                        album_artist: Some("  311  ".into()),
+                        isrc: Some("   USRC11111111   ".into()),
+                        comment: Some("  intentional padding  ".into()),
+                        ..Default::default()
+                    },
+                },
+            )]),
+        };
+        let log = default_logger();
+        save_raw(dir_path, &v2, &log);
+
+        let loaded = load_dirlib_cache(dir_path, &log);
+        assert_eq!(
+            loaded.len(),
+            1,
+            "v2→v3 must migrate in place, not discard the cache"
+        );
+        let track = &loaded
+            .get(&format!("{dir_path}/padded.m4a"))
+            .expect("migrated entry should be present")
+            .track;
+        assert_eq!(track.name, "Title");
+        assert_eq!(track.artist, "311");
+        assert_eq!(track.album, "Album Name");
+        assert_eq!(track.album_artist.as_deref(), Some("311"));
+        assert_eq!(track.isrc.as_deref(), Some("USRC11111111"));
+        // Free-form fields keep their whitespace (mirrors track_from_lofty).
+        assert_eq!(
+            track.comment.as_deref(),
+            Some("  intentional padding  "),
+            "comment is free-form and must NOT be trimmed",
+        );
     }
 
     #[test]

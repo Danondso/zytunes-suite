@@ -228,6 +228,13 @@ impl MusicBrainzClient {
     /// can log it for diagnostics without having to reconstruct it
     /// themselves (and risk drifting out of sync with the real impl).
     pub fn search_releases_url(&self, artist: &str, album: &str, limit: u32) -> String {
+        // Defensive trim: callers should already pass clean values (dirlib
+        // normalises identity tags at scan time), but a stale cache or a
+        // future caller writing through this path could still hand us
+        // "311                           " and get zero Solr hits. Trim
+        // belt-and-suspenders style.
+        let artist = artist.trim();
+        let album = album.trim();
         let query = format!(
             "release:\"{}\" AND artist:\"{}\"",
             lucene_escape(album),
@@ -940,6 +947,19 @@ mod tests {
         // Lucene operators inside quoted phrases are taken literally so they
         // don't need escaping — only the two phrase-terminators do.
         assert_eq!(lucene_escape("a + b - c"), "a + b - c");
+    }
+
+    #[test]
+    fn search_releases_url_trims_padded_inputs() {
+        // Regression: legacy iTunes-style m4a tags surface artist/album
+        // with trailing-space padding. The MB query builder must strip it
+        // so the literal phrase query "311" matches, not the doomed
+        // "311                           " which Solr would never satisfy.
+        let c = MusicBrainzClient::new(Some("ua".into()));
+        let padded = c.search_releases_url("311                           ", "  ", 12);
+        let clean = c.search_releases_url("311", "", 12);
+        assert_eq!(padded, clean);
+        assert!(padded.contains("artist%3A%22311%22"));
     }
 
     #[test]

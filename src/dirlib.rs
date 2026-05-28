@@ -444,11 +444,31 @@ fn build_track(path: &Path, id: u64) -> Track {
 /// frames across the whole file to compute duration, but the per-file cache
 /// makes sure we only pay that cost once per file per change.
 pub(crate) fn track_from_lofty(path: &Path, id: u64) -> Option<Track> {
+    use lofty::config::ParseOptions;
     use lofty::file::{AudioFile, TaggedFileExt};
     use lofty::prelude::ItemKey;
+    use lofty::probe::Probe;
     use lofty::tag::Accessor;
 
-    let tagged = lofty::probe::read_from_path(path).ok()?;
+    // Skip cover art on scan-time tag reads. The TUI renders art via the
+    // separate per-album cache in `tui::background::extract_album_art`, so
+    // the scanner doesn't need it — but the default `read_from_path` parses
+    // every APIC frame, allocating and discarding 500KB-1MB per Picard-
+    // tagged file. On a 60k-file first-run scan that's tens of GB of
+    // wasted alloc + memcpy. `read_properties(true)` stays on because
+    // duration / sample_rate / etc. populate library columns and AcoustID
+    // queries.
+    let tagged = Probe::open(path)
+        .ok()?
+        .options(
+            ParseOptions::new()
+                .read_cover_art(false)
+                .read_properties(true),
+        )
+        .guess_file_type()
+        .ok()?
+        .read()
+        .ok()?;
     let tag = tagged.primary_tag().or_else(|| tagged.first_tag())?;
 
     // Require at least a title or artist to consider the tag useful
@@ -457,18 +477,24 @@ pub(crate) fn track_from_lofty(path: &Path, id: u64) -> Option<Track> {
         return None;
     }
 
-    let name = tag
-        .title()
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| stem(path));
-    let artist = tag
-        .artist()
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| parent_name(path, 2));
-    let album = tag
-        .album()
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| parent_name(path, 1));
+    // Identity-like fields are routinely space-padded by legacy taggers
+    // (fixed-width ID3v2 frames, some CD-ripper firmwares). Strip leading/
+    // trailing whitespace at scan time so the library doesn't carry the
+    // padding into MB searches (which would forward "311                 "
+    // to Solr as a literal phrase and return zero hits), sidebar grouping
+    // (which would split "311" and "311 " into two artists), or the
+    // tag-manager diff (which would surface the padding as an apparent
+    // delta against the real MB value). Free-form fields (comment, lyrics,
+    // description) are NOT trimmed — users may have intentional whitespace.
+    let trim_opt = |o: Option<String>| -> Option<String> {
+        o.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    };
+
+    let name = trim_opt(tag.title().map(|s| s.to_string())).unwrap_or_else(|| stem(path));
+    let artist =
+        trim_opt(tag.artist().map(|s| s.to_string())).unwrap_or_else(|| parent_name(path, 2));
+    let album =
+        trim_opt(tag.album().map(|s| s.to_string())).unwrap_or_else(|| parent_name(path, 1));
 
     // Prefer an already-embedded ACOUSTID_FINGERPRINT tag (written by Picard
     // / fpcalc) over computing one — we've already parsed the tagged file,
@@ -476,7 +502,13 @@ pub(crate) fn track_from_lofty(path: &Path, id: u64) -> Option<Track> {
     // The scan loop backfills via `fingerprint_for` when this returns None.
     let acoustic_id = crate::fingerprint::read_embedded_fingerprint(path);
 
-    let s = |key: ItemKey| tag.get_string(&key).map(|v| v.to_string());
+    // Raw string lookup — preserves padding. Used only for free-form text
+    // fields (comment, lyrics, description) where whitespace may be
+    // intentional. Most callers want the trimmed variant below.
+    let s_raw = |key: ItemKey| tag.get_string(&key).map(|v| v.to_string());
+    // Trimmed + nil-if-empty lookup. Identity / MBID / numeric-ish fields
+    // route through this so a tag of "   " becomes None, not Some("   ").
+    let s = |key: ItemKey| trim_opt(s_raw(key));
     let parsed = |key: ItemKey| s(key).and_then(|v| v.parse().ok());
 
     let props = tagged.properties();
@@ -487,7 +519,7 @@ pub(crate) fn track_from_lofty(path: &Path, id: u64) -> Option<Track> {
         name,
         artist,
         album,
-        genre: tag.genre().map(|s| s.to_string()),
+        genre: trim_opt(tag.genre().map(|s| s.to_string())),
         year: tag.year(),
         track_number: tag.track(),
         disc_number: tag.disk(),
@@ -513,8 +545,8 @@ pub(crate) fn track_from_lofty(path: &Path, id: u64) -> Option<Track> {
         composer: s(ItemKey::Composer),
         conductor: s(ItemKey::Conductor),
         lyricist: s(ItemKey::Lyricist),
-        comment: s(ItemKey::Comment),
-        description: s(ItemKey::Description),
+        comment: s_raw(ItemKey::Comment),
+        description: s_raw(ItemKey::Description),
         // ID3v2 stores BPM as `IntegerBpm` (TBPM frame); VorbisComment/MP4
         // use the decimal `Bpm`. Try the decimal form first, then fall back.
         bpm: s(ItemKey::Bpm)
@@ -538,7 +570,7 @@ pub(crate) fn track_from_lofty(path: &Path, id: u64) -> Option<Track> {
         original_release_date: s(ItemKey::OriginalReleaseDate),
         track_total: parsed(ItemKey::TrackTotal),
         disc_total: parsed(ItemKey::DiscTotal),
-        lyrics: s(ItemKey::Lyrics),
+        lyrics: s_raw(ItemKey::Lyrics),
         rating: s(ItemKey::Popularimeter).and_then(|v| v.parse::<u8>().ok()),
 
         mb_track_id: s(ItemKey::MusicBrainzTrackId),
@@ -1139,6 +1171,45 @@ mod tests {
             "cached scan must preserve the acoustic_id"
         );
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn track_from_lofty_trims_whitespace_padded_identity_tags() {
+        // Regression: legacy taggers (and one of the user's iTunes-tagged
+        // m4a files) space-pad fixed-width ID3v2 frames, producing tags
+        // like Artist="311                           ". Before the trim,
+        // those padded strings reached the MB search builder verbatim and
+        // Solr returned zero hits. Verify the scan pipeline normalises
+        // identity-like fields end-to-end.
+        let dir = std::env::temp_dir().join("zytunes-dirlib-trim-padding");
+        let _ = fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("padded.wav");
+        write_sine_wav(&path, 1);
+        // Write an ID3v2 tag with deliberately space-padded values.
+        {
+            use id3::frame::ExtendedText;
+            use id3::{Tag, TagLike, Version};
+            let mut tag = Tag::new();
+            tag.set_title("Track Title   ");
+            tag.set_artist("311                           ");
+            tag.set_album("  Album Name  ");
+            tag.add_frame(ExtendedText {
+                description: "ISRC".into(),
+                value: "  USRC11111111  ".into(),
+            });
+            tag.write_to_path(&path, Version::Id3v24).unwrap();
+        }
+
+        let track =
+            track_from_lofty(&path, 1).expect("track_from_lofty should parse the tagged WAV");
+        assert_eq!(track.name, "Track Title");
+        assert_eq!(
+            track.artist, "311",
+            "trailing padding must be stripped so MB Solr queries match"
+        );
+        assert_eq!(track.album, "Album Name");
         let _ = fs::remove_dir_all(&dir);
     }
 

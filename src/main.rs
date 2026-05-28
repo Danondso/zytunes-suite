@@ -102,6 +102,7 @@ fn run(args: &[String]) -> Result<(), String> {
                     or pass a directory: zytunes video-sync <dir>")?;
             cmd_video_sync(&dir)
         }
+        "scan" => cmd_scan(),
         "probe" => cmd_probe(&args[2..]),
         "help" | "--help" | "-h" => {
             println!("zytunes — sync music to a Zune or iPod Classic\n");
@@ -114,6 +115,7 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("  photo-sync [dir]       Sync photos to the Zune");
             println!("  video-sync [dir]       Sync videos to the Zune");
             println!("  library [query]        Browse the music library");
+            println!("  scan                   Pre-warm the dirlib cache without opening the TUI");
             println!("  help                   Show this help");
             println!("\nSync types:");
             println!("  sync artist <name>     Sync all tracks by an artist");
@@ -313,6 +315,75 @@ fn cmd_sync(args: &[String]) -> Result<(), String> {
         pushable.len()
     );
 
+    Ok(())
+}
+
+/// Pre-warm the dirlib cache by scanning the music directory and printing
+/// progress to stdout. Useful for large libraries where the first scan is
+/// expensive (audio decode + chromaprint per file without an embedded
+/// fingerprint) — run this in a background terminal while you keep working,
+/// then the TUI launches instantly afterward against a warm cache.
+///
+/// Inherits the `fingerprinting` config knob so users who'd rather skip
+/// chromaprint compute can disable it for the prewarm and just populate
+/// tags + cached fingerprints.
+fn cmd_scan() -> Result<(), String> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+    use zytunes::dirlib::{DirectoryLibrary, ScanOptions, ScanProgress};
+    use zytunes::library::MusicLibrary;
+
+    let dir = zytunes::resolve_music_dir(load_config_field("music_dir").as_deref())?;
+    println!("Scanning {dir}...");
+
+    let start = Instant::now();
+    // Throttle progress prints to ~10 Hz so we don't spam the terminal with
+    // 60k lines on a fast cache-hit pass. The last-printed counter doubles
+    // as the throttle key — print only when `completed` crosses the next
+    // 1% bucket (or whenever total ≤ 100, every entry).
+    let last_pct = AtomicU64::new(u64::MAX);
+    let last_count = AtomicU64::new(0);
+
+    let opts = ScanOptions {
+        fingerprint: load_config_bool("fingerprinting").unwrap_or(true),
+        ..ScanOptions::default()
+    };
+
+    let lib = DirectoryLibrary::scan_with_options(&dir, opts, |progress: ScanProgress| {
+        last_count.store(progress.completed, Ordering::Relaxed);
+        let pct = progress
+            .completed
+            .checked_mul(100)
+            .and_then(|n| n.checked_div(progress.total))
+            .unwrap_or(0)
+            .min(100);
+        let prev = last_pct.load(Ordering::Relaxed);
+        // Print on every percent bucket change, or on the very first
+        // update (total announce), or on completion.
+        let should_print =
+            prev != pct || progress.completed == 0 || progress.completed == progress.total;
+        if !should_print {
+            return;
+        }
+        last_pct.store(pct, Ordering::Relaxed);
+        // Use \r so the terminal collapses progress into one updating
+        // line. Final \n is emitted after the scan returns.
+        let mut stdout = std::io::stdout().lock();
+        let _ = write!(
+            stdout,
+            "\r  {:>5} / {:>5}  ({pct:>2}%) ",
+            progress.completed, progress.total
+        );
+        let _ = stdout.flush();
+    })?;
+    let total_done = last_count.load(Ordering::Relaxed);
+    println!(
+        "\nCached {} tracks ({} files walked) in {:.1}s",
+        lib.track_count(),
+        total_done,
+        start.elapsed().as_secs_f64(),
+    );
     Ok(())
 }
 

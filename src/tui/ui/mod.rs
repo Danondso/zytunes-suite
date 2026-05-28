@@ -3344,10 +3344,12 @@ fn draw_tag_manager_overlay(f: &mut Frame, app: &App) {
             " Tag manager — edit query (Enter to search, Esc to close) "
         }
         TagManagerPhase::SearchPending => " Tag manager — searching MusicBrainz… ",
-        TagManagerPhase::SearchResults => " Tag manager — pick a release (Enter / Esc) ",
+        TagManagerPhase::SearchResults => {
+            " Tag manager — ↑↓ select · Enter pick · s edit query · Esc back "
+        }
         TagManagerPhase::LoadingRelease => " Tag manager — loading release… ",
         TagManagerPhase::DiffPreview => {
-            " Tag manager — j/k scroll · PgUp/PgDn · Space toggle · Enter apply · Esc back "
+            " Tag manager — j/k · Space · a/n · c fold · Enter apply · s search · Esc "
         }
         TagManagerPhase::Applying => " Tag manager — applying… ",
         TagManagerPhase::Done => " Tag manager — done (any key to close) ",
@@ -3391,8 +3393,13 @@ fn draw_tag_manager_overlay(f: &mut Frame, app: &App) {
 }
 
 fn draw_centered_line(f: &mut Frame, area: Rect, msg: &str, color: Color) {
+    // Wrap long messages so multi-sentence error strings (e.g. the
+    // tag-manager AcoustID-no-MB-link error) don't get truncated at the
+    // overlay's right edge. `trim: true` collapses leading whitespace on
+    // wrapped lines so short messages still center cleanly.
     let para = Paragraph::new(msg)
         .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true })
         .style(Style::default().fg(color));
     f.render_widget(para, area);
 }
@@ -3476,7 +3483,14 @@ fn draw_tag_manager_search_results(
         .iter()
         .enumerate()
         .map(|(i, hit)| {
-            let artist = render_artist_credit(&hit.artist_credit);
+            let artist = {
+                let rendered = render_artist_credit(&hit.artist_credit);
+                if rendered.is_empty() {
+                    "(unknown artist)".to_string()
+                } else {
+                    rendered
+                }
+            };
             let year = hit
                 .date
                 .as_deref()
@@ -3604,38 +3618,49 @@ fn draw_tag_manager_diff(
     f.render_widget(Paragraph::new(counts_line), rows[1]);
 
     // Flatten the per-track field list into one table, with per-track divider
-    // rows so the user sees structure.
+    // rows so the user sees structure. Rows are sourced from the overlay's
+    // `flattened_rows` so the renderer and the navigation/focus model can
+    // never drift — if a row isn't in the navigable list (e.g. fields of a
+    // collapsed track), it doesn't get rendered.
     struct DisplayRow<'a> {
         kind: DisplayKind<'a>,
         focused: bool,
     }
     enum DisplayKind<'a> {
-        TrackHeader(&'a zytunes::tag_ops::TrackTagDiff),
+        TrackHeader {
+            track: &'a zytunes::tag_ops::TrackTagDiff,
+            collapsed: bool,
+        },
         Field(&'a zytunes::tag_ops::FieldDiff),
     }
 
-    let mut display_rows: Vec<DisplayRow> = Vec::new();
-    // Pre-resolve the focus path to mark the row visually.
-    let focused_path = overlay
-        .flattened_field_paths
-        .get(overlay.focused_row)
-        .copied();
-
-    for (ti, track) in diff.tracks.iter().enumerate() {
-        if track.fields.is_empty() {
-            continue;
-        }
-        display_rows.push(DisplayRow {
-            kind: DisplayKind::TrackHeader(track),
-            focused: false,
-        });
-        for (fi, field) in track.fields.iter().enumerate() {
-            display_rows.push(DisplayRow {
-                kind: DisplayKind::Field(field),
-                focused: focused_path == Some((ti, fi)),
-            });
-        }
-    }
+    let display_rows: Vec<DisplayRow> = overlay
+        .flattened_rows
+        .iter()
+        .enumerate()
+        .filter_map(|(row_idx, row)| {
+            let focused = row_idx == overlay.focused_row;
+            match *row {
+                crate::app::FocusRow::Header(ti) => {
+                    let track = diff.tracks.get(ti)?;
+                    Some(DisplayRow {
+                        kind: DisplayKind::TrackHeader {
+                            track,
+                            collapsed: overlay.collapsed_tracks.contains(&ti),
+                        },
+                        focused,
+                    })
+                }
+                crate::app::FocusRow::Field(ti, fi) => {
+                    let field = diff.tracks.get(ti)?.fields.get(fi)?;
+                    Some(DisplayRow {
+                        kind: DisplayKind::Field(field),
+                        focused,
+                    })
+                }
+            }
+        })
+        .collect();
 
     if display_rows.is_empty() {
         draw_centered_line(
@@ -3650,22 +3675,49 @@ fn draw_tag_manager_diff(
     let table_rows: Vec<Row> = display_rows
         .iter()
         .map(|dr| match &dr.kind {
-            DisplayKind::TrackHeader(track) => {
-                // Build a rich header: "Track N · <current title> → <proposed
-                // title> · (k changes)". Pulls from the Title and Track #
-                // fields so the user can scan per-track without diving into
-                // every row. The change count counts ENABLED fields only.
+            DisplayKind::TrackHeader { track, collapsed } => {
+                // Build a rich header: "▼/▶ Track N · <title> · (k changes)".
+                // The fold indicator tells the user whether to expect field
+                // rows below — `▼` open, `▶` collapsed. The change count
+                // counts ENABLED fields only so collapsed tracks still show
+                // how much they hide.
                 let label = render_track_header(track);
+                let arrow = if *collapsed { "▶ " } else { "▼ " };
+                let header_style = if dr.focused {
+                    Style::default()
+                        .bg(t.selection_bg)
+                        .fg(t.selection_text)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                        .fg(t.accent_secondary)
+                        .bg(t.main_bg)
+                        .add_modifier(Modifier::BOLD)
+                };
                 Row::new(vec![
-                    Cell::from("──"),
-                    Cell::from(label).style(Style::default().add_modifier(Modifier::BOLD)),
+                    Cell::from(arrow),
+                    Cell::from(label),
                     Cell::from(""),
                     Cell::from(""),
                 ])
-                .style(Style::default().fg(t.accent_secondary).bg(t.main_bg))
+                .style(header_style)
             }
             DisplayKind::Field(field) => {
-                let mark = if field.enabled { "[x]" } else { "[ ]" };
+                // The diff now carries every field, including unchanged
+                // ones (the user wanted to see existing metadata even where
+                // MB matches). Three-state marker so unchanged rows don't
+                // look like a checkbox the user forgot to tick:
+                //   [x]  changed + applying
+                //   [ ]  changed + skipping
+                //    =   unchanged (no-op, toggle is blocked)
+                let changed = field.current != field.proposed;
+                let mark = if !changed {
+                    " = "
+                } else if field.enabled {
+                    "[x]"
+                } else {
+                    "[ ]"
+                };
                 // Filename diffs come in as full paths; collapse to basenames
                 // so the column doesn't blow out and the actual delta (the
                 // filename) is what the user sees.
@@ -3682,6 +3734,8 @@ fn draw_tag_manager_diff(
                 };
                 let style = if dr.focused {
                     Style::default().bg(t.selection_bg).fg(t.selection_text)
+                } else if !changed {
+                    Style::default().fg(t.dim_text)
                 } else if field.enabled {
                     Style::default().fg(t.sidebar_text)
                 } else {
