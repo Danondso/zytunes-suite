@@ -642,7 +642,7 @@ impl MusicLibrary for DirectoryLibrary {
         let mut artists: Vec<&str> = self
             .tracks
             .values()
-            .map(|t| t.artist.as_str())
+            .map(|t| t.grouping_artist())
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect();
@@ -654,7 +654,7 @@ impl MusicLibrary for DirectoryLibrary {
         let mut albums: Vec<(&str, &str)> = self
             .tracks
             .values()
-            .map(|t| (t.artist.as_str(), t.album.as_str()))
+            .map(|t| (t.grouping_artist(), t.album.as_str()))
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect();
@@ -667,7 +667,7 @@ impl MusicLibrary for DirectoryLibrary {
         Box::new(
             self.tracks
                 .values()
-                .filter(move |t| t.artist.eq_ignore_ascii_case(&artist)),
+                .filter(move |t| t.grouping_artist().eq_ignore_ascii_case(&artist)),
         )
     }
 
@@ -688,7 +688,8 @@ impl MusicLibrary for DirectoryLibrary {
         let artist = artist.to_string();
         let album = album.to_string();
         Box::new(self.tracks.values().filter(move |t| {
-            t.album.eq_ignore_ascii_case(&album) && t.artist.eq_ignore_ascii_case(&artist)
+            t.album.eq_ignore_ascii_case(&album)
+                && t.grouping_artist().eq_ignore_ascii_case(&artist)
         }))
     }
 
@@ -1369,5 +1370,106 @@ mod tests {
         assert!(!paths.iter().any(|p| p == old.to_str().unwrap()));
         assert!(paths.iter().any(|p| p == new.to_str().unwrap()));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Two tracks credited to different per-track artists but sharing the
+    /// same `album_artist` must group under one sidebar entry — and the
+    /// resulting album lookup must return both. This is the *NSYNC feat.
+    /// Lisa Lopes case: the credited `artist` includes the feature, but
+    /// the canonical `album_artist` is just "*NSYNC" and the album should
+    /// not split in the sidebar.
+    #[test]
+    fn feat_tracks_group_by_album_artist() {
+        let mut tracks = HashMap::new();
+        tracks.insert(
+            1,
+            Track {
+                id: 1,
+                name: "Bye Bye Bye".into(),
+                artist: "*NSYNC".into(),
+                album: "No Strings Attached".into(),
+                album_artist: Some("*NSYNC".into()),
+                ..Default::default()
+            },
+        );
+        tracks.insert(
+            2,
+            Track {
+                id: 2,
+                name: "Space Cowboy".into(),
+                artist: "*NSYNC feat. Lisa \"Left Eye\" Lopes".into(),
+                album: "No Strings Attached".into(),
+                album_artist: Some("*NSYNC".into()),
+                ..Default::default()
+            },
+        );
+        let lib = DirectoryLibrary {
+            tracks,
+            root: "/tmp/feat-test".into(),
+        };
+
+        let artists = lib.artists();
+        assert_eq!(artists, vec!["*NSYNC"], "feat track must not sidebar-split");
+
+        let by_artist: Vec<&str> = lib
+            .artist_tracks("*NSYNC")
+            .map(|t| t.name.as_str())
+            .collect();
+        assert_eq!(
+            by_artist.len(),
+            2,
+            "both tracks should resolve under *NSYNC"
+        );
+
+        let album: Vec<&str> = lib
+            .album_tracks_by_artist("*NSYNC", "No Strings Attached")
+            .map(|t| t.name.as_str())
+            .collect();
+        assert_eq!(
+            album.len(),
+            2,
+            "album under album_artist key should be whole"
+        );
+
+        let albums = lib.albums();
+        assert_eq!(albums, vec![("*NSYNC", "No Strings Attached")]);
+    }
+
+    /// When `album_artist` is absent (or blank), grouping must fall back to
+    /// the credited `artist` — otherwise libraries that never set
+    /// album_artist would collapse every track under whatever the fallback
+    /// was. Also covers the whitespace-only edge case.
+    #[test]
+    fn missing_album_artist_falls_back_to_artist() {
+        let mut tracks = HashMap::new();
+        tracks.insert(
+            1,
+            Track {
+                id: 1,
+                name: "Karma Police".into(),
+                artist: "Radiohead".into(),
+                album: "OK Computer".into(),
+                album_artist: None,
+                ..Default::default()
+            },
+        );
+        tracks.insert(
+            2,
+            Track {
+                id: 2,
+                name: "Idioteque".into(),
+                artist: "Radiohead".into(),
+                album: "Kid A".into(),
+                album_artist: Some("   ".into()), // whitespace-only -> fallback
+                ..Default::default()
+            },
+        );
+        let lib = DirectoryLibrary {
+            tracks,
+            root: "/tmp/no-aa-test".into(),
+        };
+
+        assert_eq!(lib.artists(), vec!["Radiohead"]);
+        assert_eq!(lib.artist_tracks("Radiohead").count(), 2);
     }
 }

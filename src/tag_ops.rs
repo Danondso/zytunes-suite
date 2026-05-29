@@ -2059,4 +2059,71 @@ mod tests {
             .expect("Track # field should be present");
         assert_eq!(track_field.proposed.as_deref(), Some("1"));
     }
+
+    /// When a release's track is credited to "*NSYNC feat. Lisa Lopes" but
+    /// the release-level artist credit is just "*NSYNC", the diff must
+    /// propose the feat-string for `Artist` and the canonical name for
+    /// `Album Artist`. Pairing the feature credit only into `Artist` is
+    /// what lets `dirlib::Track::grouping_artist()` keep the track filed
+    /// under the album's canonical artist.
+    #[test]
+    fn release_diff_splits_feat_artist_from_album_artist() {
+        let dir = fresh_dir("feat-split");
+        let path = dir
+            .join("Artist")
+            .join("Album")
+            .join("01 - Space Cowboy.wav");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        write_sine_wav(&path, 1);
+
+        let mut rel = make_release("No Strings Attached", "*NSYNC");
+        // Override the first track's per-recording credit to include a feature.
+        rel.media[0].tracks[0].title = "Space Cowboy".into();
+        rel.media[0].tracks[0].artist_credit = vec![
+            ArtistCredit {
+                name: "*NSYNC".into(),
+                joinphrase: Some(" feat. ".into()),
+                artist: Some(Artist {
+                    id: "art-1".into(),
+                    name: "*NSYNC".into(),
+                    sort_name: None,
+                }),
+            },
+            ArtistCredit {
+                name: "Lisa \"Left Eye\" Lopes".into(),
+                joinphrase: None,
+                artist: Some(Artist {
+                    id: "art-feat".into(),
+                    name: "Lisa \"Left Eye\" Lopes".into(),
+                    sort_name: None,
+                }),
+            },
+        ];
+
+        let lib = make_lib_track(&path, "Space Cowboy", 1);
+        let diff = build_release_diff(&[lib], &rel, &dir, DiffScope::Track, None);
+        let track = &diff.tracks[0];
+
+        let artist_field = track
+            .fields
+            .iter()
+            .find(|f| f.name == "Artist")
+            .expect("Artist field present");
+        assert_eq!(
+            artist_field.proposed.as_deref(),
+            Some("*NSYNC feat. Lisa \"Left Eye\" Lopes"),
+            "Artist should carry the per-recording credit including the feature",
+        );
+
+        let album_artist_field = track
+            .fields
+            .iter()
+            .find(|f| f.name == "Album Artist")
+            .expect("Album Artist field present");
+        assert_eq!(
+            album_artist_field.proposed.as_deref(),
+            Some("*NSYNC"),
+            "Album Artist must come from the release-level credit so dirlib groups under the canonical artist",
+        );
+    }
 }

@@ -268,25 +268,25 @@ fn migrate_cache(
     // list in `dirlib::track_from_lofty` — free-form fields (comment,
     // description, lyrics) keep their whitespace.
     if current == 2 {
+        fn trim_string(s: &mut String, dirty: &mut bool) {
+            let stripped = s.trim();
+            if stripped.len() != s.len() {
+                *s = stripped.to_string();
+                *dirty = true;
+            }
+        }
+        fn trim_opt(o: &mut Option<String>, dirty: &mut bool) {
+            if let Some(s) = o.as_mut() {
+                trim_string(s, dirty);
+                if s.is_empty() {
+                    *o = None;
+                    *dirty = true;
+                }
+            }
+        }
         let mut trimmed = 0u64;
         for entry in files.values_mut() {
             let t = &mut entry.track;
-            let trim_string = |s: &mut String, dirty: &mut bool| {
-                let stripped = s.trim();
-                if stripped.len() != s.len() {
-                    *s = stripped.to_string();
-                    *dirty = true;
-                }
-            };
-            let trim_opt = |o: &mut Option<String>, dirty: &mut bool| {
-                if let Some(s) = o.as_mut() {
-                    trim_string(s, dirty);
-                    if s.is_empty() {
-                        *o = None;
-                        *dirty = true;
-                    }
-                }
-            };
             let mut dirty = false;
             trim_string(&mut t.name, &mut dirty);
             trim_string(&mut t.artist, &mut dirty);

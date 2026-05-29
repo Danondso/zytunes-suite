@@ -130,6 +130,20 @@ pub struct Track {
     pub file_size_bytes: Option<u64>,
 }
 
+impl Track {
+    /// Artist key used for sidebar grouping: prefers a non-empty `album_artist`
+    /// (so "*NSYNC feat. Lisa Lopes" tracks sit under "*NSYNC" alongside the
+    /// rest of the album), falling back to the credited `artist` when no
+    /// album_artist tag is set.
+    pub fn grouping_artist(&self) -> &str {
+        self.album_artist
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&self.artist)
+    }
+}
+
 /// Trait abstracting a music library backend.
 ///
 /// The track-returning methods yield `Box<dyn Iterator>` so streaming callers
