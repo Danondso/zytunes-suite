@@ -11,7 +11,7 @@ use lofty::prelude::{Accessor, ItemKey};
 use lofty::tag::Tag;
 
 use super::parse::DeviceEntry;
-use super::DeviceSession;
+use super::{DeviceError, DeviceSession};
 
 /// An active session with a connected iPod.
 ///
@@ -35,7 +35,7 @@ impl IpodSession {
     ///    `prepare_itdb_for_write`)
     /// 2. Writes iTunesDB + ArtworkDB via the ipod-db serializer (signs hash58)
     /// 3. Deletes stale Play Counts / iTunesStats so the firmware regenerates
-    fn flush(&mut self) -> Result<(), String> {
+    fn flush(&mut self) -> Result<(), DeviceError> {
         self.db.reassign_track_ids();
         ipod_db::itunesdb_write::write_to_disk(&self.db, self.firewire_id.as_ref())
             .map_err(|e| format!("Failed to write iTunesDB: {}", e))?;
@@ -57,7 +57,7 @@ impl IpodSession {
 
     /// Delete the track with the given dbid: remove its file from disk,
     /// drop it from the database, and flush. Used by `rm` and `rm_by_id`.
-    fn remove_track_by_dbid(&mut self, dbid: u64) -> Result<(), String> {
+    fn remove_track_by_dbid(&mut self, dbid: u64) -> Result<(), DeviceError> {
         let track = self
             .db
             .find_track(dbid)
@@ -73,7 +73,7 @@ impl IpodSession {
 }
 
 impl DeviceSession for IpodSession {
-    fn ls(&mut self, path: &str) -> Result<Vec<DeviceEntry>, String> {
+    fn ls(&mut self, path: &str) -> Result<Vec<DeviceEntry>, DeviceError> {
         // Convert iPod colon-path or slash-path to real filesystem path.
         let real = if path.starts_with(':') {
             ipod_db::fs::real_path(self.mount(), path)
@@ -114,10 +114,10 @@ impl DeviceSession for IpodSession {
         &mut self,
         local_path: &str,
         _meta: Option<&super::TrackMeta>,
-    ) -> Result<u64, String> {
+    ) -> Result<u64, DeviceError> {
         let src = PathBuf::from(local_path);
         if !src.exists() {
-            return Err(format!("File not found: {}", local_path));
+            return Err(format!("File not found: {}", local_path).into());
         }
 
         let file_size = std::fs::metadata(&src)
@@ -167,10 +167,10 @@ impl DeviceSession for IpodSession {
             .map(|sr| sr as u16);
 
         let filetype: u32 = match ext.as_str() {
-            "mp3" => 0x4d503320,         // "MP3 "
-            "m4a" | "aac" => 0x4d344120, // "M4A "
-            "wav" => 0x57415620,         // "WAV "
-            _ => 0x4d503320,             // default MP3
+            "mp3" => ipod_db::filetype::MP3,
+            "m4a" | "aac" => ipod_db::filetype::M4A,
+            "wav" => ipod_db::filetype::WAV,
+            _ => ipod_db::filetype::MP3,
         };
 
         // Detect ALAC vs AAC for M4A files — the iPod firmware uses the filetype
@@ -263,7 +263,7 @@ impl DeviceSession for IpodSession {
         Ok(dbid)
     }
 
-    fn rm(&mut self, device_path: &str) -> Result<(), String> {
+    fn rm(&mut self, device_path: &str) -> Result<(), DeviceError> {
         // The path can arrive in several shapes:
         //   * colon-separated iPod path: `:iPod_Control:Music:F00:hash.mp3`
         //   * slash-prefixed filesystem path: `/iPod_Control/Music/F00/hash.mp3`
@@ -292,12 +292,12 @@ impl DeviceSession for IpodSession {
             .map(|t| t.dbid);
 
         let Some(dbid) = dbid else {
-            return Err(format!("Track not found: {}", device_path));
+            return Err(format!("Track not found: {}", device_path).into());
         };
         self.remove_track_by_dbid(dbid)
     }
 
-    fn rm_by_id(&mut self, object_id: u32) -> Result<(), String> {
+    fn rm_by_id(&mut self, object_id: u32) -> Result<(), DeviceError> {
         // The TUI truncates our u64 dbid to u32 when calling rm_by_id.
         // Match on the low 32 bits.
         let dbid = self
@@ -310,7 +310,7 @@ impl DeviceSession for IpodSession {
         self.remove_track_by_dbid(dbid)
     }
 
-    fn cleanup_empty_folders(&mut self) -> Result<usize, String> {
+    fn cleanup_empty_folders(&mut self) -> Result<usize, DeviceError> {
         let music_dir = self.mount().join("iPod_Control").join("Music");
         let mut removed = 0;
 
@@ -331,7 +331,7 @@ impl DeviceSession for IpodSession {
         Ok(removed)
     }
 
-    fn get_storage_info(&mut self) -> Result<(u64, u64), String> {
+    fn get_storage_info(&mut self) -> Result<(u64, u64), DeviceError> {
         let mount = self.mount().to_path_buf();
 
         // Use statvfs-style info. On Unix, we can get this via std::fs metadata
@@ -359,7 +359,7 @@ impl DeviceSession for IpodSession {
         Ok((total, free))
     }
 
-    fn collect_all_tracks(&mut self, _path: &str) -> Result<Vec<DeviceEntry>, String> {
+    fn collect_all_tracks(&mut self, _path: &str) -> Result<Vec<DeviceEntry>, DeviceError> {
         // Build "Artist/Album/Title.ext" — the TUI's build_device_index splits
         // on '/' into (artist, album, filename) and strips the final extension
         // for display. Using the track title (not the hashed on-device filename)
@@ -377,10 +377,10 @@ impl DeviceSession for IpodSession {
                     object_id: t.dbid,
                     storage_id: 0,
                     format: match t.filetype {
-                        0x4d503320 => "MP3".to_string(),
-                        0x4d344120 => "M4A".to_string(),
-                        0x57415620 => "WAV".to_string(),
-                        0x574d4120 => "WMA".to_string(),
+                        ipod_db::filetype::MP3 => "MP3".to_string(),
+                        ipod_db::filetype::M4A => "M4A".to_string(),
+                        ipod_db::filetype::WAV => "WAV".to_string(),
+                        ipod_db::filetype::WMA => "WMA".to_string(),
                         _ => "MP3".to_string(),
                     },
                     size: t.file_size as u64,
@@ -432,7 +432,7 @@ impl DeviceSession for IpodSession {
         &mut self,
         name: &str,
         track_keys: &[(String, String, String)],
-    ) -> Result<super::PlaylistImportSummary, String> {
+    ) -> Result<super::PlaylistImportSummary, DeviceError> {
         let summary = upsert_playlist(&mut self.db, name, track_keys)?;
         self.flush()?;
         Ok(summary)
@@ -450,7 +450,7 @@ fn upsert_playlist(
     db: &mut ipod_db::IpodDatabase,
     name: &str,
     track_keys: &[(String, String, String)],
-) -> Result<super::PlaylistImportSummary, String> {
+) -> Result<super::PlaylistImportSummary, DeviceError> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
         return Err("Playlist name cannot be empty".into());
@@ -458,7 +458,7 @@ fn upsert_playlist(
     if trimmed.eq_ignore_ascii_case("Library") || trimmed.eq_ignore_ascii_case("Master") {
         // The master playlist owns these names by convention; reject so
         // callers can't accidentally clobber it.
-        return Err(format!("\"{trimmed}\" is reserved for the master playlist"));
+        return Err(format!("\"{trimmed}\" is reserved for the master playlist").into());
     }
 
     // Resolve every (artist, album, title) tuple to an iPod dbid. Match

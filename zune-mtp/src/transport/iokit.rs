@@ -384,7 +384,7 @@ impl IokitTransport {
                     if kr2 == kIOReturnSuccess {
                         return Ok(chunk.len());
                     }
-                    return Err(MtpError::Usb(format!(
+                    return Err(MtpError::UsbFatal(format!(
                         "WritePipe failed: 0x{kr:08x} (retry after ClearPipeStall: 0x{kr2:08x})"
                     )));
                 }
@@ -419,7 +419,7 @@ impl IokitTransport {
                 if kr2 == kIOReturnSuccess {
                     return Ok(size2 as usize);
                 }
-                return Err(MtpError::Usb(format!(
+                return Err(MtpError::UsbFatal(format!(
                     "ReadPipe failed: 0x{kr:08x} (retry after ClearPipeStall: 0x{kr2:08x})"
                 )));
             }
@@ -477,7 +477,7 @@ impl IokitTransport {
                     ((**self.interface).ClearPipeStall)(self.interface, self.pipe_out);
                 }
                 let _ = handle.join();
-                return Err(MtpError::Usb(format!(
+                return Err(MtpError::UsbFatal(format!(
                     "ReadPipe timed out ({timeout_secs}s)"
                 )));
             }

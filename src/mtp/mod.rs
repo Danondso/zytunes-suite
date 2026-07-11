@@ -32,26 +32,111 @@ impl TrackMeta {
     }
 }
 
+/// Typed error at the [`DeviceSession`] boundary.
+///
+/// `Display` renders just the inner message (no variant prefix) so every
+/// user-visible error string is unchanged from the previous
+/// `Result<T, String>` shape — the variants exist for programmatic
+/// callers: the TUI worker aborts queued work on [`DeviceGone`], and
+/// `collect_all_tracks` propagates a [`DeviceGone`] from the ZMDB fast
+/// path instead of walking hundreds of handles on a dead pipe (any
+/// non-fatal error still falls back to the walk).
+///
+/// [`DeviceGone`]: DeviceError::DeviceGone
+/// [`Unsupported`]: DeviceError::Unsupported
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeviceError {
+    /// The device/firmware doesn't support the operation. Callers may fall
+    /// back to another path (e.g. pre-3.0 Zune firmware rejecting a vendor
+    /// op, or a backend without playlist support).
+    Unsupported(String),
+    /// Fatal USB/session failure: the session is dead until the device is
+    /// physically replugged. Callers should abort queued work.
+    DeviceGone(String),
+    /// Any other failure, as a human-readable message.
+    Other(String),
+}
+
+impl DeviceError {
+    /// The inner human-readable message, regardless of variant.
+    pub fn message(&self) -> &str {
+        match self {
+            DeviceError::Unsupported(m) | DeviceError::DeviceGone(m) | DeviceError::Other(m) => m,
+        }
+    }
+}
+
+impl std::fmt::Display for DeviceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+impl std::error::Error for DeviceError {}
+
+/// Free-form messages default to [`DeviceError::Other`]; construct the
+/// typed variants explicitly where the distinction is known.
+impl From<String> for DeviceError {
+    fn from(msg: String) -> Self {
+        DeviceError::Other(msg)
+    }
+}
+
+impl From<&str> for DeviceError {
+    fn from(msg: &str) -> Self {
+        DeviceError::Other(msg.to_string())
+    }
+}
+
+/// For callers that only display the error (CLI command handlers) — `?`
+/// erases to the human-readable message. The TUI worker keeps the typed
+/// value so it can react to `DeviceGone`.
+impl From<DeviceError> for String {
+    fn from(e: DeviceError) -> Self {
+        e.to_string()
+    }
+}
+
 /// Trait abstracting device session operations for testability.
 ///
 /// Implemented by [`NativeSession`] for real hardware and by `MockSession` in tests.
-/// All methods return `Result<T, String>` — errors are human-readable messages.
+/// All methods return `Result<T, DeviceError>`; `Display` on the error is
+/// the human-readable message.
 pub trait DeviceSession {
     /// List files and directories at `path` on the device.
-    fn ls(&mut self, path: &str) -> Result<Vec<DeviceEntry>, String>;
+    ///
+    /// Entries are the immediate children of `path`, named as they exist
+    /// on the device: `NativeSession` (Zune) returns MTP object filenames
+    /// at the resolved handle, `IpodSession` returns raw filesystem names
+    /// — so `ls("/Music")` on an iPod yields the hashed `F00..F49` dirs,
+    /// not artist folders. For human-shaped `Artist/Album/Title` paths use
+    /// [`Self::collect_all_tracks`].
+    fn ls(&mut self, path: &str) -> Result<Vec<DeviceEntry>, DeviceError>;
     /// Import a local audio file to the device. Returns the new MTP object ID.
     /// `meta`, when supplied, short-circuits the session's own tag read.
-    fn import_track(&mut self, local_path: &str, meta: Option<&TrackMeta>) -> Result<u64, String>;
+    fn import_track(
+        &mut self,
+        local_path: &str,
+        meta: Option<&TrackMeta>,
+    ) -> Result<u64, DeviceError>;
     /// Remove a file or folder by device path (e.g., `/Music/Artist/Album/track.mp3`).
-    fn rm(&mut self, device_path: &str) -> Result<(), String>;
+    fn rm(&mut self, device_path: &str) -> Result<(), DeviceError>;
     /// Remove an object by its MTP object ID.
-    fn rm_by_id(&mut self, object_id: u32) -> Result<(), String>;
+    fn rm_by_id(&mut self, object_id: u32) -> Result<(), DeviceError>;
     /// Delete empty artist/album folders under `/Music`. Returns count of folders removed.
-    fn cleanup_empty_folders(&mut self) -> Result<usize, String>;
+    fn cleanup_empty_folders(&mut self) -> Result<usize, DeviceError>;
     /// Query device storage. Returns `(total_bytes, free_bytes)`.
-    fn get_storage_info(&mut self) -> Result<(u64, u64), String>;
+    fn get_storage_info(&mut self) -> Result<(u64, u64), DeviceError>;
     /// Recursively collect all track entries under `path` (e.g., `/Music`).
-    fn collect_all_tracks(&mut self, path: &str) -> Result<Vec<DeviceEntry>, String>;
+    ///
+    /// Entry name shape is backend-specific by design: `NativeSession`
+    /// (Zune) yields device-relative `Artist/Album/file.ext` (or
+    /// `Artist/Album/Title` from the ZMDB fast path), while `IpodSession`
+    /// yields synthesized `Artist/Album/Title.ext` display paths — on disk
+    /// its files live in hashed `iPod_Control/Music/F00..F49/` dirs that
+    /// would be meaningless to browse. Callers must not assume a shared
+    /// shape.
+    fn collect_all_tracks(&mut self, path: &str) -> Result<Vec<DeviceEntry>, DeviceError>;
     /// Save the device's sync progress to a local cache file.
     /// Called after a successful sync session. Default is a no-op.
     fn save_sync_progress(&mut self) {}
@@ -59,7 +144,7 @@ pub trait DeviceSession {
     /// handles) so the first `import_track` call doesn't pay a one-time setup
     /// cost. Called once during connect. Default is a no-op for backends that
     /// don't need a separate library scan.
-    fn prewarm_library(&mut self) -> Result<(), String> {
+    fn prewarm_library(&mut self) -> Result<(), DeviceError> {
         Ok(())
     }
     /// Refresh any locally-cached free-space metadata after operations that change
@@ -69,17 +154,21 @@ pub trait DeviceSession {
     fn refresh_storage_cache(&mut self, _free_bytes: u64) {}
     /// Import a photo to the device. Takes filename and pre-resized JPEG bytes.
     /// Returns the new MTP object ID.
-    fn import_photo(&mut self, _filename: &str, _jpeg_data: &[u8]) -> Result<u64, String> {
-        Err("Photo import not supported".into())
+    fn import_photo(&mut self, _filename: &str, _jpeg_data: &[u8]) -> Result<u64, DeviceError> {
+        Err(DeviceError::Unsupported(
+            "Photo import not supported".into(),
+        ))
     }
     /// Import a video file to the device. Takes filename and raw file bytes.
     /// Returns the new MTP object ID.
-    fn import_video(&mut self, _filename: &str, _data: &[u8]) -> Result<u64, String> {
-        Err("Video import not supported".into())
+    fn import_video(&mut self, _filename: &str, _data: &[u8]) -> Result<u64, DeviceError> {
+        Err(DeviceError::Unsupported(
+            "Video import not supported".into(),
+        ))
     }
     /// Collect all video entries from the device. Uses ZMDB if available,
     /// otherwise falls back to scanning `/Videos` via MTP handle walk.
-    fn collect_all_videos(&mut self) -> Result<Vec<DeviceEntry>, String> {
+    fn collect_all_videos(&mut self) -> Result<Vec<DeviceEntry>, DeviceError> {
         Ok(Vec::new())
     }
     /// Create or replace a playlist on the device.
@@ -98,8 +187,10 @@ pub trait DeviceSession {
         &mut self,
         _name: &str,
         _track_keys: &[(String, String, String)],
-    ) -> Result<PlaylistImportSummary, String> {
-        Err("Playlist sync not supported on this device".into())
+    ) -> Result<PlaylistImportSummary, DeviceError> {
+        Err(DeviceError::Unsupported(
+            "Playlist sync not supported on this device".into(),
+        ))
     }
 }
 

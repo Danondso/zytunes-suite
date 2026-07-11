@@ -231,15 +231,6 @@ impl LocalPlays {
     /// crash mid-write leaves the previous file intact rather than a
     /// truncated JSON that `load_from` can't parse.
     pub fn save_to(&self, path: &Path) {
-        if let Some(parent) = path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                eprintln!(
-                    "zytunes: local-plays: mkdir {} failed: {e}",
-                    parent.display()
-                );
-                return;
-            }
-        }
         let on_disk = OnDisk {
             schema_version: SCHEMA_VERSION,
             tracks: self
@@ -258,22 +249,8 @@ impl LocalPlays {
                 return;
             }
         };
-        let tmp = path.with_extension("json.tmp");
-        if let Err(e) = std::fs::write(&tmp, &data) {
-            eprintln!(
-                "zytunes: local-plays: write {} ({} bytes) failed: {e}",
-                tmp.display(),
-                data.len()
-            );
-            return;
-        }
-        if let Err(e) = std::fs::rename(&tmp, path) {
-            eprintln!(
-                "zytunes: local-plays: rename {} -> {} failed: {e}",
-                tmp.display(),
-                path.display()
-            );
-            let _ = std::fs::remove_file(&tmp);
+        if let Err(e) = crate::paths::atomic_write_json(path, &data) {
+            eprintln!("zytunes: local-plays: {e}");
         }
     }
 }

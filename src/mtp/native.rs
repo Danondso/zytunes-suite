@@ -11,7 +11,7 @@ use playcount::{apply_playcounts, apply_ratings, apply_skip_counts};
 use track_cache::TrackCache;
 
 use crate::mtp::parse::DeviceEntry;
-use crate::mtp::DeviceSession;
+use crate::mtp::{DeviceError, DeviceSession};
 
 use zune_mtp::container::MTP_ROOT;
 use zune_mtp::proplist::*;
@@ -21,14 +21,26 @@ use zune_mtp::{MtpError, MtpSession, MtpzKeys};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-/// Extension trait to convert MtpError results to String results at the DeviceSession boundary.
+/// Extension trait to convert MtpError results to [`DeviceError`] results at
+/// the DeviceSession boundary. Classification happens here: the transport
+/// already marked fatal USB failures (`MtpError::UsbFatal`) and the device
+/// reported unsupported operations (`0x2005`), so no string sniffing is
+/// needed.
 trait MtpResultExt<T> {
-    fn mtp_err(self) -> Result<T, String>;
+    fn mtp_err(self) -> Result<T, DeviceError>;
 }
 
 impl<T> MtpResultExt<T> for Result<T, MtpError> {
-    fn mtp_err(self) -> Result<T, String> {
-        self.map_err(|e| e.to_string())
+    fn mtp_err(self) -> Result<T, DeviceError> {
+        self.map_err(|e| {
+            if e.is_device_gone() {
+                DeviceError::DeviceGone(e.to_string())
+            } else if e.is_operation_not_supported() {
+                DeviceError::Unsupported(e.to_string())
+            } else {
+                DeviceError::Other(e.to_string())
+            }
+        })
     }
 }
 
@@ -240,10 +252,10 @@ pub struct NativeSession {
 
 impl NativeSession {
     /// Access the device library state, returning an error if not yet initialized.
-    fn lib(&self) -> Result<&DeviceLibrary, String> {
+    fn lib(&self) -> Result<&DeviceLibrary, DeviceError> {
         self.library
             .as_ref()
-            .ok_or_else(|| "Device library not initialized".to_string())
+            .ok_or_else(|| DeviceError::Other("Device library not initialized".into()))
     }
 
     /// `(major, minor)` version parsed from the firmware string, if readable.
@@ -284,7 +296,7 @@ impl NativeSession {
     }
 
     /// Query storage info. Returns (total_bytes, free_bytes).
-    pub fn get_storage_info(&mut self) -> Result<(u64, u64), String> {
+    pub fn get_storage_info(&mut self) -> Result<(u64, u64), DeviceError> {
         self.session.get_storage_info(self.storage_id).mtp_err()
     }
 
@@ -294,34 +306,34 @@ impl NativeSession {
     /// Returns `Ok(None)` when the device reports the vendor op as unsupported
     /// (older firmware). Callers should treat that as "feature unavailable"
     /// rather than a hard error.
-    pub fn get_acquired_items_count(&mut self) -> Result<Option<u32>, String> {
+    pub fn get_acquired_items_count(&mut self) -> Result<Option<u32>, DeviceError> {
         if !self.supports_modern_vendor_ops() {
             return Ok(None);
         }
         match self.session.get_acquired_items_count() {
             Ok(count) => Ok(Some(count)),
             Err(e) if e.is_operation_not_supported() => Ok(None),
-            Err(e) => Err(e.to_string()),
+            Err(e) => Err(e).mtp_err(),
         }
     }
 
     /// Query device sync progress (vendor op 0x922f). Returns raw payload bytes,
     /// or `Ok(None)` if the device doesn't support the query.
-    pub fn get_sync_progress(&mut self) -> Result<Option<Vec<u8>>, String> {
+    pub fn get_sync_progress(&mut self) -> Result<Option<Vec<u8>>, DeviceError> {
         if !self.supports_modern_vendor_ops() {
             return Ok(None);
         }
         match self.session.get_sync_progress() {
             Ok(raw) => Ok(Some(raw)),
             Err(e) if e.is_operation_not_supported() => Ok(None),
-            Err(e) => Err(e.to_string()),
+            Err(e) => Err(e).mtp_err(),
         }
     }
 
     /// Open a native MTP session to the Zune.
     /// Performs device detection, MTP session open, and MTPZ authentication.
     /// The `log` callback receives diagnostic messages for each step.
-    pub fn open(product_id: u16, log: &dyn Fn(&str)) -> Result<Self, String> {
+    pub fn open(product_id: u16, log: &dyn Fn(&str)) -> Result<Self, DeviceError> {
         log("MTP: Opening USB device...");
         let mut session = MtpSession::open(MICROSOFT_VENDOR_ID, product_id)
             .map_err(|e| format!("USB open failed: {e}"))?;
@@ -393,7 +405,7 @@ impl NativeSession {
         parent: u32,
         prefix: &str,
         entries: &mut Vec<DeviceEntry>,
-    ) -> Result<(), String> {
+    ) -> Result<(), DeviceError> {
         let handles = self
             .session
             .get_object_handles(self.storage_id, parent)
@@ -451,7 +463,7 @@ impl NativeSession {
     }
 
     /// Find an object handle by name under a parent.
-    fn find_object(&mut self, parent: u32, name: &str) -> Result<Option<u32>, String> {
+    fn find_object(&mut self, parent: u32, name: &str) -> Result<Option<u32>, DeviceError> {
         let handles = self
             .session
             .get_object_handles(self.storage_id, parent)
@@ -480,7 +492,7 @@ impl NativeSession {
     }
 
     /// Find an existing folder by name under `parent`, or create it.
-    fn find_or_create_folder(&mut self, parent: u32, name: &str) -> Result<u32, String> {
+    fn find_or_create_folder(&mut self, parent: u32, name: &str) -> Result<u32, DeviceError> {
         if let Some(h) = self.find_object(parent, name)? {
             return Ok(h);
         }
@@ -497,7 +509,7 @@ impl NativeSession {
     }
 
     /// Resolve a path like "/Music/Artist/Album" to an object handle.
-    fn resolve_path(&mut self, path: &str) -> Result<u32, String> {
+    fn resolve_path(&mut self, path: &str) -> Result<u32, DeviceError> {
         let parts: Vec<&str> = path
             .trim_start_matches('/')
             .split('/')
@@ -508,7 +520,7 @@ impl NativeSession {
         for part in parts {
             match self.find_object(current, part)? {
                 Some(handle) => current = handle,
-                None => return Err(format!("Path not found: {}", path)),
+                None => return Err(format!("Path not found: {}", path).into()),
             }
         }
         Ok(current)
@@ -598,19 +610,18 @@ impl NativeSession {
     /// implemented, and converts `OperationNotSupported (0x2005)` from newer
     /// devices into a concise error string so the caller's fallback log reads
     /// cleanly.
-    fn try_zmdb(&mut self) -> Result<Vec<DeviceEntry>, String> {
+    fn try_zmdb(&mut self) -> Result<Vec<DeviceEntry>, DeviceError> {
         if !self.supports_modern_vendor_ops() {
             let v = self.firmware_version.as_deref().unwrap_or("unknown");
-            return Err(format!(
+            return Err(DeviceError::Unsupported(format!(
                 "firmware {v} predates ZMDB (added in firmware 3.0)"
-            ));
+            )));
         }
-        let raw = self.session.get_zmdb(1).map_err(|e| {
-            if e.is_operation_not_supported() {
-                "device does not support ZMDB bulk query".to_string()
-            } else {
-                e.to_string()
+        let raw = self.session.get_zmdb(1).mtp_err().map_err(|e| match e {
+            DeviceError::Unsupported(_) => {
+                DeviceError::Unsupported("device does not support ZMDB bulk query".to_string())
             }
+            other => other,
         })?;
         let zmdb = crate::mtp::zmdb::Zmdb::parse(&raw)?;
         self.log_msg(&format!("ZMDB: {}", zmdb.summary()));
@@ -620,31 +631,15 @@ impl NativeSession {
 
     /// Initialize the device library — find/create Music, Artists, Albums folders
     /// and scan existing artists+albums.
-    fn ensure_library(&mut self) -> Result<(), String> {
+    fn ensure_library(&mut self) -> Result<(), DeviceError> {
         if self.library.is_some() {
             return Ok(());
         }
 
         // Try loading from disk cache first.
-        if let Some(cached_lib) = self.load_library_cache() {
-            // Self-correct caches written before the HD-specific
-            // artist_supported default existed — HD (pid=0x063e) requires
-            // artist_supported=true or tracks file as "Unknown Artist".
-            let expected_artist_supported = self.product_id == 0x063e;
-            if cached_lib.caps.artist_supported != expected_artist_supported {
-                self.log_msg(&format!(
-                    "Library cache has artist_supported={}, expected {} for pid=0x{:04x} — rebuilding",
-                    cached_lib.caps.artist_supported, expected_artist_supported, self.product_id
-                ));
-            } else {
-                self.log_msg(&format!(
-                    "Loaded library cache ({} artists, {} albums)",
-                    cached_lib.artists.len(),
-                    cached_lib.albums.len()
-                ));
-                self.library = Some(cached_lib);
-                return Ok(());
-            }
+        if let Some(cached_lib) = self.load_valid_library_cache() {
+            self.library = Some(cached_lib);
+            return Ok(());
         }
 
         self.log_msg("Initializing device library...");
@@ -666,7 +661,59 @@ impl NativeSession {
             artist_supported, album_date_supported, album_cover_supported
         ));
 
-        // Find root folders.
+        let (music_folder, artists_folder, albums_folder) = self.find_library_roots()?;
+
+        let artists = self.scan_existing_artists(artist_supported, music_folder, artists_folder);
+        self.log_msg(&format!("Found {} existing artists", artists.len()));
+
+        let albums = self.scan_existing_albums(&artists, music_folder, albums_folder);
+        self.log_msg(&format!("Found {} existing albums", albums.len()));
+
+        self.library = Some(DeviceLibrary {
+            music_folder,
+            artists_folder,
+            albums_folder,
+            caps: DeviceCaps {
+                artist_supported,
+                album_date_supported,
+                album_cover_supported,
+            },
+            artists,
+            albums,
+        });
+
+        self.save_library_cache();
+        self.log_msg("Device library ready");
+
+        Ok(())
+    }
+
+    /// Load the on-disk library cache, rejecting entries written before
+    /// the HD-specific `artist_supported` default existed — HD
+    /// (pid=0x063e) requires artist_supported=true or tracks file as
+    /// "Unknown Artist".
+    fn load_valid_library_cache(&mut self) -> Option<DeviceLibrary> {
+        let cached_lib = self.load_library_cache()?;
+        let expected_artist_supported = self.product_id == 0x063e;
+        if cached_lib.caps.artist_supported != expected_artist_supported {
+            self.log_msg(&format!(
+                "Library cache has artist_supported={}, expected {} for pid=0x{:04x} — rebuilding",
+                cached_lib.caps.artist_supported, expected_artist_supported, self.product_id
+            ));
+            return None;
+        }
+        self.log_msg(&format!(
+            "Loaded library cache ({} artists, {} albums)",
+            cached_lib.artists.len(),
+            cached_lib.albums.len()
+        ));
+        Some(cached_lib)
+    }
+
+    /// Find (or, for Music, create) the three library root folders.
+    /// Returns `(music, artists, albums)`; Artists/Albums fall back to
+    /// the Music folder on devices that don't have them.
+    fn find_library_roots(&mut self) -> Result<(u32, u32, u32), DeviceError> {
         let root_handles = self
             .session
             .get_object_handles(self.storage_id, MTP_ROOT)
@@ -691,10 +738,21 @@ impl NativeSession {
             Some(h) => h,
             None => self.find_or_create_folder(MTP_ROOT, "Music")?,
         };
-        let artists_folder = artists_folder.unwrap_or(music_folder);
-        let albums_folder = albums_folder.unwrap_or(music_folder);
+        Ok((
+            music_folder,
+            artists_folder.unwrap_or(music_folder),
+            albums_folder.unwrap_or(music_folder),
+        ))
+    }
 
-        // Scan existing artists from the Artists folder.
+    /// Scan pre-existing artists: `.art` objects under Artists/ when the
+    /// device supports artist objects, otherwise Music/ subfolders.
+    fn scan_existing_artists(
+        &mut self,
+        artist_supported: bool,
+        music_folder: u32,
+        artists_folder: u32,
+    ) -> HashMap<String, ArtistInfo> {
         let mut artists = HashMap::new();
         if artist_supported {
             if let Ok(handles) = self
@@ -743,9 +801,16 @@ impl NativeSession {
                 }
             }
         }
-        self.log_msg(&format!("Found {} existing artists", artists.len()));
+        artists
+    }
 
-        // Scan existing albums from the Albums folder.
+    /// Scan pre-existing albums: `Artist--Album.alb` objects under Albums/.
+    fn scan_existing_albums(
+        &mut self,
+        artists: &HashMap<String, ArtistInfo>,
+        music_folder: u32,
+        albums_folder: u32,
+    ) -> HashMap<(String, String), AlbumInfo> {
         let mut albums = HashMap::new();
         if let Ok(handles) = self
             .session
@@ -779,29 +844,11 @@ impl NativeSession {
                 }
             }
         }
-        self.log_msg(&format!("Found {} existing albums", albums.len()));
-
-        self.library = Some(DeviceLibrary {
-            music_folder,
-            artists_folder,
-            albums_folder,
-            caps: DeviceCaps {
-                artist_supported,
-                album_date_supported,
-                album_cover_supported,
-            },
-            artists,
-            albums,
-        });
-
-        self.save_library_cache();
-        self.log_msg("Device library ready");
-
-        Ok(())
+        albums
     }
 
     /// Find or create an artist object + music folder. Returns (artist_id, music_folder_id).
-    fn find_or_create_artist_native(&mut self, name: &str) -> Result<(u32, u32), String> {
+    fn find_or_create_artist_native(&mut self, name: &str) -> Result<(u32, u32), DeviceError> {
         // Check cached.
         if let Some(lib) = &self.library {
             if let Some(a) = lib.artists.get(name) {
@@ -871,7 +918,7 @@ impl NativeSession {
         album_name: &str,
         artist_id: u32,
         artist_supported: bool,
-    ) -> Result<(u32, u32), String> {
+    ) -> Result<(u32, u32), DeviceError> {
         let key = (artist_name.to_string(), album_name.to_string());
         if let Some(lib) = &self.library {
             if let Some(a) = lib.albums.get(&key) {
@@ -935,7 +982,7 @@ impl NativeSession {
 }
 
 impl DeviceSession for NativeSession {
-    fn ls(&mut self, path: &str) -> Result<Vec<DeviceEntry>, String> {
+    fn ls(&mut self, path: &str) -> Result<Vec<DeviceEntry>, DeviceError> {
         let parent = self.resolve_path(path)?;
         let handles = self
             .session
@@ -957,7 +1004,7 @@ impl DeviceSession for NativeSession {
         &mut self,
         local_path: &str,
         meta: Option<&super::TrackMeta>,
-    ) -> Result<u64, String> {
+    ) -> Result<u64, DeviceError> {
         let file_data =
             std::fs::read(local_path).map_err(|e| format!("Cannot read {}: {}", local_path, e))?;
 
@@ -1077,7 +1124,7 @@ impl DeviceSession for NativeSession {
         Ok(track_id as u64)
     }
 
-    fn rm(&mut self, device_path: &str) -> Result<(), String> {
+    fn rm(&mut self, device_path: &str) -> Result<(), DeviceError> {
         let handle = self.resolve_path(device_path)?;
         self.delete_recursive(handle)?;
         self.cache.remove(device_path);
@@ -1085,13 +1132,13 @@ impl DeviceSession for NativeSession {
         Ok(())
     }
 
-    fn rm_by_id(&mut self, object_id: u32) -> Result<(), String> {
+    fn rm_by_id(&mut self, object_id: u32) -> Result<(), DeviceError> {
         self.delete_recursive(object_id)?;
         self.cache.remove_by_id(object_id);
         Ok(())
     }
 
-    fn cleanup_empty_folders(&mut self) -> Result<usize, String> {
+    fn cleanup_empty_folders(&mut self) -> Result<usize, DeviceError> {
         let music_folder = match self.resolve_path("/Music") {
             Ok(h) => h,
             Err(_) => return Ok(0),
@@ -1164,7 +1211,7 @@ impl DeviceSession for NativeSession {
         Ok(removed)
     }
 
-    fn collect_all_tracks(&mut self, path: &str) -> Result<Vec<DeviceEntry>, String> {
+    fn collect_all_tracks(&mut self, path: &str) -> Result<Vec<DeviceEntry>, DeviceError> {
         // Query current storage to validate cache freshness.
         let current_free = self
             .session
@@ -1250,6 +1297,11 @@ impl DeviceSession for NativeSession {
                 }
                 return Ok(tracks);
             }
+            // A fatal USB failure would just cascade across hundreds of
+            // GetObjectInfo calls on a dead pipe — propagate it. Anything
+            // else (unsupported vendor op on old firmware, ZMDB parse
+            // failure) falls back to the slow handle walk.
+            Err(e @ DeviceError::DeviceGone(_)) => return Err(e),
             Err(e) => {
                 self.log_msg(&format!("ZMDB unavailable ({}), falling back to scan", e));
             }
@@ -1275,11 +1327,11 @@ impl DeviceSession for NativeSession {
         Ok(tracks)
     }
 
-    fn get_storage_info(&mut self) -> Result<(u64, u64), String> {
+    fn get_storage_info(&mut self) -> Result<(u64, u64), DeviceError> {
         self.session.get_storage_info(self.storage_id).mtp_err()
     }
 
-    fn prewarm_library(&mut self) -> Result<(), String> {
+    fn prewarm_library(&mut self) -> Result<(), DeviceError> {
         self.ensure_library()
     }
 
@@ -1307,7 +1359,7 @@ impl DeviceSession for NativeSession {
         }
     }
 
-    fn import_photo(&mut self, filename: &str, jpeg_data: &[u8]) -> Result<u64, String> {
+    fn import_photo(&mut self, filename: &str, jpeg_data: &[u8]) -> Result<u64, DeviceError> {
         let photos_folder = self.find_or_create_folder(MTP_ROOT, "Photos")?;
 
         let props = PropListBuilder::new()
@@ -1331,7 +1383,7 @@ impl DeviceSession for NativeSession {
         Ok(obj_id as u64)
     }
 
-    fn import_video(&mut self, filename: &str, data: &[u8]) -> Result<u64, String> {
+    fn import_video(&mut self, filename: &str, data: &[u8]) -> Result<u64, DeviceError> {
         let videos_folder = self.find_or_create_folder(MTP_ROOT, "Videos")?;
 
         let format = detect_video_format(filename);
@@ -1357,7 +1409,7 @@ impl DeviceSession for NativeSession {
         Ok(obj_id as u64)
     }
 
-    fn collect_all_videos(&mut self) -> Result<Vec<DeviceEntry>, String> {
+    fn collect_all_videos(&mut self) -> Result<Vec<DeviceEntry>, DeviceError> {
         // Return cached video entries from the last ZMDB parse if available.
         if let Some(ref cached) = self.zmdb_video_cache {
             self.log_msg(&format!("Returning {} cached video entries", cached.len()));
@@ -1404,67 +1456,126 @@ impl DeviceSession for NativeSession {
         &mut self,
         name: &str,
         track_keys: &[(String, String, String)],
-    ) -> Result<super::PlaylistImportSummary, String> {
+    ) -> Result<super::PlaylistImportSummary, DeviceError> {
         let trimmed = name.trim();
         if trimmed.is_empty() {
             return Err("Playlist name cannot be empty".into());
         }
 
-        // Step 0: capability check — firmware-gated.
-        //
-        // v1.4 firmware silently drops `GetObjectPropsSupported(0xBA05)`:
-        // the device never replies, our 30s ReadPipe timeout fires, and
-        // the bulk pipe is left in a half-response state that requires a
-        // physical replug. The `mtp-probe playlist-push` binary discovered
-        // this empirically (see its `--probe-caps` gate at
-        // tools/mtp-probe/src/playlist_push.rs and project memory entry
-        // `project_v14_playcount_via_getobjectproplist`). The probe's
-        // workaround: skip the query on v1.4 and just attempt the create —
-        // SendObjectPropList(0xBA05) with [ObjectFileName, Name] is known
-        // to work on v1.4 hw (validated 2026-04-26) regardless of what
-        // the cap query did or didn't say.
-        //
-        // Firmware 3.0+ handles the query fine, so we still run it there
-        // for the diagnostic log line.
-        if self.supports_modern_vendor_ops() {
-            match self
-                .session
-                .get_object_props_supported(FORMAT_ABSTRACT_AUDIO_VIDEO_PLAYLIST)
-            {
-                Ok(supported) => {
-                    let has_filename = supported.contains(&PROP_OBJECT_FILENAME);
-                    let has_name = supported.contains(&PROP_NAME);
-                    if !has_filename || !has_name {
-                        self.log_msg(&format!(
-                            "warn: Zune doesn't advertise both required 0xBA05 props \
-                             (filename: {has_filename}, name: {has_name}); attempting anyway",
-                        ));
-                    }
-                }
-                Err(e) => {
+        // Step 0: capability check — log-only, firmware-gated.
+        self.log_playlist_prop_support();
+
+        // Step 1: resolve (artist, album, title) tuples to MTP object
+        // handles.
+        let (member_handles, skipped) = self.resolve_playlist_members(track_keys)?;
+
+        // Step 2: locate or create the playlist object.
+        let music_folder = self.lib()?.music_folder;
+
+        // Compute the on-device filename once — used both for matching
+        // existing playlists and (in the create branch) for the
+        // ObjectFileName property. Match needs `.zpl`-suffixed because
+        // that's what we store on the device; comparing the bare trimmed
+        // name would never match an existing entry and we'd accumulate a
+        // duplicate `<name>.zpl` per sync.
+        let filename = if trimmed.to_lowercase().ends_with(".zpl") {
+            trimmed.to_string()
+        } else {
+            format!("{trimmed}.zpl")
+        };
+
+        let (playlist_handle, replaced) = match self.find_existing_playlist(&filename) {
+            Some(h) => {
+                self.log_msg(&format!(
+                    "Updating existing playlist \"{trimmed}\" at handle 0x{h:08x}"
+                ));
+                (h, true)
+            }
+            None => (
+                self.create_playlist_object(trimmed, &filename, music_folder)?,
+                false,
+            ),
+        };
+
+        // Step 3: attach references. Order matters — that becomes the
+        // on-device playlist order.
+        self.session
+            .set_object_references(playlist_handle, &member_handles)
+            .map_err(|e| format!("SetObjectReferences failed: {e}"))?;
+
+        Ok(super::PlaylistImportSummary {
+            resolved: member_handles.len(),
+            skipped,
+            replaced,
+        })
+    }
+}
+
+impl NativeSession {
+    /// Diagnostic-only probe of the playlist (0xBA05) props the device
+    /// advertises. Never fails the import — it only logs.
+    ///
+    /// v1.4 firmware silently drops `GetObjectPropsSupported(0xBA05)`:
+    /// the device never replies, our 30s ReadPipe timeout fires, and
+    /// the bulk pipe is left in a half-response state that requires a
+    /// physical replug. The `mtp-probe playlist-push` binary discovered
+    /// this empirically (see its `--probe-caps` gate at
+    /// tools/mtp-probe/src/playlist_push.rs and project memory entry
+    /// `project_v14_playcount_via_getobjectproplist`). The probe's
+    /// workaround: skip the query on v1.4 and just attempt the create —
+    /// SendObjectPropList(0xBA05) with [ObjectFileName, Name] is known
+    /// to work on v1.4 hw (validated 2026-04-26) regardless of what
+    /// the cap query did or didn't say.
+    ///
+    /// Firmware 3.0+ handles the query fine, so we still run it there
+    /// for the diagnostic log line.
+    fn log_playlist_prop_support(&mut self) {
+        if !self.supports_modern_vendor_ops() {
+            self.log_msg("Skipping GetObjectPropsSupported(0xBA05) — wedges v1.4 firmware");
+            return;
+        }
+        match self
+            .session
+            .get_object_props_supported(FORMAT_ABSTRACT_AUDIO_VIDEO_PLAYLIST)
+        {
+            Ok(supported) => {
+                let has_filename = supported.contains(&PROP_OBJECT_FILENAME);
+                let has_name = supported.contains(&PROP_NAME);
+                if !has_filename || !has_name {
                     self.log_msg(&format!(
-                        "warn: GetObjectPropsSupported(0xBA05) failed ({e}); attempting create anyway"
+                        "warn: Zune doesn't advertise both required 0xBA05 props \
+                         (filename: {has_filename}, name: {has_name}); attempting anyway",
                     ));
                 }
             }
-        } else {
-            self.log_msg("Skipping GetObjectPropsSupported(0xBA05) — wedges v1.4 firmware");
+            Err(e) => {
+                self.log_msg(&format!(
+                    "warn: GetObjectPropsSupported(0xBA05) failed ({e}); attempting create anyway"
+                ));
+            }
         }
+    }
 
-        // Step 1: resolve (artist, album, title) tuples to MTP object
-        // handles. Two-tier lookup:
-        //   1. `recent_imports` — same-session uploads, populated by
-        //      `import_track`. Authoritative because the handle came
-        //      straight from `SendObjectPropList`.
-        //   2. `collect_all_tracks` — ZMDB + on-disk track cache. Covers
-        //      tracks already on the device from a previous connection.
-        //
-        // Order matters: ZMDB returns `object_id = 0` for entries it
-        // synthesises from metadata, and the on-disk cache's name format
-        // ("Artist/Album/filename.ext") doesn't match ZMDB's
-        // ("Artist/Album/Title"), so cache-driven name restoration can
-        // miss freshly-uploaded tracks across a reconnect. The recent_imports
-        // tier sidesteps both issues for any track the user just synced.
+    /// Resolve `(artist, album, title)` tuples to MTP object handles and
+    /// log the outcome. Returns `(member_handles, skipped_count)`.
+    ///
+    /// Two-tier lookup:
+    ///   1. `recent_imports` — same-session uploads, populated by
+    ///      `import_track`. Authoritative because the handle came
+    ///      straight from `SendObjectPropList`.
+    ///   2. `collect_all_tracks` — ZMDB + on-disk track cache. Covers
+    ///      tracks already on the device from a previous connection.
+    ///
+    /// Order matters: ZMDB returns `object_id = 0` for entries it
+    /// synthesises from metadata, and the on-disk cache's name format
+    /// ("Artist/Album/filename.ext") doesn't match ZMDB's
+    /// ("Artist/Album/Title"), so cache-driven name restoration can
+    /// miss freshly-uploaded tracks across a reconnect. The recent_imports
+    /// tier sidesteps both issues for any track the user just synced.
+    fn resolve_playlist_members(
+        &mut self,
+        track_keys: &[(String, String, String)],
+    ) -> Result<(Vec<u32>, usize), DeviceError> {
         let device_tracks = self.collect_all_tracks("/Music")?;
         let resolved = resolve_playlist_handles(track_keys, &self.recent_imports, &device_tracks);
         let PlaylistResolveResult {
@@ -1498,31 +1609,17 @@ impl DeviceSession for NativeSession {
                 sample.join(" | "),
             ));
         }
+        Ok((member_handles, skipped))
+    }
 
-        // Step 2: locate or create the playlist object.
-        let lib = self.lib()?;
-        let music_folder = lib.music_folder;
-
-        // Compute the on-device filename once — used both for matching
-        // existing playlists and (in the create branch below) for the
-        // ObjectFileName property. Match needs `.zpl`-suffixed because
-        // that's what we store on the device; comparing the bare trimmed
-        // name would never match an existing entry and we'd accumulate a
-        // duplicate `<name>.zpl` per sync.
-        let filename = if trimmed.to_lowercase().ends_with(".zpl") {
-            trimmed.to_string()
-        } else {
-            format!("{trimmed}.zpl")
-        };
-
-        // Try to find an existing 0xBA05 with the same filename at storage
-        // root — that's where we put new ones below. Scoping the search
-        // to the storage root keeps it cheap; the Zune tends to keep
-        // playlists there per libmtp conventions. Match is
-        // case-insensitive: filesystem layer treats `Roadtrip.zpl` and
-        // `roadtrip.zpl` as the same file on the device.
-        let existing_handle = self
-            .session
+    /// Find an existing 0xBA05 object with the given filename at the
+    /// storage root — that's where `create_playlist_object` puts new
+    /// ones. Scoping the search to the storage root keeps it cheap; the
+    /// Zune tends to keep playlists there per libmtp conventions. Match
+    /// is case-insensitive: the filesystem layer treats `Roadtrip.zpl`
+    /// and `roadtrip.zpl` as the same file on the device.
+    fn find_existing_playlist(&mut self, filename: &str) -> Option<u32> {
+        self.session
             .get_object_handles(self.storage_id, MTP_ROOT)
             .ok()
             .and_then(|handles| {
@@ -1532,86 +1629,67 @@ impl DeviceSession for NativeSession {
                         .ok()
                         .map(|info| {
                             info.object_format == FORMAT_ABSTRACT_AUDIO_VIDEO_PLAYLIST
-                                && info.filename.eq_ignore_ascii_case(&filename)
+                                && info.filename.eq_ignore_ascii_case(filename)
                         })
                         .unwrap_or(false)
                 })
-            });
+            })
+    }
 
-        let (playlist_handle, replaced) = match existing_handle {
-            Some(h) => {
-                self.log_msg(&format!(
-                    "Updating existing playlist \"{trimmed}\" at handle 0x{h:08x}"
-                ));
-                (h, true)
-            }
-            None => {
-                let mut props = PropListBuilder::new();
-                props
-                    .add_string(PROP_OBJECT_FILENAME, &filename)
-                    .add_string(PROP_NAME, trimmed);
-                let prop_list = props.build();
+    /// Create a zero-byte playlist object and return its handle. libmtp
+    /// ships parent=0 (let the device decide), with a documented fallback
+    /// to `default_music_folder` on `InvalidParent` — mirror that.
+    fn create_playlist_object(
+        &mut self,
+        name: &str,
+        filename: &str,
+        music_folder: u32,
+    ) -> Result<u32, DeviceError> {
+        let mut props = PropListBuilder::new();
+        props
+            .add_string(PROP_OBJECT_FILENAME, filename)
+            .add_string(PROP_NAME, name);
+        let prop_list = props.build();
 
-                // libmtp ships parent=0 (let the device decide), with a
-                // documented fallback to `default_music_folder` on
-                // `InvalidParent`. Mirror that.
-                let create = self.session.send_object_prop_list(
-                    self.storage_id,
-                    0,
-                    FORMAT_ABSTRACT_AUDIO_VIDEO_PLAYLIST,
-                    0,
-                    &prop_list,
-                );
-                let (_, _, handle) = match create {
-                    Ok(triple) => triple,
-                    Err(_) => {
-                        self.log_msg("parent=0 rejected; retrying with music folder");
-                        self.session
-                            .send_object_prop_list(
-                                self.storage_id,
-                                music_folder,
-                                FORMAT_ABSTRACT_AUDIO_VIDEO_PLAYLIST,
-                                0,
-                                &prop_list,
-                            )
-                            .map_err(|e| format!("SendObjectPropList(0xBA05) failed: {e}"))?
-                    }
-                };
-
-                // Empty body. The Zune ignores the payload — references
-                // are authoritative — but the create handshake requires
-                // a SendObject to commit the proplist.
+        let create = self.session.send_object_prop_list(
+            self.storage_id,
+            0,
+            FORMAT_ABSTRACT_AUDIO_VIDEO_PLAYLIST,
+            0,
+            &prop_list,
+        );
+        let (_, _, handle) = match create {
+            Ok(triple) => triple,
+            Err(_) => {
+                self.log_msg("parent=0 rejected; retrying with music folder");
                 self.session
-                    .send_object(&[])
-                    .map_err(|e| format!("SendObject(empty) failed: {e}"))?;
-
-                (handle, false)
+                    .send_object_prop_list(
+                        self.storage_id,
+                        music_folder,
+                        FORMAT_ABSTRACT_AUDIO_VIDEO_PLAYLIST,
+                        0,
+                        &prop_list,
+                    )
+                    .map_err(|e| format!("SendObjectPropList(0xBA05) failed: {e}"))?
             }
         };
 
-        // Step 3: attach references. Order matters — that becomes the
-        // on-device playlist order.
+        // Empty body. The Zune ignores the payload — references
+        // are authoritative — but the create handshake requires
+        // a SendObject to commit the proplist.
         self.session
-            .set_object_references(playlist_handle, &member_handles)
-            .map_err(|e| format!("SetObjectReferences failed: {e}"))?;
+            .send_object(&[])
+            .map_err(|e| format!("SendObject(empty) failed: {e}"))?;
 
-        Ok(super::PlaylistImportSummary {
-            resolved: member_handles.len(),
-            skipped,
-            replaced,
-        })
+        Ok(handle)
     }
-}
 
-impl NativeSession {
     /// Phase 4a probe: list MTP object properties the device advertises for
     /// the given object format. `format = 0x3009` is MP3 (the most common
     /// Zune content type). Returns the property codes in the same order the
     /// device emits them.
-    pub fn probe_supported_props(&mut self, format: u16) -> Result<Vec<u16>, String> {
-        self.session
-            .get_object_props_supported(format)
-            .map_err(|e| e.to_string())
+    pub fn probe_supported_props(&mut self, format: u16) -> Result<Vec<u16>, DeviceError> {
+        self.session.get_object_props_supported(format).mtp_err()
     }
 
     /// Phase 4a probe: ask the device for ALL properties on `object_id`,
@@ -1625,7 +1703,7 @@ impl NativeSession {
     pub fn probe_all_props(
         &mut self,
         object_id: u32,
-    ) -> Result<Vec<zune_mtp::session::PropListElement>, String> {
+    ) -> Result<Vec<zune_mtp::session::PropListElement>, DeviceError> {
         let raw = self
             .session
             .get_object_prop_list(object_id, 0, 0xFFFF_FFFF, 0, 0)
@@ -1642,19 +1720,21 @@ impl NativeSession {
     /// Use ONLY for read-only data-in operations (op code in the 0x90xx /
     /// 0x91xx Microsoft vendor ranges, or unknown 0x9xxx). Calling a
     /// data-out operation with this will fail or wedge the session.
-    pub fn probe_vendor_op(&mut self, op_code: u16, params: &[u32]) -> Result<Vec<u8>, String> {
+    pub fn probe_vendor_op(
+        &mut self,
+        op_code: u16,
+        params: &[u32],
+    ) -> Result<Vec<u8>, DeviceError> {
         // Empirical hard-block list. 0x9180 is documented in the v1.4
         // vendor-ops survey as causing a USB-resetting hang. Adding more
         // here as we learn them is cheap insurance.
         const BLOCKED: &[u16] = &[0x9180];
         if BLOCKED.contains(&op_code) {
-            return Err(format!(
+            return Err(DeviceError::Other(format!(
                 "op 0x{op_code:04X} is on the probe blocklist (known to wedge the device)"
-            ));
+            )));
         }
-        self.session
-            .execute_data_in_raw(op_code, params)
-            .map_err(|e| e.to_string())
+        self.session.execute_data_in_raw(op_code, params).mtp_err()
     }
 
     /// Phase 4a probe: dump the raw ZMDB binary (vendor op `0x9217`). Used
@@ -1665,19 +1745,18 @@ impl NativeSession {
     /// Mirrors the firmware-version guard from `try_zmdb` so users on v1.4
     /// hardware get a friendly message instead of a bare
     /// `0x2005 OperationNotSupported` from the device.
-    pub fn probe_zmdb_dump(&mut self) -> Result<Vec<u8>, String> {
+    pub fn probe_zmdb_dump(&mut self) -> Result<Vec<u8>, DeviceError> {
         if !self.supports_modern_vendor_ops() {
             let v = self.firmware_version.as_deref().unwrap_or("unknown");
-            return Err(format!(
+            return Err(DeviceError::Unsupported(format!(
                 "firmware {v} predates ZMDB (added in firmware 3.0); ZMDB dump unavailable"
-            ));
+            )));
         }
-        self.session.get_zmdb(1).map_err(|e| {
-            if e.is_operation_not_supported() {
-                "device does not support ZMDB bulk query".to_string()
-            } else {
-                e.to_string()
+        self.session.get_zmdb(1).mtp_err().map_err(|e| match e {
+            DeviceError::Unsupported(_) => {
+                DeviceError::Unsupported("device does not support ZMDB bulk query".to_string())
             }
+            other => other,
         })
     }
 
@@ -1694,7 +1773,7 @@ impl NativeSession {
     ///
     /// Used by the probe command to pick a target track without forcing the
     /// caller to know an object ID.
-    pub fn probe_first_audio_handle(&mut self) -> Result<Option<(u32, u16)>, String> {
+    pub fn probe_first_audio_handle(&mut self) -> Result<Option<(u32, u16)>, DeviceError> {
         let storage = self.storage_id;
         let mut queue: Vec<u32> = vec![MTP_ROOT];
         while let Some(parent) = queue.pop() {
@@ -1743,7 +1822,7 @@ impl NativeSession {
     /// Zune firmware does NOT cascade folder deletion for us: deleting a folder
     /// handle leaves the child objects orphaned on the device. Walk the
     /// hierarchy bottom-up so every descendant is gone before the parent.
-    fn delete_recursive(&mut self, handle: u32) -> Result<(), String> {
+    fn delete_recursive(&mut self, handle: u32) -> Result<(), DeviceError> {
         let is_folder = self
             .session
             .get_object_info(handle)

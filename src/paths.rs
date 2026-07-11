@@ -16,7 +16,7 @@
 //! pointing at the same `~/Music` can reuse one cached scan and avoid
 //! re-running the lofty pass on every new worktree. See `src/cache.rs`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Returns `ZYTUNES_CACHE_DIR` (created if missing) when set to a non-empty
 /// value, else `None`. Used as a shared override check by the two default
@@ -39,6 +39,51 @@ pub fn device_cache_base() -> Option<PathBuf> {
         return Some(dir);
     }
     std::env::var("HOME").ok().map(PathBuf::from)
+}
+
+/// Atomically write pre-serialized JSON to `path`.
+///
+/// Creates parent directories, stages the bytes to `path` with a
+/// `.json.tmp` extension, fsyncs, then renames over the target — a crash
+/// mid-write leaves the previous file intact rather than truncated JSON
+/// the loader can't parse. The fsync-before-rename matters: without
+/// `sync_all` a crash between the rename returning and the kernel
+/// flushing the tmp's page cache can leave a renamed-but-empty file.
+///
+/// Returns a human-readable message naming the failed step; callers add
+/// their own subsystem prefix when logging.
+pub fn atomic_write_json(path: &Path, data: &[u8]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("mkdir {} failed: {e}", parent.display()))?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp)
+        .and_then(|mut f| {
+            use std::io::Write;
+            f.write_all(data)?;
+            f.sync_all()
+        })
+        .map_err(|e| format!("write {} ({} bytes) failed: {e}", tmp.display(), data.len()))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("rename {} -> {} failed: {e}", tmp.display(), path.display())
+    })?;
+    // Fsync the parent directory so the rename itself survives power
+    // loss — the file *data* was synced above, but on POSIX the new
+    // directory entry isn't durable until the directory is. Best-effort:
+    // the write already succeeded, and opening a directory read-only can
+    // fail on exotic filesystems.
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

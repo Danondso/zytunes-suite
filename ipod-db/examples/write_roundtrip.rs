@@ -76,7 +76,7 @@ fn main() {
         track.bitrate = Some(320);
         track.sample_rate = Some(44100);
         track.ipod_path = test_path;
-        track.filetype = 0x4d503320; // MP3
+        track.filetype = ipod_db::filetype::MP3;
         let dbid = db.add_track(track);
         println!(
             "Added test track (dbid=0x{:016x}), total tracks: {}",

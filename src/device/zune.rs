@@ -230,7 +230,8 @@ impl DeviceBackend for ZuneBackend {
             }
         };
 
-        let mut session = crate::mtp::NativeSession::open(data.product_id, &log_fn)?;
+        let mut session =
+            crate::mtp::NativeSession::open(data.product_id, &log_fn).map_err(|e| e.to_string())?;
         session.set_serial(data.serial_number.clone());
         Ok(Box::new(session))
     }

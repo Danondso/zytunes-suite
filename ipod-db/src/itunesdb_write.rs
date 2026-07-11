@@ -31,6 +31,25 @@ use crate::{IpodDatabase, IpodDbError, IpodTrack};
 /// 2001-based Cocoa epoch.
 const HFS_EPOCH_OFFSET: u64 = 2_082_844_800;
 
+// Format-specific mhit "mystery" fields, from libgpod's
+// `itdb_track_set_defaults` cross-checked against an iTunes-written golden
+// database (see the workspace DEBUG.md for the bring-up investigation).
+// Formats not covered by a constant write 0.
+
+/// mhit +0x7E (`unk126`) for MP3 and AAC tracks.
+const UNK126_MP3_AAC: u16 = 0xffff;
+/// mhit +0x90 (`unk144`) for MP3 tracks.
+const UNK144_MP3: u16 = 0x000c;
+/// mhit +0x90 (`unk144`) for AAC tracks.
+const UNK144_AAC: u16 = 0x0033;
+/// mhit +0xCC (`unk204`) for MP3 tracks (libgpod parity; iTunes-synced MP3s
+/// play fine with this value).
+const UNK204_MP3: u32 = 1;
+/// mhit +0xCC (`unk204`) for AAC tracks. libgpod writes 0 here, but iTunes
+/// writes 0x02000003 (verified from the golden DB) and AAC tracks skip on
+/// playback without the iTunes-compatible value.
+const UNK204_AAC: u32 = 0x0200_0003;
+
 /// Current time as a Mac HFS timestamp (seconds since 1904-01-01 00:00:00 UTC).
 fn mac_timestamp_now() -> u32 {
     let unix_secs = std::time::SystemTime::now()
@@ -135,11 +154,11 @@ fn build_track_mhods(track: &IpodTrack, _artwork_count: u32) -> Vec<Vec<u8>> {
         .filetype_string
         .as_deref()
         .unwrap_or(match track.filetype {
-            0x4d503320 => "MPEG audio file",
-            0x4d344120 => "AAC audio file",
-            0x4d345020 => "Protected AAC audio file",
-            0x57415620 => "WAV audio file",
-            0x574d4120 => "WMA audio file",
+            crate::filetype::MP3 => "MPEG audio file",
+            crate::filetype::M4A => "AAC audio file",
+            crate::filetype::M4P => "Protected AAC audio file",
+            crate::filetype::WAV => "WAV audio file",
+            crate::filetype::WMA => "WMA audio file",
             _ => "Audio file",
         });
     mhods.push(write_mhod(6, filetype_str));
@@ -194,24 +213,20 @@ fn write_mhit(
     let sr_float = (sample_rate as f32).to_bits();
 
     // Determine format-specific defaults (from libgpod itdb_track_set_defaults).
-    let is_mp3 = track.filetype == 0x4d503320;
-    let is_aac = track.filetype == 0x4d344120;
-    let unk126: u16 = if is_mp3 || is_aac { 0xffff } else { 0 };
+    let is_mp3 = track.filetype == crate::filetype::MP3;
+    let is_aac = track.filetype == crate::filetype::M4A;
+    let unk126: u16 = if is_mp3 || is_aac { UNK126_MP3_AAC } else { 0 };
     let unk144: u16 = if is_mp3 {
-        0x000c
+        UNK144_MP3
     } else if is_aac {
-        0x0033
+        UNK144_AAC
     } else {
         0
     };
-    // unk204 at +0xCC: libgpod writes 1 for MP3, 0 for others. But iTunes
-    // actually writes 0x02000003 for AAC tracks (verified from golden DB).
-    // MP3s synced by iTunes play even with libgpod's value, so MP3=1 is fine.
-    // AAC tracks need the iTunes-compatible value or they skip on playback.
     let unk204: u32 = if is_mp3 {
-        1
+        UNK204_MP3
     } else if is_aac {
-        0x0200_0003
+        UNK204_AAC
     } else {
         0
     };

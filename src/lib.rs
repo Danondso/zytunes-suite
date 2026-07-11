@@ -905,35 +905,35 @@ mod tests {
     }
 
     impl DeviceSession for MockSession {
-        fn ls(&mut self, _path: &str) -> Result<Vec<mtp::parse::DeviceEntry>, String> {
+        fn ls(&mut self, _path: &str) -> Result<Vec<mtp::parse::DeviceEntry>, mtp::DeviceError> {
             Ok(vec![])
         }
         fn import_track(
             &mut self,
             local_path: &str,
             _meta: Option<&mtp::TrackMeta>,
-        ) -> Result<u64, String> {
+        ) -> Result<u64, mtp::DeviceError> {
             self.import_calls.push(local_path.to_string());
             let id = self.next_import_id;
             self.next_import_id += 1;
             Ok(id)
         }
-        fn rm(&mut self, _device_path: &str) -> Result<(), String> {
+        fn rm(&mut self, _device_path: &str) -> Result<(), mtp::DeviceError> {
             Ok(())
         }
-        fn rm_by_id(&mut self, _object_id: u32) -> Result<(), String> {
+        fn rm_by_id(&mut self, _object_id: u32) -> Result<(), mtp::DeviceError> {
             Ok(())
         }
-        fn cleanup_empty_folders(&mut self) -> Result<usize, String> {
+        fn cleanup_empty_folders(&mut self) -> Result<usize, mtp::DeviceError> {
             Ok(0)
         }
-        fn get_storage_info(&mut self) -> Result<(u64, u64), String> {
+        fn get_storage_info(&mut self) -> Result<(u64, u64), mtp::DeviceError> {
             Ok((30_000_000_000, 15_000_000_000))
         }
         fn collect_all_tracks(
             &mut self,
             _path: &str,
-        ) -> Result<Vec<mtp::parse::DeviceEntry>, String> {
+        ) -> Result<Vec<mtp::parse::DeviceEntry>, mtp::DeviceError> {
             Ok(self.device_tracks.clone())
         }
     }

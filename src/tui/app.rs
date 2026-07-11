@@ -273,9 +273,7 @@ impl AlbumArtCache {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-#[allow(dead_code)]
 pub enum PlaybackState {
-    Stopped,
     Playing,
     Paused,
 }
@@ -1090,8 +1088,6 @@ pub struct AlbumInfo {
     pub name: String,
     pub artist: String,
     pub year: Option<u32>,
-    #[allow(dead_code)]
-    pub track_count: usize,
 }
 
 #[derive(Clone)]
@@ -3770,22 +3766,20 @@ impl App {
 
         match &entry {
             SidebarEntry::Artist(artist) => {
-                let mut album_map: std::collections::BTreeMap<String, (Option<u32>, usize)> =
+                let mut album_map: std::collections::BTreeMap<String, Option<u32>> =
                     std::collections::BTreeMap::new();
                 for t in lib.artist_tracks(artist) {
-                    let e = album_map.entry(t.album.clone()).or_insert((t.year, 0));
-                    e.1 += 1;
-                    if e.0.is_none() && t.year.is_some() {
-                        e.0 = t.year;
+                    let e = album_map.entry(t.album.clone()).or_insert(t.year);
+                    if e.is_none() && t.year.is_some() {
+                        *e = t.year;
                     }
                 }
                 self.album_list = album_map
                     .into_iter()
-                    .map(|(name, (year, count))| AlbumInfo {
+                    .map(|(name, year)| AlbumInfo {
                         name,
                         artist: artist.clone(),
                         year,
-                        track_count: count,
                     })
                     .collect();
                 // Sort by year (oldest first), albums without a year go last.
@@ -3877,19 +3871,10 @@ impl App {
                 if let Some(albums) = self.device.albums.get(artist) {
                     self.album_list = albums
                         .iter()
-                        .map(|album_name| {
-                            let count = self
-                                .device
-                                .album_tracks
-                                .get(&(artist.clone(), album_name.clone()))
-                                .map(|t| t.len())
-                                .unwrap_or(0);
-                            AlbumInfo {
-                                name: album_name.clone(),
-                                artist: artist.clone(),
-                                year: None,
-                                track_count: count,
-                            }
+                        .map(|album_name| AlbumInfo {
+                            name: album_name.clone(),
+                            artist: artist.clone(),
+                            year: None,
                         })
                         .collect();
                     self.album_selected = 0;
@@ -7664,19 +7649,16 @@ mod tests {
                 name: "C".into(),
                 artist: "X".into(),
                 year: None,
-                track_count: 1,
             },
             AlbumInfo {
                 name: "A".into(),
                 artist: "X".into(),
                 year: Some(2000),
-                track_count: 1,
             },
             AlbumInfo {
                 name: "B".into(),
                 artist: "X".into(),
                 year: Some(1990),
-                track_count: 1,
             },
         ];
         // Simulate the sort that select_sidebar_item does.
@@ -7700,25 +7682,21 @@ mod tests {
                 name: "A".into(),
                 artist: "X".into(),
                 year: Some(1990),
-                track_count: 1,
             },
             AlbumInfo {
                 name: "B".into(),
                 artist: "X".into(),
                 year: Some(1990),
-                track_count: 1,
             },
             AlbumInfo {
                 name: "C".into(),
                 artist: "X".into(),
                 year: Some(2000),
-                track_count: 1,
             },
             AlbumInfo {
                 name: "D".into(),
                 artist: "X".into(),
                 year: None,
-                track_count: 1,
             },
         ];
         app.album_selected = 0;
@@ -7739,25 +7717,21 @@ mod tests {
                 name: "A".into(),
                 artist: "X".into(),
                 year: Some(1990),
-                track_count: 1,
             },
             AlbumInfo {
                 name: "B".into(),
                 artist: "X".into(),
                 year: Some(1990),
-                track_count: 1,
             },
             AlbumInfo {
                 name: "C".into(),
                 artist: "X".into(),
                 year: Some(2000),
-                track_count: 1,
             },
             AlbumInfo {
                 name: "D".into(),
                 artist: "X".into(),
                 year: None,
-                track_count: 1,
             },
         ];
         app.album_selected = 3;
@@ -10482,7 +10456,6 @@ mod tests {
         app.handle_bg_event(BgEvent::RipEvent(RipEvent::Started {
             current: 1,
             total: 3,
-            track_position: 1,
             track_title: "Come Together".into(),
             track_length_ms: Some(259_000),
         }));
@@ -10499,10 +10472,7 @@ mod tests {
         use crate::background::RipEvent;
         let mut app = App::new();
         // No-op if no rip is active.
-        app.handle_bg_event(BgEvent::RipEvent(RipEvent::Progress {
-            track_position: 1,
-            elapsed_ms: 12_345,
-        }));
+        app.handle_bg_event(BgEvent::RipEvent(RipEvent::Progress { elapsed_ms: 12_345 }));
         assert!(app.cd.rip.is_none());
 
         // After Started, Progress events update the elapsed field so the
@@ -10510,20 +10480,13 @@ mod tests {
         app.handle_bg_event(BgEvent::RipEvent(RipEvent::Started {
             current: 1,
             total: 1,
-            track_position: 1,
             track_title: "T".into(),
             track_length_ms: Some(60_000),
         }));
-        app.handle_bg_event(BgEvent::RipEvent(RipEvent::Progress {
-            track_position: 1,
-            elapsed_ms: 15_000,
-        }));
+        app.handle_bg_event(BgEvent::RipEvent(RipEvent::Progress { elapsed_ms: 15_000 }));
         let rip = app.cd.rip.as_ref().unwrap();
         assert_eq!(rip.elapsed_ms, 15_000);
-        app.handle_bg_event(BgEvent::RipEvent(RipEvent::Progress {
-            track_position: 1,
-            elapsed_ms: 30_000,
-        }));
+        app.handle_bg_event(BgEvent::RipEvent(RipEvent::Progress { elapsed_ms: 30_000 }));
         assert_eq!(app.cd.rip.as_ref().unwrap().elapsed_ms, 30_000);
     }
 
@@ -10750,7 +10713,6 @@ mod tests {
             name: "Album X".into(),
             artist: "Artist X".into(),
             year: Some(1969),
-            track_count: 2,
         });
         app.album_selected = 0;
         app.track_list.push(TrackInfo::new(

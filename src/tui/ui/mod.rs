@@ -40,6 +40,16 @@ pub(crate) struct LayoutMetrics {
     player_art_width: u16,
 }
 
+/// Terminal width (cells) below which the layout drops to the compact
+/// tier: no device panel, no keys reference, narrow sidebar.
+const COMPACT_TIER_MAX_W: u16 = 100;
+/// Terminal width below which the layout uses the standard tier (narrower
+/// device panel, keys reference still hidden). At or above it, the full
+/// layout applies.
+const STANDARD_TIER_MAX_W: u16 = 140;
+/// Terminal height below which the now-playing panel can't physically fit.
+const PLAYER_MIN_H: u16 = 12;
+
 impl LayoutMetrics {
     /// `show_player` is the final resolved decision from the caller — it
     /// already accounts for the user's preference and the current playback
@@ -48,9 +58,9 @@ impl LayoutMetrics {
     fn new(area: Rect, show_keys: bool, has_album_browser: bool, show_player: bool) -> Self {
         let w = area.width;
         let h = area.height;
-        let show_now_playing = show_player && h >= 12;
+        let show_now_playing = show_player && h >= PLAYER_MIN_H;
 
-        if w < 100 {
+        if w < COMPACT_TIER_MAX_W {
             // Compact: hide device panel, force-hide keys, narrow sidebar.
             LayoutMetrics {
                 device_width: 0,
@@ -62,7 +72,7 @@ impl LayoutMetrics {
                 footer_left_width: 12,
                 player_art_width: 0,
             }
-        } else if w < 140 {
+        } else if w < STANDARD_TIER_MAX_W {
             // Standard: narrower device panel, force-hide keys.
             LayoutMetrics {
                 device_width: 28,
@@ -100,9 +110,9 @@ impl LayoutMetrics {
         show_keys: bool,
         has_album_browser: bool,
     ) -> (u16, u16, u16, u16) {
-        if width < 100 {
+        if width < COMPACT_TIER_MAX_W {
             (0, 20, if has_album_browser { 22 } else { 0 }, 0)
-        } else if width < 140 {
+        } else if width < STANDARD_TIER_MAX_W {
             (28, 24, if has_album_browser { 24 } else { 0 }, 0)
         } else {
             (
@@ -1896,7 +1906,6 @@ fn draw_now_playing(f: &mut Frame, app: &App, np: &NowPlaying, area: Rect, art_w
     let state_icon = match np.state {
         PlaybackState::Playing => skin.play,
         PlaybackState::Paused => skin.pause,
-        PlaybackState::Stopped => skin.play,
     };
 
     let border_color = if np.state == PlaybackState::Playing {

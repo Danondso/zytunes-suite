@@ -95,7 +95,7 @@
 //! track.bitrate = Some(320);
 //! track.sample_rate = Some(44100);
 //! track.ipod_path = ":iPod_Control:Music:F00:ABCD.mp3".into();
-//! track.filetype = 0x4d503320;
+//! track.filetype = ipod_db::filetype::MP3;
 //! db.add_track(track);
 //!
 //! // Write back to disk (atomic, with .bak backup and hash58 signing)
@@ -135,6 +135,22 @@ pub enum IpodDbError {
 
 pub type Result<T> = std::result::Result<T, IpodDbError>;
 
+/// FourCC file-type codes for [`IpodTrack::filetype`] (the mhit
+/// `filetype_marker` field). The bytes spell the format name in ASCII,
+/// space-padded — e.g. `0x4d503320` is `b"MP3 "` read big-endian.
+pub mod filetype {
+    /// `"MP3 "` — MPEG audio.
+    pub const MP3: u32 = 0x4d50_3320;
+    /// `"M4A "` — AAC or ALAC in an MPEG-4 container.
+    pub const M4A: u32 = 0x4d34_4120;
+    /// `"M4P "` — FairPlay-protected AAC.
+    pub const M4P: u32 = 0x4d34_5020;
+    /// `"WAV "` — RIFF/WAVE audio.
+    pub const WAV: u32 = 0x5741_5620;
+    /// `"WMA "` — Windows Media Audio.
+    pub const WMA: u32 = 0x574d_4120;
+}
+
 /// A track entry in the iPod database.
 #[derive(Debug, Clone, Default)]
 pub struct IpodTrack {
@@ -172,7 +188,7 @@ pub struct IpodTrack {
     pub sample_rate: Option<u16>,
     /// iPod-style path (colon-separated, e.g. ":iPod_Control:Music:F00:ABCD.mp3").
     pub ipod_path: String,
-    /// File type code (0x4d503320 = MP3, 0x4d344120 = M4A/AAC/ALAC, etc).
+    /// File type FourCC (see [`crate::filetype`] for the known codes).
     pub filetype: u32,
     /// Filetype description string for mhod type 6 (e.g. "MPEG audio file",
     /// "AAC audio file", "Apple Lossless audio file"). The iPod firmware uses

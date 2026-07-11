@@ -11,6 +11,13 @@ use std::fmt;
 pub enum MtpError {
     /// USB transport errors (open, read, write, timeout).
     Usb(String),
+    /// Fatal USB transport failure: the device is gone or the bulk pipes
+    /// are wedged in a way that survives a stall clear (failed retry,
+    /// read timeout, unplug). The session is dead until the device is
+    /// physically replugged — callers should abort queued work instead of
+    /// retrying. Constructed only by the transport backends (IOKit and
+    /// libusb), which know which of their outcomes are fatal.
+    UsbFatal(String),
     /// MTP protocol-level errors (bad response codes, malformed data).
     Protocol(String),
     /// Device responded to an operation with an MTP response code other than OK.
@@ -31,12 +38,21 @@ impl MtpError {
     pub fn is_operation_not_supported(&self) -> bool {
         matches!(self, MtpError::DeviceRejected(0x2005))
     }
+
+    /// True if this is a fatal USB failure ([`MtpError::UsbFatal`]) — the
+    /// session is unrecoverable until the device is physically replugged.
+    pub fn is_device_gone(&self) -> bool {
+        matches!(self, MtpError::UsbFatal(_))
+    }
 }
 
 impl fmt::Display for MtpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             MtpError::Usb(msg) => write!(f, "USB error: {msg}"),
+            // Same rendering as `Usb` on purpose: the fatal/transient split
+            // is for programmatic callers; users see one kind of USB error.
+            MtpError::UsbFatal(msg) => write!(f, "USB error: {msg}"),
             MtpError::Protocol(msg) => write!(f, "MTP protocol error: {msg}"),
             MtpError::DeviceRejected(code) => write!(f, "device rejected operation (0x{code:04x})"),
             MtpError::Crypto(msg) => write!(f, "MTPZ crypto error: {msg}"),
@@ -76,6 +92,15 @@ pub use session::{MtpSession, ObjectInfo};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usb_fatal_classifies_as_device_gone() {
+        assert!(MtpError::UsbFatal("ReadPipe timed out (30s)".into()).is_device_gone());
+        // Plain (retryable) USB errors and protocol errors are not fatal.
+        assert!(!MtpError::Usb("WritePipe failed: 0x1".into()).is_device_gone());
+        assert!(!MtpError::Protocol("bad header".into()).is_device_gone());
+        assert!(!MtpError::DeviceRejected(0x2005).is_device_gone());
+    }
 
     #[test]
     fn device_rejected_classifies_operation_not_supported() {

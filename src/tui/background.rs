@@ -3,7 +3,19 @@ use std::thread;
 
 /// True when `err` indicates the MTP session is effectively dead and no
 /// further bulk ops on this session will succeed — only a physical replug
-/// recovers. Observed cascade modes:
+/// recovers.
+///
+/// Primary signal is the typed [`DeviceError::DeviceGone`] variant, which
+/// both transports classify at the source (failed retry-after-stall-clear
+/// on either pipe, read timeout). The string heuristic in
+/// [`is_device_gone_str`] stays as a defense-in-depth fallback for errors
+/// that reach us through paths that stringify before we can match the
+/// variant.
+fn is_device_gone(err: &DeviceError) -> bool {
+    matches!(err, DeviceError::DeviceGone(_)) || is_device_gone_str(err.message())
+}
+
+/// String-sniffing fallback for [`is_device_gone`]. Observed cascade modes:
 ///   - `0xe00002c0` (kIOReturnNoDevice): interface invalidated.
 ///   - `0xe00002ed` (kIOReturnNotResponding): device stopped answering.
 ///   - `"retry after ClearPipeStall"`: our transport tried to clear the
@@ -12,7 +24,7 @@ use std::thread;
 ///   - `"ReadPipe timed out"`: a command's response never came. Once we've
 ///     written a command and the device doesn't answer within its timeout,
 ///     subsequent writes reliably cascade into pipe errors.
-fn is_device_gone(err: &str) -> bool {
+fn is_device_gone_str(err: &str) -> bool {
     err.contains("0xe00002c0")
         || err.contains("0xe00002ed")
         || err.contains("retry after ClearPipeStall")
@@ -35,7 +47,7 @@ use zytunes::device::{
 };
 use zytunes::mtp::native::NativeSession;
 use zytunes::mtp::parse::DeviceEntry;
-use zytunes::mtp::DeviceSession;
+use zytunes::mtp::{DeviceError, DeviceSession};
 use zytunes::musicbrainz::{MbError, MusicBrainzClient, Release};
 use zytunes::{
     collect_photo_files_with_logger, collect_video_files_with_logger, make_transcode_temp_dir,
@@ -355,31 +367,17 @@ pub enum RipEvent {
     Started {
         current: usize,
         total: usize,
-        // Reserved for the eventual auto-queue-to-device flow.
-        #[allow(dead_code)]
-        track_position: u32,
         track_title: String,
         track_length_ms: Option<u64>,
     },
     /// Per-track progress update. `elapsed_ms` comes from ffmpeg's
     /// `-progress pipe:1` stream (`out_time_us` ÷ 1000). Roughly every
     /// ~100 ms while the rip is running.
-    Progress {
-        #[allow(dead_code)]
-        track_position: u32,
-        elapsed_ms: u64,
-    },
+    Progress { elapsed_ms: u64 },
     /// A track finished. `error` is `Some` on failure (ffmpeg, tagging,
     /// or file move).
     TrackDone {
-        // `track_position` and `dest_path` are surfaced for the eventual
-        // auto-queue-to-device flow (queue the just-ripped file for a
-        // connected device); the Phase 3 commit doesn't wire that path yet.
-        #[allow(dead_code)]
-        track_position: u32,
         track_title: String,
-        #[allow(dead_code)]
-        dest_path: Option<PathBuf>,
         error: Option<String>,
     },
     /// All tracks in the request have been processed. `ejected` reflects
@@ -425,14 +423,9 @@ pub enum CdStatusEvent {
     /// hot-path event enum small without forcing all variants to box.
     Identified {
         drive: CdDrive,
-        // `toc`, `mb_disc_id`, and `alternates` are written to App state in
-        // Phase 1 and consumed by the import overlay in Phase 2.
-        #[allow(dead_code)]
         toc: DiscToc,
-        #[allow(dead_code)]
         mb_disc_id: String,
         primary: Box<Release>,
-        #[allow(dead_code)]
         alternates: Vec<Release>,
     },
 }
@@ -615,7 +608,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                 ));
                                 Ok(Box::new(s))
                             }
-                            Err(e) => Err(e),
+                            Err(e) => Err(e.to_string()),
                         }
                     } else {
                         // Generic path for iPod and future backends.
@@ -688,7 +681,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                             "Failed to load tracks: {}",
                                             e
                                         )));
-                                        let _ = event_tx.send(BgEvent::Error(e));
+                                        let _ = event_tx.send(BgEvent::Error(e.to_string()));
                                     }
                                 }
 
@@ -726,7 +719,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                             Err(e) => {
                                 let _ = event_tx
                                     .send(BgEvent::SyncMessage(format!("Refresh failed: {}", e)));
-                                let _ = event_tx.send(BgEvent::Error(e));
+                                let _ = event_tx.send(BgEvent::Error(e.to_string()));
                             }
                         }
                     } else {
@@ -1324,7 +1317,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                     let _ = event_tx.send(BgEvent::SyncTrackDone {
                                         track_name: item.name.clone(),
                                         success: false,
-                                        error: Some(e),
+                                        error: Some(e.to_string()),
                                     });
                                     if gone {
                                         session_dead = true;
@@ -1404,7 +1397,9 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                 }
                 BgCommand::ImportPlaylist { name, track_keys } => {
                     if let Some(ref mut s) = session {
-                        let result = s.import_playlist(&name, &track_keys);
+                        let result = s
+                            .import_playlist(&name, &track_keys)
+                            .map_err(|e| e.to_string());
                         let _ = event_tx.send(BgEvent::PlaylistImported {
                             name,
                             summary: result,
@@ -1728,9 +1723,7 @@ fn run_rip_and_import(
         let Some(mb_track) = mb_tracks.get(&position) else {
             failed += 1;
             let _ = event_tx.send(BgEvent::RipEvent(RipEvent::TrackDone {
-                track_position: position,
                 track_title: format!("track {position}"),
-                dest_path: None,
                 error: Some(format!(
                     "track {position} not present in MusicBrainz release"
                 )),
@@ -1741,7 +1734,6 @@ fn run_rip_and_import(
         let _ = event_tx.send(BgEvent::RipEvent(RipEvent::Started {
             current: idx + 1,
             total,
-            track_position: position,
             track_title: mb_track.title.clone(),
             track_length_ms: mb_track.length.map(u64::from),
         }));
@@ -1760,7 +1752,6 @@ fn run_rip_and_import(
         let progress_tx = event_tx.clone();
         let on_progress = move |elapsed_us: u64| {
             let _ = progress_tx.send(BgEvent::RipEvent(RipEvent::Progress {
-                track_position: position,
                 elapsed_ms: elapsed_us / 1_000,
             }));
         };
@@ -1789,30 +1780,28 @@ fn run_rip_and_import(
         // - `Cancelled` doesn't increment anything; the `Complete
         //   { cancelled: true }` event tells the user why.
         // - `Failed` increments `failed`.
-        let (dest_path, error_for_event) = match &outcome {
-            TrackOutcome::Ripped(p) => {
+        let error_for_event = match &outcome {
+            TrackOutcome::Ripped => {
                 ripped += 1;
-                (Some(p.clone()), None)
+                None
             }
-            TrackOutcome::RippedUntagged { dest, warning } => {
+            TrackOutcome::RippedUntagged { warning } => {
                 ripped += 1;
                 let _ = event_tx.send(BgEvent::SyncMessage(format!(
                     "[rip] {} — {warning}",
                     mb_track.title
                 )));
-                (Some(dest.clone()), None)
+                None
             }
-            TrackOutcome::Cancelled => (None, None),
+            TrackOutcome::Cancelled => None,
             TrackOutcome::Failed(e) => {
                 failed += 1;
-                (None, Some(e.clone()))
+                Some(e.clone())
             }
         };
 
         let _ = event_tx.send(BgEvent::RipEvent(RipEvent::TrackDone {
-            track_position: position,
             track_title: mb_track.title.clone(),
-            dest_path,
             error: error_for_event,
         }));
 
@@ -1869,11 +1858,11 @@ struct SingleTrackRip<'a> {
 /// for accounting purposes.
 pub(crate) enum TrackOutcome {
     /// Audio ripped and tagged. Counts as `ripped`.
-    Ripped(PathBuf),
+    Ripped,
     /// Audio ripped and on disk, but tagging failed — file is still in
     /// the library so it counts as `ripped`; the warning is logged so
     /// the user knows their tags are missing.
-    RippedUntagged { dest: PathBuf, warning: String },
+    RippedUntagged { warning: String },
     /// User cancelled mid-track. Doesn't count as `ripped` or `failed`;
     /// `.part` temp file is cleaned up before returning.
     Cancelled,
@@ -2048,18 +2037,15 @@ fn run_single_track_rip<'a>(
 
     match (tag_warning, fingerprint_warning) {
         (Some(tag_err), Some(fp_err)) => TrackOutcome::RippedUntagged {
-            dest: dest.to_path_buf(),
             warning: format!("tagging failed: {tag_err}; fingerprint failed: {fp_err}"),
         },
         (Some(tag_err), None) => TrackOutcome::RippedUntagged {
-            dest: dest.to_path_buf(),
             warning: format!("tagging failed: {tag_err}"),
         },
         (None, Some(fp_err)) => TrackOutcome::RippedUntagged {
-            dest: dest.to_path_buf(),
             warning: format!("fingerprint failed: {fp_err}"),
         },
-        (None, None) => TrackOutcome::Ripped(dest.to_path_buf()),
+        (None, None) => TrackOutcome::Ripped,
     }
 }
 
@@ -2347,29 +2333,50 @@ mod tests {
     }
 
     #[test]
+    fn is_device_gone_matches_typed_variant() {
+        // The transport-classified variant is authoritative regardless of
+        // message content.
+        assert!(is_device_gone(&DeviceError::DeviceGone(
+            "USB error: anything".into()
+        )));
+        // Untyped errors still fall back to the string heuristic.
+        assert!(is_device_gone(&DeviceError::Other(
+            "USB error: ReadPipe timed out (30s)".into()
+        )));
+        assert!(!is_device_gone(&DeviceError::Other(
+            "MTP protocol error: bad response".into()
+        )));
+        assert!(!is_device_gone(&DeviceError::Unsupported(
+            "device rejected operation (0x2005)".into()
+        )));
+    }
+
+    #[test]
     fn is_device_gone_matches_real_error_string() {
         // Shape of real error strings observed in the cascade-to-death logs.
-        assert!(is_device_gone(
+        assert!(is_device_gone_str(
             "USB error: WritePipe failed: 0xe00002c0 (retry after ClearPipeStall: 0xe00002c0)"
         ));
-        assert!(is_device_gone(
+        assert!(is_device_gone_str(
             "USB error: ReadPipe failed: 0xe00002c0 (retry after ClearPipeStall: 0xe00002c0)"
         ));
         // NotResponding: device stopped answering (observed after an art timeout).
-        assert!(is_device_gone("USB error: WritePipe failed: 0xe00002ed"));
+        assert!(is_device_gone_str(
+            "USB error: WritePipe failed: 0xe00002ed"
+        ));
         // Retry-after-stall failed: the suffix alone means recovery failed.
-        assert!(is_device_gone(
+        assert!(is_device_gone_str(
             "USB error: WritePipe failed: 0xe000404f (retry after ClearPipeStall: 0xe00002ed)"
         ));
         // Read timeout: once a command is in-flight and the response never
         // comes, subsequent writes cascade.
-        assert!(is_device_gone("USB error: ReadPipe timed out (30s)"));
-        assert!(is_device_gone("USB error: ReadPipe timed out (90s)"));
+        assert!(is_device_gone_str("USB error: ReadPipe timed out (30s)"));
+        assert!(is_device_gone_str("USB error: ReadPipe timed out (90s)"));
         // libusb/Linux variants — same semantics, different wording.
-        assert!(is_device_gone(
+        assert!(is_device_gone_str(
             "USB error: write_bulk failed: Pipe error (retry after clear_halt: No such device)"
         ));
-        assert!(is_device_gone("USB error: read_bulk timed out (30s)"));
+        assert!(is_device_gone_str("USB error: read_bulk timed out (30s)"));
     }
 
     #[test]
@@ -2378,9 +2385,11 @@ mod tests {
         // A bare pipe error (no retry suffix) may still recover via our
         // single-shot ClearPipeStall retry — only mark the session dead
         // once the retry itself has been reported as failed.
-        assert!(!is_device_gone("USB error: WritePipe failed: 0xe000404f"));
-        assert!(!is_device_gone("MTP protocol error: bad response"));
-        assert!(!is_device_gone("IO error: file not found"));
+        assert!(!is_device_gone_str(
+            "USB error: WritePipe failed: 0xe000404f"
+        ));
+        assert!(!is_device_gone_str("MTP protocol error: bad response"));
+        assert!(!is_device_gone_str("IO error: file not found"));
     }
 
     #[test]

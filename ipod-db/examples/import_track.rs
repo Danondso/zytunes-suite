@@ -126,10 +126,10 @@ fn main() {
         .map(|d| (d * 1000.0) as u32);
 
     let filetype: u32 = match ext.as_str() {
-        "mp3" => 0x4d503320,
-        "m4a" | "aac" => 0x4d344120,
-        "wav" => 0x57415620,
-        _ => 0x4d503320,
+        "mp3" => ipod_db::filetype::MP3,
+        "m4a" | "aac" => ipod_db::filetype::M4A,
+        "wav" => ipod_db::filetype::WAV,
+        _ => ipod_db::filetype::MP3,
     };
     let filetype_string = match codec.as_str() {
         "alac" => Some("Apple Lossless audio file".to_string()),

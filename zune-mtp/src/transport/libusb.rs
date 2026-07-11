@@ -21,6 +21,15 @@ fn is_recoverable_libusb_error(err: &RusbError) -> bool {
     )
 }
 
+/// True when a libusb error means the device is gone for good — no retry
+/// or `clear_halt` can help and the session is dead until replug.
+/// `NoDevice` is what a physical unplug surfaces as on Linux; without this
+/// classification an unplug mid-sync would grind through every queued
+/// track as `Usb` errors instead of aborting via `UsbFatal`.
+fn is_fatal_libusb_error(err: &RusbError) -> bool {
+    matches!(err, RusbError::NoDevice)
+}
+
 /// USB transport using libusb (via rusb) for bulk I/O.
 pub struct LibusbTransport {
     handle: rusb::DeviceHandle<rusb::Context>,
@@ -196,10 +205,13 @@ impl LibusbTransport {
                     self.handle
                         .write_bulk(self.endpoint_out, chunk, timeout)
                         .map_err(|e2| {
-                            MtpError::Usb(format!(
+                            MtpError::UsbFatal(format!(
                                 "write_bulk failed: {e} (retry after clear_halt: {e2})"
                             ))
                         })
+                }
+                Err(e) if is_fatal_libusb_error(&e) => {
+                    Err(MtpError::UsbFatal(format!("write_bulk failed: {e}")))
                 }
                 Err(e) => Err(MtpError::Usb(format!("write_bulk failed: {e}"))),
             }
@@ -216,10 +228,13 @@ impl LibusbTransport {
                 self.handle
                     .read_bulk(self.endpoint_in, buf, timeout)
                     .map_err(|e2| {
-                        MtpError::Usb(format!(
+                        MtpError::UsbFatal(format!(
                             "read_bulk failed: {e} (retry after clear_halt: {e2})"
                         ))
                     })
+            }
+            Err(e) if is_fatal_libusb_error(&e) => {
+                Err(MtpError::UsbFatal(format!("read_bulk failed: {e}")))
             }
             Err(e) => Err(MtpError::Usb(format!("read_bulk failed: {e}"))),
         }
@@ -239,7 +254,7 @@ impl LibusbTransport {
                 // until the user physically replugs.
                 let _ = self.handle.clear_halt(self.endpoint_in);
                 let _ = self.handle.clear_halt(self.endpoint_out);
-                Err(MtpError::Usb(format!(
+                Err(MtpError::UsbFatal(format!(
                     "read_bulk timed out ({timeout_secs}s)"
                 )))
             }
@@ -248,10 +263,13 @@ impl LibusbTransport {
                 self.handle
                     .read_bulk(self.endpoint_in, buf, timeout)
                     .map_err(|e2| {
-                        MtpError::Usb(format!(
+                        MtpError::UsbFatal(format!(
                             "read_bulk failed: {e} (retry after clear_halt: {e2})"
                         ))
                     })
+            }
+            Err(e) if is_fatal_libusb_error(&e) => {
+                Err(MtpError::UsbFatal(format!("read_bulk failed: {e}")))
             }
             Err(e) => Err(MtpError::Usb(format!("read_bulk failed: {e}"))),
         }
@@ -299,5 +317,18 @@ mod tests {
         // NotFound / InvalidParam indicate caller error, not a wire glitch.
         assert!(!is_recoverable_libusb_error(&RusbError::NotFound));
         assert!(!is_recoverable_libusb_error(&RusbError::InvalidParam));
+    }
+
+    #[test]
+    fn is_fatal_libusb_error_classifies_unplug_only() {
+        // Physical unplug — the session is dead until replug, so the
+        // transport must mint `UsbFatal`, not plain `Usb`.
+        assert!(is_fatal_libusb_error(&RusbError::NoDevice));
+        // Everything else either recovers via clear_halt+retry or should
+        // surface as a retryable/diagnosable `Usb` error.
+        assert!(!is_fatal_libusb_error(&RusbError::Pipe));
+        assert!(!is_fatal_libusb_error(&RusbError::Timeout));
+        assert!(!is_fatal_libusb_error(&RusbError::Access));
+        assert!(!is_fatal_libusb_error(&RusbError::Busy));
     }
 }

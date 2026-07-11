@@ -98,7 +98,7 @@ pub fn transcode_and_import_video(
     session: &mut dyn DeviceSession,
     local_path: &str,
     temp_dir: &Path,
-) -> Result<u64, String> {
+) -> Result<u64, mtp::DeviceError> {
     let upload_path = if needs_video_transcoding(local_path) {
         transcode_to_wmv(local_path, temp_dir)?
     } else {
@@ -120,7 +120,7 @@ pub fn transcode_and_import(
     temp_dir: &Path,
     caps: &DeviceCapabilities,
     meta: Option<&mtp::TrackMeta>,
-) -> Result<u64, String> {
+) -> Result<u64, mtp::DeviceError> {
     let upload_path = transcode_for_device(local_path, temp_dir, caps)?;
     session.import_track(&upload_path, meta)
 }

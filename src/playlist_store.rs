@@ -216,15 +216,6 @@ impl PlaylistStore {
     /// Atomic write to an arbitrary path — staged via `.tmp` + rename so a
     /// crash mid-write leaves the previous file intact.
     pub fn save_to(&self, path: &Path) {
-        if let Some(parent) = path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                eprintln!(
-                    "zytunes: playlist-store: mkdir {} failed: {e}",
-                    parent.display()
-                );
-                return;
-            }
-        }
         let on_disk = OnDisk {
             schema_version: SCHEMA_VERSION,
             playlists: self.playlists.clone(),
@@ -239,38 +230,8 @@ impl PlaylistStore {
                 return;
             }
         };
-        let tmp = path.with_extension("json.tmp");
-        // Write + fsync the tmp file *before* the rename. Without sync_all
-        // a crash between rename returning and the kernel flushing the
-        // tmp's page cache leaves a renamed-but-empty playlists.json. Cheap
-        // on the small JSON the store produces; matches the durability
-        // shape libgpod uses on the iPod side.
-        let write_result = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp)
-            .and_then(|mut f| {
-                use std::io::Write;
-                f.write_all(&data)?;
-                f.sync_all()?;
-                Ok(())
-            });
-        if let Err(e) = write_result {
-            eprintln!(
-                "zytunes: playlist-store: write {} ({} bytes) failed: {e}",
-                tmp.display(),
-                data.len()
-            );
-            return;
-        }
-        if let Err(e) = std::fs::rename(&tmp, path) {
-            eprintln!(
-                "zytunes: playlist-store: rename {} -> {} failed: {e}",
-                tmp.display(),
-                path.display()
-            );
-            let _ = std::fs::remove_file(&tmp);
+        if let Err(e) = crate::paths::atomic_write_json(path, &data) {
+            eprintln!("zytunes: playlist-store: {e}");
         }
     }
 }

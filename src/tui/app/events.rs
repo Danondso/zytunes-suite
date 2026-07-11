@@ -351,7 +351,6 @@ impl App {
             RipEvent::Started {
                 current,
                 total,
-                track_position: _,
                 track_title,
                 track_length_ms,
             } => {
@@ -370,17 +369,12 @@ impl App {
                     errors,
                 });
             }
-            RipEvent::Progress {
-                track_position: _,
-                elapsed_ms,
-            } => {
+            RipEvent::Progress { elapsed_ms } => {
                 if let Some(rip) = self.cd.rip.as_mut() {
                     rip.elapsed_ms = elapsed_ms;
                 }
             }
-            RipEvent::TrackDone {
-                track_title, error, ..
-            } => {
+            RipEvent::TrackDone { track_title, error } => {
                 if let Some(rip) = self.cd.rip.as_mut() {
                     if let Some(e) = error {
                         rip.errors.push(format!("{track_title}: {e}"));
