@@ -1,0 +1,431 @@
+//! Background-event dispatch for the TUI.
+//!
+//! `App::handle_bg_event` is the single entry point the run loop feeds
+//! [`BgEvent`]s through. The match itself stays a thin dispatcher — every
+//! multi-line reaction lives in a named `on_*` method below so each
+//! event's behaviour reads in isolation. Trivial field-set arms stay
+//! inline; anything with ordering constraints or follow-up commands gets
+//! its own method and doc comment.
+
+use zytunes::mtp::parse::DeviceEntry;
+
+use super::{App, BrowseMode, DeviceStatus, RipProgressState, SyncStatus};
+use crate::background::{BgCommand, BgEvent, DeviceInfo, StorageInfo};
+
+impl App {
+    pub fn handle_bg_event(&mut self, event: BgEvent) {
+        match event {
+            BgEvent::LibraryLoaded(result) => self.on_library_loaded(result),
+            BgEvent::LibraryScanProgress(p) => self.on_library_scan_progress(p),
+            BgEvent::DeviceDetected(info) => self.on_device_detected(info),
+            BgEvent::SessionReady(storage) => self.on_session_ready(storage),
+            BgEvent::SessionFailed(e) => self.on_session_failed(e),
+            BgEvent::DeviceSyncStatus(status) => {
+                self.device.sync_status = status;
+            }
+            BgEvent::AlbumArtLoaded { key, image } => {
+                // Only apply if the key still matches (user hasn't navigated away).
+                if key == self.album_art_key {
+                    self.album_art = image;
+                    self.album_art_cache = None;
+                    self.album_art_size = (0, 0);
+                }
+            }
+            BgEvent::LoadingDeviceTracks => {
+                self.device.loading_tracks = true;
+                self.set_toast("Loading device tracks...".into(), false);
+            }
+            BgEvent::DeviceTracksLoaded(tracks) => self.on_device_tracks_loaded(tracks),
+            BgEvent::DeviceTrackAdded(entry) => {
+                self.device.add_indexed_track(&entry);
+                self.device.tracks.push(entry);
+                self.device_index_dirty = true;
+            }
+            BgEvent::DeviceTrackRemoved(path) => self.on_device_track_removed(path),
+            BgEvent::Error(e) => {
+                self.device.loading_tracks = false;
+                self.set_toast(e, true);
+            }
+            BgEvent::SyncMessage(msg) => {
+                self.sync.log.push(msg);
+            }
+            BgEvent::SyncProgress {
+                current,
+                total,
+                track_name,
+            } => {
+                self.sync.status = SyncStatus::Running { current, total };
+                self.sync.current_track = track_name;
+            }
+            BgEvent::SyncTrackDone {
+                track_name,
+                success,
+                error,
+            } => {
+                if !success {
+                    self.set_toast(
+                        format!("Failed: {} - {}", track_name, error.unwrap_or_default()),
+                        true,
+                    );
+                }
+            }
+            BgEvent::SyncComplete {
+                success,
+                failed,
+                skipped,
+            } => self.on_sync_complete(success, failed, skipped),
+            BgEvent::RemoveProgress {
+                current,
+                total,
+                name,
+            } => {
+                self.sync.status = SyncStatus::Running { current, total };
+                self.sync.current_track = format!("Removing: {}", name);
+            }
+            BgEvent::RemoveComplete { success, failed } => {
+                self.sync.status = SyncStatus::Idle;
+                self.set_toast(
+                    format!("Removed {} tracks, {} failed", success, failed),
+                    failed > 0,
+                );
+            }
+            BgEvent::StorageUpdated(storage) => {
+                self.device.storage = Some(storage);
+            }
+            BgEvent::PhotoSyncComplete { success, failed } => {
+                if success > 0 || failed > 0 {
+                    self.set_toast(
+                        format!("Photo sync: {} done, {} failed", success, failed),
+                        failed > 0,
+                    );
+                }
+            }
+            BgEvent::VideoSyncComplete { success, failed } => {
+                if success > 0 || failed > 0 {
+                    self.set_toast(
+                        format!("Video sync: {} done, {} failed", success, failed),
+                        failed > 0,
+                    );
+                }
+            }
+            BgEvent::AcquiredItemsCount(count) => {
+                self.device.acquired_items = count;
+            }
+            BgEvent::PlaylistImported { name, summary } => self.on_playlist_imported(name, summary),
+            BgEvent::CdStatus(status) => {
+                self.cd.detect_in_flight = false;
+                self.cd.last_status = Some(status);
+            }
+            BgEvent::RipEvent(event) => {
+                self.handle_rip_event(event);
+            }
+            BgEvent::MbSearchResults { token, result } => {
+                self.handle_mb_search_results(token, result);
+            }
+            BgEvent::MbReleaseLoaded { token, result } => {
+                self.handle_mb_release_loaded(token, result);
+            }
+            BgEvent::TagsApplied {
+                token,
+                results,
+                rename_map,
+            } => {
+                self.handle_tags_applied(token, results, rename_map);
+            }
+            BgEvent::LibraryRereadComplete { token, result } => {
+                self.handle_library_reread_complete(token, result);
+            }
+            BgEvent::AcoustIdResolved { token, result } => {
+                self.handle_acoustid_resolved(token, result);
+            }
+            BgEvent::MbRecordingReleases { token, result } => {
+                self.handle_mb_recording_releases(token, result);
+            }
+        }
+    }
+
+    /// The background library scan finished (successfully or not).
+    fn on_library_loaded(
+        &mut self,
+        result: Result<Box<dyn zytunes::library::MusicLibrary + Send>, String>,
+    ) {
+        self.loading_library = false;
+        self.scan_progress = None;
+        self.scan_phrase = None;
+        self.scan_phrase_rotated_at = None;
+        self.scan_samples.clear();
+        match result {
+            Ok(lib) => {
+                self.library = Some(lib);
+                // Re-resolve the popup's cached lib `Track` against
+                // the new library *before* `refresh_sidebar` clears
+                // `track_list` — closed popups drop the cache, open
+                // ones repaint from the freshly-scanned metadata.
+                self.refresh_track_info_lib();
+                self.rebuild_artist_device_status();
+                self.refresh_sidebar();
+                // If a device connected before the library finished
+                // scanning, the merge couldn't fire on
+                // `DeviceTracksLoaded`. Catch up now.
+                self.merge_device_plays_into_local();
+            }
+            Err(e) => {
+                self.set_toast(format!("Library: {}", e), true);
+            }
+        }
+    }
+
+    fn on_library_scan_progress(&mut self, p: zytunes::dirlib::ScanProgress) {
+        self.scan_progress = Some((p.completed, p.total));
+        if let Some(sample) = p.sample {
+            // Keep a small rolling buffer (~128 most recent).
+            if self.scan_samples.len() >= 128 {
+                self.scan_samples.remove(0);
+            }
+            self.scan_samples.push(sample);
+        }
+        self.maybe_rotate_scan_phrase();
+    }
+
+    fn on_device_detected(&mut self, info: DeviceInfo) {
+        self.device.name = Some(info.name);
+        self.device.firmware = info.firmware_version;
+        self.device.serial = info.serial_number;
+        self.device.manufacturer = info.manufacturer;
+        self.device.model = info.model;
+        self.device.usb_mode = info.usb_mode;
+        self.device.family = Some(info.family);
+        self.device.status = DeviceStatus::Connecting;
+    }
+
+    fn on_session_ready(&mut self, storage: Option<StorageInfo>) {
+        self.device.status = DeviceStatus::Connected;
+        self.connection_anim_start = None;
+        self.device.storage = storage;
+        self.set_toast("Device connected".into(), false);
+
+        // Auto-sync photos/videos if configured.
+        let cfg = crate::config::load();
+        if let Some(photo_dir) = std::env::var("ZYTUNES_PHOTOS_DIR").ok().or(cfg.photo_dir) {
+            self.pending_bg_commands
+                .push(BgCommand::SyncPhotos { dir: photo_dir });
+        }
+        if let Some(video_dir) = std::env::var("ZYTUNES_VIDEOS_DIR").ok().or(cfg.video_dir) {
+            self.pending_bg_commands
+                .push(BgCommand::SyncVideos { dir: video_dir });
+        }
+    }
+
+    fn on_session_failed(&mut self, e: String) {
+        self.device.status = DeviceStatus::Disconnected;
+        self.device.sync_status = None;
+        self.connection_anim_start = None;
+        self.set_toast(format!("Connection failed: {}", e), true);
+        if self.browse_mode == BrowseMode::Library {
+            self.retag_on_device();
+        }
+    }
+
+    fn on_device_tracks_loaded(&mut self, tracks: Vec<DeviceEntry>) {
+        self.device.loading_tracks = false;
+        self.device.tracks = tracks;
+        self.build_device_index();
+        self.rebuild_artist_device_status();
+        self.set_toast(
+            format!("Loaded {} device tracks", self.device.tracks.len()),
+            false,
+        );
+        if self.browse_mode == BrowseMode::Device {
+            self.refresh_sidebar();
+        }
+        if self.browse_mode == BrowseMode::Library {
+            self.retag_on_device();
+        }
+        // Fold the device's per-track play/skip counters into the
+        // aggregate local-plays sidecar via per-(track, device)
+        // baselines. No-op when the library hasn't loaded yet —
+        // the `LibraryLoaded` handler runs the merge in that order.
+        self.merge_device_plays_into_local();
+    }
+
+    fn on_device_track_removed(&mut self, path: String) {
+        // path is a full device path like "/Music/Artist/Album/track.mp3"
+        // but DeviceEntry.name is relative like "Artist/Album/track.mp3"
+        let relative = path.strip_prefix("/Music/").unwrap_or(&path).to_string();
+        self.device.tracks.retain(|t| t.name != relative);
+        self.device.remove_indexed_track(&relative);
+        self.device_index_dirty = true;
+    }
+
+    /// A sync run finished. Clears the queue, reports totals, then drains
+    /// any queued playlist imports now that the tracks they reference are
+    /// on the device.
+    fn on_sync_complete(&mut self, success: usize, failed: usize, skipped: usize) {
+        self.sync.status = SyncStatus::Idle;
+        self.sync.queue.clear();
+        self.sync.queue_selected = 0;
+        let msg = if skipped > 0 {
+            format!(
+                "Sync complete: {} done, {} skipped, {} failed",
+                success, skipped, failed
+            )
+        } else {
+            format!("Sync complete: {} done, {} failed", success, failed)
+        };
+        self.set_toast(msg, failed > 0 || skipped > 0);
+        // Drain queued playlist imports — the file sync completed,
+        // so the device-side resolver will now see freshly-uploaded
+        // tracks. Per-backend gating decides whether each spec
+        // actually fires:
+        //   - Zune: always fire (validated end-to-end on hw 2026-04-26)
+        //   - iPod: only fire when ZYTUNES_EXPERIMENTAL_PLAYLIST_SYNC=1
+        //     until the iTunesDB-corruption incident is root-caused
+        //   - Unknown family: skip (defensive — no point sending to
+        //     a backend whose Err semantics we don't trust yet)
+        let family = self.device.family;
+        let allow = match family {
+            Some(zytunes::device::DeviceFamily::Zune) => true,
+            Some(zytunes::device::DeviceFamily::Ipod) => self.experimental_playlist_sync,
+            None => false,
+        };
+        let drained: Vec<_> = self.pending_playlist_imports.drain(..).collect();
+        for spec in drained {
+            if allow {
+                self.sync
+                    .log
+                    .push(format!("Importing playlist \"{}\" to device", spec.name));
+                self.pending_bg_commands.push(BgCommand::ImportPlaylist {
+                    name: spec.name,
+                    track_keys: spec.track_keys,
+                });
+            } else {
+                let reason = match family {
+                    Some(zytunes::device::DeviceFamily::Ipod) => {
+                        "iPod playlist sync gated off after 2026-04-26 \
+                         iTunesDB-corruption incident; set \
+                         ZYTUNES_EXPERIMENTAL_PLAYLIST_SYNC=1 to opt in"
+                    }
+                    _ => "no device session active",
+                };
+                self.sync.log.push(format!(
+                    "Playlist \"{}\": device-side push skipped ({reason})",
+                    spec.name
+                ));
+            }
+        }
+    }
+
+    fn on_playlist_imported(
+        &mut self,
+        name: String,
+        summary: Result<zytunes::mtp::PlaylistImportSummary, String>,
+    ) {
+        match summary {
+            Ok(s) => {
+                let verb = if s.replaced { "Replaced" } else { "Created" };
+                let msg = if s.skipped > 0 {
+                    format!(
+                        "{verb} playlist \"{}\" on device — {} tracks ({} unresolved)",
+                        name, s.resolved, s.skipped
+                    )
+                } else {
+                    format!(
+                        "{verb} playlist \"{}\" on device — {} tracks",
+                        name, s.resolved
+                    )
+                };
+                self.sync.log.push(msg.clone());
+                self.set_toast(msg, false);
+            }
+            Err(e) => {
+                let msg = format!("Playlist \"{}\" import failed: {}", name, e);
+                self.sync.log.push(msg.clone());
+                self.set_toast(msg, true);
+            }
+        }
+    }
+
+    fn handle_rip_event(&mut self, event: crate::background::RipEvent) {
+        use crate::background::RipEvent;
+        match event {
+            RipEvent::Started {
+                current,
+                total,
+                track_position: _,
+                track_title,
+                track_length_ms,
+            } => {
+                let errors = self
+                    .cd
+                    .rip
+                    .as_ref()
+                    .map(|r| r.errors.clone())
+                    .unwrap_or_default();
+                self.cd.rip = Some(RipProgressState {
+                    current,
+                    total,
+                    track_title,
+                    track_length_ms,
+                    elapsed_ms: 0,
+                    errors,
+                });
+            }
+            RipEvent::Progress {
+                track_position: _,
+                elapsed_ms,
+            } => {
+                if let Some(rip) = self.cd.rip.as_mut() {
+                    rip.elapsed_ms = elapsed_ms;
+                }
+            }
+            RipEvent::TrackDone {
+                track_title, error, ..
+            } => {
+                if let Some(rip) = self.cd.rip.as_mut() {
+                    if let Some(e) = error {
+                        rip.errors.push(format!("{track_title}: {e}"));
+                    }
+                }
+            }
+            RipEvent::Complete {
+                ripped,
+                failed,
+                cancelled,
+                ejected,
+            } => {
+                let errors = self
+                    .cd
+                    .rip
+                    .as_ref()
+                    .map(|r| r.errors.clone())
+                    .unwrap_or_default();
+                self.cd.rip = None;
+                let mut msg = if cancelled {
+                    format!("Rip cancelled: {ripped} ripped, {failed} failed")
+                } else if failed > 0 {
+                    format!("Rip done: {ripped} ripped, {failed} failed")
+                } else {
+                    format!("Rip complete: {ripped} tracks ripped")
+                };
+                if ejected {
+                    msg.push_str(", disc ejected");
+                }
+                let is_error = failed > 0 || cancelled;
+                self.set_toast(msg, is_error);
+                for e in errors {
+                    self.sync.log.push(format!("[rip] {e}"));
+                }
+                // Refresh the library so the newly-ripped tracks become
+                // visible in the sidebar/track list. Re-uses the same
+                // `LoadLibrary` path the initial startup load takes — the
+                // dirlib cache is mtime-keyed so the re-scan only re-parses
+                // the new files (existing entries hit the cache). Skipped
+                // when zero tracks landed so a fully-cancelled or fully-
+                // failed rip doesn't trigger a no-op scan.
+                if ripped > 0 {
+                    self.queue_library_reload();
+                }
+            }
+        }
+    }
+}
