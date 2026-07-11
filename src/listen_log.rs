@@ -30,6 +30,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::cache::{default_logger, Logger};
+
 /// Default session gap: events more than this far apart are treated as
 /// different sessions. 30 minutes mirrors what most listening-history
 /// tools settle on (long enough to forgive a pause for coffee, short
@@ -51,12 +53,32 @@ pub struct ListenEvent {
 
 /// In-memory view of the listen log. Built by `load_from`; mutated only
 /// by appends, which write straight through to disk for crash safety.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone)]
 pub struct ListenLog {
     events: Vec<ListenEvent>,
     /// Path the log persists to. `None` means "in-memory only" (used by
     /// tests + the App when no `HOME` is set).
     save_path: Option<PathBuf>,
+    logger: Logger,
+}
+
+impl Default for ListenLog {
+    fn default() -> Self {
+        ListenLog {
+            events: Vec::new(),
+            save_path: None,
+            logger: default_logger(),
+        }
+    }
+}
+
+impl std::fmt::Debug for ListenLog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ListenLog")
+            .field("events", &self.events)
+            .field("save_path", &self.save_path)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ListenLog {
@@ -67,6 +89,14 @@ impl ListenLog {
     /// Bind the log to a path. After this, `append` writes through.
     pub fn with_save_path(mut self, path: PathBuf) -> Self {
         self.save_path = Some(path);
+        self
+    }
+
+    /// Override the logger. Defaults to `default_logger()` (stderr).
+    /// Pass a channel-routing closure in the TUI so disk errors appear
+    /// in the sync log instead of scribbling through the ratatui frame.
+    pub fn with_logger(mut self, logger: Logger) -> Self {
+        self.logger = logger;
         self
     }
 
@@ -97,24 +127,24 @@ impl ListenLog {
         // Borrow rather than clone — `append_to_disk` only needs `&Path`,
         // and this fires on every play/skip in the hot path.
         if let Some(path) = self.save_path.as_deref() {
-            Self::append_to_disk(path, &event);
+            Self::append_to_disk(path, &event, &self.logger);
         }
     }
 
-    fn append_to_disk(path: &Path, event: &ListenEvent) {
+    fn append_to_disk(path: &Path, event: &ListenEvent, log: &Logger) {
         if let Some(parent) = path.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
-                eprintln!(
+                log(&format!(
                     "zytunes: listen-log: mkdir {} failed: {e}",
                     parent.display()
-                );
+                ));
                 return;
             }
         }
         let line = match serde_json::to_string(event) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("zytunes: listen-log: serialize event failed: {e}");
+                log(&format!("zytunes: listen-log: serialize event failed: {e}"));
                 return;
             }
         };
@@ -125,12 +155,18 @@ impl ListenLog {
         {
             Ok(f) => f,
             Err(e) => {
-                eprintln!("zytunes: listen-log: open {} failed: {e}", path.display());
+                log(&format!(
+                    "zytunes: listen-log: open {} failed: {e}",
+                    path.display()
+                ));
                 return;
             }
         };
         if let Err(e) = writeln!(f, "{line}") {
-            eprintln!("zytunes: listen-log: write {} failed: {e}", path.display());
+            log(&format!(
+                "zytunes: listen-log: write {} failed: {e}",
+                path.display()
+            ));
             return;
         }
         // Best-effort flush so the appended line survives a crash within
@@ -138,38 +174,45 @@ impl ListenLog {
         // diagnostic-only — the in-memory state is already updated and
         // the recommender treats the log as an info signal.
         if let Err(e) = f.sync_all() {
-            eprintln!(
+            log(&format!(
                 "zytunes: listen-log: sync_all {} failed: {e}",
                 path.display()
-            );
+            ));
         }
     }
 
     /// Read the log from the well-known path. Missing or empty files yield
     /// an empty in-memory log.
     pub fn load() -> Self {
+        let logger = default_logger();
         match default_save_path() {
-            Some(p) => {
-                let mut log = Self::load_from(&p);
-                log.save_path = Some(p);
-                log
-            }
+            Some(p) => Self::load_from(&p, &logger).with_save_path(p),
             None => ListenLog::default(),
         }
     }
 
     /// Read from an arbitrary path. Lines that fail to parse are skipped
-    /// with a warning to stderr — one malformed event must never poison
-    /// the rest of the log. Events come back in file order (which equals
-    /// chronological order for an append-only log).
-    pub fn load_from(path: &Path) -> Self {
+    /// with a warning — one malformed event must never poison the rest of
+    /// the log. Events come back in file order (which equals chronological
+    /// order for an append-only log).
+    ///
+    /// The supplied `log` is stored on the returned instance so subsequent
+    /// `append` calls route disk errors through the same sink.
+    pub fn load_from(path: &Path, log: &Logger) -> Self {
         let data = match std::fs::read_to_string(path) {
             Ok(d) => d,
             Err(e) => {
                 if e.kind() != std::io::ErrorKind::NotFound {
-                    eprintln!("zytunes: listen-log: read {} failed: {e}", path.display());
+                    log(&format!(
+                        "zytunes: listen-log: read {} failed: {e}",
+                        path.display()
+                    ));
                 }
-                return ListenLog::default();
+                return ListenLog {
+                    events: Vec::new(),
+                    save_path: None,
+                    logger: log.clone(),
+                };
             }
         };
         let mut events = Vec::new();
@@ -185,14 +228,15 @@ impl ListenLog {
             }
         }
         if bad > 0 {
-            eprintln!(
+            log(&format!(
                 "zytunes: listen-log: skipped {bad} malformed line(s) in {}",
                 path.display()
-            );
+            ));
         }
         ListenLog {
             events,
             save_path: None,
+            logger: log.clone(),
         }
     }
 
@@ -282,7 +326,7 @@ mod tests {
             completed: false,
         });
 
-        let loaded = ListenLog::load_from(&path);
+        let loaded = ListenLog::load_from(&path, &default_logger());
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded.events()[0].id, 1);
         assert_eq!(loaded.events()[1].id, 2);
@@ -313,7 +357,7 @@ mod tests {
         });
         drop(b);
 
-        let loaded = ListenLog::load_from(&path);
+        let loaded = ListenLog::load_from(&path, &default_logger());
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded.events()[0].id, 100);
         assert_eq!(loaded.events()[1].id, 200);
@@ -331,7 +375,7 @@ mod tests {
              {\"ts\":2,\"id\":43,\"completed\":false}\n",
         )
         .unwrap();
-        let loaded = ListenLog::load_from(&path);
+        let loaded = ListenLog::load_from(&path, &default_logger());
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded.events()[0].id, 42);
         assert_eq!(loaded.events()[1].id, 43);
@@ -342,7 +386,7 @@ mod tests {
     fn load_missing_file_returns_empty() {
         let path = temp_path("missing");
         let _ = std::fs::remove_file(&path);
-        let loaded = ListenLog::load_from(&path);
+        let loaded = ListenLog::load_from(&path, &default_logger());
         assert!(loaded.is_empty());
     }
 
@@ -422,5 +466,103 @@ mod tests {
         // One session — backwards delta is treated as 0 (no gap).
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].len(), 2);
+    }
+
+    #[test]
+    fn append_routes_disk_errors_through_stored_logger() {
+        use std::sync::{Arc, Mutex};
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let cap = captured.clone();
+        let log: crate::cache::Logger = Arc::new(move |msg: &str| {
+            cap.lock().unwrap().push(msg.to_string());
+        });
+
+        // /dev/null is a character device; any path beneath it is always
+        // unresolvable on Linux, so create_dir_all fails and append_to_disk
+        // bails on the mkdir branch (open is never reached — see below for
+        // that branch).
+        let bad_path = std::path::PathBuf::from("/dev/null/zytunes-test-listen/listen-log.jsonl");
+        let mut listen_log = ListenLog::new().with_save_path(bad_path).with_logger(log);
+        listen_log.append(ListenEvent {
+            ts: 1,
+            id: 42,
+            completed: true,
+        });
+
+        let msgs = captured.lock().unwrap().clone();
+        assert!(
+            msgs.iter().any(|m| m.contains("mkdir")),
+            "append must route mkdir errors through the stored logger, got: {msgs:?}"
+        );
+        // The event must still be in-memory despite the disk failure.
+        assert_eq!(listen_log.len(), 1);
+
+        // Second scenario: a save path that IS an existing directory. Its
+        // parent exists so create_dir_all succeeds, and the failure lands
+        // on the `open` branch instead (EISDIR).
+        captured.lock().unwrap().clear();
+        let dir_path = std::env::temp_dir().join(format!(
+            "zytunes-listen-log-test-{}-open-branch",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir_path).unwrap();
+        let cap2 = captured.clone();
+        let log2: crate::cache::Logger = Arc::new(move |msg: &str| {
+            cap2.lock().unwrap().push(msg.to_string());
+        });
+        let mut dir_log = ListenLog::new()
+            .with_save_path(dir_path.clone())
+            .with_logger(log2);
+        dir_log.append(ListenEvent {
+            ts: 2,
+            id: 43,
+            completed: true,
+        });
+        let msgs = captured.lock().unwrap().clone();
+        assert!(
+            msgs.iter().any(|m| m.contains("open")),
+            "append must route open errors through the stored logger, got: {msgs:?}"
+        );
+        assert_eq!(dir_log.len(), 1);
+        let _ = std::fs::remove_dir(&dir_path);
+    }
+
+    #[test]
+    fn load_from_routes_errors_through_supplied_logger() {
+        use std::sync::{Arc, Mutex};
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let cap = captured.clone();
+        let log: crate::cache::Logger = Arc::new(move |msg: &str| {
+            cap.lock().unwrap().push(msg.to_string());
+        });
+
+        // Malformed lines must be reported through the supplied logger.
+        let path = temp_path("logger-malformed");
+        std::fs::write(&path, "{\"ts\":1,\"id\":42,\"completed\":true}\nnot json\n").unwrap();
+        let loaded = ListenLog::load_from(&path, &log);
+        assert_eq!(loaded.len(), 1);
+        let msgs = captured.lock().unwrap().clone();
+        assert!(
+            msgs.iter().any(|m| m.contains("malformed")),
+            "load_from must route malformed-line warnings through the supplied logger, got: {msgs:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+
+        // A read error that isn't NotFound (here: the path is a directory)
+        // must also be reported, not silently swallowed or sent to stderr.
+        captured.lock().unwrap().clear();
+        let dir_path = std::env::temp_dir().join(format!(
+            "zytunes-listen-log-test-{}-load-dir",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir_path).unwrap();
+        let loaded = ListenLog::load_from(&dir_path, &log);
+        assert!(loaded.is_empty());
+        let msgs = captured.lock().unwrap().clone();
+        assert!(
+            msgs.iter().any(|m| m.contains("read")),
+            "load_from must route read errors through the supplied logger, got: {msgs:?}"
+        );
+        let _ = std::fs::remove_dir(&dir_path);
     }
 }

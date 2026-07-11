@@ -1301,17 +1301,26 @@ impl App {
     /// bind future `append`s to the same path. Production code calls this
     /// once after `App::new()`; tests skip it so the in-memory log starts
     /// empty and never writes to the developer's home dir.
-    pub fn load_listen_log_from_disk(&mut self) {
-        self.listen_log = ListenLog::load();
+    ///
+    /// Pass a channel-routing `Logger` in the TUI so load and disk errors
+    /// appear in the sync log rather than corrupting the ratatui frame.
+    pub fn load_listen_log_from_disk(&mut self, log: &zytunes::cache::Logger) {
+        self.listen_log = match zytunes::listen_log::default_save_path() {
+            Some(p) => ListenLog::load_from(&p, log).with_save_path(p),
+            None => ListenLog::default(),
+        };
     }
 
     /// Wire `playlists` to the on-disk file (`~/.config/zytunes/playlists.json`)
     /// and load any existing state. Production code calls this once after
     /// `App::new()`; tests skip it to avoid picking up developer-machine state.
-    pub fn load_playlists_from_disk(&mut self) {
+    ///
+    /// Pass a channel-routing `Logger` in the TUI so load and disk errors
+    /// appear in the sync log rather than corrupting the ratatui frame.
+    pub fn load_playlists_from_disk(&mut self, log: &zytunes::cache::Logger) {
         let path = playlist_store::default_save_path();
         if let Some(p) = path.as_deref() {
-            self.playlists = PlaylistStore::load_from(p);
+            self.playlists = PlaylistStore::load_from(p, log);
         }
         self.playlists_save_path = path;
     }
@@ -1856,10 +1865,13 @@ impl App {
     /// Wire `local_plays` to the on-disk sidecar (`~/.cache/zytunes/local-plays.json`)
     /// and load any existing state. Production code calls this once after
     /// `App::new()`; tests skip it so they don't pick up developer-machine state.
-    pub fn load_local_plays_from_disk(&mut self) {
+    ///
+    /// Pass a channel-routing `Logger` in the TUI so load and disk errors
+    /// appear in the sync log rather than corrupting the ratatui frame.
+    pub fn load_local_plays_from_disk(&mut self, log: &zytunes::cache::Logger) {
         let path = local_plays::default_save_path();
         if let Some(p) = path.as_deref() {
-            self.local_plays = LocalPlays::load_from(p);
+            self.local_plays = LocalPlays::load_from(p, log);
         }
         self.local_plays_save_path = path;
     }

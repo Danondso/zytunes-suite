@@ -45,20 +45,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = config::load();
     theme::init_themes(&cfg.themes);
 
+    // Set up background worker first so we can clone event_tx for the
+    // TUI logger before the background thread takes ownership.
+    let (event_tx, event_rx) = mpsc::channel();
+    let tui_log_tx = event_tx.clone();
+    let tui_logger: zytunes::cache::Logger = std::sync::Arc::new(move |msg: &str| {
+        let _ = tui_log_tx.send(background::BgEvent::SyncMessage(msg.to_string()));
+    });
+    let cmd_tx = background::spawn(event_tx);
+
     // Create app state.
     let mut app = App::new();
-    app.load_local_plays_from_disk();
-    app.load_playlists_from_disk();
-    app.load_listen_log_from_disk();
+    app.load_local_plays_from_disk(&tui_logger);
+    app.load_playlists_from_disk(&tui_logger);
+    app.load_listen_log_from_disk(&tui_logger);
     app.loading_library = true;
 
     if let Some(ref theme_name) = cfg.theme {
         app.theme = theme::theme_by_name(theme_name);
     }
-
-    // Set up background worker.
-    let (event_tx, event_rx) = mpsc::channel();
-    let cmd_tx = background::spawn(event_tx);
 
     // Set up audio thread.
     let (audio_event_tx, audio_event_rx) = mpsc::channel();

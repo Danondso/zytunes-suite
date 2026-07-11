@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::cache::{default_logger, Logger};
 use crate::playlist::{now_unix_ms, Playlist};
 
 /// Bumped whenever the on-disk shape changes such that older entries would
@@ -28,9 +29,27 @@ struct OnDisk {
 
 /// In-memory store. `App` owns one of these and persists changes via
 /// `save_to` after each mutation.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone)]
 pub struct PlaylistStore {
     playlists: Vec<Playlist>,
+    logger: Logger,
+}
+
+impl Default for PlaylistStore {
+    fn default() -> Self {
+        PlaylistStore {
+            playlists: Vec::new(),
+            logger: default_logger(),
+        }
+    }
+}
+
+impl std::fmt::Debug for PlaylistStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlaylistStore")
+            .field("playlists", &self.playlists)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Why a [`PlaylistStore::rename`] call failed. Distinguishing the two cases
@@ -158,51 +177,65 @@ impl PlaylistStore {
     /// an empty store; on parse failure or schema mismatch the existing file
     /// is preserved (renamed) so it can be inspected/recovered manually.
     pub fn load() -> Self {
+        let log = default_logger();
         match default_save_path() {
-            Some(p) => Self::load_from(&p),
+            Some(p) => Self::load_from(&p, &log),
             None => PlaylistStore::default(),
         }
     }
 
     /// Read from an arbitrary path — the test seam.
-    pub fn load_from(path: &Path) -> Self {
+    ///
+    /// The supplied `log` is stored on the returned store so subsequent
+    /// `save_to` calls route diagnostics through the same sink.
+    pub fn load_from(path: &Path, log: &Logger) -> Self {
         let data = match std::fs::read(path) {
             Ok(d) => d,
             Err(e) => {
                 if e.kind() != std::io::ErrorKind::NotFound {
-                    eprintln!(
+                    log(&format!(
                         "zytunes: playlist-store: read {} failed: {e}",
                         path.display()
-                    );
+                    ));
                 }
-                return PlaylistStore::default();
+                return PlaylistStore {
+                    playlists: Vec::new(),
+                    logger: log.clone(),
+                };
             }
         };
         let parsed: OnDisk = match serde_json::from_slice(&data) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!(
+                log(&format!(
                     "zytunes: playlist-store: parse {} ({} bytes) failed: {e} — preserving as .corrupt.bak",
                     path.display(),
                     data.len()
-                );
-                back_up(path, "corrupt");
-                return PlaylistStore::default();
+                ));
+                back_up(path, "corrupt", log);
+                return PlaylistStore {
+                    playlists: Vec::new(),
+                    logger: log.clone(),
+                };
             }
         };
         if parsed.schema_version != SCHEMA_VERSION {
-            eprintln!(
+            log(&format!(
                 "zytunes: playlist-store: stored schema {} != current {} — preserving {} entries as .v{}.bak",
                 parsed.schema_version,
                 SCHEMA_VERSION,
                 parsed.playlists.len(),
                 parsed.schema_version,
-            );
-            back_up(path, &format!("v{}", parsed.schema_version));
-            return PlaylistStore::default();
+            ));
+            back_up(path, &format!("v{}", parsed.schema_version), log);
+            return PlaylistStore {
+                playlists: Vec::new(),
+                logger: log.clone(),
+            };
         }
         PlaylistStore {
             playlists: parsed.playlists,
+            logger: log.clone(),
         }
     }
 
@@ -216,6 +249,7 @@ impl PlaylistStore {
     /// Atomic write to an arbitrary path — staged via `.tmp` + rename so a
     /// crash mid-write leaves the previous file intact.
     pub fn save_to(&self, path: &Path) {
+        let log = &self.logger;
         let on_disk = OnDisk {
             schema_version: SCHEMA_VERSION,
             playlists: self.playlists.clone(),
@@ -223,15 +257,15 @@ impl PlaylistStore {
         let data = match serde_json::to_vec_pretty(&on_disk) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!(
+                log(&format!(
                     "zytunes: playlist-store: serialize {} entries failed: {e}",
                     self.playlists.len()
-                );
+                ));
                 return;
             }
         };
         if let Err(e) = crate::paths::atomic_write_json(path, &data) {
-            eprintln!("zytunes: playlist-store: {e}");
+            log(&format!("zytunes: playlist-store: {e}"));
         }
     }
 }
@@ -250,7 +284,7 @@ pub fn default_save_path() -> Option<PathBuf> {
 
 /// Rename `path` to `path.{tag}.bak`, finding a unique suffix if a previous
 /// backup already exists. Best-effort: log on failure but don't propagate.
-fn back_up(path: &Path, tag: &str) {
+fn back_up(path: &Path, tag: &str, log: &Logger) {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let stem = path
         .file_name()
@@ -266,26 +300,26 @@ fn back_up(path: &Path, tag: &str) {
         let candidate = parent.join(&suffix);
         if !candidate.exists() {
             if let Err(e) = std::fs::rename(path, &candidate) {
-                eprintln!(
+                log(&format!(
                     "zytunes: playlist-store: backup {} -> {} failed: {e}",
                     path.display(),
                     candidate.display()
-                );
+                ));
             } else {
-                eprintln!(
+                log(&format!(
                     "zytunes: playlist-store: backed up {} -> {}",
                     path.display(),
                     candidate.display()
-                );
+                ));
             }
             return;
         }
         n += 1;
         if n > 100 {
-            eprintln!(
+            log(&format!(
                 "zytunes: playlist-store: gave up finding a unique backup name for {}",
                 path.display()
-            );
+            ));
             return;
         }
     }
@@ -394,7 +428,7 @@ mod tests {
         s.add_track(id, 200);
         s.save_to(&path);
 
-        let loaded = PlaylistStore::load_from(&path);
+        let loaded = PlaylistStore::load_from(&path, &default_logger());
         assert_eq!(loaded.len(), 1);
         let got = loaded.get(id).unwrap();
         assert_eq!(got.name, "Faves");
@@ -411,7 +445,7 @@ mod tests {
         let id = s.add(Playlist::new_generated("DW", params.clone(), vec![1, 2, 3]));
         s.save_to(&path);
 
-        let loaded = PlaylistStore::load_from(&path);
+        let loaded = PlaylistStore::load_from(&path, &default_logger());
         let got = loaded.get(id).unwrap();
         assert!(got.is_generated());
         assert_eq!(got.track_ids, vec![1, 2, 3]);
@@ -434,7 +468,7 @@ mod tests {
     fn load_missing_file_returns_empty() {
         let path = temp_path("missing");
         let _ = std::fs::remove_file(&path);
-        let s = PlaylistStore::load_from(&path);
+        let s = PlaylistStore::load_from(&path, &default_logger());
         assert!(s.is_empty());
     }
 
@@ -461,7 +495,7 @@ mod tests {
         let body = r#"{"schema_version":0,"playlists":[]}"#;
         std::fs::write(&path, body).unwrap();
 
-        let s = PlaylistStore::load_from(&path);
+        let s = PlaylistStore::load_from(&path, &default_logger());
         assert!(s.is_empty(), "stale-schema file must yield empty store");
         assert!(!path.exists(), "original file must be renamed away");
 
@@ -499,7 +533,7 @@ mod tests {
         let path = temp_path("corrupt");
         std::fs::write(&path, b"not json {{").unwrap();
 
-        let s = PlaylistStore::load_from(&path);
+        let s = PlaylistStore::load_from(&path, &default_logger());
         assert!(s.is_empty());
         assert!(!path.exists(), "corrupt file must be renamed away");
 
@@ -517,5 +551,57 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn load_from_routes_errors_through_supplied_logger() {
+        use std::sync::{Arc, Mutex};
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let cap = captured.clone();
+        let log: Logger = Arc::new(move |msg: &str| {
+            cap.lock().unwrap().push(msg.to_string());
+        });
+
+        let path = temp_path("logger-corrupt");
+        std::fs::write(&path, b"not json").unwrap();
+        let _ = PlaylistStore::load_from(&path, &log);
+
+        let msgs = captured.lock().unwrap();
+        assert!(
+            msgs.iter().any(|m| m.contains("playlist-store")),
+            "load_from must route parse errors through the supplied logger, got: {msgs:?}"
+        );
+        // Cleanup
+        let parent = path.parent().unwrap();
+        if let Ok(entries) = std::fs::read_dir(parent) {
+            for entry in entries.flatten() {
+                let n = entry.file_name();
+                if n.to_string_lossy().contains("logger-corrupt") {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn save_to_routes_errors_through_stored_logger() {
+        use std::sync::{Arc, Mutex};
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let cap = captured.clone();
+        let log: Logger = Arc::new(move |msg: &str| {
+            cap.lock().unwrap().push(msg.to_string());
+        });
+
+        // /dev/null is a character device; any path beneath it is always
+        // unresolvable on Linux, so create_dir_all must fail.
+        let bad_path = std::path::Path::new("/dev/null/zytunes-test-ps/playlists.json");
+        let s = PlaylistStore::load_from(&temp_path("logger-save-src"), &log);
+        s.save_to(bad_path);
+
+        let msgs = captured.lock().unwrap();
+        assert!(
+            msgs.iter().any(|m| m.contains("playlist-store")),
+            "save_to must route I/O errors through the stored logger, got: {msgs:?}"
+        );
     }
 }

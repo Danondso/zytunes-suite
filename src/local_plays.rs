@@ -18,6 +18,7 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
+use crate::cache::{default_logger, Logger};
 use crate::device::DeviceFamily;
 
 /// Bumped when the on-disk shape changes such that older entries would
@@ -89,9 +90,27 @@ struct OnDisk {
 
 /// In-memory sidecar. `App` holds one of these and persists changes via
 /// `save_to` after each mutation.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone)]
 pub struct LocalPlays {
     tracks: HashMap<u64, TrackPlays>,
+    logger: Logger,
+}
+
+impl Default for LocalPlays {
+    fn default() -> Self {
+        LocalPlays {
+            tracks: HashMap::new(),
+            logger: default_logger(),
+        }
+    }
+}
+
+impl std::fmt::Debug for LocalPlays {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalPlays")
+            .field("tracks", &self.tracks)
+            .finish_non_exhaustive()
+    }
 }
 
 impl LocalPlays {
@@ -174,48 +193,67 @@ impl LocalPlays {
     /// Read the sidecar from the well-known path. Missing, unparseable, or
     /// stale-schema files all degrade to an empty in-memory state.
     pub fn load() -> Self {
+        let log = default_logger();
         sidecar_path()
-            .map(|p| Self::load_from(&p))
+            .map(|p| Self::load_from(&p, &log))
             .unwrap_or_default()
     }
 
     /// Read from an arbitrary path — the test seam.
-    pub fn load_from(path: &Path) -> Self {
+    ///
+    /// The supplied `log` is stored on the returned instance so subsequent
+    /// `save_to` calls route diagnostics through the same sink.
+    pub fn load_from(path: &Path, log: &Logger) -> Self {
         let data = match std::fs::read(path) {
             Ok(d) => d,
             Err(e) => {
                 if e.kind() != std::io::ErrorKind::NotFound {
-                    eprintln!("zytunes: local-plays: read {} failed: {e}", path.display());
+                    log(&format!(
+                        "zytunes: local-plays: read {} failed: {e}",
+                        path.display()
+                    ));
                 }
-                return LocalPlays::default();
+                return LocalPlays {
+                    tracks: HashMap::new(),
+                    logger: log.clone(),
+                };
             }
         };
         let parsed: OnDisk = match serde_json::from_slice(&data) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!(
+                log(&format!(
                     "zytunes: local-plays: parse {} ({} bytes) failed: {e} — discarding",
                     path.display(),
                     data.len()
-                );
-                return LocalPlays::default();
+                ));
+                return LocalPlays {
+                    tracks: HashMap::new(),
+                    logger: log.clone(),
+                };
             }
         };
         if parsed.schema_version != SCHEMA_VERSION {
-            eprintln!(
+            log(&format!(
                 "zytunes: local-plays: stored schema {} != current {} — discarding {} entries",
                 parsed.schema_version,
                 SCHEMA_VERSION,
                 parsed.tracks.len()
-            );
-            return LocalPlays::default();
+            ));
+            return LocalPlays {
+                tracks: HashMap::new(),
+                logger: log.clone(),
+            };
         }
         let tracks = parsed
             .tracks
             .into_iter()
             .filter_map(|(k, v)| k.parse::<u64>().ok().map(|id| (id, v)))
             .collect();
-        LocalPlays { tracks }
+        LocalPlays {
+            tracks,
+            logger: log.clone(),
+        }
     }
 
     /// Persist to the well-known path. Caller decides cadence — the App
@@ -231,6 +269,7 @@ impl LocalPlays {
     /// crash mid-write leaves the previous file intact rather than a
     /// truncated JSON that `load_from` can't parse.
     pub fn save_to(&self, path: &Path) {
+        let log = &self.logger;
         let on_disk = OnDisk {
             schema_version: SCHEMA_VERSION,
             tracks: self
@@ -242,15 +281,15 @@ impl LocalPlays {
         let data = match serde_json::to_vec(&on_disk) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!(
+                log(&format!(
                     "zytunes: local-plays: serialize {} entries failed: {e}",
                     self.tracks.len()
-                );
+                ));
                 return;
             }
         };
         if let Err(e) = crate::paths::atomic_write_json(path, &data) {
-            eprintln!("zytunes: local-plays: {e}");
+            log(&format!("zytunes: local-plays: {e}"));
         }
     }
 }
@@ -554,7 +593,7 @@ mod tests {
         p.merge_device_observation(1, "Zune-ABC", 5, 1, 1_700_000_020_000);
         p.save_to(&path);
 
-        let loaded = LocalPlays::load_from(&path);
+        let loaded = LocalPlays::load_from(&path, &default_logger());
         assert_eq!(loaded.len(), 2);
 
         let t1 = loaded.get(1).unwrap();
@@ -596,7 +635,7 @@ mod tests {
     fn load_missing_file_returns_empty() {
         let path = temp_path("missing");
         let _ = std::fs::remove_file(&path);
-        let p = LocalPlays::load_from(&path);
+        let p = LocalPlays::load_from(&path, &default_logger());
         assert!(p.is_empty());
     }
 
@@ -604,7 +643,7 @@ mod tests {
     fn load_corrupt_file_returns_empty() {
         let path = temp_path("corrupt");
         std::fs::write(&path, b"this is not json {{{").unwrap();
-        let p = LocalPlays::load_from(&path);
+        let p = LocalPlays::load_from(&path, &default_logger());
         assert!(p.is_empty());
         let _ = std::fs::remove_file(&path);
     }
@@ -615,7 +654,7 @@ mod tests {
         // Mock an on-disk file with schema_version = 0 (pre-versioning).
         let body = r#"{"schema_version":0,"tracks":{"1":{"play_count":99,"skip_count":0,"last_played_at_ms":0,"device_baselines":{}}}}"#;
         std::fs::write(&path, body).unwrap();
-        let p = LocalPlays::load_from(&path);
+        let p = LocalPlays::load_from(&path, &default_logger());
         assert!(p.is_empty(), "stale-schema file must be discarded");
         let _ = std::fs::remove_file(&path);
     }
@@ -627,9 +666,44 @@ mod tests {
         let path = temp_path("bad-id");
         let body = r#"{"schema_version":1,"tracks":{"not-a-number":{"play_count":5,"skip_count":0,"last_played_at_ms":0,"device_baselines":{}},"42":{"play_count":3,"skip_count":0,"last_played_at_ms":0,"device_baselines":{}}}}"#;
         std::fs::write(&path, body).unwrap();
-        let p = LocalPlays::load_from(&path);
+        let p = LocalPlays::load_from(&path, &default_logger());
         assert_eq!(p.len(), 1);
         assert_eq!(p.get(42).unwrap().play_count, 3);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_from_and_save_to_route_errors_through_supplied_logger() {
+        use std::sync::{Arc, Mutex};
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let cap = captured.clone();
+        let log: Logger = Arc::new(move |msg: &str| {
+            cap.lock().unwrap().push(msg.to_string());
+        });
+
+        // load_from: a corrupt file should log through the supplied logger.
+        let path = temp_path("logger-corrupt");
+        std::fs::write(&path, b"not json").unwrap();
+        let _ = LocalPlays::load_from(&path, &log);
+        let _ = std::fs::remove_file(&path);
+
+        let load_msgs = captured.lock().unwrap().clone();
+        assert!(
+            load_msgs.iter().any(|m| m.contains("local-plays")),
+            "load_from must route parse errors through the supplied logger, got: {load_msgs:?}"
+        );
+
+        // save_to: an unwritable path should log through the stored logger.
+        captured.lock().unwrap().clear();
+        let good_path = temp_path("logger-save-src");
+        let store = LocalPlays::load_from(&good_path, &log);
+        let bad_path = std::path::Path::new("/dev/null/zytunes-test-lp/local-plays.json");
+        store.save_to(bad_path);
+
+        let save_msgs = captured.lock().unwrap().clone();
+        assert!(
+            save_msgs.iter().any(|m| m.contains("local-plays")),
+            "save_to must route I/O errors through the stored logger, got: {save_msgs:?}"
+        );
     }
 }
