@@ -68,6 +68,35 @@ struct DeviceCaps {
     album_cover_supported: bool,
 }
 
+/// Drop `device_path`'s entries from a [`DeviceLibrary`]. `/Music/{artist}`
+/// drops the artist and every album under it; `/Music/{artist}/{album}` (or
+/// deeper) drops just that album. Returns whether anything was removed so
+/// callers can skip a pointless cache re-save. Pure so it can be tested
+/// without a live device session.
+fn invalidate_device_library(lib: &mut DeviceLibrary, device_path: &str) -> bool {
+    let parts: Vec<&str> = device_path
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+    if parts.first().copied() != Some("Music") || parts.len() < 2 {
+        return false;
+    }
+    let artist = parts[1].to_string();
+    match parts.len() {
+        2 => {
+            let albums_before = lib.albums.len();
+            lib.albums.retain(|(a, _), _| a != &artist);
+            let artist_removed = lib.artists.remove(&artist).is_some();
+            artist_removed || lib.albums.len() != albums_before
+        }
+        _ => {
+            let album = parts[2].to_string();
+            lib.albums.remove(&(artist, album)).is_some()
+        }
+    }
+}
+
 /// Device library state — folders and cached artist/album mappings.
 struct DeviceLibrary {
     music_folder: u32,
@@ -1105,6 +1134,13 @@ impl DeviceSession for NativeSession {
                         "Cleaned up empty folder: {}/{}",
                         artist_info.filename, album_info.filename
                     ));
+                    // Deleting the folder orphans the cached abstract-album
+                    // handle — drop it or the next sync of this album feeds a
+                    // dead handle to send_object_prop_list (findings.md).
+                    self.invalidate_library_for_path(&format!(
+                        "/Music/{}/{}",
+                        artist_info.filename, album_info.filename
+                    ));
                     removed += 1;
                 }
             }
@@ -1119,6 +1155,9 @@ impl DeviceSession for NativeSession {
                     "Cleaned up empty folder: {}",
                     artist_info.filename
                 ));
+                // Same staleness hazard as the album case, for the artist
+                // handle (and any album entries still keyed under it).
+                self.invalidate_library_for_path(&format!("/Music/{}", artist_info.filename));
                 removed += 1;
             }
         }
@@ -1728,32 +1767,15 @@ impl NativeSession {
     /// resulting `send_object_prop_list` against a dead parent halts the
     /// OUT bulk pipe and cascades every queued track. See findings.md.
     fn invalidate_library_for_path(&mut self, device_path: &str) {
-        let parts: Vec<&str> = device_path
-            .trim_start_matches('/')
-            .split('/')
-            .filter(|s| !s.is_empty())
-            .collect();
-        if parts.first().copied() != Some("Music") || parts.len() < 2 {
-            return;
-        }
-        let artist = parts[1].to_string();
         if self.library.is_none() {
             self.library = self.load_library_cache();
         }
         let Some(lib) = self.library.as_mut() else {
             return;
         };
-        match parts.len() {
-            2 => {
-                lib.albums.retain(|(a, _), _| a != &artist);
-                lib.artists.remove(&artist);
-            }
-            _ => {
-                let album = parts[2].to_string();
-                lib.albums.remove(&(artist, album));
-            }
+        if invalidate_device_library(lib, device_path) {
+            self.save_library_cache();
         }
-        self.save_library_cache();
     }
 
     /// Delete the device library cache file.
@@ -1802,11 +1824,6 @@ impl NativeSession {
         if self.session.set_sync_progress(&cached[..530]).is_ok() {
             self.log_msg("Restored sync progress from cache");
         }
-    }
-
-    /// Clear the track cache entirely.
-    pub fn clear_cache(&self) {
-        self.cache.clear();
     }
 
     /// Try to extract and set album art on the device. Logs but doesn't fail on errors.
@@ -2131,6 +2148,103 @@ fn parse_firmware_version(raw: &str) -> Option<(u16, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_library() -> DeviceLibrary {
+        let mut artists = HashMap::new();
+        artists.insert(
+            "Rush".to_string(),
+            ArtistInfo {
+                id: 0x100,
+                music_folder_id: 0x10,
+            },
+        );
+        artists.insert(
+            "Yes".to_string(),
+            ArtistInfo {
+                id: 0x101,
+                music_folder_id: 0x11,
+            },
+        );
+        let mut albums = HashMap::new();
+        albums.insert(
+            ("Rush".to_string(), "Moving Pictures".to_string()),
+            AlbumInfo {
+                id: 0x200,
+                music_folder_id: 0x20,
+            },
+        );
+        albums.insert(
+            ("Rush".to_string(), "Hemispheres".to_string()),
+            AlbumInfo {
+                id: 0x201,
+                music_folder_id: 0x21,
+            },
+        );
+        albums.insert(
+            ("Yes".to_string(), "Fragile".to_string()),
+            AlbumInfo {
+                id: 0x202,
+                music_folder_id: 0x22,
+            },
+        );
+        DeviceLibrary {
+            music_folder: 1,
+            artists_folder: 2,
+            albums_folder: 3,
+            caps: DeviceCaps {
+                artist_supported: true,
+                album_date_supported: true,
+                album_cover_supported: true,
+            },
+            artists,
+            albums,
+        }
+    }
+
+    #[test]
+    fn invalidate_album_path_drops_only_that_album() {
+        let mut lib = sample_library();
+        assert!(invalidate_device_library(
+            &mut lib,
+            "/Music/Rush/Moving Pictures"
+        ));
+        assert!(!lib
+            .albums
+            .contains_key(&("Rush".to_string(), "Moving Pictures".to_string())));
+        // Sibling album and the artist itself survive.
+        assert!(lib
+            .albums
+            .contains_key(&("Rush".to_string(), "Hemispheres".to_string())));
+        assert!(lib.artists.contains_key("Rush"));
+    }
+
+    #[test]
+    fn invalidate_artist_path_drops_artist_and_all_its_albums() {
+        let mut lib = sample_library();
+        assert!(invalidate_device_library(&mut lib, "/Music/Rush"));
+        assert!(!lib.artists.contains_key("Rush"));
+        assert!(!lib.albums.keys().any(|(a, _)| a == "Rush"));
+        // Unrelated artist untouched.
+        assert!(lib.artists.contains_key("Yes"));
+        assert!(lib
+            .albums
+            .contains_key(&("Yes".to_string(), "Fragile".to_string())));
+    }
+
+    #[test]
+    fn invalidate_reports_whether_anything_was_removed() {
+        let mut lib = sample_library();
+        // Non-Music path and unknown entries are no-ops.
+        assert!(!invalidate_device_library(&mut lib, "/Videos/clip.wmv"));
+        assert!(!invalidate_device_library(&mut lib, "/Music/Nobody"));
+        assert!(!invalidate_device_library(
+            &mut lib,
+            "/Music/Rush/Not There"
+        ));
+        // A real removal reports true; repeating it reports false.
+        assert!(invalidate_device_library(&mut lib, "/Music/Rush"));
+        assert!(!invalidate_device_library(&mut lib, "/Music/Rush"));
+    }
 
     #[test]
     fn parse_firmware_version_handles_zune_format() {

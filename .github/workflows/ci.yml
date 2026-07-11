@@ -3,8 +3,9 @@ name: CI
 on:
   push:
     branches: [main, master]
+  # No branch filter on pull_request: stacked PRs target their parent
+  # feature branch until it merges, and they need CI too.
   pull_request:
-    branches: [main, master]
 
 env:
   CARGO_TERM_COLOR: always

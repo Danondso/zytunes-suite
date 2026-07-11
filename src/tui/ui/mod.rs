@@ -2031,7 +2031,7 @@ fn draw_now_playing(f: &mut Frame, app: &App, np: &NowPlaying, area: Rect, art_w
     // Track name
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            format!(" {}", &np.track_name),
+            format!(" {}", np.track_name),
             Style::default()
                 .fg(t.sidebar_text)
                 .add_modifier(Modifier::BOLD),
@@ -2041,8 +2041,8 @@ fn draw_now_playing(f: &mut Frame, app: &App, np: &NowPlaying, area: Rect, art_w
 
     // Artist — Album (year)
     let album_line = match np.year {
-        Some(y) => format!(" {} — {} ({})", &np.artist, &np.album, y),
-        None => format!(" {} — {}", &np.artist, &np.album),
+        Some(y) => format!(" {} — {} ({})", np.artist, np.album, y),
+        None => format!(" {} — {}", np.artist, np.album),
     };
     f.render_widget(
         Paragraph::new(album_line).style(Style::default().fg(t.header_text)),

@@ -275,7 +275,7 @@ pub fn transcode_to_wmv(input: &str, temp_dir: &Path) -> Result<String, String> 
             "-ar",
             "44100",
         ])
-        .arg(output.to_str().unwrap())
+        .arg(output.to_str().ok_or("output path not UTF-8")?)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .output()
@@ -407,6 +407,135 @@ pub fn transcode_flac_to_alac(input: &str, temp_dir: &Path) -> Result<String, St
     }
 
     Ok(output.to_string_lossy().into_owned())
+}
+
+/// Parsed MPEG audio frame header fields needed for Xing-tag patching.
+struct Mp3FrameHeader {
+    /// Whole frame length in bytes, including the 4-byte header.
+    frame_len: usize,
+    /// MPEG-1 (true) vs MPEG-2/2.5 (false) — decides side-info size.
+    mpeg1: bool,
+    /// Mono channel mode — decides side-info size.
+    mono: bool,
+}
+
+/// Parse an MPEG-1/2/2.5 Layer III frame header at the start of `b`.
+/// Returns `None` for anything that is not a plain Layer III frame with a
+/// defined bitrate (free-format and invalid indices are rejected).
+fn parse_mp3_frame_header(b: &[u8]) -> Option<Mp3FrameHeader> {
+    if b.len() < 4 || b[0] != 0xff || (b[1] & 0xe0) != 0xe0 {
+        return None;
+    }
+    let version = (b[1] >> 3) & 0x3; // 3 = MPEG1, 2 = MPEG2, 0 = MPEG2.5
+    let layer = (b[1] >> 1) & 0x3; // 1 = Layer III
+    if layer != 1 || version == 1 {
+        return None;
+    }
+    let bitrate_idx = (b[2] >> 4) as usize;
+    let sr_idx = ((b[2] >> 2) & 0x3) as usize;
+    if bitrate_idx == 0 || bitrate_idx == 15 || sr_idx == 3 {
+        return None;
+    }
+    const BITRATE_V1: [u32; 15] = [
+        0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
+    ];
+    const BITRATE_V2: [u32; 15] = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160];
+    const SAMPLE_RATE_V1: [u32; 3] = [44_100, 48_000, 32_000];
+    let mpeg1 = version == 3;
+    let sample_rate = match version {
+        3 => SAMPLE_RATE_V1[sr_idx],
+        2 => SAMPLE_RATE_V1[sr_idx] / 2,
+        _ => SAMPLE_RATE_V1[sr_idx] / 4,
+    };
+    let bitrate = if mpeg1 {
+        BITRATE_V1[bitrate_idx]
+    } else {
+        BITRATE_V2[bitrate_idx]
+    } * 1000;
+    let padding = ((b[2] >> 1) & 1) as usize;
+    let per_frame = if mpeg1 { 144 } else { 72 };
+    let frame_len = per_frame * bitrate as usize / sample_rate as usize + padding;
+    let mono = (b[3] >> 6) == 0b11;
+    Some(Mp3FrameHeader {
+        frame_len,
+        mpeg1,
+        mono,
+    })
+}
+
+/// Overwrite LAME's reserved VBR-tag placeholder with a valid Xing header.
+///
+/// LAME (with `bWriteVbrTag` on, its default) emits an all-zero placeholder
+/// frame at the start of the stream and expects the caller to rewrite it
+/// after encoding — the C file-based flow does this via
+/// `lame_get_lametag_frame()`, which the Rust wrapper does not expose. If the
+/// placeholder is left zeroed, the stream carries no Xing data at all, and
+/// players fall back to estimating duration as
+/// `stream bytes ÷ first-frame bitrate`. Against the placeholder's nominal
+/// 128 kbps, typical VBR NearBest music (~250 kbps average) reads as roughly
+/// twice its real length — the Zune then shows a doubled duration and replays
+/// the audio to fill the phantom tail, and the iPod DB records the same bad
+/// estimate via lofty.
+///
+/// Returns `false` (leaving `mp3` untouched) when the stream doesn't start
+/// with a zeroed placeholder or any frame fails to parse — in that case the
+/// output is exactly what we shipped before this fix, never corrupted.
+fn patch_xing_header(mp3: &mut [u8]) -> bool {
+    let Some(first) = parse_mp3_frame_header(mp3) else {
+        return false;
+    };
+    if mp3.len() < first.frame_len {
+        return false;
+    }
+    // Only patch a genuine placeholder: payload must be all zeros.
+    if mp3[4..first.frame_len].iter().any(|&b| b != 0) {
+        return false;
+    }
+    let side_info_len = match (first.mpeg1, first.mono) {
+        (true, true) => 17,
+        (true, false) => 32,
+        (false, true) => 9,
+        (false, false) => 17,
+    };
+    // "Xing" + flags + frame count + byte count + 100-entry TOC.
+    if 4 + side_info_len + 112 > first.frame_len {
+        return false;
+    }
+
+    // Walk the whole stream to collect frame offsets. Bail on any parse
+    // failure — a wrong TOC is worse than no TOC.
+    let mut offsets: Vec<usize> = Vec::new();
+    let mut pos = 0usize;
+    while pos < mp3.len() {
+        let Some(h) = parse_mp3_frame_header(&mp3[pos..]) else {
+            return false;
+        };
+        if pos + h.frame_len > mp3.len() {
+            return false;
+        }
+        offsets.push(pos);
+        pos += h.frame_len;
+    }
+    // The placeholder itself is not an audio frame.
+    let audio_frames = (offsets.len().saturating_sub(1)) as u32;
+    if audio_frames == 0 {
+        return false;
+    }
+    let total_bytes = mp3.len() as u32;
+
+    let tag_start = 4 + side_info_len;
+    mp3[tag_start..tag_start + 4].copy_from_slice(b"Xing");
+    // Flags: FRAMES | BYTES | TOC.
+    mp3[tag_start + 4..tag_start + 8].copy_from_slice(&7u32.to_be_bytes());
+    mp3[tag_start + 8..tag_start + 12].copy_from_slice(&audio_frames.to_be_bytes());
+    mp3[tag_start + 12..tag_start + 16].copy_from_slice(&total_bytes.to_be_bytes());
+    for i in 0..100usize {
+        let frame_idx = 1 + (i * audio_frames as usize) / 100;
+        let off = offsets[frame_idx.min(offsets.len() - 1)];
+        let scaled = (off as u64 * 256 / u64::from(total_bytes)).min(255) as u8;
+        mp3[tag_start + 16 + i] = scaled;
+    }
+    true
 }
 
 /// Byte index of the end of the last frame in `samples` that contains any
@@ -590,6 +719,11 @@ pub fn transcode_to_mp3(
     mp3_encoder
         .flush_to_vec::<mp3lame_encoder::FlushGap>(&mut mp3_data)
         .map_err(|e| format!("LAME flush: {e:?}"))?;
+
+    // Fill in the Xing/VBR header LAME reserved at the head of the stream.
+    // Best-effort: a `false` return leaves the stream as-is (playable, but
+    // duration estimates fall back to first-frame bitrate).
+    patch_xing_header(&mut mp3_data);
 
     // 4. Write the MP3 file
     std::fs::write(&output, &mp3_data).map_err(|e| format!("Write MP3: {e}"))?;
@@ -1926,6 +2060,160 @@ mod tests {
     }
 
     /// Generate a minimal JPEG image of given dimensions.
+    /// Write a 44.1 kHz / 16-bit sine-tone WAV with the given channel count.
+    /// Unlike `make_wav` (silence) this produces real signal so duration
+    /// assertions can't be confused with the silence-trimming logic.
+    fn make_sine_wav(path: &std::path::Path, seconds: u32, channels: u16) {
+        use std::io::Write;
+        let sample_rate: u32 = 44_100;
+        let bits: u16 = 16;
+        let frames = sample_rate * seconds;
+        let data_size = frames * u32::from(channels) * u32::from(bits) / 8;
+        let byte_rate = sample_rate * u32::from(channels) * u32::from(bits) / 8;
+        let block_align = channels * bits / 8;
+
+        let mut f = std::fs::File::create(path).unwrap();
+        f.write_all(b"RIFF").unwrap();
+        f.write_all(&(36 + data_size).to_le_bytes()).unwrap();
+        f.write_all(b"WAVE").unwrap();
+        f.write_all(b"fmt ").unwrap();
+        f.write_all(&16u32.to_le_bytes()).unwrap();
+        f.write_all(&1u16.to_le_bytes()).unwrap();
+        f.write_all(&channels.to_le_bytes()).unwrap();
+        f.write_all(&sample_rate.to_le_bytes()).unwrap();
+        f.write_all(&byte_rate.to_le_bytes()).unwrap();
+        f.write_all(&block_align.to_le_bytes()).unwrap();
+        f.write_all(&bits.to_le_bytes()).unwrap();
+        f.write_all(b"data").unwrap();
+        f.write_all(&data_size.to_le_bytes()).unwrap();
+        let mut pcm = Vec::with_capacity(data_size as usize);
+        for frame in 0..frames {
+            let t = frame as f32 / sample_rate as f32;
+            let v = ((t * 440.0 * std::f32::consts::TAU).sin() * 20_000.0) as i16;
+            for _ in 0..channels {
+                pcm.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        f.write_all(&pcm).unwrap();
+    }
+
+    /// Transcoded output must be roughly as long as the source — not doubled
+    /// (audio repeated) and not halved (frame-count confusion). Regression
+    /// guard for duration bugs in the decode→LAME loop.
+    fn assert_transcode_duration(channels: u16, label: &str) {
+        let dir = std::env::temp_dir().join(format!("zytunes-test-dur-{label}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("tone.wav");
+        make_sine_wav(&wav, 3, channels);
+
+        let mp3 = transcode_to_mp3(wav.to_str().unwrap(), &dir, None).unwrap();
+        let frames = count_mp3_frames(&mp3);
+        let secs = frames as f64 / 44_100.0;
+        assert!(
+            (2.5..=4.0).contains(&secs),
+            "{label}: 3s source transcoded to {secs:.2}s ({frames} frames)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transcode_preserves_duration_stereo() {
+        assert_transcode_duration(2, "stereo");
+    }
+
+    #[test]
+    fn transcode_preserves_duration_mono() {
+        assert_transcode_duration(1, "mono");
+    }
+
+    /// Locate the first MPEG frame in an MP3 file (skipping any ID3v2 tag)
+    /// and return (stream offset, stream bytes).
+    fn mp3_stream_bounds(data: &[u8]) -> (usize, usize) {
+        let mut off = 0usize;
+        if data.starts_with(b"ID3") && data.len() > 10 {
+            let sz = ((data[6] as usize) << 21)
+                | ((data[7] as usize) << 14)
+                | ((data[8] as usize) << 7)
+                | (data[9] as usize);
+            off = 10 + sz;
+        }
+        (off, data.len() - off)
+    }
+
+    /// The transcoder must fill in LAME's reserved Xing placeholder.
+    /// Without it, players estimate duration from the placeholder's nominal
+    /// bitrate — roughly 2× real length for typical VBR music — which is how
+    /// tracks synced to the Zune ended up "twice as long, played twice".
+    #[test]
+    fn transcoded_mp3_has_valid_xing_header() {
+        let dir = std::env::temp_dir().join("zytunes-test-xing");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("tone.wav");
+        make_sine_wav(&wav, 3, 2);
+
+        let mp3 = transcode_to_mp3(wav.to_str().unwrap(), &dir, None).unwrap();
+        let data = std::fs::read(&mp3).unwrap();
+        let (off, stream_len) = mp3_stream_bounds(&data);
+
+        // Stereo MPEG-1: Xing magic sits after 4-byte header + 32-byte side info.
+        let tag_start = off + 4 + 32;
+        assert_eq!(
+            &data[tag_start..tag_start + 4],
+            b"Xing",
+            "no Xing magic at expected offset — placeholder left unpatched"
+        );
+        let be_u32 =
+            |i: usize| u32::from_be_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+        let flags = be_u32(tag_start + 4);
+        assert_eq!(flags & 0x3, 0x3, "FRAMES and BYTES flags must be set");
+        let frames = be_u32(tag_start + 8);
+        let bytes = be_u32(tag_start + 12);
+
+        // Duration players derive from the tag must match the real 3 s source.
+        let tag_secs = frames as f64 * 1152.0 / 44_100.0;
+        assert!(
+            (2.5..=4.0).contains(&tag_secs),
+            "Xing frame count implies {tag_secs:.2}s for a 3s source"
+        );
+        assert_eq!(
+            bytes as usize, stream_len,
+            "Xing byte count must equal the MPEG stream length"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Duration-by-Xing must agree with duration-by-decode — the exact
+    /// mismatch that produced doubled-length tracks on device.
+    #[test]
+    fn xing_duration_matches_decoded_duration() {
+        let dir = std::env::temp_dir().join("zytunes-test-xing-dur");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("tone.wav");
+        make_sine_wav(&wav, 3, 2);
+
+        let mp3 = transcode_to_mp3(wav.to_str().unwrap(), &dir, None).unwrap();
+        let decoded_secs = count_mp3_frames(&mp3) as f64 / 44_100.0;
+
+        let data = std::fs::read(&mp3).unwrap();
+        let (off, _) = mp3_stream_bounds(&data);
+        let tag_start = off + 4 + 32;
+        let frames = u32::from_be_bytes([
+            data[tag_start + 8],
+            data[tag_start + 9],
+            data[tag_start + 10],
+            data[tag_start + 11],
+        ]);
+        let tag_secs = frames as f64 * 1152.0 / 44_100.0;
+        assert!(
+            (tag_secs - decoded_secs).abs() < 0.25,
+            "Xing duration {tag_secs:.2}s vs decoded {decoded_secs:.2}s"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn make_jpeg(width: u32, height: u32) -> Vec<u8> {
         use image::{ImageBuffer, Rgb};
         let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::new(width, height);
@@ -2140,6 +2428,15 @@ mod tests {
         let subdir = dir.join("subdir");
         std::fs::create_dir_all(&subdir).unwrap();
         std::fs::set_permissions(&subdir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Root ignores permission bits, so the unreadable-dir failure path
+        // can't be exercised (e.g. CI containers). Skip rather than assert
+        // a diagnostic that can't be produced.
+        if std::fs::read_dir(&subdir).is_ok() {
+            std::fs::set_permissions(&subdir, std::fs::Permissions::from_mode(0o755)).ok();
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
 
         let msgs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let msgs_clone = msgs.clone();
