@@ -34,6 +34,40 @@ fn is_device_gone_str(err: &str) -> bool {
         || err.contains("read_bulk timed out")
 }
 
+/// Drain every command pending on `cmd_rx` during a sync run: appended
+/// items are spliced onto the back of `sync_queue` (bumping `total`), and
+/// `CancelSync` is reported via the return value. Any other command is
+/// dropped — the TUI doesn't send them while `SyncStatus` is `Running`.
+///
+/// The sync loop must call this *before* its queue-empty exit check, not
+/// after popping an item: an `AppendSyncQueue` sent while the final track
+/// was transcoding/uploading has to extend the queue here, otherwise the
+/// loop would exit with the command unread and the appended tracks would
+/// silently never sync.
+fn drain_sync_commands(
+    cmd_rx: &mpsc::Receiver<BgCommand>,
+    event_tx: &mpsc::Sender<BgEvent>,
+    sync_queue: &mut std::collections::VecDeque<SyncItem>,
+    total: &mut usize,
+) -> bool {
+    let mut cancelled = false;
+    while let Ok(cmd) = cmd_rx.try_recv() {
+        match cmd {
+            BgCommand::CancelSync => cancelled = true,
+            BgCommand::AppendSyncQueue(more) if !more.is_empty() => {
+                let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                    "Queued {} more track(s) during sync",
+                    more.len()
+                )));
+                *total += more.len();
+                sync_queue.extend(more);
+            }
+            _ => {}
+        }
+    }
+    cancelled
+}
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -734,10 +768,6 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                 BgCommand::CancelSync => {
                     // Handled inline during sync execution via try_recv.
                 }
-                BgCommand::AppendSyncQueue(_) => {
-                    // Appends are consumed by the in-flight sync loop; any that
-                    // arrive when no sync is active are silently dropped.
-                }
                 BgCommand::RemoveFromDevice(items) => {
                     if let Some(ref mut s) = session {
                         let total = items.len();
@@ -1096,7 +1126,13 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                         let _ = event_tx.send(BgEvent::Error("No active session".into()));
                     }
                 }
-                BgCommand::ExecuteSyncQueue(items) => {
+                // `AppendSyncQueue` is normally consumed by the in-flight
+                // sync loop's between-track drain. One can still land here
+                // when it races the end of a sync (sent while the final
+                // track was uploading, received after the loop exited) —
+                // treat it exactly like a fresh `ExecuteSyncQueue` so the
+                // user's added tracks sync instead of vanishing.
+                BgCommand::ExecuteSyncQueue(items) | BgCommand::AppendSyncQueue(items) => {
                     if let Some(ref mut s) = session {
                         let cur_caps = caps.clone();
                         let supported_formats = cur_caps
@@ -1127,30 +1163,27 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                             total, to_transcode
                         )));
 
-                        while let Some(item) = sync_queue.pop_front() {
-                            // Drain any pending commands between tracks:
-                            // honour cancel, splice appended items onto the end.
-                            while let Ok(cmd) = cmd_rx.try_recv() {
-                                match cmd {
-                                    BgCommand::CancelSync => cancelled = true,
-                                    BgCommand::AppendSyncQueue(more) if !more.is_empty() => {
-                                        let _ = event_tx.send(BgEvent::SyncMessage(format!(
-                                            "Queued {} more track(s) during sync",
-                                            more.len()
-                                        )));
-                                        total += more.len();
-                                        sync_queue.extend(more);
-                                    }
-                                    // Other commands dropped during sync; the
-                                    // TUI doesn't send them while SyncStatus is Running.
-                                    _ => {}
-                                }
-                            }
+                        loop {
+                            // Drain pending commands between tracks: honour
+                            // cancel, splice appended items onto the end.
+                            // This runs before the pop (and before the
+                            // queue-empty exit) so tracks appended while the
+                            // previous — possibly final — track was uploading
+                            // still join this run instead of being lost.
+                            cancelled |= drain_sync_commands(
+                                &cmd_rx,
+                                &event_tx,
+                                &mut sync_queue,
+                                &mut total,
+                            );
                             if cancelled {
                                 let _ =
                                     event_tx.send(BgEvent::SyncMessage("Sync cancelled".into()));
                                 break;
                             }
+                            let Some(item) = sync_queue.pop_front() else {
+                                break;
+                            };
                             processed += 1;
                             let _ = event_tx.send(BgEvent::SyncProgress {
                                 current: processed,
@@ -2245,6 +2278,59 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn drain_sync_commands_splices_append_even_when_queue_is_empty() {
+        // Regression: tracks appended while the final track of a sync was
+        // transcoding/uploading used to sit unread in the channel until
+        // the sync loop exited on the empty queue — the append was then
+        // dropped and the tracks silently never synced. The drain must
+        // run before the empty-queue exit and extend an empty queue.
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel();
+        let mut queue: std::collections::VecDeque<SyncItem> = std::collections::VecDeque::new();
+        let mut total = 3usize;
+
+        cmd_tx
+            .send(BgCommand::AppendSyncQueue(vec![SyncItem {
+                name: "late add".into(),
+                ..Default::default()
+            }]))
+            .unwrap();
+
+        let cancelled = drain_sync_commands(&cmd_rx, &event_tx, &mut queue, &mut total);
+
+        assert!(!cancelled);
+        assert_eq!(queue.len(), 1, "append must extend an already-empty queue");
+        assert_eq!(queue[0].name, "late add");
+        assert_eq!(total, 4, "running total must include the appended track");
+        let ev = event_rx.try_recv().ok();
+        assert!(
+            matches!(ev, Some(BgEvent::SyncMessage(ref m)) if m.contains("more track(s)")),
+            "splice should announce itself in the sync log"
+        );
+    }
+
+    #[test]
+    fn drain_sync_commands_reports_cancel_and_ignores_empty_appends() {
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel();
+        let mut queue: std::collections::VecDeque<SyncItem> = std::collections::VecDeque::new();
+        let mut total = 2usize;
+
+        cmd_tx.send(BgCommand::AppendSyncQueue(vec![])).unwrap();
+        cmd_tx.send(BgCommand::CancelSync).unwrap();
+
+        let cancelled = drain_sync_commands(&cmd_rx, &event_tx, &mut queue, &mut total);
+
+        assert!(cancelled, "CancelSync must be reported");
+        assert!(queue.is_empty(), "empty appends must not enqueue anything");
+        assert_eq!(total, 2, "empty appends must not bump the total");
+        assert!(
+            event_rx.try_recv().is_err(),
+            "empty appends must not log a splice message"
+        );
     }
 
     #[test]

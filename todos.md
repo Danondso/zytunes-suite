@@ -183,6 +183,40 @@ sidebar_bg, alt_row on main_bg) reviewed and left as-is — alt rows are
 intentionally subtle, and sidebar text is already high-contrast on every
 built-in.
 
+## UX bugs
+
+### Device track list: duration column is empty (Zune)
+`DeviceEntry` (`src/mtp/parse.rs`) has no duration field, so device-mode
+rows always render an empty Duration column. Two-pronged fix, scoped
+during investigation (2026-07-11):
+
+1. **MTP enrichment (device truth).** Add `PROP_DURATION: u16 = 0xDC89`
+   to `zune-mtp/src/proplist.rs`, an `apply_durations` projection in
+   `src/mtp/native/playcount.rs` (skip `0` values — duration 0 is
+   meaningless, unlike play_count 0), and a fourth
+   `enrich_one_prop(tracks, PROP_DURATION, ...)` call in
+   `NativeSession::enrich_with_playcounts`. The bulk
+   `GetObjectPropList(0xFFFFFFFF, MP3, prop, 0, 0)` pattern is already
+   proven on v1.4 firmware for UseCount/Rating — one extra round trip
+   per connect. ZMDB has **no** duration in the audio record (all 28
+   fixed bytes are mapped: album/artist/genre/folder refs, size,
+   track#, format), so ZMDB rows only pick duration up after the cache
+   merge restores their object handles — same limitation playcounts
+   already have.
+2. **Library fallback (instant coverage).** In `device_tracks_to_info`
+   (`src/tui/app.rs`), refactor `resolve_library_id_for_device_track`
+   to return the matched `&Track` and use
+   `dt.duration_ms.or(lib_track.total_time_ms)` — covers every
+   device row that has a library counterpart with zero USB traffic.
+
+Wiring: `DeviceEntry.duration_ms: Option<u32>`, 9th tab-separated
+column in `TrackCache` (`splitn(9, ..)`, old caches parse fine),
+`DeviceTrackInfo.duration_ms: Option<u64>` threaded through
+`add_indexed_track`, and iPod fills it for free from mhit `+40`
+(`t.total_time_ms`, lift 0 → `None`) in
+`IpodSession::collect_all_tracks`. The UI already renders
+`TrackInfo.duration_ms` when present — no render changes needed.
+
 ## Future features
 
 ### Tag manager: composer / lyricist / performer fields

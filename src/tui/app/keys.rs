@@ -535,20 +535,15 @@ impl App {
         self.active_panel = Panel::Library;
     }
 
-    /// `d` — panel-dependent delete: dequeue a sync item, disconnect the
-    /// device, or delete a playlist / playlist track.
+    /// `d` — panel-dependent delete: dequeue a sync item or delete a
+    /// playlist / playlist track. On any panel that doesn't claim `d`
+    /// for itself, it disconnects the device — disconnecting shouldn't
+    /// require tabbing over to the Device panel first.
     fn handle_delete_key(&mut self, cmd_tx: &mpsc::Sender<BgCommand>) {
         match self.active_panel {
             Panel::SyncQueue => {
                 self.remove_queue_item();
-            }
-            Panel::Device => {
-                let _ = cmd_tx.send(BgCommand::Disconnect);
-                self.device.status = DeviceStatus::Disconnected;
-                self.device.name = None;
-                self.device.tracks.clear();
-                self.clear_device_index();
-                self.set_toast("Disconnected".into(), false);
+                return;
             }
             Panel::Library if self.browse_mode == BrowseMode::Playlists => {
                 if let Some(SidebarEntry::Playlist { id, .. }) =
@@ -556,12 +551,28 @@ impl App {
                 {
                     self.pending_playlist_delete = Some(id);
                 }
+                return;
             }
             Panel::TrackList if self.browse_mode == BrowseMode::Playlists => {
                 self.remove_selected_track_from_playlist();
+                return;
             }
             _ => {}
         }
+        if self.device.status != DeviceStatus::Disconnected {
+            self.disconnect_device(cmd_tx);
+        }
+    }
+
+    /// Disconnect the device: drop the worker session and clear all
+    /// device-side UI state.
+    fn disconnect_device(&mut self, cmd_tx: &mpsc::Sender<BgCommand>) {
+        let _ = cmd_tx.send(BgCommand::Disconnect);
+        self.device.status = DeviceStatus::Disconnected;
+        self.device.name = None;
+        self.device.tracks.clear();
+        self.clear_device_index();
+        self.set_toast("Disconnected".into(), false);
     }
 
     /// `Enter` — panel-dependent activate: drill into the sidebar

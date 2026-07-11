@@ -6908,6 +6908,101 @@ mod tests {
     }
 
     #[test]
+    fn d_disconnects_from_any_panel_when_connected() {
+        // Regression: `d` only disconnected when the Device panel was
+        // active; from any other panel it was a no-op, forcing the user
+        // to Tab over to the device panel first.
+        use crate::audio::AudioCommand;
+        use crate::background::BgCommand;
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<BgCommand>();
+        let (audio_tx, _audio_rx) = std::sync::mpsc::channel::<AudioCommand>();
+        let mut app = App::new();
+        app.device.status = DeviceStatus::Connected;
+        app.device.name = Some("Zune".into());
+        app.active_panel = Panel::Library;
+
+        app.handle_key(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('d'),
+                crossterm::event::KeyModifiers::empty(),
+            ),
+            &cmd_tx,
+            &audio_tx,
+        );
+
+        assert_eq!(app.device.status, DeviceStatus::Disconnected);
+        assert!(app.device.name.is_none());
+        assert!(
+            matches!(cmd_rx.try_recv(), Ok(BgCommand::Disconnect)),
+            "worker must be told to drop the session"
+        );
+    }
+
+    #[test]
+    fn d_on_sync_queue_panel_dequeues_instead_of_disconnecting() {
+        use crate::audio::AudioCommand;
+        use crate::background::BgCommand;
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<BgCommand>();
+        let (audio_tx, _audio_rx) = std::sync::mpsc::channel::<AudioCommand>();
+        let mut app = App::new();
+        app.device.status = DeviceStatus::Connected;
+        app.active_panel = Panel::SyncQueue;
+        app.sync.queue.push(QueuedItem {
+            label: "Album — Artist".into(),
+            tracks: vec![],
+        });
+
+        app.handle_key(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('d'),
+                crossterm::event::KeyModifiers::empty(),
+            ),
+            &cmd_tx,
+            &audio_tx,
+        );
+
+        assert!(app.sync.queue.is_empty(), "queue item should be removed");
+        assert_eq!(
+            app.device.status,
+            DeviceStatus::Connected,
+            "sync-queue `d` must not disconnect"
+        );
+        assert!(
+            !matches!(cmd_rx.try_recv(), Ok(BgCommand::Disconnect)),
+            "no Disconnect command should be sent"
+        );
+    }
+
+    #[test]
+    fn d_when_disconnected_is_a_noop() {
+        use crate::audio::AudioCommand;
+        use crate::background::BgCommand;
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<BgCommand>();
+        let (audio_tx, _audio_rx) = std::sync::mpsc::channel::<AudioCommand>();
+        let mut app = App::new();
+        assert_eq!(app.device.status, DeviceStatus::Disconnected);
+        app.active_panel = Panel::Library;
+
+        app.handle_key(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('d'),
+                crossterm::event::KeyModifiers::empty(),
+            ),
+            &cmd_tx,
+            &audio_tx,
+        );
+
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "no command with nothing connected"
+        );
+        assert!(
+            app.toast_message.is_none(),
+            "no phantom 'Disconnected' toast"
+        );
+    }
+
+    #[test]
     fn clear_device_index_resets_browse_mode() {
         let mut app = App::new();
         app.browse_mode = BrowseMode::Device;
