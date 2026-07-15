@@ -4073,6 +4073,7 @@ dependencies = [
  "image",
  "insta",
  "ipod-db",
+ "libc",
  "lofty",
  "mp3lame-encoder",
  "ratatui",

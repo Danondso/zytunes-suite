@@ -9,7 +9,8 @@
 
 use zytunes::mtp::parse::DeviceEntry;
 
-use super::{App, BrowseMode, DeviceStatus, RipProgressState, SyncStatus};
+use super::{App, BrowseMode, DeviceStatus, RipProgressState, StemStatus, SyncStatus};
+use crate::audio::AudioCommand;
 use crate::background::{BgCommand, BgEvent, DeviceInfo, StorageInfo};
 
 impl App {
@@ -141,6 +142,159 @@ impl App {
             BgEvent::MbRecordingReleases { token, result } => {
                 self.handle_mb_recording_releases(token, result);
             }
+            BgEvent::StemEngineProgress(line) => {
+                self.sync.log.push(format!("[stems] {line}"));
+            }
+            BgEvent::StemEngineReady { gen, command } => self.on_stem_engine_ready(gen, command),
+            BgEvent::StemEngineFailed {
+                gen,
+                error,
+                cancelled,
+            } => self.on_stem_engine_failed(gen, error, cancelled),
+            BgEvent::StemProgress { gen, pct, .. } => {
+                if gen == self.stems.job_gen {
+                    if let super::StemStatus::Separating { pct: ref mut p } = self.stems.status {
+                        *p = Some(pct);
+                    }
+                }
+            }
+            BgEvent::StemsReady {
+                gen,
+                track_path,
+                stems,
+            } => self.on_stems_ready(gen, track_path, *stems),
+            BgEvent::StemsFailed {
+                gen,
+                track_path,
+                error,
+                cancelled,
+            } => self.on_stems_failed(gen, track_path, error, cancelled),
+        }
+    }
+
+    /// Engine install finished: persist the resolved path (in memory and
+    /// to config.toml) and resume the separation the user asked for.
+    fn on_stem_engine_ready(&mut self, gen: u64, command: std::path::PathBuf) {
+        let path_str = self.stem_engine_ready_in_memory(gen, &command);
+        crate::config::update(move |c| c.stems.command = Some(path_str));
+    }
+
+    /// In-memory half of [`Self::on_stem_engine_ready`], split out (the
+    /// `cycle_show_player` pattern) so tests can drive the state machine
+    /// without writing the developer's real config file. Returns the
+    /// engine path string the wrapper persists — even for a stale `gen`,
+    /// since a finished install is a usable engine no matter which job
+    /// ran it; staleness only skips the state transitions.
+    pub(crate) fn stem_engine_ready_in_memory(
+        &mut self,
+        gen: u64,
+        command: &std::path::Path,
+    ) -> String {
+        let path_str = command.to_string_lossy().into_owned();
+        self.sync
+            .log
+            .push(format!("[stems] engine ready at {path_str}"));
+        self.stems_cfg.command = Some(path_str.clone());
+        if gen != self.stems.job_gen {
+            return path_str;
+        }
+        if let Some(pending) = self.stems.pending_path.take() {
+            self.dispatch_separation(pending);
+        } else {
+            // Track changed while installing: nothing to auto-split, but
+            // the engine is now ready for the next M-press.
+            self.stems.reset();
+            self.sync
+                .log
+                .push("[stems] press M to split the playing track".into());
+        }
+        path_str
+    }
+
+    fn on_stem_engine_failed(&mut self, gen: u64, err: String, cancelled: bool) {
+        if cancelled {
+            // User-initiated (or superseded) — not an error. The cancel
+            // site already reset state and toasted "Stem job cancelled".
+            self.sync
+                .log
+                .push(format!("[stems] engine install cancelled: {err}"));
+            return;
+        }
+        self.sync
+            .log
+            .push(format!("[stems] engine install failed: {err}"));
+        if gen != self.stems.job_gen {
+            return;
+        }
+        self.stems.reset();
+        self.stems.pending_path = None;
+        self.set_toast(format!("Stem engine install failed: {err}"), true);
+    }
+
+    /// Separation finished. If we're still waiting on this exact track and
+    /// it's still the one playing, swap playback into the stem mixer at
+    /// the current position; otherwise the stems just sit in the cache
+    /// (instant on the next `M`-press for that track).
+    fn on_stems_ready(&mut self, gen: u64, track_path: String, stems: zytunes::stems::StemSet) {
+        let waiting =
+            gen == self.stems.job_gen && matches!(self.stems.status, StemStatus::Separating { .. });
+        let still_playing = self.playing_track_path().as_deref() == Some(track_path.as_str());
+        if !(waiting && still_playing) {
+            self.sync
+                .log
+                .push(format!("[stems] stems cached for {track_path}"));
+            if waiting {
+                self.stems.reset();
+            }
+            return;
+        }
+
+        self.stems.enabled = [true; zytunes::stems::NUM_STEMS];
+        let gains = zytunes::stems::new_stem_gains(&self.stems.enabled);
+        // One gapless swap: the audio thread pre-seeks the mixer to its
+        // own live position (preserving pause state) before cutting over,
+        // so no Scrub/Pause choreography is needed here.
+        self.pending_audio_commands.push(AudioCommand::SwapSource {
+            target: crate::audio::SwapTarget::Stems {
+                stems: Box::new(stems),
+                gains: gains.clone(),
+            },
+        });
+        self.stems.gains = Some(gains);
+        self.stems.status = StemStatus::Active;
+        self.set_toast("Stem mode — 1-6 toggle stems, M exits".into(), false);
+    }
+
+    fn on_stems_failed(&mut self, gen: u64, track_path: String, error: String, cancelled: bool) {
+        // Identity is the job generation, NOT the track path: a cancelled
+        // job's late terminal event for track A must not reset a newer
+        // job separating that same track A.
+        let ours = gen == self.stems.job_gen;
+        if cancelled {
+            self.sync
+                .log
+                .push(format!("[stems] separation of {track_path} cancelled"));
+        } else {
+            self.sync.log.push(format!(
+                "[stems] separation of {track_path} failed: {error}"
+            ));
+            // A missing Python module means the engine env itself is
+            // broken (e.g. installed before the `--with numpy` fix).
+            // Discovery keeps finding the broken shim and skips
+            // provisioning, so point at the manual repair.
+            if error.contains("ModuleNotFoundError") {
+                self.sync.log.push(
+                    "[stems] engine env looks broken — run `uv tool uninstall demucs`, \
+                     clear [stems] command in config.toml, then press M to reinstall"
+                        .into(),
+                );
+            }
+            if ours {
+                self.set_toast(format!("Stem separation failed: {error}"), true);
+            }
+        }
+        if ours {
+            self.stems.reset();
         }
     }
 

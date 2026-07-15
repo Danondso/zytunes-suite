@@ -46,6 +46,7 @@ impl App {
             || self.handle_search_key(key)
             || self.handle_theme_picker_key(key)
             || self.handle_cache_clear_key(key)
+            || self.handle_stem_consent_key(key)
             || self.handle_removal_confirm_key(key, cmd_tx)
             || self.handle_help_key(key)
         {
@@ -61,7 +62,61 @@ impl App {
             return KeyOutcome::Continue;
         }
 
+        if self.handle_stem_key(key) {
+            return KeyOutcome::Continue;
+        }
+
         self.handle_global_key(key, cmd_tx, audio_tx)
+    }
+
+    /// Engine-install consent overlay (opened by `M` when no stem engine
+    /// is found and `[stems]` provisioning is auto). A real modal: it
+    /// claims every key while open.
+    fn handle_stem_consent_key(&mut self, key: KeyEvent) -> bool {
+        if self.stems.consent.is_none() {
+            return false;
+        }
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                if let Some(consent) = self.stems.consent.take() {
+                    self.stems.job_gen += 1;
+                    self.stems.status = super::StemStatus::Provisioning;
+                    self.pending_bg_commands
+                        .push(BgCommand::ProvisionStemEngine {
+                            gen: self.stems.job_gen,
+                            package: consent.package,
+                            gpu: consent.gpu,
+                        });
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.stems.consent = None;
+                self.stems.pending_path = None;
+                self.set_toast("Stem engine install skipped".into(), false);
+            }
+            _ => {}
+        }
+        true
+    }
+
+    /// While stem playback is Active, keys `1`–`6` toggle the six stems
+    /// (they normally switch sidebar modes / jump panels). Everything
+    /// else falls through — this claims exactly those six keys, and `M`
+    /// in the global map exits stem mode. Claiming is additionally gated
+    /// on the strip being visible: with the player panel hidden (`P`
+    /// force-hidden, or a terminal too short for it), `1`/`2` silently
+    /// mutating invisible stems read as the sidebar keys going dead.
+    fn handle_stem_key(&mut self, key: KeyEvent) -> bool {
+        if self.stems.status != super::StemStatus::Active || !self.stem_strip_visible() {
+            return false;
+        }
+        match key.code {
+            KeyCode::Char(c @ '1'..='6') => {
+                self.toggle_stem(c as usize - '1' as usize);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Playlist name input modal — handles both create-new and rename.
@@ -377,6 +432,9 @@ impl App {
                     && self.library.is_some() =>
             {
                 self.open_tag_manager(cmd_tx);
+            }
+            KeyCode::Char('M') => {
+                self.press_stem_mode();
             }
             KeyCode::Char('P') => {
                 let label = self.cycle_show_player();

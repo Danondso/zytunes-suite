@@ -19,11 +19,12 @@ use crate::anim;
 use crate::app::{
     format_duration, format_with_commas, AlbumArtCache, App, BrowseMode, DevicePresence,
     DeviceStatus, GenerationFormState, NowPlaying, Panel, PlaybackState, SidebarEntry, SidebarMode,
-    SortColumn, SyncStatus,
+    SortColumn, StemStatus, SyncStatus,
 };
 use crate::background::CdStatusEvent;
 use crate::theme;
 use zytunes::musicbrainz::render_artist_credit;
+use zytunes::stems::StemKind;
 
 /// Responsive layout dimensions computed from terminal size.
 ///
@@ -48,7 +49,9 @@ const COMPACT_TIER_MAX_W: u16 = 100;
 /// layout applies.
 const STANDARD_TIER_MAX_W: u16 = 140;
 /// Terminal height below which the now-playing panel can't physically fit.
-const PLAYER_MIN_H: u16 = 12;
+/// `pub(crate)` because `App::stem_strip_visible` mirrors this floor when
+/// deciding whether the stem keys may claim input.
+pub(crate) const PLAYER_MIN_H: u16 = 12;
 
 impl LayoutMetrics {
     /// `show_player` is the final resolved decision from the caller — it
@@ -182,13 +185,16 @@ pub fn draw(f: &mut Frame, app: &App) {
         draw_device_left_panel(f, app, outer[0]);
     }
 
-    // Middle: browser area + optional now-playing + footer
+    // Middle: browser area + optional now-playing + footer. The player
+    // panel grows one row while a stem-strip line is showing; the height
+    // lives on App so the album-art pre-render sees the same number.
+    let player_h = app.player_panel_height();
     let middle = if m.show_now_playing {
         Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(8),
-                Constraint::Length(9),
+                Constraint::Length(player_h),
                 Constraint::Length(3),
             ])
             .split(outer[1])
@@ -243,6 +249,10 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     if app.pending_cache_clear {
         draw_confirm_cache_clear(f, app);
+    }
+
+    if let Some(ref consent) = app.stems.consent {
+        draw_stem_consent(f, app, consent);
     }
 
     // Toast overlay.
@@ -1782,6 +1792,7 @@ fn draw_keys_panel(f: &mut Frame, app: &App, area: Rect) {
         ("t", "Theme picker"),
         ("T", "Art style"),
         ("P", "Player panel"),
+        ("M", "Stem mixer"),
         ("/", "Search"),
         ("c", "Connect"),
         ("X", "Clear cache"),
@@ -2130,6 +2141,103 @@ fn draw_now_playing(f: &mut Frame, app: &App, np: &NowPlaying, area: Rect, art_w
             rows[5],
         );
     }
+
+    // Stem strip — the Min(0) absorber row at the bottom (the panel is one
+    // row taller whenever stems are engaged, so this normally has space).
+    let strip_area = rows[rows.len() - 1];
+    if app.stems.status != StemStatus::Off && strip_area.height >= 1 {
+        let strip = Rect::new(strip_area.x, strip_area.y, strip_area.width, 1);
+        f.render_widget(stem_strip_line(app, strip.width), strip);
+    }
+}
+
+/// One-line stem status for the now-playing panel. `Active` renders the
+/// six toggle cells (`[1 Voc ●]`, filled = audible / hollow = muted),
+/// dropping the labels below the ~66 columns the full form needs.
+fn stem_strip_line(app: &App, width: u16) -> Paragraph<'static> {
+    let t = app.theme();
+    let header = Span::styled(
+        " STEMS ",
+        Style::default()
+            .fg(t.header_text)
+            .add_modifier(Modifier::BOLD),
+    );
+    let mut spans = vec![header];
+    match app.stems.status {
+        StemStatus::Provisioning => spans.push(Span::styled(
+            " installing engine… (one-time, see log)",
+            Style::default().fg(t.dim_text),
+        )),
+        StemStatus::Separating { pct } => spans.push(Span::styled(
+            match pct {
+                Some(p) => format!(" separating… {p}%"),
+                None => " separating…".to_string(),
+            },
+            Style::default().fg(t.progress_bar),
+        )),
+        StemStatus::Active => {
+            let wide = width >= 66;
+            for kind in StemKind::ALL {
+                let i = kind.index();
+                let on = app.stems.enabled[i];
+                let dot = if on { "●" } else { "○" };
+                let cell = if wide {
+                    format!("[{} {} {}] ", i + 1, kind.short_label(), dot)
+                } else {
+                    format!("[{}{}]", i + 1, dot)
+                };
+                let style = if on {
+                    Style::default()
+                        .fg(t.success_text)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(t.dim_text)
+                };
+                spans.push(Span::styled(cell, style));
+            }
+        }
+        StemStatus::Off => {}
+    }
+    Paragraph::new(Line::from(spans))
+}
+
+/// Consent modal for the one-time stem-engine install (`M` with no
+/// engine found). Mirrors the cache-clear confirm.
+fn draw_stem_consent(f: &mut Frame, app: &App, consent: &crate::app::StemConsent) {
+    let t = app.theme();
+    let area = f.area();
+    let w = 56u16.min(area.width.saturating_sub(4));
+    let h = 7u16.min(area.height.saturating_sub(2));
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let rect = Rect::new(x, y, w, h);
+
+    f.render_widget(Clear, rect);
+
+    let block = t
+        .block()
+        .style(t.modal())
+        .border_style(t.success())
+        .title(" Stem Playback ")
+        .title_alignment(Alignment::Center);
+
+    let size_note = if consent.gpu {
+        "(GPU build — several GB, one-time)"
+    } else {
+        "(~1.5 GB one-time download)"
+    };
+    let lines = vec![
+        Line::from(""),
+        Line::from(format!(
+            " Splitting tracks needs the {} engine.",
+            consent.package
+        )),
+        Line::from(format!(" Install it now via uv? {size_note}")),
+        Line::from(""),
+        Line::from(Span::styled(" Enter/y:install  Esc/n:skip", t.modal_dim())),
+    ];
+    let p = Paragraph::new(lines).block(block).style(t.modal());
+    f.render_widget(p, rect);
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect, footer_left_width: u16) {
@@ -2284,6 +2392,8 @@ fn draw_help_overlay(f: &mut Frame, app: &App) {
         "  Space       Play / pause selected track",
         "  n / p       Next / previous track in playlist",
         "  < / >       Seek -/+ 5 seconds",
+        "  M           Stem mixer (split vocals/drums/bass/…)",
+        "  1-6         Toggle stems while the mixer is active",
         "",
         "  Logs",
         "  PgUp/PgDn   Scroll sync log",

@@ -87,6 +87,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &audio_event_rx,
     );
 
+    // Take down any running stem engine/installer before this process
+    // exits — detached job threads die with us, but their demucs/uv
+    // children would survive as orphans (on macOS there's no PDEATHSIG),
+    // and an orphaned demucs holding the HuggingFace download lock wedges
+    // every future separation until someone finds and kills it.
+    zytunes::stems::kill_active_stem_children();
+
     // Restore terminal.
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -108,6 +115,10 @@ fn run_loop(
     audio_rx: &mpsc::Receiver<audio::AudioEvent>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
+        // Refresh the height snapshot key dispatch uses for visibility
+        // questions (e.g. whether the stem strip may claim keys 1-6).
+        app.last_term_height = terminal.size()?.height;
+
         // Pre-render album art for the area below the track list in album detail view.
         if app.album_art.is_some() && app.has_album_browser() {
             let size = terminal.size()?;
@@ -120,8 +131,17 @@ fn run_loop(
             // Available height below tracks: total browser height minus
             // a minimum of 4 rows for the track list, borders, footer, player.
             let show_player = app.should_show_player(size.height);
-            let overhead = 2 + 3 + if show_player { 9 } else { 0 }; // borders + footer + player
-            let browser_h = size.height.saturating_sub(overhead as u16);
+            // borders + footer + player; the player height comes from the
+            // same accessor draw() uses (10 while stems are engaged) so
+            // the art is sized for the panel that will actually be drawn.
+            let overhead: u16 = 2
+                + 3
+                + if show_player {
+                    app.player_panel_height()
+                } else {
+                    0
+                };
+            let browser_h = size.height.saturating_sub(overhead);
             let track_min = 4u16.min(app.track_list.len() as u16);
             // Art panel total rows (including its own top/bottom border and padding).
             let art_panel_h = browser_h.saturating_sub(track_min).min(26);
@@ -148,6 +168,11 @@ fn run_loop(
         // Flush any pending background commands queued during event handling.
         for cmd in app.pending_bg_commands.drain(..) {
             let _ = cmd_tx.send(cmd);
+        }
+        // Same for audio commands (stem-mode swaps queue Play/Scrub pairs
+        // from event handlers, which have no audio_tx). Order preserved.
+        for cmd in app.pending_audio_commands.drain(..) {
+            let _ = audio_tx.send(cmd);
         }
         app.flush_device_index();
 

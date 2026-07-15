@@ -11,6 +11,9 @@ license = "MIT"
 
 [dependencies]
 rusb = "0.9"
+# PR_SET_PDEATHSIG for stem-engine children (Linux): the engine must die
+# with the TUI or an orphan wedges the HuggingFace model-download lock.
+libc = "0.2"
 ratatui = "0.30"
 crossterm = "0.28"
 throbber-widgets-tui = "0.11.0"

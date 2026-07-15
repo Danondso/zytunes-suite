@@ -56,6 +56,74 @@ pub struct Config {
     /// into the theme picker alongside the built-ins.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub themes: BTreeMap<String, UserTheme>,
+    /// `[stems]` table — stem-separation engine and cache settings.
+    #[serde(default, skip_serializing_if = "StemsConfig::is_default")]
+    pub stems: StemsConfig,
+}
+
+/// `[stems]` — settings for stem-split playback (`M` in the player).
+/// Everything is optional with working defaults; see the accessors for
+/// the effective values.
+#[derive(Serialize, Deserialize, Default, Clone, PartialEq, Debug)]
+pub struct StemsConfig {
+    /// Engine provisioning strategy: `"auto"` (default — offer a
+    /// uv-managed install when no engine is found) or `"manual"` (never
+    /// install; report the missing engine instead). `"bundled"` is
+    /// reserved for a future pre-built distribution.
+    pub provision: Option<String>,
+    /// Explicit demucs binary path (venv/pipx/system). Set by hand for
+    /// manual installs; the auto-provisioner writes the resolved path
+    /// back here after a successful install.
+    pub command: Option<String>,
+    /// pip requirement spec the auto-provisioner installs. Swap for a
+    /// maintained fork (e.g. `demucs-next`) without a zytunes release.
+    pub package: Option<String>,
+    /// Demucs model name. Participates in the stem-cache key — changing
+    /// it re-separates on next use.
+    pub model: Option<String>,
+    /// `true` installs the default (CUDA/MPS-capable) torch instead of
+    /// the much smaller CPU-only build. Auto-provision only.
+    pub gpu: Option<bool>,
+    /// Stem cache size cap in GiB (LRU-pruned).
+    pub cache_max_gb: Option<u64>,
+}
+
+impl StemsConfig {
+    fn is_default(&self) -> bool {
+        *self == StemsConfig::default()
+    }
+
+    /// Auto-provisioning is on unless `provision = "manual"`.
+    pub fn auto_provision(&self) -> bool {
+        self.provision.as_deref() != Some("manual")
+    }
+
+    pub fn package(&self) -> String {
+        self.package.clone().unwrap_or_else(|| "demucs".to_string())
+    }
+
+    pub fn model(&self) -> String {
+        self.model
+            .clone()
+            .unwrap_or_else(|| "htdemucs_6s".to_string())
+    }
+
+    pub fn gpu(&self) -> bool {
+        self.gpu.unwrap_or(false)
+    }
+
+    pub fn cache_max_bytes(&self) -> u64 {
+        self.cache_max_gb.unwrap_or(10).saturating_mul(1 << 30)
+    }
+
+    /// Explicit engine path, ignoring empty strings so a commented-out
+    /// or blanked field behaves like unset.
+    pub fn command_path(&self) -> Option<std::path::PathBuf> {
+        self.command
+            .as_deref()
+            .filter(|c| !c.trim().is_empty())
+            .map(std::path::PathBuf::from)
+    }
 }
 
 /// Configurable overrides for a custom theme. All fields are optional and
@@ -305,6 +373,72 @@ music_dir = "/home/user/Music"
             let deserialized: Config = toml::from_str(&serialized).unwrap();
             assert_eq!(deserialized.album_art_style.as_deref(), Some(style));
         }
+    }
+
+    #[test]
+    fn stems_config_defaults() {
+        let cfg = Config::default();
+        assert!(cfg.stems.auto_provision());
+        assert_eq!(cfg.stems.package(), "demucs");
+        assert_eq!(cfg.stems.model(), "htdemucs_6s");
+        assert!(!cfg.stems.gpu());
+        assert_eq!(cfg.stems.cache_max_bytes(), 10 * (1 << 30));
+        assert!(cfg.stems.command_path().is_none());
+    }
+
+    #[test]
+    fn stems_config_parses_table() {
+        let toml_str = r#"
+theme = "BIOS"
+
+[stems]
+provision = "manual"
+command = "/home/u/.venvs/demucs/bin/demucs"
+package = "demucs-next"
+model = "htdemucs"
+gpu = true
+cache_max_gb = 25
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(!cfg.stems.auto_provision());
+        assert_eq!(
+            cfg.stems.command_path().as_deref(),
+            Some(std::path::Path::new("/home/u/.venvs/demucs/bin/demucs"))
+        );
+        assert_eq!(cfg.stems.package(), "demucs-next");
+        assert_eq!(cfg.stems.model(), "htdemucs");
+        assert!(cfg.stems.gpu());
+        assert_eq!(cfg.stems.cache_max_bytes(), 25 * (1 << 30));
+    }
+
+    #[test]
+    fn stems_config_empty_command_reads_as_unset() {
+        let cfg: Config = toml::from_str("[stems]\ncommand = \"\"\n").unwrap();
+        assert!(cfg.stems.command_path().is_none());
+    }
+
+    #[test]
+    fn empty_stems_table_is_not_serialized() {
+        let serialized = toml::to_string_pretty(&Config::default()).unwrap();
+        assert!(
+            !serialized.contains("[stems]"),
+            "default stems table should be omitted; got:\n{serialized}"
+        );
+    }
+
+    #[test]
+    fn stems_config_round_trips() {
+        let config = Config {
+            stems: StemsConfig {
+                command: Some("/x/demucs".into()),
+                cache_max_gb: Some(5),
+                ..StemsConfig::default()
+            },
+            ..Config::default()
+        };
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let deserialized: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(deserialized.stems, config.stems);
     }
 
     #[test]

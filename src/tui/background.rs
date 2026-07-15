@@ -83,6 +83,9 @@ use zytunes::mtp::native::NativeSession;
 use zytunes::mtp::parse::DeviceEntry;
 use zytunes::mtp::{DeviceError, DeviceSession};
 use zytunes::musicbrainz::{MbError, MusicBrainzClient, Release};
+use zytunes::stems::{
+    cached_stems, stem_cache_key, store_stems, StemError, StemSeparator, StemSet,
+};
 use zytunes::{
     collect_photo_files_with_logger, collect_video_files_with_logger, make_transcode_temp_dir,
     needs_transcoding, needs_video_transcoding, resize_photo_for_zune, transcode_and_import_video,
@@ -219,6 +222,42 @@ pub enum BgCommand {
         mb_base_url: Option<String>,
         mb_user_agent: Option<String>,
     },
+    /// Ensure a stem-separation engine exists, installing one via uv if
+    /// needed. Sent only after the user consents in the TUI overlay —
+    /// never at startup. Params ride on the command (`DetectCd` precedent:
+    /// the worker stays config-agnostic). Progress streams as
+    /// [`BgEvent::StemEngineProgress`]; outcome as `StemEngineReady` /
+    /// `StemEngineFailed`.
+    ProvisionStemEngine {
+        /// Job generation from `StemState::job_gen`, echoed back on every
+        /// event this job emits. The app bumps its counter whenever it
+        /// dispatches or cancels a stem job, so a terminal event from a
+        /// superseded/cancelled job compares stale and can't wipe the
+        /// state of the job that replaced it (jobs are keyed by identity,
+        /// not by track path — same-track re-requests were colliding).
+        gen: u64,
+        package: String,
+        gpu: bool,
+    },
+    /// Separate `track_path` into six stems, cache-first. On a cache hit
+    /// this answers with [`BgEvent::StemsReady`] without touching the
+    /// engine; on a miss it runs demucs on a detached thread (the worker
+    /// stays free for Connect/sync dispatch — separation takes minutes).
+    /// Cancellation via [`BgCommand::CancelSeparation`], which trips a
+    /// dedicated `AtomicBool` (independent of the rip flag).
+    SeparateStems {
+        /// Job generation, echoed on this job's events — see
+        /// [`BgCommand::ProvisionStemEngine::gen`].
+        gen: u64,
+        track_path: String,
+        /// Explicit engine path from `[stems].command`; `None` falls back
+        /// to PATH and the managed bin dir.
+        engine_command: Option<PathBuf>,
+        model: String,
+        cache_max_bytes: u64,
+    },
+    /// Cancel the active separation or engine install. No-op when idle.
+    CancelSeparation,
 }
 
 /// Payload for [`BgCommand::RipAndImport`]. Constructed by the TUI from
@@ -389,6 +428,49 @@ pub enum BgEvent {
         token: u64,
         result: Result<Box<zytunes::musicbrainz::RecordingLookupResponse>, String>,
     },
+    /// One line of engine-install output (uv/pip download progress). The
+    /// TUI mirrors these into the sync log.
+    StemEngineProgress(String),
+    /// The stem engine is installed and usable at `command`. The TUI
+    /// writes it back to `[stems].command` so later launches skip
+    /// discovery, then re-issues the pending [`BgCommand::SeparateStems`].
+    /// The engine path is persisted even when `gen` is stale — the
+    /// install succeeded regardless of which job asked for it.
+    StemEngineReady {
+        gen: u64,
+        command: PathBuf,
+    },
+    /// Engine install didn't complete. `cancelled` distinguishes the user
+    /// hitting cancel from a real failure (a cancel is logged quietly, not
+    /// toasted as an error). A stale `gen` means a superseded job's
+    /// terminal event — logged, never allowed to touch current state.
+    StemEngineFailed {
+        gen: u64,
+        error: String,
+        cancelled: bool,
+    },
+    /// Percent tick for the active separation, parsed from demucs stderr.
+    /// Sparse or absent on engines that print no progress. `gen` names
+    /// the job (and thereby the track) — see [`BgCommand::SeparateStems`].
+    StemProgress {
+        gen: u64,
+        pct: u8,
+    },
+    /// Six stems are in the cache and ready to play.
+    StemsReady {
+        gen: u64,
+        track_path: String,
+        stems: Box<StemSet>,
+    },
+    /// Separation didn't produce a playable stem set. `cancelled`
+    /// distinguishes the user hitting cancel from a real failure (the rip
+    /// pipeline's convention — a cancel is not an error in the summary).
+    StemsFailed {
+        gen: u64,
+        track_path: String,
+        error: String,
+        cancelled: bool,
+    },
 }
 
 /// Phase 3 per-track and end-of-rip events.
@@ -481,6 +563,14 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
         // cleared at the start of each new rip. Lives outside the rip
         // dispatch arm so it survives across cmd_rx.recv() turns.
         let rip_cancel = Arc::new(AtomicBool::new(false));
+
+        // Stem provisioning/separation run on detached threads (they take
+        // minutes and the worker must stay free for Connect/sync).
+        // `StemJobs` serialises them — one at a time — and gives each job
+        // its own cancel token so a newly dispatched job supersedes
+        // (cancels) whatever is still running or queued, independent of
+        // the rip flag.
+        let stem_jobs = StemJobs::default();
 
         // AcoustID disk cache, lazily initialised on first `AcoustIdLookup`.
         // Kept across the worker's lifetime so all lookups in one session
@@ -1458,6 +1548,123 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                 BgCommand::CancelRip => {
                     rip_cancel.store(true, Ordering::SeqCst);
                 }
+                BgCommand::ProvisionStemEngine { gen, package, gpu } => {
+                    let token = stem_jobs.supersede();
+                    let jobs = stem_jobs.clone();
+                    let tx = event_tx.clone();
+                    thread::spawn(move || {
+                        let _guard = jobs.acquire();
+                        if token.load(Ordering::SeqCst) {
+                            let _ = tx.send(BgEvent::StemEngineFailed {
+                                gen,
+                                error: "superseded before starting".into(),
+                                cancelled: true,
+                            });
+                            return;
+                        }
+                        let on_line = |line: &str| {
+                            let _ = tx.send(BgEvent::StemEngineProgress(line.to_string()));
+                        };
+                        let cancelled = || token.load(Ordering::SeqCst);
+                        match zytunes::stems::provision::provision_engine(
+                            &package, gpu, &cancelled, &on_line,
+                        ) {
+                            Ok(command) => {
+                                let _ = tx.send(BgEvent::StemEngineReady { gen, command });
+                            }
+                            Err(e) => {
+                                let _ = tx.send(BgEvent::StemEngineFailed {
+                                    gen,
+                                    cancelled: matches!(
+                                        e,
+                                        zytunes::stems::provision::ProvisionError::Cancelled
+                                    ),
+                                    error: e.to_string(),
+                                });
+                            }
+                        }
+                    });
+                }
+                BgCommand::SeparateStems {
+                    gen,
+                    track_path,
+                    engine_command,
+                    model,
+                    cache_max_bytes,
+                } => {
+                    let token = stem_jobs.supersede();
+                    let jobs = stem_jobs.clone();
+                    let tx = event_tx.clone();
+                    thread::spawn(move || {
+                        // Wait for the superseded job to notice its token
+                        // and exit; if OUR token tripped while waiting, a
+                        // newer request replaced this one — bow out.
+                        let _guard = jobs.acquire();
+                        if token.load(Ordering::SeqCst) {
+                            let _ = tx.send(BgEvent::StemsFailed {
+                                gen,
+                                track_path,
+                                error: "superseded before starting".into(),
+                                cancelled: true,
+                            });
+                            return;
+                        }
+                        match (
+                            zytunes::stems::default_stem_cache_dir(),
+                            zytunes::stems::provision::find_engine(engine_command.as_deref()),
+                        ) {
+                            (None, _) => {
+                                let _ = tx.send(BgEvent::StemsFailed {
+                                    gen,
+                                    track_path,
+                                    error: "cannot resolve $HOME for the stem cache".into(),
+                                    cancelled: false,
+                                });
+                            }
+                            (_, None) => {
+                                // The TUI provisions before separating, so
+                                // this is a race (engine removed between
+                                // M-press and dispatch), not the normal path.
+                                let _ = tx.send(BgEvent::StemsFailed {
+                                    gen,
+                                    track_path,
+                                    error: "stem engine not installed".into(),
+                                    cancelled: false,
+                                });
+                            }
+                            (Some(cache_dir), Some(command)) => {
+                                // Emitted from OUR side, before the spawn:
+                                // its absence in the log means the running
+                                // binary predates this code, not that the
+                                // engine is silent.
+                                let _ = tx.send(BgEvent::SyncMessage(format!(
+                                    "[stems] launching {} (-n {model}) — first engine \
+                                     output can lag ~a minute while python+torch start",
+                                    command.display()
+                                )));
+                                let separator = zytunes::stems::DemucsCli {
+                                    command,
+                                    model: model.clone(),
+                                };
+                                run_separation(
+                                    &SeparationJob {
+                                        gen,
+                                        track_path: &track_path,
+                                        model: &model,
+                                        cache_dir: &cache_dir,
+                                        max_bytes: cache_max_bytes,
+                                    },
+                                    &separator,
+                                    &|| token.load(Ordering::SeqCst),
+                                    &tx,
+                                );
+                            }
+                        }
+                    });
+                }
+                BgCommand::CancelSeparation => {
+                    stem_jobs.cancel_active();
+                }
                 BgCommand::MbSearchReleases {
                     token,
                     artist,
@@ -2242,6 +2449,136 @@ fn parse_sync_progress(data: &[u8]) -> String {
     }
 }
 
+/// Serialisation + supersede plumbing for stem jobs (engine install and
+/// separation). One job runs at a time (each job thread holds `lock` for
+/// its duration), and every job gets its own cancel token: dispatching a
+/// new job trips the previous job's token whether it is running or still
+/// waiting for the lock. That is what makes a track change or a fresh
+/// `M`-press replace a stale separation instead of queueing behind it or
+/// bouncing off a busy flag.
+#[derive(Clone, Default)]
+struct StemJobs {
+    lock: Arc<std::sync::Mutex<()>>,
+    /// Cancel token of the most recently dispatched job.
+    active: Arc<std::sync::Mutex<Option<Arc<AtomicBool>>>>,
+}
+
+impl StemJobs {
+    /// Register a new job: trips the previous job's token (if any) and
+    /// returns the fresh token the new job must poll.
+    fn supersede(&self) -> Arc<AtomicBool> {
+        let token = Arc::new(AtomicBool::new(false));
+        let mut slot = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(prev) = slot.replace(Arc::clone(&token)) {
+            prev.store(true, Ordering::SeqCst);
+        }
+        token
+    }
+
+    /// Trip the most recent job's token (user-initiated cancel). The
+    /// token stays registered so repeat cancels are idempotent.
+    fn cancel_active(&self) {
+        let slot = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(token) = slot.as_ref() {
+            token.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Block until the previous job finishes. A poisoned lock (panicked
+    /// job thread) must not wedge stem playback forever, so it's cleared.
+    fn acquire(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.lock.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Everything that names a separation job: which job it is (`gen`), what
+/// it splits, and where results live. Groups the parameters that ride
+/// every [`run_separation`] call so the driver's signature stays small.
+struct SeparationJob<'a> {
+    gen: u64,
+    track_path: &'a str,
+    model: &'a str,
+    cache_dir: &'a std::path::Path,
+    max_bytes: u64,
+}
+
+/// Cache-first separation driver: answer from the stem cache when the
+/// entry is fresh, otherwise run `separator` into a work dir under the
+/// cache root and move the result in. Emits [`BgEvent::StemProgress`]
+/// ticks while separating and exactly one terminal event —
+/// [`BgEvent::StemsReady`] or [`BgEvent::StemsFailed`].
+///
+/// Takes the separator as `&dyn StemSeparator` so tests drive it with a
+/// fake; production wraps `DemucsCli` on a detached thread.
+fn run_separation(
+    job: &SeparationJob<'_>,
+    separator: &dyn StemSeparator,
+    cancelled: &dyn Fn() -> bool,
+    event_tx: &mpsc::Sender<BgEvent>,
+) {
+    let SeparationJob {
+        gen,
+        track_path,
+        model,
+        cache_dir,
+        max_bytes,
+    } = *job;
+    let log_tx = event_tx.clone();
+    let log: zytunes::cache::Logger = Arc::new(move |msg: &str| {
+        let _ = log_tx.send(BgEvent::SyncMessage(format!("[stems] {msg}")));
+    });
+    let source = std::path::Path::new(track_path);
+
+    if let Some(stems) = cached_stems(cache_dir, source, model, &log) {
+        let _ = event_tx.send(BgEvent::StemsReady {
+            gen,
+            track_path: track_path.to_string(),
+            stems: Box::new(stems),
+        });
+        return;
+    }
+
+    // Work dir keyed like the cache entry so concurrent runs on different
+    // tracks can't collide; removed whatever the outcome (partial demucs
+    // output must never look like a cache).
+    let work_dir = cache_dir.join("work").join(stem_cache_key(track_path));
+    let _ = std::fs::remove_dir_all(&work_dir);
+
+    let progress_tx = event_tx.clone();
+    let on_progress = move |pct: u8| {
+        let _ = progress_tx.send(BgEvent::StemProgress { gen, pct });
+    };
+
+    // Engine chatter (model download notices, per-track banners, torch
+    // warnings) goes to the sync log so a slow first run is visibly
+    // "downloading the model", not a mystery stall.
+    let on_line = |line: &str| log(line);
+    let outcome = separator.separate(source, &work_dir, cancelled, &on_progress, &on_line);
+    let terminal = match outcome {
+        Ok(produced) => match store_stems(cache_dir, source, model, &produced, max_bytes, &log) {
+            Ok(stems) => BgEvent::StemsReady {
+                gen,
+                track_path: track_path.to_string(),
+                stems: Box::new(stems),
+            },
+            Err(e) => BgEvent::StemsFailed {
+                gen,
+                track_path: track_path.to_string(),
+                error: e,
+                cancelled: false,
+            },
+        },
+        Err(e) => BgEvent::StemsFailed {
+            gen,
+            track_path: track_path.to_string(),
+            error: e.to_string(),
+            cancelled: matches!(e, StemError::Cancelled),
+        },
+    };
+    let _ = std::fs::remove_dir_all(&work_dir);
+    let _ = event_tx.send(terminal);
+}
+
 #[cfg(test)]
 fn parse_storage_line(line: &str) -> Option<StorageInfo> {
     // "used 12345678 (45%), free 15000000 bytes of 27345678"
@@ -2352,6 +2689,240 @@ mod tests {
                 "same-stem different-extension straggler {s} should be removed"
             );
         }
+    }
+
+    /// Test double for [`run_separation`]: "separates" by writing six
+    /// bytes-long stem files into the work dir. Counts invocations so the
+    /// cache-hit fast path is observable.
+    struct FakeSeparator {
+        calls: std::cell::Cell<usize>,
+        outcome: Result<(), StemError>,
+    }
+
+    impl FakeSeparator {
+        fn ok() -> Self {
+            FakeSeparator {
+                calls: std::cell::Cell::new(0),
+                outcome: Ok(()),
+            }
+        }
+    }
+
+    impl StemSeparator for FakeSeparator {
+        fn available(&self) -> Result<(), String> {
+            Ok(())
+        }
+        fn separate(
+            &self,
+            _src: &std::path::Path,
+            out_dir: &std::path::Path,
+            _cancelled: &dyn Fn() -> bool,
+            progress: &dyn Fn(u8),
+            _on_line: &dyn Fn(&str),
+        ) -> Result<StemSet, StemError> {
+            self.calls.set(self.calls.get() + 1);
+            match &self.outcome {
+                Ok(()) => {
+                    progress(50);
+                    std::fs::create_dir_all(out_dir).unwrap();
+                    let set = StemSet::from_dir(out_dir, zytunes::stems::STEM_EXT);
+                    for p in &set.paths {
+                        std::fs::write(p, b"stem").unwrap();
+                    }
+                    Ok(set)
+                }
+                Err(StemError::Cancelled) => Err(StemError::Cancelled),
+                Err(_) => Err(StemError::EngineFailed {
+                    exit_code: Some(1),
+                    stderr: "boom".into(),
+                }),
+            }
+        }
+    }
+
+    fn stem_events(rx: &mpsc::Receiver<BgEvent>) -> (Vec<u8>, Option<BgEvent>) {
+        let mut ticks = Vec::new();
+        let mut terminal = None;
+        for ev in rx.try_iter() {
+            match ev {
+                BgEvent::StemProgress { pct, .. } => ticks.push(pct),
+                e @ (BgEvent::StemsReady { .. } | BgEvent::StemsFailed { .. }) => {
+                    assert!(terminal.is_none(), "exactly one terminal event");
+                    terminal = Some(e);
+                }
+                BgEvent::SyncMessage(_) => {}
+                _ => panic!("unexpected event kind"),
+            }
+        }
+        (ticks, terminal)
+    }
+
+    #[test]
+    fn stem_jobs_supersede_trips_previous_token_only() {
+        let jobs = StemJobs::default();
+        let first = jobs.supersede();
+        assert!(!first.load(Ordering::SeqCst), "fresh token starts clear");
+
+        let second = jobs.supersede();
+        assert!(
+            first.load(Ordering::SeqCst),
+            "dispatching a new job cancels the previous one"
+        );
+        assert!(!second.load(Ordering::SeqCst), "the new job itself runs");
+
+        let third = jobs.supersede();
+        assert!(second.load(Ordering::SeqCst));
+        assert!(!third.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn stem_jobs_cancel_active_trips_latest_and_is_idempotent() {
+        let jobs = StemJobs::default();
+        // No job registered: harmless no-op.
+        jobs.cancel_active();
+
+        let token = jobs.supersede();
+        jobs.cancel_active();
+        assert!(token.load(Ordering::SeqCst));
+        jobs.cancel_active(); // repeat cancel stays fine
+
+        // A job dispatched after a cancel starts with a clear token.
+        let next = jobs.supersede();
+        assert!(!next.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn run_separation_misses_then_hits_cache() {
+        let dir = fresh_dir("stems-run-roundtrip");
+        let cache = dir.join("cache");
+        let source = dir.join("song.mp3");
+        std::fs::write(&source, b"mp3").unwrap();
+        let (event_tx, event_rx) = mpsc::channel();
+        let sep = FakeSeparator::ok();
+        let track = source.to_string_lossy().into_owned();
+
+        run_separation(
+            &SeparationJob {
+                gen: 7,
+                track_path: &track,
+                model: "m",
+                cache_dir: &cache,
+                max_bytes: u64::MAX,
+            },
+            &sep,
+            &|| false,
+            &event_tx,
+        );
+        let (ticks, terminal) = stem_events(&event_rx);
+        assert_eq!(sep.calls.get(), 1);
+        assert!(ticks.contains(&50), "progress ticks forwarded: {ticks:?}");
+        match terminal {
+            Some(BgEvent::StemsReady {
+                gen,
+                track_path,
+                stems,
+            }) => {
+                assert_eq!(gen, 7, "events echo the dispatching job's gen");
+                assert_eq!(track_path, track);
+                assert!(stems.all_exist(), "stems live in the cache");
+                assert!(
+                    stems.paths[0].starts_with(&cache),
+                    "ready paths must point at cached copies"
+                );
+            }
+            other => panic!("expected StemsReady, got {:?}", other.is_some()),
+        }
+
+        // Second run: cache hit, the separator is not consulted again.
+        run_separation(
+            &SeparationJob {
+                gen: 8,
+                track_path: &track,
+                model: "m",
+                cache_dir: &cache,
+                max_bytes: u64::MAX,
+            },
+            &sep,
+            &|| false,
+            &event_tx,
+        );
+        let (_, terminal) = stem_events(&event_rx);
+        assert_eq!(sep.calls.get(), 1, "cache hit must skip the engine");
+        assert!(matches!(terminal, Some(BgEvent::StemsReady { .. })));
+    }
+
+    #[test]
+    fn run_separation_failure_reports_error_not_cancel() {
+        let dir = fresh_dir("stems-run-fail");
+        let source = dir.join("song.mp3");
+        std::fs::write(&source, b"mp3").unwrap();
+        let (event_tx, event_rx) = mpsc::channel();
+        let sep = FakeSeparator {
+            calls: std::cell::Cell::new(0),
+            outcome: Err(StemError::EngineFailed {
+                exit_code: Some(1),
+                stderr: String::new(),
+            }),
+        };
+
+        run_separation(
+            &SeparationJob {
+                gen: 7,
+                track_path: &source.to_string_lossy(),
+                model: "m",
+                cache_dir: &dir.join("cache"),
+                max_bytes: u64::MAX,
+            },
+            &sep,
+            &|| false,
+            &event_tx,
+        );
+        let (_, terminal) = stem_events(&event_rx);
+        match terminal {
+            Some(BgEvent::StemsFailed {
+                error, cancelled, ..
+            }) => {
+                assert!(!cancelled);
+                assert!(error.contains("boom"), "{error}");
+            }
+            _ => panic!("expected StemsFailed"),
+        }
+    }
+
+    #[test]
+    fn run_separation_cancel_sets_cancelled_flag() {
+        let dir = fresh_dir("stems-run-cancel");
+        let source = dir.join("song.mp3");
+        std::fs::write(&source, b"mp3").unwrap();
+        let (event_tx, event_rx) = mpsc::channel();
+        let sep = FakeSeparator {
+            calls: std::cell::Cell::new(0),
+            outcome: Err(StemError::Cancelled),
+        };
+
+        run_separation(
+            &SeparationJob {
+                gen: 7,
+                track_path: &source.to_string_lossy(),
+                model: "m",
+                cache_dir: &dir.join("cache"),
+                max_bytes: u64::MAX,
+            },
+            &sep,
+            &|| false,
+            &event_tx,
+        );
+        let (_, terminal) = stem_events(&event_rx);
+        assert!(
+            matches!(
+                terminal,
+                Some(BgEvent::StemsFailed {
+                    cancelled: true,
+                    ..
+                })
+            ),
+            "user cancel must be distinguishable from failure"
+        );
     }
 
     #[test]

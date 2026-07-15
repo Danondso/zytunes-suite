@@ -61,11 +61,19 @@ impl Harness {
     /// deterministic — tests that want the spinner to advance can call
     /// `tick()` explicitly.
     pub fn step(&mut self) {
+        // Mirror the run loop's height snapshot so visibility-gated key
+        // handling (stem strip) sees the harness's real terminal size.
+        if let Ok(size) = self.term.size() {
+            self.app.last_term_height = size.height;
+        }
         while let Ok(ev) = self.bg_rx.try_recv() {
             self.app.handle_bg_event(ev);
         }
         for cmd in self.app.pending_bg_commands.drain(..) {
             let _ = self.cmd_tx.send(cmd);
+        }
+        for cmd in self.app.pending_audio_commands.drain(..) {
+            let _ = self.audio_tx.send(cmd);
         }
         self.app.flush_device_index();
 

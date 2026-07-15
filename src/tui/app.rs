@@ -310,6 +310,80 @@ pub struct NowPlaying {
     pub metadata_marquee: String,
 }
 
+/// Where the stem-mode flow currently is. Rendered as one line in the
+/// now-playing panel; `Active` additionally claims keys `1`–`6`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StemStatus {
+    Off,
+    /// Engine install running in the background (consent already given).
+    Provisioning,
+    /// demucs is separating the requested track. `pct` is the last
+    /// progress tick, `None` before the first one arrives.
+    Separating {
+        pct: Option<u8>,
+    },
+    /// Stem playback is live; `StemState::gains` is `Some`.
+    Active,
+}
+
+/// Consent overlay payload for the one-time engine install. `Some` on
+/// [`StemState::consent`] means the modal is up and claims all keys.
+#[derive(Debug, Clone)]
+pub struct StemConsent {
+    pub package: String,
+    pub gpu: bool,
+}
+
+/// Stem-split playback state (`M` in the player). Pattern-matches
+/// `DeviceState`/`SyncState`: one sub-struct so `App` stays navigable.
+pub struct StemState {
+    pub status: StemStatus,
+    /// Shared per-stem gain targets while `Active` — the audio thread's
+    /// mixer holds a clone, so toggles are lock-free stores.
+    pub gains: Option<zytunes::stems::StemGains>,
+    /// UI mirror of the gains for rendering the strip.
+    pub enabled: [bool; zytunes::stems::NUM_STEMS],
+    /// Library path of the track the current status refers to.
+    pub for_path: Option<String>,
+    /// Path awaiting separation once provisioning completes.
+    pub pending_path: Option<String>,
+    /// Engine-install consent overlay; `Some` = modal open.
+    pub consent: Option<StemConsent>,
+    /// Monotonic job identity. Bumped on every dispatch AND every cancel;
+    /// stem `BgEvent`s echo the gen of the job that produced them, and
+    /// handlers ignore events whose gen isn't current. Track paths are
+    /// not identity — a cancel-then-re-request of the SAME track produces
+    /// two jobs whose events would otherwise collide (the first job's
+    /// late `StemsFailed{cancelled}` was resetting the second job's
+    /// Separating state). Never cleared by [`StemState::reset`].
+    pub job_gen: u64,
+}
+
+impl Default for StemState {
+    fn default() -> Self {
+        StemState {
+            status: StemStatus::Off,
+            gains: None,
+            enabled: [true; zytunes::stems::NUM_STEMS],
+            for_path: None,
+            pending_path: None,
+            consent: None,
+            job_gen: 0,
+        }
+    }
+}
+
+impl StemState {
+    /// Back to Off, dropping playback/gain state but leaving any open
+    /// consent overlay alone (the caller decides that separately).
+    fn reset(&mut self) {
+        self.status = StemStatus::Off;
+        self.gains = None;
+        self.enabled = [true; zytunes::stems::NUM_STEMS];
+        self.for_path = None;
+    }
+}
+
 /// Extract the year and assemble a `|`-separated metadata marquee from a
 /// library `Track`. Empty inputs (or `None`) produce `(None, "".into())`.
 /// Each segment is only added when the underlying tag is present, so a
@@ -984,6 +1058,21 @@ pub struct App {
     pub show_player: Option<bool>,
     /// Background commands to send after event handling (main loop flushes these).
     pub pending_bg_commands: Vec<BgCommand>,
+    /// Audio commands queued by event handlers (which have no `audio_tx`)
+    /// and stem-mode transitions; the main loop flushes these each tick,
+    /// preserving order (Play before Scrub matters).
+    pub pending_audio_commands: Vec<AudioCommand>,
+    /// Stem-split playback state (`M`).
+    pub stems: StemState,
+    /// Terminal height as of the most recent frame, refreshed by the run
+    /// loop (and the test harness) before input handling. Lets key
+    /// dispatch answer visibility questions — the stem strip claims keys
+    /// `1`–`6` only while the panel it renders in is actually on screen.
+    pub last_term_height: u16,
+    /// `[stems]` config table, read once at startup. `command` is also
+    /// updated in memory when the provisioner writes the resolved engine
+    /// path back to disk.
+    pub stems_cfg: crate::config::StemsConfig,
     /// Aggregate play/skip counters across the TUI and any connected device.
     /// TUI plays bump it directly via `record_now_playing_play`/`_skip`;
     /// device-side counters merge in via `merge_device_observation` on each
@@ -993,6 +1082,10 @@ pub struct App {
     /// `~/.cache/zytunes/local-plays.json`; tests set `None` to disable disk
     /// writes or override with a temp path.
     pub local_plays_save_path: Option<PathBuf>,
+    /// Stem-engine discovery, injectable so tests don't depend on
+    /// whether the developer's machine has demucs installed. Production
+    /// value is [`zytunes::stems::provision::find_engine`].
+    pub stem_engine_finder: fn(Option<&std::path::Path>) -> Option<PathBuf>,
     /// User-authored playlists (manual + generated). Loaded once at TUI
     /// launch via `load_playlists_from_disk`; `App::new()` leaves this empty
     /// so unit tests don't pick up developer-machine state.
@@ -1245,6 +1338,7 @@ impl App {
             // so unit tests get a clean default `App` without inheriting
             // whatever sidecar exists on the developer's machine.
             local_plays_save_path: None,
+            stem_engine_finder: zytunes::stems::provision::find_engine,
             local_plays: LocalPlays::default(),
             playlists: PlaylistStore::default(),
             playlists_save_path: None,
@@ -1267,6 +1361,13 @@ impl App {
             scan_fingerprint: true,
             music_dir_cache: None, // overwritten below from config
             tag_manager: None,
+            pending_audio_commands: Vec::new(),
+            stems: StemState::default(),
+            // Overwritten with the real height every tick; a typical
+            // default keeps pre-first-frame (and unit-test) behaviour on
+            // the "panel visible" path.
+            last_term_height: 24,
+            stems_cfg: crate::config::StemsConfig::default(), // overwritten below
         };
 
         // Read config once at the end of construction and apply all the
@@ -1294,6 +1395,7 @@ impl App {
             .clone()
             .or_else(|| std::env::var("ZYTUNES_MUSIC_DIR").ok())
             .map(std::path::PathBuf::from);
+        app.stems_cfg = cfg.stems;
         app
     }
 
@@ -1913,6 +2015,28 @@ impl App {
             Some(false) => false,
             None => height >= 20,
         }
+    }
+
+    /// Rows the now-playing panel occupies when shown: one extra while a
+    /// stem strip is rendering inside it. The single source of truth for
+    /// `ui::draw`'s layout AND the run loop's album-art pre-render — the
+    /// pre-render sizing art against a hardcoded 9 clipped the art's
+    /// bottom row whenever stems were engaged.
+    pub fn player_panel_height(&self) -> u16 {
+        if self.stems.status != StemStatus::Off {
+            10
+        } else {
+            9
+        }
+    }
+
+    /// Whether the stem strip — the only UI for the `1`–`6` toggles — is
+    /// actually on screen: the now-playing panel is enabled AND the
+    /// terminal clears the panel's physical floor. Key dispatch consults
+    /// this so a hidden strip never swallows the sidebar-mode keys.
+    pub fn stem_strip_visible(&self) -> bool {
+        self.should_show_player(self.last_term_height)
+            && self.last_term_height >= crate::ui::PLAYER_MIN_H
     }
 
     /// Toggle between halfblock and ASCII album art renderers, invalidating caches
@@ -2971,6 +3095,7 @@ impl App {
         // out counts as a skip — record before we lose the old `now_playing`.
         self.record_now_playing_skip();
 
+        self.reset_stems_for_track_change();
         let index = self.track_selected.min(self.track_list.len() - 1);
         let track = &self.track_list[index];
         let path = match &track.location {
@@ -3035,6 +3160,7 @@ impl App {
                 self.play_from_playlist(next_idx, playlist, audio_tx);
             } else {
                 // End of playlist
+                self.reset_stems_for_track_change();
                 let _ = audio_tx.send(AudioCommand::Stop);
                 self.now_playing = None;
             }
@@ -3065,6 +3191,7 @@ impl App {
 
     pub fn stop_playback(&mut self, audio_tx: &mpsc::Sender<AudioCommand>) {
         self.record_now_playing_skip();
+        self.reset_stems_for_track_change();
         let _ = audio_tx.send(AudioCommand::Stop);
         self.now_playing = None;
     }
@@ -3086,6 +3213,7 @@ impl App {
         let lib_track = self.lookup_library_track(&track);
         let track_id = lib_track.as_ref().map(|t| t.id);
         let (year, metadata_marquee) = build_now_playing_metadata(lib_track.as_ref());
+        self.reset_stems_for_track_change();
         let _ = audio_tx.send(AudioCommand::Play { path });
         self.now_playing = Some(NowPlaying {
             track_name: track.name.clone(),
@@ -3102,6 +3230,139 @@ impl App {
             year,
             metadata_marquee,
         });
+    }
+
+    /// `M` — the stem-mode entry point. Cycles by current status:
+    /// Off → request stems (cache/engine/consent as needed);
+    /// Provisioning/Separating → cancel the in-flight job;
+    /// Active → back to normal single-file playback, position preserved.
+    pub fn press_stem_mode(&mut self) {
+        match self.stems.status {
+            StemStatus::Active => self.exit_stem_playback(),
+            StemStatus::Provisioning | StemStatus::Separating { .. } => {
+                self.pending_bg_commands.push(BgCommand::CancelSeparation);
+                // The cancelled job's terminal event is stale from here on
+                // — without the bump it would race a same-track re-request
+                // and wipe the new job's state.
+                self.stems.job_gen += 1;
+                self.stems.reset();
+                self.stems.pending_path = None;
+                self.set_toast("Stem job cancelled".into(), false);
+            }
+            StemStatus::Off => self.request_stems(),
+        }
+    }
+
+    /// Kick off the stem flow for the currently playing track. Gated on
+    /// the playing track's origin, not the browse mode: `now_playing` can
+    /// only ever hold local library tracks (device rows have no location
+    /// and both play paths bail on that), so a library track playing
+    /// while the user inspects Device view is still splittable.
+    fn request_stems(&mut self) {
+        let Some(path) = self.playing_track_path() else {
+            self.set_toast(
+                "Play a track first — M splits the playing track".into(),
+                true,
+            );
+            return;
+        };
+        if (self.stem_engine_finder)(self.stems_cfg.command_path().as_deref()).is_some() {
+            self.dispatch_separation(path);
+        } else if self.stems_cfg.auto_provision() {
+            self.stems.pending_path = Some(path);
+            self.stems.consent = Some(StemConsent {
+                package: self.stems_cfg.package(),
+                gpu: self.stems_cfg.gpu(),
+            });
+        } else {
+            self.set_toast(
+                "Stem engine not found — set [stems] command in config.toml".into(),
+                true,
+            );
+        }
+    }
+
+    /// Queue a `SeparateStems` for `path` and flip status to Separating.
+    /// The worker answers instantly on a cache hit, so this is also the
+    /// happy path for already-separated tracks.
+    pub(crate) fn dispatch_separation(&mut self, path: String) {
+        self.stems.job_gen += 1;
+        self.stems.status = StemStatus::Separating { pct: None };
+        self.stems.for_path = Some(path.clone());
+        self.pending_bg_commands.push(BgCommand::SeparateStems {
+            gen: self.stems.job_gen,
+            track_path: path,
+            engine_command: self.stems_cfg.command_path(),
+            model: self.stems_cfg.model(),
+            cache_max_bytes: self.stems_cfg.cache_max_bytes(),
+        });
+    }
+
+    /// Swap live stem playback back to the original file, gaplessly — the
+    /// audio thread pre-seeks the file to its own live position before
+    /// cutting over.
+    fn exit_stem_playback(&mut self) {
+        if let Some(path) = self.stems.for_path.clone() {
+            self.pending_audio_commands.push(AudioCommand::SwapSource {
+                target: crate::audio::SwapTarget::File { path },
+            });
+        }
+        self.stems.reset();
+    }
+
+    /// Toggle stem `index` (0-based) while stem playback is Active.
+    pub fn toggle_stem(&mut self, index: usize) {
+        if self.stems.status != StemStatus::Active || index >= zytunes::stems::NUM_STEMS {
+            return;
+        }
+        self.stems.enabled[index] = !self.stems.enabled[index];
+        if let Some(ref gains) = self.stems.gains {
+            zytunes::stems::set_stem_gain(gains, index, self.stems.enabled[index]);
+        }
+    }
+
+    /// Library path of the track that is playing right now, if any.
+    fn playing_track_path(&self) -> Option<String> {
+        self.now_playing
+            .as_ref()
+            .and_then(|np| np.playlist.get(np.track_index))
+            .and_then(|t| t.location.clone())
+    }
+
+    /// Stems are per-track: any track transition drops stem playback,
+    /// closes a pending consent overlay (its target track is gone), and
+    /// DETACHES an in-flight separation rather than cancelling it — the
+    /// job runs to completion and lands in the cache (instant on the
+    /// next M-press for that track). Cancelling here meant a split that
+    /// outlasted the song's remaining playtime was killed by the
+    /// auto-advance every time; on CPU that was every split. A new
+    /// M-press on another track still supersedes (cancels) the detached
+    /// job worker-side, so the worker is never blocked. An engine
+    /// install (Provisioning) is NOT cancelled AND keeps its status —
+    /// it's track-agnostic and expensive to redo, and wiping the status
+    /// to Off mid-install invited a second consent whose dispatch
+    /// superseded (killed) the running download. Only the track-bound
+    /// half goes: the pending auto-split target is cleared so finishing
+    /// the install doesn't split a track the user has already moved past.
+    fn reset_stems_for_track_change(&mut self) {
+        match self.stems.status {
+            StemStatus::Separating { .. } => {
+                // Stale-ify the detached job's events; its StemsReady
+                // arrives with an old gen and logs "stems cached for …".
+                self.stems.job_gen += 1;
+                if let Some(path) = &self.stems.for_path {
+                    self.sync.log.push(format!(
+                        "[stems] track changed — separation of {path} continues in \
+                         the background and will be cached"
+                    ));
+                }
+                self.stems.reset();
+            }
+            StemStatus::Provisioning => {}
+            StemStatus::Active | StemStatus::Off => self.stems.reset(),
+        }
+        self.stems.pending_path = None;
+        self.stems.consent = None;
     }
 
     pub fn handle_audio_event(&mut self, event: AudioEvent, audio_tx: &mpsc::Sender<AudioCommand>) {
@@ -3125,7 +3386,26 @@ impl App {
                 // A playback failure isn't a user-initiated skip — drop
                 // the session without recording either way.
                 self.now_playing = None;
+                self.reset_stems_for_track_change();
                 self.set_toast(format!("Playback: {}", msg), true);
+            }
+            AudioEvent::SwapFailed { error, to_stems } => {
+                // Playback survived — the audio thread kept the old
+                // source when the swap build failed. Only the stem-mode
+                // transition needs unwinding: entering left the app
+                // showing Active while the file plays on, so stem state
+                // resets; a failed exit left the mixer audible with the
+                // app already Off (M re-enters cleanly from there).
+                if to_stems {
+                    self.stems.reset();
+                }
+                self.set_toast(format!("Stem swap failed: {}", error), true);
+            }
+            AudioEvent::SeekFailed(msg) => {
+                // The seek didn't happen; the track keeps playing at its
+                // old position. Worth a toast (the keypress visibly did
+                // nothing) but nothing to reset.
+                self.set_toast(format!("Seek failed: {}", msg), true);
             }
         }
     }
@@ -10702,6 +10982,595 @@ mod tests {
         }));
         let (_, _, is_error) = app.toast_message.as_ref().unwrap();
         assert!(*is_error);
+    }
+
+    /// App with one library track playing at 42 s — the baseline fixture
+    /// for stem-mode tests.
+    fn stem_playing_app(path: &str) -> App {
+        let mut app = App::new();
+        app.local_plays_save_path = None;
+        // Hermetic: never discover the developer machine's real demucs,
+        // and drop whatever [stems] table their real config.toml carries
+        // (App::new loads it; the provisioner writes `command` there).
+        app.stem_engine_finder = |_| None;
+        app.stems_cfg = crate::config::StemsConfig::default();
+        let info = TrackInfo::new(
+            "Song".into(),
+            "Artist".into(),
+            "Album".into(),
+            Some(200_000),
+            None,
+            Some(path.to_string()),
+            None,
+            None,
+            None,
+            false,
+        );
+        app.now_playing = Some(NowPlaying {
+            track_name: "Song".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            duration_ms: 200_000,
+            elapsed_ms: 42_000,
+            state: PlaybackState::Playing,
+            track_index: 0,
+            playlist: Arc::from(vec![info].as_slice()),
+            paused_frame: None,
+            track_id: None,
+            counted: false,
+            year: None,
+            metadata_marquee: String::new(),
+        });
+        app
+    }
+
+    fn stem_key(app: &mut App, code: KeyCode) {
+        let (cmd_tx, _cmd_rx) = mpsc::channel();
+        let (audio_tx, _audio_rx) = mpsc::channel();
+        app.handle_key(crossterm::event::KeyEvent::from(code), &cmd_tx, &audio_tx);
+    }
+
+    #[test]
+    fn stem_mode_gated_on_playing_track_not_browse_mode() {
+        // Nothing playing: toast, no state change, no commands.
+        let mut app = App::new();
+        app.local_plays_save_path = None;
+        app.press_stem_mode();
+        assert_eq!(app.stems.status, StemStatus::Off);
+        assert!(matches!(app.toast_message, Some((_, _, true))));
+        assert!(app.pending_bg_commands.is_empty());
+
+        // Device browse mode with a LIBRARY track playing: the request
+        // proceeds — now_playing can only hold local tracks, so the old
+        // browse-mode gate was refusing splittable playback just because
+        // the user toggled views. (No engine in the test env, so the
+        // flow lands on the consent modal rather than a dispatch.)
+        let mut app = stem_playing_app("/lib/song.mp3");
+        app.browse_mode = BrowseMode::Device;
+        app.press_stem_mode();
+        assert!(
+            app.stems.consent.is_some(),
+            "device view must not block stems for a playing library track"
+        );
+        assert_eq!(app.stems.pending_path.as_deref(), Some("/lib/song.mp3"));
+    }
+
+    #[test]
+    fn dispatch_separation_queues_command_with_config_values() {
+        let mut app = stem_playing_app("/lib/song.mp3");
+        app.dispatch_separation("/lib/song.mp3".into());
+        assert_eq!(app.stems.status, StemStatus::Separating { pct: None });
+        assert_eq!(app.stems.for_path.as_deref(), Some("/lib/song.mp3"));
+        match app.pending_bg_commands.as_slice() {
+            [BgCommand::SeparateStems {
+                gen,
+                track_path,
+                engine_command,
+                model,
+                cache_max_bytes,
+            }] => {
+                assert_eq!(*gen, app.stems.job_gen, "command carries the new gen");
+                assert_eq!(track_path, "/lib/song.mp3");
+                assert!(engine_command.is_none(), "no [stems] command configured");
+                assert_eq!(model, "htdemucs_6s");
+                assert_eq!(*cache_max_bytes, 10 * (1u64 << 30));
+            }
+            other => panic!("expected one SeparateStems, got {} commands", other.len()),
+        }
+    }
+
+    #[test]
+    fn stem_consent_enter_provisions_and_esc_declines() {
+        let mut app = stem_playing_app("/lib/song.mp3");
+        app.stems.consent = Some(StemConsent {
+            package: "demucs".into(),
+            gpu: false,
+        });
+        app.stems.pending_path = Some("/lib/song.mp3".into());
+        stem_key(&mut app, KeyCode::Enter);
+        assert_eq!(app.stems.status, StemStatus::Provisioning);
+        assert!(app.stems.consent.is_none());
+        assert!(matches!(
+            app.pending_bg_commands.as_slice(),
+            [BgCommand::ProvisionStemEngine { package, gpu: false, .. }] if package == "demucs"
+        ));
+
+        // Decline path.
+        let mut app = stem_playing_app("/lib/song.mp3");
+        app.stems.consent = Some(StemConsent {
+            package: "demucs".into(),
+            gpu: false,
+        });
+        app.stems.pending_path = Some("/lib/song.mp3".into());
+        stem_key(&mut app, KeyCode::Esc);
+        assert!(app.stems.consent.is_none());
+        assert!(app.stems.pending_path.is_none());
+        assert_eq!(app.stems.status, StemStatus::Off);
+        assert!(app.pending_bg_commands.is_empty());
+    }
+
+    #[test]
+    fn stem_engine_ready_resumes_pending_separation() {
+        let mut app = stem_playing_app("/lib/song.mp3");
+        app.stems.job_gen = 3;
+        app.stems.status = StemStatus::Provisioning;
+        app.stems.pending_path = Some("/lib/song.mp3".into());
+        let persisted =
+            app.stem_engine_ready_in_memory(3, std::path::Path::new("/managed/bin/demucs"));
+        assert_eq!(persisted, "/managed/bin/demucs");
+        assert_eq!(
+            app.stems_cfg.command.as_deref(),
+            Some("/managed/bin/demucs")
+        );
+        assert_eq!(app.stems.status, StemStatus::Separating { pct: None });
+        assert!(matches!(
+            app.pending_bg_commands.as_slice(),
+            [BgCommand::SeparateStems { engine_command: Some(p), .. }]
+                if p == std::path::Path::new("/managed/bin/demucs")
+        ));
+    }
+
+    #[test]
+    fn stale_engine_ready_persists_command_without_dispatch() {
+        // The install succeeded, so the engine path is real and worth
+        // keeping — but a stale gen (user cancelled / superseded the job)
+        // must not dispatch a separation or touch status.
+        let mut app = stem_playing_app("/lib/song.mp3");
+        app.stems.job_gen = 5;
+        app.stems.status = StemStatus::Separating { pct: Some(10) }; // a newer job
+        let _ = app.stem_engine_ready_in_memory(3, std::path::Path::new("/managed/bin/demucs"));
+        assert_eq!(
+            app.stems_cfg.command.as_deref(),
+            Some("/managed/bin/demucs"),
+            "engine path persists regardless of job identity"
+        );
+        assert_eq!(app.stems.status, StemStatus::Separating { pct: Some(10) });
+        assert!(app.pending_bg_commands.is_empty());
+    }
+
+    #[test]
+    fn stems_ready_swaps_playback_when_track_still_playing() {
+        let mut app = stem_playing_app("/lib/song.mp3");
+        app.stems.job_gen = 1;
+        app.stems.status = StemStatus::Separating { pct: Some(90) };
+        app.stems.for_path = Some("/lib/song.mp3".into());
+        app.handle_bg_event(crate::background::BgEvent::StemsReady {
+            gen: 1,
+            track_path: "/lib/song.mp3".into(),
+            stems: Box::new(zytunes::stems::StemSet::from_dir(
+                std::path::Path::new("/cache/x"),
+                "flac",
+            )),
+        });
+        assert_eq!(app.stems.status, StemStatus::Active);
+        assert!(app.stems.gains.is_some());
+        assert!(app.stems.enabled.iter().all(|&e| e), "fresh entry all-on");
+        // One gapless swap command; position/pause handling is the audio
+        // thread's job (it seeks to its own live clock during the swap).
+        match app.pending_audio_commands.as_slice() {
+            [AudioCommand::SwapSource {
+                target: crate::audio::SwapTarget::Stems { .. },
+            }] => {}
+            other => panic!("expected one SwapSource, got {} commands", other.len()),
+        }
+    }
+
+    #[test]
+    fn stems_ready_for_unrelated_track_only_logs() {
+        let mut app = stem_playing_app("/lib/song.mp3");
+        app.stems.job_gen = 2;
+        app.handle_bg_event(crate::background::BgEvent::StemsReady {
+            gen: 1,
+            track_path: "/lib/other.mp3".into(),
+            stems: Box::new(zytunes::stems::StemSet::from_dir(
+                std::path::Path::new("/cache/y"),
+                "flac",
+            )),
+        });
+        assert_eq!(app.stems.status, StemStatus::Off);
+        assert!(app.pending_audio_commands.is_empty());
+        assert!(app.sync.log.iter().any(|l| l.contains("cached")));
+    }
+
+    #[test]
+    fn stem_keys_claimed_only_while_active() {
+        let mut app = stem_playing_app("/lib/song.mp3");
+        // Off: '1' keeps its global sidebar binding, stems untouched.
+        app.sidebar_mode = SidebarMode::Albums;
+        stem_key(&mut app, KeyCode::Char('1'));
+        assert_eq!(app.sidebar_mode, SidebarMode::Artists);
+        assert!(app.stems.enabled[0]);
+
+        // Active: '1' toggles the vocals stem and the sidebar stays put.
+        app.stems.status = StemStatus::Active;
+        app.stems.gains = Some(zytunes::stems::new_stem_gains(&app.stems.enabled));
+        app.sidebar_mode = SidebarMode::Albums;
+        stem_key(&mut app, KeyCode::Char('1'));
+        assert_eq!(
+            app.sidebar_mode,
+            SidebarMode::Albums,
+            "claimed while active"
+        );
+        assert!(!app.stems.enabled[0]);
+        // Clone the Arc — the same atomics the mixer would observe.
+        let gains = app.stems.gains.as_ref().unwrap().clone();
+        assert_eq!(zytunes::stems::stem_gain(&gains, 0), 0.0);
+
+        // '6' hits the last stem; toggle back restores gain 1.0.
+        stem_key(&mut app, KeyCode::Char('6'));
+        assert!(!app.stems.enabled[5]);
+        stem_key(&mut app, KeyCode::Char('6'));
+        assert!(app.stems.enabled[5]);
+        assert_eq!(zytunes::stems::stem_gain(&gains, 5), 1.0);
+    }
+
+    #[test]
+    fn stem_keys_fall_through_when_strip_hidden() {
+        // The strip is the only UI for the toggles; with the player panel
+        // hidden the keys must keep their global meanings instead of
+        // silently mutating invisible stems.
+        let mut app = stem_playing_app("/lib/song.mp3");
+        app.stems.status = StemStatus::Active;
+        app.stems.gains = Some(zytunes::stems::new_stem_gains(&app.stems.enabled));
+
+        // Force-hidden player (P cycled to hidden).
+        app.show_player = Some(false);
+        app.sidebar_mode = SidebarMode::Albums;
+        stem_key(&mut app, KeyCode::Char('1'));
+        assert_eq!(app.sidebar_mode, SidebarMode::Artists, "global '1' ran");
+        assert!(app.stems.enabled[0], "hidden stem untouched");
+
+        // Terminal too short for the panel's physical floor.
+        app.show_player = None;
+        app.last_term_height = crate::ui::PLAYER_MIN_H - 1;
+        app.sidebar_mode = SidebarMode::Artists;
+        stem_key(&mut app, KeyCode::Char('2'));
+        assert_eq!(app.sidebar_mode, SidebarMode::Albums, "global '2' ran");
+        assert!(app.stems.enabled[1], "hidden stem untouched");
+    }
+
+    #[test]
+    fn player_panel_height_grows_while_stems_engaged() {
+        let mut app = stem_playing_app("/lib/song.mp3");
+        assert_eq!(app.player_panel_height(), 9);
+        app.stems.status = StemStatus::Separating { pct: None };
+        assert_eq!(app.player_panel_height(), 10);
+        app.stems.status = StemStatus::Active;
+        assert_eq!(app.player_panel_height(), 10);
+        app.stems.status = StemStatus::Off;
+        assert_eq!(app.player_panel_height(), 9);
+    }
+
+    #[test]
+    fn m_exits_active_stem_mode_at_position() {
+        let mut app = stem_playing_app("/lib/song.mp3");
+        app.stems.status = StemStatus::Active;
+        app.stems.gains = Some(zytunes::stems::new_stem_gains(&[true; 6]));
+        app.stems.for_path = Some("/lib/song.mp3".into());
+        stem_key(&mut app, KeyCode::Char('M'));
+        assert_eq!(app.stems.status, StemStatus::Off);
+        assert!(app.stems.gains.is_none());
+        match app.pending_audio_commands.as_slice() {
+            [AudioCommand::SwapSource {
+                target: crate::audio::SwapTarget::File { path },
+            }] => {
+                assert_eq!(path, "/lib/song.mp3");
+            }
+            other => panic!("expected one SwapSource, got {} commands", other.len()),
+        }
+    }
+
+    #[test]
+    fn m_cancels_inflight_separation() {
+        let mut app = stem_playing_app("/lib/song.mp3");
+        app.stems.status = StemStatus::Separating { pct: Some(10) };
+        app.stems.for_path = Some("/lib/song.mp3".into());
+        stem_key(&mut app, KeyCode::Char('M'));
+        assert_eq!(app.stems.status, StemStatus::Off);
+        assert!(matches!(
+            app.pending_bg_commands.as_slice(),
+            [BgCommand::CancelSeparation]
+        ));
+    }
+
+    #[test]
+    fn track_change_resets_stem_state() {
+        let mut app = stem_playing_app("/lib/song.mp3");
+        app.stems.status = StemStatus::Active;
+        app.stems.gains = Some(zytunes::stems::new_stem_gains(&[true; 6]));
+        app.stems.for_path = Some("/lib/song.mp3".into());
+        app.stems.enabled[2] = false;
+        // Single-entry playlist: next_track hits the end-of-playlist branch.
+        let (audio_tx, _audio_rx) = mpsc::channel();
+        app.next_track(&audio_tx);
+        assert!(app.now_playing.is_none());
+        assert_eq!(app.stems.status, StemStatus::Off);
+        assert!(app.stems.gains.is_none());
+        assert!(app.stems.enabled.iter().all(|&e| e), "toggles reset");
+        // Active playback has no separation in flight — nothing to cancel.
+        assert!(
+            !app.pending_bg_commands
+                .iter()
+                .any(|c| matches!(c, BgCommand::CancelSeparation)),
+            "track change while Active must not send a cancel"
+        );
+    }
+
+    #[test]
+    fn track_change_detaches_inflight_separation() {
+        let mut app = stem_playing_app("/lib/song.mp3");
+        app.stems.status = StemStatus::Separating { pct: Some(40) };
+        app.stems.for_path = Some("/lib/song.mp3".into());
+        let gen_before = app.stems.job_gen;
+        let (audio_tx, _audio_rx) = mpsc::channel();
+        app.next_track(&audio_tx);
+        assert_eq!(app.stems.status, StemStatus::Off);
+        assert!(
+            !app.pending_bg_commands
+                .iter()
+                .any(|c| matches!(c, BgCommand::CancelSeparation)),
+            "changing songs must NOT cancel the running separation — on \
+             CPU the split outlasts the song, so cancelling here killed \
+             every split at auto-advance; it finishes into the cache"
+        );
+        assert_eq!(
+            app.stems.job_gen,
+            gen_before + 1,
+            "detached job's events must compare stale"
+        );
+        assert!(
+            app.sync
+                .log
+                .iter()
+                .any(|l| l.contains("continues in the background")),
+            "detach is logged so the user knows the split is still running"
+        );
+    }
+
+    #[test]
+    fn detached_separation_ready_lands_in_cache_log_not_playback() {
+        let mut app = stem_playing_app("/lib/song.mp3");
+        app.stems.status = StemStatus::Separating { pct: Some(40) };
+        app.stems.for_path = Some("/lib/song.mp3".into());
+        let stale_gen = app.stems.job_gen;
+        let (audio_tx, _audio_rx) = mpsc::channel();
+        app.next_track(&audio_tx); // detaches: bumps gen, status Off
+        app.handle_bg_event(crate::background::BgEvent::StemsReady {
+            gen: stale_gen,
+            track_path: "/lib/song.mp3".into(),
+            stems: Box::new(zytunes::stems::StemSet::from_dir(
+                std::path::Path::new("/cache/xyz"),
+                "flac",
+            )),
+        });
+        assert_eq!(app.stems.status, StemStatus::Off, "no swap into playback");
+        assert!(
+            app.pending_audio_commands.is_empty(),
+            "stale StemsReady must not queue a SwapSource"
+        );
+        assert!(
+            app.sync.log.iter().any(|l| l.contains("stems cached for")),
+            "completion of the detached job is logged as a cache fill"
+        );
+    }
+
+    #[test]
+    fn stems_failed_resets_only_matching_job_gen() {
+        let mut app = stem_playing_app("/lib/song.mp3");
+        app.stems.job_gen = 2;
+        app.stems.status = StemStatus::Separating { pct: None };
+        app.stems.for_path = Some("/lib/song.mp3".into());
+        // Failure from a stale job: state untouched.
+        app.handle_bg_event(crate::background::BgEvent::StemsFailed {
+            gen: 1,
+            track_path: "/lib/other.mp3".into(),
+            error: "boom".into(),
+            cancelled: false,
+        });
+        assert_eq!(app.stems.status, StemStatus::Separating { pct: None });
+        // Failure from the current job: reset + error toast.
+        app.handle_bg_event(crate::background::BgEvent::StemsFailed {
+            gen: 2,
+            track_path: "/lib/song.mp3".into(),
+            error: "boom".into(),
+            cancelled: false,
+        });
+        assert_eq!(app.stems.status, StemStatus::Off);
+        assert!(matches!(app.toast_message, Some((_, _, true))));
+    }
+
+    #[test]
+    fn stale_cancelled_stems_failed_leaves_same_track_rerequest_alone() {
+        // M (job1) → M cancel → M again (job2, SAME track). Job1's kill
+        // lands on its 100 ms poll, so its terminal event arrives after
+        // job2 is dispatched. Track paths match — only the gen tells the
+        // jobs apart, and the stale event must not flip job2 off.
+        let mut app = stem_playing_app("/lib/song.mp3");
+        app.stems.job_gen = 1; // job1 dispatched
+        app.stems.status = StemStatus::Separating { pct: Some(30) };
+        app.stems.for_path = Some("/lib/song.mp3".into());
+        stem_key(&mut app, KeyCode::Char('M')); // cancel: gen → 2
+                                                // Re-request the same track (the engine-found arm of request_stems;
+                                                // the test container has no demucs so M would open consent instead).
+        app.dispatch_separation("/lib/song.mp3".into()); // gen → 3
+        assert_eq!(app.stems.status, StemStatus::Separating { pct: None });
+        assert_eq!(app.stems.job_gen, 3);
+
+        // Job1's late terminal event, same track path, stale gen.
+        app.handle_bg_event(crate::background::BgEvent::StemsFailed {
+            gen: 1,
+            track_path: "/lib/song.mp3".into(),
+            error: "cancelled".into(),
+            cancelled: true,
+        });
+        assert_eq!(
+            app.stems.status,
+            StemStatus::Separating { pct: None },
+            "stale cancel must not reset the newer job"
+        );
+
+        // Job2's StemsReady still engages stem playback.
+        app.handle_bg_event(crate::background::BgEvent::StemsReady {
+            gen: 3,
+            track_path: "/lib/song.mp3".into(),
+            stems: Box::new(zytunes::stems::StemSet::from_dir(
+                std::path::Path::new("/cache/x"),
+                "flac",
+            )),
+        });
+        assert_eq!(app.stems.status, StemStatus::Active);
+    }
+
+    #[test]
+    fn track_change_preserves_running_engine_install() {
+        // An engine install is track-agnostic: skipping to the next song
+        // must not wipe Provisioning (that invited a second consent whose
+        // dispatch superseded — killed — the running download). Only the
+        // stale auto-split target is dropped.
+        let mut app = stem_playing_app("/lib/song.mp3");
+        app.stems.job_gen = 1;
+        app.stems.status = StemStatus::Provisioning;
+        app.stems.pending_path = Some("/lib/song.mp3".into());
+        let (audio_tx, _audio_rx) = mpsc::channel();
+        app.next_track(&audio_tx);
+        assert_eq!(app.stems.status, StemStatus::Provisioning);
+        assert_eq!(app.stems.job_gen, 1, "install job identity unchanged");
+        assert!(app.stems.pending_path.is_none(), "auto-split target gone");
+        assert!(
+            !app.pending_bg_commands
+                .iter()
+                .any(|c| matches!(c, BgCommand::CancelSeparation)),
+            "the install must keep running"
+        );
+
+        // When the install completes, nothing auto-splits — the user gets
+        // a log hint and status returns to Off, engine ready for M.
+        let _ = app.stem_engine_ready_in_memory(1, std::path::Path::new("/managed/bin/demucs"));
+        assert_eq!(app.stems.status, StemStatus::Off);
+        assert!(app.pending_bg_commands.is_empty());
+        assert!(app.sync.log.iter().any(|l| l.contains("press M")));
+    }
+
+    #[test]
+    fn cancelled_install_never_toasts_an_error() {
+        // User cancels the install with M: the cancel site toasts "Stem
+        // job cancelled"; the job's terminal event (arriving later, stale
+        // by gen) must not overwrite that with an error toast.
+        let mut app = stem_playing_app("/lib/song.mp3");
+        app.stems.job_gen = 1;
+        app.stems.status = StemStatus::Provisioning;
+        stem_key(&mut app, KeyCode::Char('M')); // cancel: gen → 2
+        assert_eq!(app.stems.status, StemStatus::Off);
+        app.toast_message = None;
+        app.handle_bg_event(crate::background::BgEvent::StemEngineFailed {
+            gen: 1,
+            error: "engine install cancelled by user".into(),
+            cancelled: true,
+        });
+        assert!(app.toast_message.is_none(), "cancel is not an error");
+        assert!(app.sync.log.iter().any(|l| l.contains("cancelled")));
+
+        // A stale REAL failure logs but doesn't touch the current job.
+        app.stems.job_gen = 5;
+        app.stems.status = StemStatus::Separating { pct: None };
+        app.handle_bg_event(crate::background::BgEvent::StemEngineFailed {
+            gen: 2,
+            error: "disk full".into(),
+            cancelled: false,
+        });
+        assert!(app.toast_message.is_none());
+        assert_eq!(app.stems.status, StemStatus::Separating { pct: None });
+    }
+
+    #[test]
+    fn stems_failed_module_error_logs_repair_hint() {
+        // A ModuleNotFoundError means the installed engine env is broken
+        // (e.g. pre-`--with numpy` install). Discovery keeps finding the
+        // shim, so the log must carry the manual repair path.
+        let mut app = stem_playing_app("/lib/song.mp3");
+        app.stems.job_gen = 1;
+        app.stems.status = StemStatus::Separating { pct: None };
+        app.stems.for_path = Some("/lib/song.mp3".into());
+        app.handle_bg_event(crate::background::BgEvent::StemsFailed {
+            gen: 1,
+            track_path: "/lib/song.mp3".into(),
+            error: "stem engine exited with status 1: ModuleNotFoundError: No module named 'numpy'"
+                .into(),
+            cancelled: false,
+        });
+        assert!(app
+            .sync
+            .log
+            .iter()
+            .any(|l| l.contains("uv tool uninstall demucs")));
+    }
+
+    #[test]
+    fn swap_failed_unwinds_stem_state_but_keeps_playback() {
+        // The audio thread keeps the old source playing when a swap build
+        // fails; the app must NOT drop now_playing (that's PlaybackError
+        // semantics), only unwind the premature Active state.
+        let mut app = stem_playing_app("/lib/song.mp3");
+        app.stems.status = StemStatus::Active;
+        app.stems.gains = Some(zytunes::stems::new_stem_gains(&[true; 6]));
+        app.stems.for_path = Some("/lib/song.mp3".into());
+        let (audio_tx, _audio_rx) = mpsc::channel();
+        app.handle_audio_event(
+            crate::audio::AudioEvent::SwapFailed {
+                error: "stem 2 has 1 ch".into(),
+                to_stems: true,
+            },
+            &audio_tx,
+        );
+        assert!(app.now_playing.is_some(), "playback survived");
+        assert_eq!(app.stems.status, StemStatus::Off, "stem entry unwound");
+        assert!(app.stems.gains.is_none());
+        assert!(matches!(app.toast_message, Some((_, _, true))));
+
+        // A failed EXIT (file swap) leaves stem state alone — the app
+        // already reset it and the mixer keeps playing; M re-enters.
+        let mut app = stem_playing_app("/lib/song.mp3");
+        app.handle_audio_event(
+            crate::audio::AudioEvent::SwapFailed {
+                error: "Open: gone".into(),
+                to_stems: false,
+            },
+            &audio_tx,
+        );
+        assert!(app.now_playing.is_some());
+        assert_eq!(app.stems.status, StemStatus::Off);
+    }
+
+    #[test]
+    fn seek_failed_toasts_without_dropping_playback() {
+        let mut app = stem_playing_app("/lib/song.mp3");
+        let (audio_tx, _audio_rx) = mpsc::channel();
+        app.handle_audio_event(
+            crate::audio::AudioEvent::SeekFailed("Open: gone".into()),
+            &audio_tx,
+        );
+        assert!(app.now_playing.is_some(), "seek failure is not track loss");
+        assert!(matches!(app.toast_message, Some((_, _, true))));
     }
 
     #[test]

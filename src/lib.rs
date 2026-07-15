@@ -22,6 +22,7 @@ pub mod paths;
 pub mod playlist;
 pub mod playlist_store;
 pub mod recommender;
+pub mod stems;
 pub mod tag_ops;
 pub mod transcode;
 
