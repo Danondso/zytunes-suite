@@ -53,7 +53,15 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev libasound2-dev libdiscid-dev
       - name: Install system deps (macOS)
         if: runner.os == 'macOS'
-        run: brew install libdiscid
+        # The rust-cache'd build-script outputs of the *-sys crates pin
+        # versioned Homebrew Cellar paths (e.g. .../libdiscid/0.6.5/lib).
+        # When the runner image's formula bumps, the linker dies on the
+        # stale path ("library 'discid' not found") because the cached
+        # fingerprint never re-runs the build script. Clean exactly those
+        # crates so pkg-config re-resolves against what brew installed.
+        run: |
+          brew install libdiscid
+          cargo clean -p discid-sys -p libusb1-sys
       - run: cargo test --workspace
       - name: Doc warnings
         env:

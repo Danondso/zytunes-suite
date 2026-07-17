@@ -3100,12 +3100,32 @@ impl App {
         if self.track_list.is_empty() {
             return;
         }
+        let index = self.track_selected.min(self.track_list.len() - 1);
+        // Enter on the track that is already loaded is a same-session
+        // action (resume, or restart-from-the-top), never a transition:
+        // routing it through the transition path below would record a
+        // phantom skip and — worse — `reset_stems_for_track_change` +
+        // a fresh `Play` silently tears down an active stem mixer.
+        if self.track_list[index].location.is_some()
+            && self.track_list[index].location == self.playing_track_path()
+            && self.resume_or_restart_current(audio_tx)
+        {
+            // Re-anchor navigation context on the list the user pressed
+            // Enter in: the same track can be reached from a different
+            // playlist (album view vs. all-songs, or a search filter), and
+            // next/prev should follow what is on screen — matching what
+            // the pre-same-track-path behaviour did via a fresh session.
+            if let Some(np) = self.now_playing.as_mut() {
+                np.track_index = index;
+                np.playlist = Arc::from(self.track_list.as_slice());
+            }
+            return;
+        }
         // If the prior session never crossed the play threshold, transitioning
         // out counts as a skip — record before we lose the old `now_playing`.
         self.record_now_playing_skip();
 
         self.reset_stems_for_track_change();
-        let index = self.track_selected.min(self.track_list.len() - 1);
         let track = &self.track_list[index];
         let path = match &track.location {
             Some(p) => p.clone(),
@@ -3133,6 +3153,41 @@ impl App {
             year,
             metadata_marquee,
         });
+    }
+
+    /// Same-track `Enter`: resume when paused, restart from 0:00 when
+    /// already playing. Both keep the current playback session — no skip
+    /// is recorded and stem state is untouched. The restart goes through
+    /// `Scrub` rather than a fresh `Play` because Scrub rebuilds whichever
+    /// `NowSource` is live (file or stem mixer, same gains Arc), so an
+    /// active stem split survives the rewind. Returns false when there is
+    /// no session to act on (caller falls through to the normal play path).
+    /// The caller re-anchors `track_index`/`playlist` afterwards so
+    /// navigation context follows the list Enter was pressed in.
+    fn resume_or_restart_current(&mut self, audio_tx: &mpsc::Sender<AudioCommand>) -> bool {
+        let Some(np) = self.now_playing.as_mut() else {
+            return false;
+        };
+        match np.state {
+            PlaybackState::Paused => {
+                let _ = audio_tx.send(AudioCommand::Resume);
+                np.state = PlaybackState::Playing;
+                np.paused_frame = None;
+            }
+            PlaybackState::Playing => {
+                // Over-shoot the rewind by a minute: the audio thread
+                // clamps at 0, and its own clock may sit slightly ahead
+                // of the last Position event we saw.
+                let delta = -(np.elapsed_ms as i64) - 60_000;
+                let _ = audio_tx.send(AudioCommand::Scrub { delta_ms: delta });
+                np.elapsed_ms = 0;
+                // A restart opens a new counting session — mirrors
+                // `prev_track`'s restart, which rebuilds `NowPlaying`
+                // with `counted: false` via `play_from_playlist`.
+                np.counted = false;
+            }
+        }
+        true
     }
 
     pub fn toggle_playback(&mut self, audio_tx: &mpsc::Sender<AudioCommand>) {
@@ -11154,6 +11209,142 @@ mod tests {
         assert!(app.stems.enabled[6], "index 6 is outside a 6-stem layout");
         app.toggle_stem(0);
         assert!(!app.stems.enabled[0], "in-layout toggles still work");
+    }
+
+    /// Install Active stem state and make the loaded track also the selected
+    /// row, so `Enter` targets the very track that is playing/paused.
+    fn stem_active_app_with_selection(path: &str) -> App {
+        let mut app = stem_playing_app(path);
+        app.stems.status = StemStatus::Active;
+        app.stems.layout = Some(zytunes::stems::SIX_STEM_LAYOUT);
+        app.stems.gains = Some(zytunes::stems::new_stem_gains(&[true; 6]));
+        app.stems.enabled = [true; zytunes::stems::MAX_STEMS];
+        if let Some(np) = app.now_playing.as_mut() {
+            np.track_id = Some(7);
+        }
+        app.track_list = app.now_playing.as_ref().unwrap().playlist.to_vec();
+        app.track_selected = 0;
+        app
+    }
+
+    /// Enter on the track that is already loaded and paused must resume in
+    /// place — not route through the full restart path, whose
+    /// `reset_stems_for_track_change` + fresh `Play` silently tears down
+    /// the active stem mixer and rewinds to 0:00.
+    #[test]
+    fn enter_on_paused_split_track_resumes_and_keeps_stems() {
+        let mut app = stem_active_app_with_selection("/lib/song.mp3");
+        if let Some(np) = app.now_playing.as_mut() {
+            np.state = PlaybackState::Paused;
+        }
+
+        let (tx, rx) = mpsc::channel::<AudioCommand>();
+        app.play_selected_track(&tx);
+
+        assert_eq!(app.stems.status, StemStatus::Active, "stems must survive");
+        let np = app.now_playing.as_ref().unwrap();
+        assert_eq!(np.state, PlaybackState::Playing);
+        assert_eq!(np.elapsed_ms, 42_000, "resume keeps the position");
+        assert!(matches!(rx.try_recv(), Ok(AudioCommand::Resume)));
+        assert!(rx.try_recv().is_err(), "exactly one command: Resume");
+        assert!(app.local_plays.get(7).is_none(), "a resume is not a skip");
+    }
+
+    /// Enter on the already-playing loaded track keeps the double-click
+    /// restart-from-the-top semantics, but restarts via a scrub-to-zero on
+    /// the live source (stem-aware: `Scrub` rebuilds whichever `NowSource`
+    /// is live over the same gains Arc) instead of a fresh `Play`.
+    #[test]
+    fn enter_on_playing_split_track_restarts_via_scrub() {
+        let mut app = stem_active_app_with_selection("/lib/song.mp3");
+        if let Some(np) = app.now_playing.as_mut() {
+            // Prior session already recorded its play; a restart must open
+            // a fresh counting session (mirrors prev_track's restart).
+            np.counted = true;
+            // The session was started from a longer list where this track
+            // sat at index 3; the on-screen list now shows it alone at 0.
+            let song = np.playlist[0].clone();
+            let filler = |n: usize| {
+                TrackInfo::new(
+                    format!("Filler {n}"),
+                    "Artist".into(),
+                    "Album".into(),
+                    Some(180_000),
+                    None,
+                    Some(format!("/lib/filler{n}.mp3")),
+                    None,
+                    None,
+                    None,
+                    false,
+                )
+            };
+            np.playlist = Arc::from(vec![filler(1), filler(2), filler(3), song].as_slice());
+            np.track_index = 3;
+        }
+
+        let (tx, rx) = mpsc::channel::<AudioCommand>();
+        app.play_selected_track(&tx);
+
+        assert_eq!(app.stems.status, StemStatus::Active, "stems must survive");
+        let np = app.now_playing.as_ref().unwrap();
+        assert_eq!(np.state, PlaybackState::Playing);
+        assert_eq!(np.elapsed_ms, 0, "restart rewinds the clock");
+        assert!(!np.counted, "restart opens a new counting session");
+        assert_eq!(
+            np.track_index, 0,
+            "navigation context re-anchors on the list Enter was pressed in"
+        );
+        assert_eq!(
+            np.playlist.len(),
+            1,
+            "playlist snapshot follows the on-screen list"
+        );
+        match rx.try_recv() {
+            Ok(AudioCommand::Scrub { delta_ms }) => {
+                assert!(delta_ms <= -42_000, "scrub must reach 0:00");
+            }
+            _ => panic!("expected a stem-aware Scrub, not Play"),
+        }
+        assert!(rx.try_recv().is_err(), "exactly one command: Scrub");
+        assert!(
+            app.local_plays.get(7).is_none(),
+            "same-session restart is not a skip"
+        );
+    }
+
+    /// A *different* selected row still takes the full transition path:
+    /// skip recorded, stems reset, fresh `Play` dispatched.
+    #[test]
+    fn enter_on_a_different_track_still_resets_stems() {
+        let mut app = stem_active_app_with_selection("/lib/song.mp3");
+        let other = TrackInfo::new(
+            "Other".into(),
+            "Artist".into(),
+            "Album".into(),
+            Some(180_000),
+            None,
+            Some("/lib/other.mp3".to_string()),
+            None,
+            None,
+            None,
+            false,
+        );
+        app.track_list = vec![other];
+        app.track_selected = 0;
+
+        let (tx, rx) = mpsc::channel::<AudioCommand>();
+        app.play_selected_track(&tx);
+
+        assert_eq!(
+            app.stems.status,
+            StemStatus::Off,
+            "track change resets stems"
+        );
+        assert!(matches!(rx.try_recv(), Ok(AudioCommand::Play { .. })));
+        assert!(
+            app.local_plays.get(7).is_some(),
+            "moving to another track records the abandoned session as a skip"
+        );
     }
 
     #[test]

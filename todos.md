@@ -404,40 +404,20 @@ Scope:
    bytes, and that this is minutes-per-track on CPU. `hq-harmony` on a
    12-track album is a very long, very hot operation.
 
-### Playing a paused track after splitting it clears stem state
-Splitting the paused track works — `on_stems_ready`
-(`src/tui/app/events.rs:238`) swaps into the stem mixer with pause state
-preserved — but "playing" it afterwards can silently exit stem mode. Space
-(`toggle_playback`, `src/tui/app.rs:3138`) resumes correctly; Enter on the
-track row does not: `handle_enter_key` (`src/tui/app/keys.rs:664`) always
-routes to `play_selected_track` (`src/tui/app.rs:3099`), which
-unconditionally calls `reset_stems_for_track_change()` and sends a fresh
-`AudioCommand::Play` — even when the selected track IS the currently loaded,
-paused `now_playing`. The user's active stems are torn down and the track
-restarts from 0:00.
-
-Scope:
-
-1. **Same-track detection.** In `play_selected_track` (or in
-   `handle_enter_key` before delegating), compare the selected track's path
-   against `playing_track_path()`. If they match and `now_playing` is
-   `Paused`, resume (`AudioCommand::Resume` + state flip, i.e. the
-   `toggle_playback` paused arm) instead of restarting. This preserves both
-   the stem mixer and the playback position.
-2. **Decide the Playing case.** Enter on the already-playing track currently
-   restarts it from the top — arguably intended (iTunes-style double-click
-   semantics). If restart is kept, it should still be a *stem-aware* restart:
-   scrub-to-zero on the live source (`AudioCommand::Scrub` rebuilds whichever
-   `NowSource` is live and keeps the gains `Arc`) rather than
-   `AudioCommand::Play`, so stem mode survives.
-3. **Skip accounting.** `play_selected_track` calls
-   `record_now_playing_skip()` before transitioning; a same-track resume must
-   not count as a skip (the `prev_track` restart path at
-   `src/tui/app.rs:3183` already models this distinction).
-4. **Regression test.** Pause → stems Active → Enter on the same row:
-   assert stems stay Active, no `AudioCommand::Play` is emitted, and state is
-   Playing. Mirror of the existing track-change tests around
-   `reset_stems_for_track_change`.
+### ~~Playing a paused track after splitting it clears stem state~~ (done)
+`play_selected_track` now detects when the selected row IS the loaded
+track (path comparison against `playing_track_path()`) and routes through
+`resume_or_restart_current` instead of the transition path: a paused
+session resumes in place (`AudioCommand::Resume`, position and stem mixer
+preserved), and an already-playing session keeps the double-click restart
+semantics but rewinds via a stem-aware `AudioCommand::Scrub` to 0:00 —
+Scrub rebuilds whichever `NowSource` is live over the same gains `Arc`,
+so an active split survives with its toggle state. Neither case records a
+skip (same session, mirroring the `prev_track` restart distinction).
+Regression tests: `enter_on_paused_split_track_resumes_and_keeps_stems`,
+`enter_on_playing_split_track_restarts_via_scrub`, and
+`enter_on_a_different_track_still_resets_stems` (the full transition path
+— skip + stem reset + fresh `Play` — still fires for a different row).
 
 ### Model-checkpoint cache has no eviction
 `~/.cache/zytunes/models` (`default_model_file_dir`, `src/stems.rs` — passed
