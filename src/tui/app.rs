@@ -332,6 +332,9 @@ pub enum StemStatus {
 pub struct StemConsent {
     pub package: String,
     pub gpu: bool,
+    /// Which engine the install provisions — the recipe's engine at the
+    /// time the modal opened.
+    pub engine: zytunes::stems::provision::EngineKind,
 }
 
 /// Stem-split playback state (`M` in the player). Pattern-matches
@@ -342,7 +345,10 @@ pub struct StemState {
     /// mixer holds a clone, so toggles are lock-free stores.
     pub gains: Option<zytunes::stems::StemGains>,
     /// UI mirror of the gains for rendering the strip.
-    pub enabled: [bool; zytunes::stems::NUM_STEMS],
+    pub enabled: [bool; zytunes::stems::MAX_STEMS],
+    /// Ordered stems of the ACTIVE set — the recipe layout the strip
+    /// renders and the digit keys claim against. `None` outside Active.
+    pub layout: Option<&'static [zytunes::stems::StemKind]>,
     /// Library path of the track the current status refers to.
     pub for_path: Option<String>,
     /// Path awaiting separation once provisioning completes.
@@ -364,7 +370,8 @@ impl Default for StemState {
         StemState {
             status: StemStatus::Off,
             gains: None,
-            enabled: [true; zytunes::stems::NUM_STEMS],
+            enabled: [true; zytunes::stems::MAX_STEMS],
+            layout: None,
             for_path: None,
             pending_path: None,
             consent: None,
@@ -379,7 +386,8 @@ impl StemState {
     fn reset(&mut self) {
         self.status = StemStatus::Off;
         self.gains = None;
-        self.enabled = [true; zytunes::stems::NUM_STEMS];
+        self.enabled = [true; zytunes::stems::MAX_STEMS];
+        self.layout = None;
         self.for_path = None;
     }
 }
@@ -1085,7 +1093,8 @@ pub struct App {
     /// Stem-engine discovery, injectable so tests don't depend on
     /// whether the developer's machine has demucs installed. Production
     /// value is [`zytunes::stems::provision::find_engine`].
-    pub stem_engine_finder: fn(Option<&std::path::Path>) -> Option<PathBuf>,
+    pub stem_engine_finder:
+        fn(zytunes::stems::provision::EngineKind, Option<&std::path::Path>) -> Option<PathBuf>,
     /// User-authored playlists (manual + generated). Loaded once at TUI
     /// launch via `load_playlists_from_disk`; `App::new()` leaves this empty
     /// so unit tests don't pick up developer-machine state.
@@ -3253,6 +3262,21 @@ impl App {
         }
     }
 
+    /// Recipe from config; an unknown value falls back to demucs with a
+    /// log line rather than silently downgrading (the parse error keeps
+    /// the raw string for exactly this message).
+    pub(crate) fn stems_recipe(&mut self) -> zytunes::stems::RecipeKind {
+        match self.stems_cfg.recipe_kind() {
+            Ok(recipe) => recipe,
+            Err(raw) => {
+                self.sync.log.push(format!(
+                    "[stems] unknown recipe \"{raw}\" in config.toml — using \"demucs\""
+                ));
+                zytunes::stems::RecipeKind::Demucs
+            }
+        }
+    }
+
     /// Kick off the stem flow for the currently playing track. Gated on
     /// the playing track's origin, not the browse mode: `now_playing` can
     /// only ever hold local library tracks (device rows have no location
@@ -3266,13 +3290,16 @@ impl App {
             );
             return;
         };
-        if (self.stem_engine_finder)(self.stems_cfg.command_path().as_deref()).is_some() {
-            self.dispatch_separation(path);
+        let recipe = self.stems_recipe();
+        let engine = recipe.engine();
+        if (self.stem_engine_finder)(engine, self.stems_cfg.command_path().as_deref()).is_some() {
+            self.dispatch_separation(path, recipe);
         } else if self.stems_cfg.auto_provision() {
             self.stems.pending_path = Some(path);
             self.stems.consent = Some(StemConsent {
-                package: self.stems_cfg.package(),
+                package: self.stems_cfg.resolved_package(engine),
                 gpu: self.stems_cfg.gpu(),
+                engine,
             });
         } else {
             self.set_toast(
@@ -3284,8 +3311,10 @@ impl App {
 
     /// Queue a `SeparateStems` for `path` and flip status to Separating.
     /// The worker answers instantly on a cache hit, so this is also the
-    /// happy path for already-separated tracks.
-    pub(crate) fn dispatch_separation(&mut self, path: String) {
+    /// happy path for already-separated tracks. Takes the caller's
+    /// already-parsed recipe — re-parsing here logged the unknown-recipe
+    /// warning twice per M-press.
+    pub(crate) fn dispatch_separation(&mut self, path: String, recipe: zytunes::stems::RecipeKind) {
         self.stems.job_gen += 1;
         self.stems.status = StemStatus::Separating { pct: None };
         self.stems.for_path = Some(path.clone());
@@ -3293,6 +3322,7 @@ impl App {
             gen: self.stems.job_gen,
             track_path: path,
             engine_command: self.stems_cfg.command_path(),
+            recipe,
             model: self.stems_cfg.model(),
             cache_max_bytes: self.stems_cfg.cache_max_bytes(),
         });
@@ -3311,8 +3341,11 @@ impl App {
     }
 
     /// Toggle stem `index` (0-based) while stem playback is Active.
+    /// Bounded by the active layout, not the capacity — index 6 exists
+    /// under harmony but not under the six-stem layouts.
     pub fn toggle_stem(&mut self, index: usize) {
-        if self.stems.status != StemStatus::Active || index >= zytunes::stems::NUM_STEMS {
+        let stem_count = self.stems.layout.map_or(0, |l| l.len());
+        if self.stems.status != StemStatus::Active || index >= stem_count {
             return;
         }
         self.stems.enabled[index] = !self.stems.enabled[index];
@@ -10992,7 +11025,7 @@ mod tests {
         // Hermetic: never discover the developer machine's real demucs,
         // and drop whatever [stems] table their real config.toml carries
         // (App::new loads it; the provisioner writes `command` there).
-        app.stem_engine_finder = |_| None;
+        app.stem_engine_finder = |_, _| None;
         app.stems_cfg = crate::config::StemsConfig::default();
         let info = TrackInfo::new(
             "Song".into(),
@@ -11058,7 +11091,7 @@ mod tests {
     #[test]
     fn dispatch_separation_queues_command_with_config_values() {
         let mut app = stem_playing_app("/lib/song.mp3");
-        app.dispatch_separation("/lib/song.mp3".into());
+        app.dispatch_separation("/lib/song.mp3".into(), zytunes::stems::RecipeKind::Demucs);
         assert_eq!(app.stems.status, StemStatus::Separating { pct: None });
         assert_eq!(app.stems.for_path.as_deref(), Some("/lib/song.mp3"));
         match app.pending_bg_commands.as_slice() {
@@ -11066,12 +11099,14 @@ mod tests {
                 gen,
                 track_path,
                 engine_command,
+                recipe,
                 model,
                 cache_max_bytes,
             }] => {
                 assert_eq!(*gen, app.stems.job_gen, "command carries the new gen");
                 assert_eq!(track_path, "/lib/song.mp3");
                 assert!(engine_command.is_none(), "no [stems] command configured");
+                assert_eq!(*recipe, zytunes::stems::RecipeKind::Demucs);
                 assert_eq!(model, "htdemucs_6s");
                 assert_eq!(*cache_max_bytes, 10 * (1u64 << 30));
             }
@@ -11080,11 +11115,120 @@ mod tests {
     }
 
     #[test]
+    fn stem_keys_claim_range_follows_active_layout() {
+        // Harmony layout: key 7 toggles stem 6; key 8 falls through.
+        let mut app = stem_playing_app("/lib/song.mp3");
+        app.last_term_height = 40;
+        app.stems.status = StemStatus::Active;
+        app.stems.layout = Some(zytunes::stems::HARMONY_STEM_LAYOUT);
+        app.stems.gains = Some(zytunes::stems::new_stem_gains(&[true; 7]));
+        app.stems.enabled = [true; zytunes::stems::MAX_STEMS];
+        stem_key(&mut app, KeyCode::Char('7'));
+        assert!(!app.stems.enabled[6], "key 7 toggles the 7th stem");
+        let before = app.stems.enabled;
+        stem_key(&mut app, KeyCode::Char('8'));
+        assert_eq!(app.stems.enabled, before, "key 8 is beyond the layout");
+
+        // Six-stem layout: key 7 must fall through to global handling.
+        let mut app = stem_playing_app("/lib/song.mp3");
+        app.last_term_height = 40;
+        app.stems.status = StemStatus::Active;
+        app.stems.layout = Some(zytunes::stems::SIX_STEM_LAYOUT);
+        app.stems.gains = Some(zytunes::stems::new_stem_gains(&[true; 6]));
+        app.stems.enabled = [true; zytunes::stems::MAX_STEMS];
+        stem_key(&mut app, KeyCode::Char('7'));
+        assert!(
+            app.stems.enabled[6],
+            "key 7 unclaimed under a 6-stem layout"
+        );
+    }
+
+    #[test]
+    fn toggle_stem_is_bounded_by_the_active_layout() {
+        let mut app = stem_playing_app("/lib/song.mp3");
+        app.stems.status = StemStatus::Active;
+        app.stems.layout = Some(zytunes::stems::SIX_STEM_LAYOUT);
+        app.stems.gains = Some(zytunes::stems::new_stem_gains(&[true; 6]));
+        app.stems.enabled = [true; zytunes::stems::MAX_STEMS];
+        app.toggle_stem(6);
+        assert!(app.stems.enabled[6], "index 6 is outside a 6-stem layout");
+        app.toggle_stem(0);
+        assert!(!app.stems.enabled[0], "in-layout toggles still work");
+    }
+
+    #[test]
+    fn dispatch_separation_carries_configured_recipe() {
+        // The recipe is parsed once in request_stems and passed through —
+        // dispatch_separation re-reading config logged the unknown-recipe
+        // warning twice per M-press. End-to-end: config recipe → command.
+        let mut app = stem_playing_app("/lib/song.mp3");
+        app.stems_cfg.recipe = Some("hq".into());
+        app.stem_engine_finder = |_, _| Some(std::path::PathBuf::from("/bin/engine"));
+        app.press_stem_mode();
+        assert!(matches!(
+            app.pending_bg_commands.as_slice(),
+            [BgCommand::SeparateStems {
+                recipe: zytunes::stems::RecipeKind::Hq,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn unknown_recipe_logs_once_per_stem_request() {
+        // stems_recipe() logs on every parse; request_stems must parse
+        // once and hand the result to dispatch_separation, not have both
+        // parse (and both log).
+        let mut app = stem_playing_app("/lib/song.mp3");
+        app.stems_cfg.recipe = Some("roformer".into());
+        app.stem_engine_finder = |_, _| Some(std::path::PathBuf::from("/bin/engine"));
+        app.press_stem_mode();
+        let warnings = app
+            .sync
+            .log
+            .iter()
+            .filter(|l| l.contains("unknown recipe"))
+            .count();
+        assert_eq!(warnings, 1, "log: {:?}", app.sync.log);
+    }
+
+    #[test]
+    fn unknown_recipe_falls_back_to_demucs_and_logs() {
+        let mut app = stem_playing_app("/lib/song.mp3");
+        app.stems_cfg.recipe = Some("roformer".into());
+        assert_eq!(app.stems_recipe(), zytunes::stems::RecipeKind::Demucs);
+        assert!(
+            app.sync.log.iter().any(|l| l.contains("unknown recipe")),
+            "fallback must be visible in the log: {:?}",
+            app.sync.log
+        );
+    }
+
+    #[test]
+    fn hq_consent_offers_the_pinned_audio_separator_package() {
+        // No engine in the test env, recipe = hq: the consent modal must
+        // name the audio-separator install, not demucs.
+        let mut app = stem_playing_app("/lib/song.mp3");
+        app.stems_cfg.recipe = Some("hq".into());
+        app.press_stem_mode();
+        let consent = app.stems.consent.as_ref().expect("consent modal");
+        assert_eq!(
+            consent.engine,
+            zytunes::stems::provision::EngineKind::AudioSeparator
+        );
+        assert_eq!(
+            consent.package,
+            zytunes::stems::provision::EngineKind::AudioSeparator.default_package(false)
+        );
+    }
+
+    #[test]
     fn stem_consent_enter_provisions_and_esc_declines() {
         let mut app = stem_playing_app("/lib/song.mp3");
         app.stems.consent = Some(StemConsent {
             package: "demucs".into(),
             gpu: false,
+            engine: zytunes::stems::provision::EngineKind::Demucs,
         });
         app.stems.pending_path = Some("/lib/song.mp3".into());
         stem_key(&mut app, KeyCode::Enter);
@@ -11092,7 +11236,12 @@ mod tests {
         assert!(app.stems.consent.is_none());
         assert!(matches!(
             app.pending_bg_commands.as_slice(),
-            [BgCommand::ProvisionStemEngine { package, gpu: false, .. }] if package == "demucs"
+            [BgCommand::ProvisionStemEngine {
+                package,
+                gpu: false,
+                engine: zytunes::stems::provision::EngineKind::Demucs,
+                ..
+            }] if package == "demucs"
         ));
 
         // Decline path.
@@ -11100,6 +11249,7 @@ mod tests {
         app.stems.consent = Some(StemConsent {
             package: "demucs".into(),
             gpu: false,
+            engine: zytunes::stems::provision::EngineKind::Demucs,
         });
         app.stems.pending_path = Some("/lib/song.mp3".into());
         stem_key(&mut app, KeyCode::Esc);
@@ -11157,9 +11307,10 @@ mod tests {
         app.handle_bg_event(crate::background::BgEvent::StemsReady {
             gen: 1,
             track_path: "/lib/song.mp3".into(),
-            stems: Box::new(zytunes::stems::StemSet::from_dir(
+            stems: Box::new(zytunes::stems::StemSet::from_layout(
                 std::path::Path::new("/cache/x"),
                 "flac",
+                zytunes::stems::SIX_STEM_LAYOUT,
             )),
         });
         assert_eq!(app.stems.status, StemStatus::Active);
@@ -11182,9 +11333,10 @@ mod tests {
         app.handle_bg_event(crate::background::BgEvent::StemsReady {
             gen: 1,
             track_path: "/lib/other.mp3".into(),
-            stems: Box::new(zytunes::stems::StemSet::from_dir(
+            stems: Box::new(zytunes::stems::StemSet::from_layout(
                 std::path::Path::new("/cache/y"),
                 "flac",
+                zytunes::stems::SIX_STEM_LAYOUT,
             )),
         });
         assert_eq!(app.stems.status, StemStatus::Off);
@@ -11203,6 +11355,7 @@ mod tests {
 
         // Active: '1' toggles the vocals stem and the sidebar stays put.
         app.stems.status = StemStatus::Active;
+        app.stems.layout = Some(zytunes::stems::SIX_STEM_LAYOUT);
         app.stems.gains = Some(zytunes::stems::new_stem_gains(&app.stems.enabled));
         app.sidebar_mode = SidebarMode::Albums;
         stem_key(&mut app, KeyCode::Char('1'));
@@ -11231,6 +11384,7 @@ mod tests {
         // silently mutating invisible stems.
         let mut app = stem_playing_app("/lib/song.mp3");
         app.stems.status = StemStatus::Active;
+        app.stems.layout = Some(zytunes::stems::SIX_STEM_LAYOUT);
         app.stems.gains = Some(zytunes::stems::new_stem_gains(&app.stems.enabled));
 
         // Force-hidden player (P cycled to hidden).
@@ -11358,9 +11512,10 @@ mod tests {
         app.handle_bg_event(crate::background::BgEvent::StemsReady {
             gen: stale_gen,
             track_path: "/lib/song.mp3".into(),
-            stems: Box::new(zytunes::stems::StemSet::from_dir(
+            stems: Box::new(zytunes::stems::StemSet::from_layout(
                 std::path::Path::new("/cache/xyz"),
                 "flac",
+                zytunes::stems::SIX_STEM_LAYOUT,
             )),
         });
         assert_eq!(app.stems.status, StemStatus::Off, "no swap into playback");
@@ -11412,7 +11567,7 @@ mod tests {
         stem_key(&mut app, KeyCode::Char('M')); // cancel: gen → 2
                                                 // Re-request the same track (the engine-found arm of request_stems;
                                                 // the test container has no demucs so M would open consent instead).
-        app.dispatch_separation("/lib/song.mp3".into()); // gen → 3
+        app.dispatch_separation("/lib/song.mp3".into(), zytunes::stems::RecipeKind::Demucs); // gen → 3
         assert_eq!(app.stems.status, StemStatus::Separating { pct: None });
         assert_eq!(app.stems.job_gen, 3);
 
@@ -11433,9 +11588,10 @@ mod tests {
         app.handle_bg_event(crate::background::BgEvent::StemsReady {
             gen: 3,
             track_path: "/lib/song.mp3".into(),
-            stems: Box::new(zytunes::stems::StemSet::from_dir(
+            stems: Box::new(zytunes::stems::StemSet::from_layout(
                 std::path::Path::new("/cache/x"),
                 "flac",
+                zytunes::stems::SIX_STEM_LAYOUT,
             )),
         });
         assert_eq!(app.stems.status, StemStatus::Active);

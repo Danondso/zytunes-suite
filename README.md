@@ -31,7 +31,12 @@ A Rust tool for syncing music (and photos/videos on Zune) to a Microsoft Zune or
 - **Device track removal** — in device view mode, `a`/`A` removes selected tracks, albums, or artists from the device. Progress is shown during removal and the device track list auto-refreshes afterward
 - **Album-art rendering** — two renderers: unicode `halfblock` (default) and a 10-char luminance ramp `ascii` renderer. Press `T` to toggle; choice persists to `config.toml`. Per-album renderings are cached at `~/.cache/zytunes/art/` keyed by `(artist, album)` with `(mtime, size)` fingerprint invalidation so re-tagging refreshes automatically
 - **Audio playback** — in-TUI preview of library tracks via rodio (play/pause/skip). Press `P` to cycle the now-playing panel through auto → force-hidden → force-shown. Selected rows marquee-scroll long titles
-- **Stem-split playback** — press `M` while a track plays to split it into six stems (vocals / drums / bass / guitar / piano / other, Demucs `htdemucs_6s`) and mute/unmute each live with keys `1`–`6` from a strip in the now-playing panel. Separation runs in the background — the original keeps playing and swaps into stem playback at the same position when the stems are ready — and results are cached under `~/.cache/zytunes/stems/` (10 GB LRU cap). The engine is Python `demucs` run as a subprocess; on first use zytunes offers a one-time managed install via `uv` (CPU-only PyTorch, ~1.5 GB) after explicit consent — nothing installs at startup or during the library scan. Configure via the `[stems]` table in `~/.config/zytunes/config.toml` (`command`, `package`, `model`, `gpu`, `cache_max_gb`, `provision = "manual"` to opt out of auto-install)
+- **Stem-split playback** — press `M` while a track plays to split it into live-toggleable stems, muted/unmuted with the digit keys from a strip in the now-playing panel. Separation runs in the background — the original keeps playing and swaps into stem playback at the same position when the stems are ready — and results are cached under `~/.cache/zytunes/stems/` (10 GB LRU cap). Three recipes, selected with `recipe` in the `[stems]` table:
+  - `demucs` (default) — six stems (vocals / drums / bass / guitar / piano / other) from a single Demucs `htdemucs_6s` pass, keys `1`–`6`
+  - `hq` — the same six stems via a two-pass cascade through [`audio-separator`](https://github.com/nomadkaraoke/python-audio-separator): BS-Roformer pulls the vocals (audibly cleaner than demucs), then `htdemucs_6s` separates the band from the devocalized instrumental
+  - `hq-harmony` — seven stems, keys `1`–`7`: a Mel-Roformer karaoke pass additionally splits the vocals into **lead** and **backing/harmony**
+
+  Engines are Python subprocesses; on first use zytunes offers a one-time managed install via `uv` (CPU-only PyTorch, ~1.5 GB; the Roformer recipes also download model checkpoints of 200 MB–1 GB on first separation) after explicit consent — nothing installs at startup or during the library scan. Heads-up: Roformer inference on CPU is markedly slower than demucs — the `hq` recipes really want `gpu = true`. Configure via the `[stems]` table in `~/.config/zytunes/config.toml` (`recipe`, `command`, `package`, `model`, `gpu`, `cache_max_gb`, `provision = "manual"` to opt out of auto-install)
 - **Track-info inspector** — press `I` on any library track to open a centered, scrollable popup with all parsed metadata: title/artist/album, composer / conductor / lyricist, ISRC / barcode / catalog number, all seven MusicBrainz IDs, ReplayGain values, audio properties (sample rate, bit depth, bitrate, channels), file size, encoder, and a lyrics preview. Sections are suppressed when empty so lightly-tagged tracks stay terse. Long values (file paths, MB UUIDs) marquee-scroll inside the value column
 - **Log export** — press `L` to dump the live log to `/tmp/zytunes-log.txt` and copy the path to the system clipboard
 - **USB resilience (macOS)** — the native IOKit backend recovers from transient pipe stalls via `ClearPipeStall` with a one-shot retry on both read and write paths. Read timeouts clear stalls on both bulk endpoints so the OUT pipe stays in sync with the device. When a sync/remove cascade indicates the USB session is truly gone (device unplug, `NotResponding`, unrecoverable stall, read timeout) the TUI aborts remaining work, clears the session, and prompts the user to replug
@@ -126,8 +131,8 @@ The album detail view shows a ZIP disk ASCII art with album metadata (artist, al
 |-----|--------|
 | `p` | Play / pause selected track |
 | `P` | Cycle now-playing panel (auto → hidden → always on) |
-| `M` | Stem mixer — split the playing track into 6 stems (first use offers a one-time engine install); press again to cancel a running job or return to normal playback |
-| `1`–`6` | Toggle vocals / drums / bass / guitar / piano / other while the stem mixer is active |
+| `M` | Stem mixer — split the playing track into stems (first use offers a one-time engine install); press again to cancel a running job or return to normal playback |
+| `1`–`7` | Toggle stems while the stem mixer is active (six under `demucs`/`hq`; seven — lead vocals / backing vocals / drums / bass / guitar / piano / other — under `hq-harmony`) |
 | `T` | Toggle album-art style (halfblock / ASCII) |
 | `L` | Dump log to `/tmp/zytunes-log.txt` and copy path to clipboard |
 
@@ -246,7 +251,7 @@ brew install ffmpeg            # required for `video-sync` and CD ripping; optio
 
 On Debian/Ubuntu: `apt install libusb-1.0-0-dev libdiscid-dev ffmpeg`.
 
-Stem-split playback (`M` in the TUI) additionally needs the Python `demucs` engine. You don't have to preinstall it — on first use zytunes offers a one-time managed install via [`uv`](https://docs.astral.sh/uv/) — but an existing install works too: point `[stems] command` in `~/.config/zytunes/config.toml` at your `demucs` binary.
+Stem-split playback (`M` in the TUI) additionally needs a Python engine: `demucs` for the default recipe, or [`audio-separator`](https://github.com/nomadkaraoke/python-audio-separator) for the `hq`/`hq-harmony` recipes. You don't have to preinstall either — on first use zytunes offers a one-time managed install via [`uv`](https://docs.astral.sh/uv/) — but an existing install works too: point `[stems] command` in `~/.config/zytunes/config.toml` at the engine binary. Roformer model checkpoints download automatically on first separation into `~/.cache/zytunes/models/`.
 
 ### MTPZ keys (Zune only)
 
@@ -411,8 +416,9 @@ src/
   dirlib.rs          — DirectoryLibrary: recursive folder scanner (lofty tags + path fallback)
   cache.rs           — on-disk cache for the directory scanner
   paths.rs           — device-scoped cache paths (ZYTUNES_CACHE_DIR aware)
-  stems.rs           — stem separation (demucs shell-out) + stem cache (LRU)
+  stems.rs           — recipes, engines (demucs / audio-separator), stem cache (LRU)
   stems/
+    process.rs       — shared engine-subprocess driver (drains, cancel, teardown)
     provision.rs     — stem-engine discovery + uv-managed install
   tui/
     main.rs          — TUI entry point (zytunes-tui binary)
@@ -422,7 +428,7 @@ src/
     anim.rs          — theme-aware animations
     audio.rs         — local audio playback (rodio), stem playback commands
     audio/
-      stem_mix.rs    — six-stem mixing Source with live per-stem gains
+      stem_mix.rs    — stem mixing Source with live per-stem gains
     theme.rs         — Theme struct, built-in presets, user-theme merge
     config.rs        — TOML config file (~/.config/zytunes/config.toml)
 ```

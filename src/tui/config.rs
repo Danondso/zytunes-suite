@@ -71,21 +71,35 @@ pub struct StemsConfig {
     /// install; report the missing engine instead). `"bundled"` is
     /// reserved for a future pre-built distribution.
     pub provision: Option<String>,
-    /// Explicit demucs binary path (venv/pipx/system). Set by hand for
+    /// Explicit engine binary path (venv/pipx/system). Set by hand for
     /// manual installs; the auto-provisioner writes the resolved path
-    /// back here after a successful install.
+    /// back here after a successful install. Shared across engines, so
+    /// discovery only honors it for the engine whose exe name the file
+    /// name contains (`demucs` vs `audio-separator`) — a path left
+    /// behind by the other engine's install falls through to PATH / the
+    /// managed dir instead of being driven with the wrong argv.
     pub command: Option<String>,
     /// pip requirement spec the auto-provisioner installs. Swap for a
     /// maintained fork (e.g. `demucs-next`) without a zytunes release.
+    /// Applies only to the engine whose package family it names (same
+    /// prefix rule as `command`); the other engine keeps its default.
     pub package: Option<String>,
-    /// Demucs model name. Participates in the stem-cache key — changing
-    /// it re-separates on next use.
+    /// Demucs model name (demucs recipe only). Participates in stem-cache
+    /// validity via the entry's recorded model id — changing it
+    /// re-separates on next use.
     pub model: Option<String>,
     /// `true` installs the default (CUDA/MPS-capable) torch instead of
     /// the much smaller CPU-only build. Auto-provision only.
     pub gpu: Option<bool>,
     /// Stem cache size cap in GiB (LRU-pruned).
     pub cache_max_gb: Option<u64>,
+    /// Separation recipe: `"demucs"` (default), `"hq"` (the Roformer
+    /// vocals / demucs band cascade), or `"hq-harmony"` (adds
+    /// lead/backing vocal stems). Its `cache_id` is recorded in each
+    /// stem-cache entry's metadata, so switching recipes re-separates on
+    /// next use (the entry directory itself is keyed by source path
+    /// alone — see todos.md for per-recipe coexistence).
+    pub recipe: Option<String>,
 }
 
 impl StemsConfig {
@@ -96,10 +110,6 @@ impl StemsConfig {
     /// Auto-provisioning is on unless `provision = "manual"`.
     pub fn auto_provision(&self) -> bool {
         self.provision.as_deref() != Some("manual")
-    }
-
-    pub fn package(&self) -> String {
-        self.package.clone().unwrap_or_else(|| "demucs".to_string())
     }
 
     pub fn model(&self) -> String {
@@ -114,6 +124,35 @@ impl StemsConfig {
 
     pub fn cache_max_bytes(&self) -> u64 {
         self.cache_max_gb.unwrap_or(10).saturating_mul(1 << 30)
+    }
+
+    /// Parsed `recipe`, blank/unset defaulting to demucs. `Err` carries
+    /// the raw unknown value so the caller can log it before falling
+    /// back — a typo'd recipe silently downgrading to demucs quality
+    /// would be a confusing failure mode.
+    pub fn recipe_kind(&self) -> Result<zytunes::stems::RecipeKind, String> {
+        match self.recipe.as_deref().map(str::trim) {
+            None | Some("") => Ok(zytunes::stems::RecipeKind::Demucs),
+            Some(raw) => raw.parse(),
+        }
+    }
+
+    /// Package spec the provisioner installs for `engine`: the explicit
+    /// `package` override when it names a package in `engine`'s family
+    /// (`demucs-next` → Demucs, `audio-separator[gpu]==X` →
+    /// AudioSeparator), else the engine's default (which for
+    /// audio-separator honors the `gpu` flag's extra). A demucs-era
+    /// override must not leak into an audio-separator install: uv would
+    /// install the wrong package "successfully" and provisioning would
+    /// then dead-end on the missing engine binary.
+    pub fn resolved_package(&self, engine: zytunes::stems::provision::EngineKind) -> String {
+        use zytunes::stems::provision::package_name;
+        self.package
+            .clone()
+            .filter(|spec| {
+                package_name(spec).starts_with(package_name(&engine.default_package(false)))
+            })
+            .unwrap_or_else(|| engine.default_package(self.gpu()))
     }
 
     /// Explicit engine path, ignoring empty strings so a commented-out
@@ -379,7 +418,11 @@ music_dir = "/home/user/Music"
     fn stems_config_defaults() {
         let cfg = Config::default();
         assert!(cfg.stems.auto_provision());
-        assert_eq!(cfg.stems.package(), "demucs");
+        assert_eq!(
+            cfg.stems
+                .resolved_package(zytunes::stems::provision::EngineKind::Demucs),
+            "demucs"
+        );
         assert_eq!(cfg.stems.model(), "htdemucs_6s");
         assert!(!cfg.stems.gpu());
         assert_eq!(cfg.stems.cache_max_bytes(), 10 * (1 << 30));
@@ -405,10 +448,81 @@ cache_max_gb = 25
             cfg.stems.command_path().as_deref(),
             Some(std::path::Path::new("/home/u/.venvs/demucs/bin/demucs"))
         );
-        assert_eq!(cfg.stems.package(), "demucs-next");
+        assert_eq!(
+            cfg.stems
+                .resolved_package(zytunes::stems::provision::EngineKind::Demucs),
+            "demucs-next"
+        );
         assert_eq!(cfg.stems.model(), "htdemucs");
         assert!(cfg.stems.gpu());
         assert_eq!(cfg.stems.cache_max_bytes(), 25 * (1 << 30));
+    }
+
+    #[test]
+    fn stems_recipe_defaults_to_demucs_and_parses_known_values() {
+        let cfg = Config::default();
+        assert_eq!(
+            cfg.stems.recipe_kind(),
+            Ok(zytunes::stems::RecipeKind::Demucs)
+        );
+
+        for (raw, kind) in [
+            ("demucs", zytunes::stems::RecipeKind::Demucs),
+            ("hq", zytunes::stems::RecipeKind::Hq),
+            ("hq-harmony", zytunes::stems::RecipeKind::HqHarmony),
+        ] {
+            let cfg: Config = toml::from_str(&format!("[stems]\nrecipe = \"{raw}\"\n")).unwrap();
+            assert_eq!(cfg.stems.recipe_kind(), Ok(kind));
+        }
+
+        // Blank behaves like unset; unknown surfaces the raw value so
+        // the caller can log it before falling back.
+        let cfg: Config = toml::from_str("[stems]\nrecipe = \"\"\n").unwrap();
+        assert_eq!(
+            cfg.stems.recipe_kind(),
+            Ok(zytunes::stems::RecipeKind::Demucs)
+        );
+        let cfg: Config = toml::from_str("[stems]\nrecipe = \"roformer\"\n").unwrap();
+        assert_eq!(cfg.stems.recipe_kind(), Err("roformer".to_string()));
+    }
+
+    #[test]
+    fn stems_resolved_package_prefers_explicit_then_engine_default() {
+        use zytunes::stems::provision::EngineKind;
+        let cfg: Config = toml::from_str("[stems]\npackage = \"demucs-next\"\n").unwrap();
+        // An explicit package wins only for the engine whose family it
+        // names — a demucs-era override leaking into an audio-separator
+        // install would "succeed" and then dead-end on the missing
+        // engine binary.
+        assert_eq!(
+            cfg.stems.resolved_package(EngineKind::Demucs),
+            "demucs-next"
+        );
+        assert_eq!(
+            cfg.stems.resolved_package(EngineKind::AudioSeparator),
+            EngineKind::AudioSeparator.default_package(false)
+        );
+        // And the reverse: an audio-separator pin stays off demucs.
+        let cfg: Config =
+            toml::from_str("[stems]\npackage = \"audio-separator[gpu]==0.44.3\"\n").unwrap();
+        assert_eq!(
+            cfg.stems.resolved_package(EngineKind::AudioSeparator),
+            "audio-separator[gpu]==0.44.3"
+        );
+        assert_eq!(cfg.stems.resolved_package(EngineKind::Demucs), "demucs");
+
+        // Unset: each engine's default, honoring the gpu flag.
+        let cfg = Config::default();
+        assert_eq!(cfg.stems.resolved_package(EngineKind::Demucs), "demucs");
+        assert_eq!(
+            cfg.stems.resolved_package(EngineKind::AudioSeparator),
+            EngineKind::AudioSeparator.default_package(false)
+        );
+        let cfg: Config = toml::from_str("[stems]\ngpu = true\n").unwrap();
+        assert_eq!(
+            cfg.stems.resolved_package(EngineKind::AudioSeparator),
+            EngineKind::AudioSeparator.default_package(true)
+        );
     }
 
     #[test]

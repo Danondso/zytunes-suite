@@ -236,6 +236,8 @@ pub enum BgCommand {
         /// state of the job that replaced it (jobs are keyed by identity,
         /// not by track path — same-track re-requests were colliding).
         gen: u64,
+        /// Engine the consented install provisions.
+        engine: zytunes::stems::provision::EngineKind,
         package: String,
         gpu: bool,
     },
@@ -253,6 +255,11 @@ pub enum BgCommand {
         /// Explicit engine path from `[stems].command`; `None` falls back
         /// to PATH and the managed bin dir.
         engine_command: Option<PathBuf>,
+        /// Which pipeline to run — decides the engine, the passes, and
+        /// the cache identity.
+        recipe: zytunes::stems::RecipeKind,
+        /// Demucs model name (the demucs recipe's model and cache id;
+        /// multi-pass recipes ignore it in favor of pinned checkpoints).
         model: String,
         cache_max_bytes: u64,
     },
@@ -1548,7 +1555,12 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                 BgCommand::CancelRip => {
                     rip_cancel.store(true, Ordering::SeqCst);
                 }
-                BgCommand::ProvisionStemEngine { gen, package, gpu } => {
+                BgCommand::ProvisionStemEngine {
+                    gen,
+                    engine,
+                    package,
+                    gpu,
+                } => {
                     let token = stem_jobs.supersede();
                     let jobs = stem_jobs.clone();
                     let tx = event_tx.clone();
@@ -1567,7 +1579,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                         };
                         let cancelled = || token.load(Ordering::SeqCst);
                         match zytunes::stems::provision::provision_engine(
-                            &package, gpu, &cancelled, &on_line,
+                            engine, &package, gpu, &cancelled, &on_line,
                         ) {
                             Ok(command) => {
                                 let _ = tx.send(BgEvent::StemEngineReady { gen, command });
@@ -1589,6 +1601,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                     gen,
                     track_path,
                     engine_command,
+                    recipe,
                     model,
                     cache_max_bytes,
                 } => {
@@ -1611,7 +1624,10 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                         }
                         match (
                             zytunes::stems::default_stem_cache_dir(),
-                            zytunes::stems::provision::find_engine(engine_command.as_deref()),
+                            zytunes::stems::provision::find_engine(
+                                recipe.engine(),
+                                engine_command.as_deref(),
+                            ),
                         ) {
                             (None, _) => {
                                 let _ = tx.send(BgEvent::StemsFailed {
@@ -1637,24 +1653,68 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                 // its absence in the log means the running
                                 // binary predates this code, not that the
                                 // engine is silent.
+                                let what = match recipe {
+                                    zytunes::stems::RecipeKind::Demucs => format!("-n {model}"),
+                                    _ => format!("recipe {recipe}"),
+                                };
                                 let _ = tx.send(BgEvent::SyncMessage(format!(
-                                    "[stems] launching {} (-n {model}) — first engine \
+                                    "[stems] launching {} ({what}) — first engine \
                                      output can lag ~a minute while python+torch start",
                                     command.display()
                                 )));
-                                let separator = zytunes::stems::DemucsCli {
-                                    command,
-                                    model: model.clone(),
+                                let cache_id = recipe.cache_id(&model);
+                                let separator: Box<dyn StemSeparator> = match recipe {
+                                    zytunes::stems::RecipeKind::Demucs => {
+                                        Box::new(zytunes::stems::DemucsCli {
+                                            command,
+                                            model: model.clone(),
+                                            layout: recipe.layout(),
+                                        })
+                                    }
+                                    zytunes::stems::RecipeKind::Hq
+                                    | zytunes::stems::RecipeKind::HqHarmony => {
+                                        // cache_dir being Some proves $HOME
+                                        // resolves, so the model dir does too.
+                                        let model_file_dir =
+                                            match zytunes::stems::default_model_file_dir() {
+                                                Some(d) => d,
+                                                None => {
+                                                    let _ = tx.send(BgEvent::StemsFailed {
+                                                        gen,
+                                                        track_path,
+                                                        error: "cannot resolve $HOME for the \
+                                                                model cache"
+                                                            .into(),
+                                                        cancelled: false,
+                                                    });
+                                                    return;
+                                                }
+                                            };
+                                        Box::new(zytunes::stems::CascadeSeparator {
+                                            engine: zytunes::stems::AudioSeparatorCli {
+                                                command,
+                                                model_file_dir,
+                                            },
+                                            passes: match recipe {
+                                                zytunes::stems::RecipeKind::HqHarmony => {
+                                                    zytunes::stems::hq_harmony_recipe_passes()
+                                                }
+                                                _ => zytunes::stems::hq_recipe_passes(),
+                                            },
+                                            layout: recipe.layout(),
+                                        })
+                                    }
                                 };
                                 run_separation(
                                     &SeparationJob {
                                         gen,
                                         track_path: &track_path,
-                                        model: &model,
+                                        layout: recipe.layout(),
+                                        cache_id: &cache_id,
                                         cache_dir: &cache_dir,
                                         max_bytes: cache_max_bytes,
                                     },
-                                    &separator,
+                                    separator.as_ref(),
                                     &|| token.load(Ordering::SeqCst),
                                     &tx,
                                 );
@@ -2497,7 +2557,13 @@ impl StemJobs {
 struct SeparationJob<'a> {
     gen: u64,
     track_path: &'a str,
-    model: &'a str,
+    /// Ordered stems the recipe produces — cache lookups validate
+    /// against this exact file set.
+    layout: &'static [zytunes::stems::StemKind],
+    /// Cache identity ([`zytunes::stems::RecipeKind::cache_id`]) — the
+    /// demucs model string for the demucs recipe, a versioned recipe id
+    /// otherwise.
+    cache_id: &'a str,
     cache_dir: &'a std::path::Path,
     max_bytes: u64,
 }
@@ -2519,7 +2585,8 @@ fn run_separation(
     let SeparationJob {
         gen,
         track_path,
-        model,
+        layout,
+        cache_id,
         cache_dir,
         max_bytes,
     } = *job;
@@ -2529,7 +2596,7 @@ fn run_separation(
     });
     let source = std::path::Path::new(track_path);
 
-    if let Some(stems) = cached_stems(cache_dir, source, model, &log) {
+    if let Some(stems) = cached_stems(cache_dir, source, cache_id, layout, &log) {
         let _ = event_tx.send(BgEvent::StemsReady {
             gen,
             track_path: track_path.to_string(),
@@ -2555,19 +2622,21 @@ fn run_separation(
     let on_line = |line: &str| log(line);
     let outcome = separator.separate(source, &work_dir, cancelled, &on_progress, &on_line);
     let terminal = match outcome {
-        Ok(produced) => match store_stems(cache_dir, source, model, &produced, max_bytes, &log) {
-            Ok(stems) => BgEvent::StemsReady {
-                gen,
-                track_path: track_path.to_string(),
-                stems: Box::new(stems),
-            },
-            Err(e) => BgEvent::StemsFailed {
-                gen,
-                track_path: track_path.to_string(),
-                error: e,
-                cancelled: false,
-            },
-        },
+        Ok(produced) => {
+            match store_stems(cache_dir, source, cache_id, &produced, max_bytes, &log) {
+                Ok(stems) => BgEvent::StemsReady {
+                    gen,
+                    track_path: track_path.to_string(),
+                    stems: Box::new(stems),
+                },
+                Err(e) => BgEvent::StemsFailed {
+                    gen,
+                    track_path: track_path.to_string(),
+                    error: e,
+                    cancelled: false,
+                },
+            }
+        }
         Err(e) => BgEvent::StemsFailed {
             gen,
             track_path: track_path.to_string(),
@@ -2725,7 +2794,11 @@ mod tests {
                 Ok(()) => {
                     progress(50);
                     std::fs::create_dir_all(out_dir).unwrap();
-                    let set = StemSet::from_dir(out_dir, zytunes::stems::STEM_EXT);
+                    let set = StemSet::from_layout(
+                        out_dir,
+                        zytunes::stems::STEM_EXT,
+                        zytunes::stems::SIX_STEM_LAYOUT,
+                    );
                     for p in &set.paths {
                         std::fs::write(p, b"stem").unwrap();
                     }
@@ -2805,7 +2878,8 @@ mod tests {
             &SeparationJob {
                 gen: 7,
                 track_path: &track,
-                model: "m",
+                layout: zytunes::stems::SIX_STEM_LAYOUT,
+                cache_id: "m",
                 cache_dir: &cache,
                 max_bytes: u64::MAX,
             },
@@ -2838,7 +2912,8 @@ mod tests {
             &SeparationJob {
                 gen: 8,
                 track_path: &track,
-                model: "m",
+                layout: zytunes::stems::SIX_STEM_LAYOUT,
+                cache_id: "m",
                 cache_dir: &cache,
                 max_bytes: u64::MAX,
             },
@@ -2869,7 +2944,8 @@ mod tests {
             &SeparationJob {
                 gen: 7,
                 track_path: &source.to_string_lossy(),
-                model: "m",
+                layout: zytunes::stems::SIX_STEM_LAYOUT,
+                cache_id: "m",
                 cache_dir: &dir.join("cache"),
                 max_bytes: u64::MAX,
             },
@@ -2904,7 +2980,8 @@ mod tests {
             &SeparationJob {
                 gen: 7,
                 track_path: &source.to_string_lossy(),
-                model: "m",
+                layout: zytunes::stems::SIX_STEM_LAYOUT,
+                cache_id: "m",
                 cache_dir: &dir.join("cache"),
                 max_bytes: u64::MAX,
             },

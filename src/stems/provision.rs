@@ -15,10 +15,52 @@
 
 use std::path::{Path, PathBuf};
 
-/// Executable name the engine package installs. Both upstream `demucs`
-/// and the `demucs-next` fork expose a `demucs` entry point, so this is
-/// package-independent today; revisit if a future fork renames it.
-pub const ENGINE_EXE: &str = "demucs";
+/// audio-separator release the managed install pins. The argv contract
+/// (`--custom_output_names` JSON, `--model_file_dir`, stem-name keys)
+/// is verified against this exact version — bump deliberately, never
+/// let it float.
+pub const AUDIO_SEPARATOR_VERSION: &str = "0.44.3";
+
+/// A stem-engine executable zytunes knows how to drive. Which engine a
+/// recipe needs comes from [`crate::stems::RecipeKind::engine`]; this
+/// enum owns the executable name and install spec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineKind {
+    /// The `demucs` CLI (or a compatible fork — both upstream and
+    /// `demucs-next` expose a `demucs` entry point).
+    Demucs,
+    /// `python-audio-separator`'s `audio-separator` CLI, which runs
+    /// Roformer checkpoints and demucs models alike.
+    AudioSeparator,
+}
+
+impl EngineKind {
+    /// Executable name the engine package installs (and discovery
+    /// searches for).
+    pub fn exe_name(self) -> &'static str {
+        match self {
+            EngineKind::Demucs => "demucs",
+            EngineKind::AudioSeparator => "audio-separator",
+        }
+    }
+
+    /// uv package spec installed when `[stems] package` is unset.
+    /// demucs is unpinned (upstream is frozen; nothing can drift);
+    /// audio-separator is version-pinned so its CLI contract can't
+    /// change under us, with the extra selecting the onnxruntime
+    /// flavor — torch itself is a core dependency either way, which is
+    /// why the CPU index pin in [`build_install_command`] applies to
+    /// both engines.
+    pub fn default_package(self, gpu: bool) -> String {
+        match self {
+            EngineKind::Demucs => "demucs".to_string(),
+            EngineKind::AudioSeparator => format!(
+                "audio-separator[{}]=={AUDIO_SEPARATOR_VERSION}",
+                if gpu { "gpu" } else { "cpu" }
+            ),
+        }
+    }
+}
 
 /// PyTorch's CPU-only wheel index — hosts `torch` builds without the
 /// bundled CUDA runtime.
@@ -97,53 +139,56 @@ pub fn find_on_path_in(name: &str, path_env: &str) -> Option<PathBuf> {
         .find(|p| is_executable(p))
 }
 
-fn is_executable(path: &Path) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false;
-    };
-    if !meta.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        meta.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
-}
+use super::process::is_executable;
 
-/// Locate a usable engine binary without installing anything.
+/// Locate a usable binary for `engine` without installing anything.
 ///
-/// Precedence: explicit config `command` (if it points at a real file) →
-/// `demucs` on `path_env` → `bin_dir/demucs` (the managed-install
-/// location). A configured command that doesn't exist falls through to
-/// the automatic candidates rather than erroring — the config may simply
-/// predate a venv rebuild.
+/// Precedence: explicit config `command` (if it points at a real file
+/// AND its file name matches `engine`) → the engine's exe on `path_env`
+/// → `bin_dir/<exe>` (the managed-install location). A configured
+/// command that doesn't exist falls through to the automatic candidates
+/// rather than erroring — the config may simply predate a venv rebuild.
+///
+/// The engine match matters because `[stems] command` is one shared
+/// config field written back by whichever engine last installed:
+/// honoring a demucs path while the hq recipe asks for audio-separator
+/// would drive the wrong binary with the wrong argv AND suppress the
+/// install consent prompt for the engine actually needed.
 pub fn find_engine_with(
+    engine: EngineKind,
     explicit: Option<&Path>,
     path_env: &str,
     bin_dir: Option<&Path>,
 ) -> Option<PathBuf> {
     if let Some(cmd) = explicit {
-        if is_executable(cmd) {
+        if is_executable(cmd) && command_matches_engine(cmd, engine) {
             return Some(cmd.to_path_buf());
         }
     }
-    if let Some(found) = find_on_path_in(ENGINE_EXE, path_env) {
+    if let Some(found) = find_on_path_in(engine.exe_name(), path_env) {
         return Some(found);
     }
     bin_dir
-        .map(|d| d.join(ENGINE_EXE))
+        .map(|d| d.join(engine.exe_name()))
         .filter(|p| is_executable(p))
 }
 
+/// Whether an explicit `[stems] command` plausibly belongs to `engine`:
+/// its file name must contain the engine's exe name (`demucs`,
+/// `demucs-next`, `my-demucs` all match Demucs; none match
+/// AudioSeparator). Contains rather than equality so fork shims and
+/// wrapper scripts keep working; the paths the provisioner writes back
+/// always end in the exact exe name.
+fn command_matches_engine(cmd: &Path, engine: EngineKind) -> bool {
+    cmd.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.contains(engine.exe_name()))
+}
+
 /// [`find_engine_with`] against the real environment.
-pub fn find_engine(explicit: Option<&Path>) -> Option<PathBuf> {
+pub fn find_engine(engine: EngineKind, explicit: Option<&Path>) -> Option<PathBuf> {
     let path_env = std::env::var("PATH").unwrap_or_default();
-    find_engine_with(explicit, &path_env, zytunes_bin_dir().as_deref())
+    find_engine_with(engine, explicit, &path_env, zytunes_bin_dir().as_deref())
 }
 
 /// Locate a usable `uv` binary: PATH first, then the bootstrapped copy in
@@ -171,21 +216,20 @@ pub fn find_uv() -> Option<PathBuf> {
 /// PATH help.
 pub fn build_install_command(
     uv: &Path,
+    engine: EngineKind,
     package: &str,
     gpu: bool,
     bin_dir: &Path,
 ) -> (PathBuf, Vec<String>, Vec<(String, String)>) {
-    let mut args: Vec<String> = vec![
-        "tool".into(),
-        "install".into(),
-        package.into(),
+    let mut args: Vec<String> = vec!["tool".into(), "install".into(), package.into()];
+    if engine == EngineKind::Demucs {
         // demucs' package metadata omits numpy — it historically arrived
         // transitively via torch, which stopped depending on it — so the
         // env imports `numpy` at runtime and dies with ModuleNotFoundError
-        // unless it's injected explicitly.
-        "--with".into(),
-        "numpy".into(),
-    ];
+        // unless it's injected explicitly. audio-separator declares its
+        // own `numpy>=2`; injecting there would just fight it.
+        args.extend(["--with".into(), "numpy".into()]);
+    }
     if !gpu {
         args.extend([
             "--index".into(),
@@ -216,17 +260,15 @@ pub fn build_uv_bootstrap_command(bin_dir: &Path) -> (PathBuf, Vec<String>, Vec<
     (PathBuf::from("sh"), vec!["-c".into(), script], envs)
 }
 
-/// Where the engine shim lands after a managed install.
-pub fn managed_engine_path(bin_dir: &Path) -> PathBuf {
-    bin_dir.join(ENGINE_EXE)
+/// Where `engine`'s shim lands after a managed install.
+pub fn managed_engine_path(bin_dir: &Path, engine: EngineKind) -> PathBuf {
+    bin_dir.join(engine.exe_name())
 }
 
 /// Run `program args` with `envs`, streaming every output line (stdout
 /// and stderr, `\r` treated as a line break) to `on_line`, polling
-/// `cancelled` every ~100 ms and killing the child when it trips.
-///
-/// Not unit-tested against a live child (the `rip_track_cancellable`
-/// precedent) — exercised end-to-end via the manual provisioning flow.
+/// `cancelled` every ~100 ms and killing the child when it trips. A thin
+/// [`ProvisionError`] mapping over the shared engine-process driver.
 pub fn run_streaming(
     program: &Path,
     args: &[String],
@@ -234,122 +276,24 @@ pub fn run_streaming(
     cancelled: &dyn Fn() -> bool,
     on_line: &dyn Fn(&str),
 ) -> Result<(), ProvisionError> {
-    use std::sync::{Arc, Mutex};
+    use super::process::{run_engine_process, EngineHooks, EngineOutcome};
 
     let mut cmd = std::process::Command::new(program);
     cmd.args(args)
-        .envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    // An installer orphaned by TUI death would keep holding uv's own
-    // locks — same failure mode as an orphaned engine. The process group
-    // matters doubly here: the uv bootstrap is a `sh -c "curl … | sh"`
-    // pipeline whose stages are grandchildren a direct kill would miss.
-    super::isolate_child_process(&mut cmd);
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| ProvisionError::Spawn(format!("{}: {e}", program.display())))?;
-    let _group = super::ChildGroupGuard::register(&child);
-
-    // Both pipes drain continuously (deadlock avoidance) into a shared
-    // line channel; a bounded tail is kept for the error message.
-    let (line_tx, line_rx) = std::sync::mpsc::channel::<String>();
-    let tail: Arc<Mutex<std::collections::VecDeque<String>>> =
-        Arc::new(Mutex::new(std::collections::VecDeque::new()));
-    let mut handles = Vec::new();
-    for pipe in [
-        child
-            .stdout
-            .take()
-            .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
-        child
-            .stderr
-            .take()
-            .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        let tx = line_tx.clone();
-        let tail = Arc::clone(&tail);
-        handles.push(std::thread::spawn(move || {
-            let mut reader = pipe;
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 4096];
-            loop {
-                match reader.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        buf.extend_from_slice(&chunk[..n]);
-                        // Emit complete lines; \r counts as a terminator so
-                        // progress rewrites surface as they happen.
-                        while let Some(pos) = buf.iter().position(|b| *b == b'\n' || *b == b'\r') {
-                            let line: Vec<u8> = buf.drain(..=pos).collect();
-                            let text = String::from_utf8_lossy(&line[..line.len() - 1])
-                                .trim()
-                                .to_string();
-                            if !text.is_empty() {
-                                if let Ok(mut t) = tail.lock() {
-                                    t.push_back(text.clone());
-                                    while t.len() > 12 {
-                                        t.pop_front();
-                                    }
-                                }
-                                let _ = tx.send(text);
-                            }
-                        }
-                    }
-                }
-            }
-        }));
-    }
-    drop(line_tx);
-
-    let drain = |rx: &std::sync::mpsc::Receiver<String>| {
-        while let Ok(line) = rx.try_recv() {
-            on_line(&line);
-        }
+        .envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    let hooks = EngineHooks {
+        cancelled,
+        // Installers print no tqdm bars; skip percent parsing.
+        on_progress: None,
+        on_line,
     };
-    let outcome: Result<(), ProvisionError> = loop {
-        drain(&line_rx);
-        if cancelled() {
-            // Cancel-during-completion race: a child that already exited
-            // keeps its real outcome — success stays success, and a
-            // failure must NOT be masked as a user cancel (the masked
-            // variant hid genuine install failures behind a quiet
-            // "cancelled" log line).
-            if let Ok(Some(status)) = child.try_wait() {
-                if status.success() {
-                    break Ok(());
-                }
-                break Err(ProvisionError::Failed(format!("exit {:?}", status.code())));
-            }
-            super::kill_child_group(&mut child);
-            break Err(ProvisionError::Cancelled);
-        }
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => break Ok(()),
-            Ok(Some(status)) => {
-                break Err(ProvisionError::Failed(format!("exit {:?}", status.code())))
-            }
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
-            Err(e) => break Err(ProvisionError::Spawn(e.to_string())),
-        }
-    };
-    for h in handles {
-        let _ = h.join();
-    }
-    drain(&line_rx);
-
-    match outcome {
-        Err(ProvisionError::Failed(code)) => {
-            let tail_text = tail
-                .lock()
-                .map(|t| t.iter().cloned().collect::<Vec<_>>().join("\n"))
-                .unwrap_or_default();
-            Err(ProvisionError::Failed(format!("{code}\n{tail_text}")))
-        }
-        other => other,
+    match run_engine_process(&mut cmd, &hooks) {
+        Err(e) => Err(ProvisionError::Spawn(format!("{}: {e}", program.display()))),
+        Ok(EngineOutcome::Success) => Ok(()),
+        Ok(EngineOutcome::Cancelled) => Err(ProvisionError::Cancelled),
+        Ok(EngineOutcome::Failed { exit_code, tail }) => Err(ProvisionError::Failed(format!(
+            "exit {exit_code:?}\n{tail}"
+        ))),
     }
 }
 
@@ -357,6 +301,7 @@ pub fn run_streaming(
 /// caller has obtained user consent), install the engine package, and
 /// return the path of the installed engine binary.
 pub fn provision_engine(
+    engine: EngineKind,
     package: &str,
     gpu: bool,
     cancelled: &dyn Fn() -> bool,
@@ -380,14 +325,14 @@ pub fn provision_engine(
         "installing {} via uv (one-time)…",
         package_name(package)
     ));
-    let (prog, args, envs) = build_install_command(&uv, package, gpu, &bin_dir);
+    let (prog, args, envs) = build_install_command(&uv, engine, package, gpu, &bin_dir);
     run_streaming(&prog, &args, &envs, cancelled, on_line)?;
 
-    let engine = managed_engine_path(&bin_dir);
-    if engine.is_file() {
-        Ok(engine)
+    let installed = managed_engine_path(&bin_dir, engine);
+    if installed.is_file() {
+        Ok(installed)
     } else {
-        Err(ProvisionError::EngineMissingAfterInstall(engine))
+        Err(ProvisionError::EngineMissingAfterInstall(installed))
     }
 }
 
@@ -416,6 +361,146 @@ mod tests {
         std::fs::write(&p, b"#!/bin/sh\n").unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
         p
+    }
+
+    #[test]
+    fn engine_exe_names_and_default_packages() {
+        assert_eq!(EngineKind::Demucs.exe_name(), "demucs");
+        assert_eq!(EngineKind::AudioSeparator.exe_name(), "audio-separator");
+
+        // demucs installs unpinned (upstream is frozen; nothing drifts).
+        assert_eq!(EngineKind::Demucs.default_package(false), "demucs");
+        assert_eq!(EngineKind::Demucs.default_package(true), "demucs");
+        // audio-separator is version-pinned so the argv/JSON contract
+        // can't drift under us, and the extra picks the onnxruntime
+        // flavor (torch itself is a core dep either way).
+        assert_eq!(
+            EngineKind::AudioSeparator.default_package(false),
+            format!("audio-separator[cpu]=={AUDIO_SEPARATOR_VERSION}")
+        );
+        assert_eq!(
+            EngineKind::AudioSeparator.default_package(true),
+            format!("audio-separator[gpu]=={AUDIO_SEPARATOR_VERSION}")
+        );
+    }
+
+    #[test]
+    fn install_command_injects_numpy_only_for_demucs() {
+        // demucs' package metadata omits numpy (it historically arrived
+        // transitively via torch); audio-separator declares numpy>=2
+        // properly, and an injected constraint would just fight it.
+        let (_p, demucs_args, _e) = build_install_command(
+            Path::new("uv"),
+            EngineKind::Demucs,
+            "demucs",
+            false,
+            Path::new("/b"),
+        );
+        assert!(demucs_args
+            .windows(2)
+            .any(|w| w[0] == "--with" && w[1] == "numpy"));
+
+        let (_p, sep_args, _e) = build_install_command(
+            Path::new("uv"),
+            EngineKind::AudioSeparator,
+            "audio-separator[cpu]==1.0",
+            false,
+            Path::new("/b"),
+        );
+        assert!(
+            !sep_args.iter().any(|a| a == "numpy"),
+            "audio-separator declares its own numpy: {sep_args:?}"
+        );
+    }
+
+    #[test]
+    fn install_command_pins_cpu_torch_for_both_engines() {
+        // torch is a core dependency of BOTH engines; without the CPU
+        // index pin a Linux install pulls the multi-GB CUDA build.
+        for engine in [EngineKind::Demucs, EngineKind::AudioSeparator] {
+            let (_p, args, _e) = build_install_command(
+                Path::new("uv"),
+                engine,
+                &engine.default_package(false),
+                false,
+                Path::new("/b"),
+            );
+            let idx = args
+                .iter()
+                .position(|a| a == "--index")
+                .unwrap_or_else(|| panic!("{engine:?}: --index missing in {args:?}"));
+            assert_eq!(args[idx + 1], TORCH_CPU_INDEX);
+            assert!(args
+                .windows(2)
+                .any(|w| w[0] == "--index-strategy" && w[1] == "unsafe-best-match"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_engine_locates_the_requested_engine_only() {
+        let bin_dir = temp_dir("engine-kind");
+        let _demucs = write_executable(&bin_dir, "demucs");
+        // Only demucs is installed: the audio-separator lookup must NOT
+        // fall back to it.
+        assert!(find_engine_with(EngineKind::Demucs, None, "", Some(&bin_dir)).is_some());
+        assert!(find_engine_with(EngineKind::AudioSeparator, None, "", Some(&bin_dir)).is_none());
+
+        let sep = write_executable(&bin_dir, "audio-separator");
+        assert_eq!(
+            find_engine_with(EngineKind::AudioSeparator, None, "", Some(&bin_dir)),
+            Some(sep)
+        );
+        let _ = std::fs::remove_dir_all(&bin_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_command_only_matches_its_own_engine() {
+        // `[stems] command` is one shared field: a demucs path written
+        // back by a demucs install must not satisfy an audio-separator
+        // lookup after a recipe switch (wrong argv + suppressed install
+        // consent), and vice versa.
+        let bin_dir = temp_dir("explicit-engine");
+        let demucs = write_executable(&bin_dir, "demucs");
+        assert_eq!(
+            find_engine_with(EngineKind::Demucs, Some(&demucs), "", None),
+            Some(demucs.clone())
+        );
+        assert_eq!(
+            find_engine_with(EngineKind::AudioSeparator, Some(&demucs), "", None),
+            None
+        );
+        // Mismatched explicit still falls through to the managed dir.
+        let sep = write_executable(&bin_dir, "audio-separator");
+        assert_eq!(
+            find_engine_with(
+                EngineKind::AudioSeparator,
+                Some(&demucs),
+                "",
+                Some(&bin_dir)
+            ),
+            Some(sep)
+        );
+        // Fork shims keep working: contains match, not equality.
+        let fork = write_executable(&bin_dir, "demucs-next");
+        assert_eq!(
+            find_engine_with(EngineKind::Demucs, Some(&fork), "", None),
+            Some(fork)
+        );
+        let _ = std::fs::remove_dir_all(&bin_dir);
+    }
+
+    #[test]
+    fn managed_engine_path_is_per_engine() {
+        assert_eq!(
+            managed_engine_path(Path::new("/b/bin"), EngineKind::Demucs),
+            Path::new("/b/bin/demucs")
+        );
+        assert_eq!(
+            managed_engine_path(Path::new("/b/bin"), EngineKind::AudioSeparator),
+            Path::new("/b/bin/audio-separator")
+        );
     }
 
     #[test]
@@ -469,33 +554,46 @@ mod tests {
         let path_env = path_dir.to_string_lossy().into_owned();
 
         // Nothing anywhere → None.
-        assert_eq!(find_engine_with(None, &path_env, Some(&bin_dir)), None);
+        assert_eq!(
+            find_engine_with(EngineKind::Demucs, None, &path_env, Some(&bin_dir)),
+            None
+        );
 
         // Managed bin dir only.
         let managed = write_executable(&bin_dir, "demucs");
         assert_eq!(
-            find_engine_with(None, &path_env, Some(&bin_dir)),
+            find_engine_with(EngineKind::Demucs, None, &path_env, Some(&bin_dir)),
             Some(managed.clone())
         );
 
         // PATH beats bin dir.
         let on_path = write_executable(&path_dir, "demucs");
         assert_eq!(
-            find_engine_with(None, &path_env, Some(&bin_dir)),
+            find_engine_with(EngineKind::Demucs, None, &path_env, Some(&bin_dir)),
             Some(on_path.clone())
         );
 
         // Explicit beats both…
         let explicit = write_executable(&explicit_dir, "my-demucs");
         assert_eq!(
-            find_engine_with(Some(&explicit), &path_env, Some(&bin_dir)),
+            find_engine_with(
+                EngineKind::Demucs,
+                Some(&explicit),
+                &path_env,
+                Some(&bin_dir)
+            ),
             Some(explicit.clone())
         );
 
         // …but a dangling explicit path falls through to PATH.
         let dangling = explicit_dir.join("gone");
         assert_eq!(
-            find_engine_with(Some(&dangling), &path_env, Some(&bin_dir)),
+            find_engine_with(
+                EngineKind::Demucs,
+                Some(&dangling),
+                &path_env,
+                Some(&bin_dir)
+            ),
             Some(on_path)
         );
 
@@ -508,6 +606,7 @@ mod tests {
     fn install_command_cpu_pins_torch_cpu_index() {
         let (prog, args, envs) = build_install_command(
             Path::new("/usr/bin/uv"),
+            EngineKind::Demucs,
             "demucs",
             false,
             Path::new("/home/u/.local/share/zytunes/bin"),
@@ -528,8 +627,13 @@ mod tests {
 
     #[test]
     fn install_command_gpu_uses_default_index() {
-        let (_prog, args, envs) =
-            build_install_command(Path::new("uv"), "demucs", true, Path::new("/b"));
+        let (_prog, args, envs) = build_install_command(
+            Path::new("uv"),
+            EngineKind::Demucs,
+            "demucs",
+            true,
+            Path::new("/b"),
+        );
         assert!(
             !args
                 .iter()
@@ -537,22 +641,6 @@ mod tests {
             "gpu installs resolve torch from the default (CUDA/MPS-capable) index"
         );
         assert!(envs.iter().any(|(k, _)| k == "UV_TOOL_BIN_DIR"));
-    }
-
-    #[test]
-    fn install_command_always_injects_numpy() {
-        // demucs' package metadata omits numpy (it historically arrived
-        // transitively via torch, which no longer depends on it), so the
-        // tool env crashes with ModuleNotFoundError at separation time
-        // without this. Both index modes need it.
-        for gpu in [false, true] {
-            let (_prog, args, _envs) =
-                build_install_command(Path::new("uv"), "demucs", gpu, Path::new("/b"));
-            assert!(
-                args.windows(2).any(|w| w[0] == "--with" && w[1] == "numpy"),
-                "gpu={gpu}: expected `--with numpy` in {args:?}"
-            );
-        }
     }
 
     #[test]
@@ -568,14 +656,6 @@ mod tests {
         assert!(envs
             .iter()
             .any(|(k, v)| k == "UV_NO_MODIFY_PATH" && v == "1"));
-    }
-
-    #[test]
-    fn managed_engine_path_joins_exe_name() {
-        assert_eq!(
-            managed_engine_path(Path::new("/b/bin")),
-            Path::new("/b/bin/demucs")
-        );
     }
 
     #[cfg(unix)]

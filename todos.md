@@ -308,3 +308,159 @@ Out of scope: AcoustID submission of new fingerprints (we read, we
 don't contribute). Per-track batch lookup for an entire untagged
 album — let the user invoke per-track for now; a "scan untagged"
 batch mode is its own follow-up.
+
+## Stem-split follow-ups
+
+### Stem cache holds one entry per track, so recipe A/B re-separates every flip
+`stem_cache_key` (`src/stems.rs:762`) hashes the source path alone, and
+`store_stems` `remove_dir_all`s the previous entry before renaming the new
+stage in (`src/stems.rs:867`). Model-change invalidation itself already works
+— `cached_stems` misses on `meta.model != model` and re-separates, and the
+stale entry is deleted rather than orphaned. The gap is that the two recipes'
+outputs cannot coexist: switching `demucs` -> `hq` -> `demucs` pays a full
+multi-minute separation each way, which makes comparing recipes on the same
+track far more expensive than it should be.
+
+Fold the model id into the key (`{path_hash}-{cache_id}`) so entries are
+per-(track, recipe). Consequences to handle:
+
+1. **Migration.** Existing entries are keyed by bare path hash and would all
+   become invisible misses — dead bytes the LRU never reclaims because
+   `prune_stem_cache` only sees them as unreadable dirs. Either sweep
+   unrecognised key shapes on first run, or accept one re-separation and
+   have the prune pass evict legacy dirs by mtime.
+2. **Cache cap pressure.** N recipes x ~150-220 MB per track against the same
+   `cache_max_gb` default of 10. The LRU handles it, but the effective
+   track count at the cap drops by the number of recipes in play; worth a
+   note in the config docs.
+3. **`prune_stem_cache` keep_key.** Still correct (it keeps the just-stored
+   key), but the `Some(&key)` exemption now protects one recipe's entry only
+   — verify a store under a cap smaller than two entries still plays.
+
+### Stem config panel in the TUI
+Recipe selection is config-file-only today (`[stems] recipe`, read via
+`StemsConfig::recipe_kind` in `src/tui/config.rs:123`), so trying a different
+recipe means quitting, hand-editing `~/.config/zytunes/config.toml`, and
+relaunching. There is no in-TUI affordance and no discovery path — a user who
+never reads the config docs will never learn `hq`/`hq-harmony` exist.
+
+Scope:
+
+1. **Overlay** in the existing modal cascade (`src/tui/app/keys.rs` —
+   bool-returning `handle_*_key` tried before the global map), following the
+   theme picker's shape since it is the closest analogue: a list, live
+   preview of the selection, persist-on-confirm.
+2. **Recipe picker.** List `RecipeKind` variants with their engine, stem
+   count, and a rough cost hint (`hq-harmony` = 3 passes + 2 checkpoint
+   downloads on first use). Persist via the same `update_contents` path the
+   theme picker uses — note it refuses to write an unparseable config file,
+   which is the desired behaviour here too.
+3. **Model overrides.** `[stems] model` is demucs-only; the Roformer
+   checkpoints are pinned consts (`BS_ROFORMER_VOCALS_MODEL`,
+   `MEL_ROFORMER_KARAOKE_MODEL`) deliberately, since `AUDIO_SEPARATOR_VERSION`
+   pins the argv contract alongside them. Exposing arbitrary checkpoint
+   strings invites unbootable combinations. Prefer a curated list per recipe
+   over a free-text field; if free-text lands, validate before persisting.
+4. **Uninstall.** `uv tool uninstall <package>` for the engine, plus optional
+   eviction of `~/.cache/zytunes/models` (Roformer checkpoints, hundreds of
+   MB) and `~/.cache/zytunes/stems`. Show reclaimed bytes per target; confirm
+   destructively. Must clear `[stems] command` on success — a stale path there
+   is exactly what suppresses the re-install consent prompt.
+5. **Engine state display.** Show what is currently discovered and via which
+   precedence rung (`[stems] command` -> PATH -> managed
+   `~/.local/share/zytunes/bin`). This alone would have explained the
+   "why am I not being prompted" confusion during bring-up.
+
+### Bulk stem separation for an album
+`M` is per-track and gated on `now_playing` (`StemState` in `src/tui/app.rs`),
+so pre-warming an album for offline or on-stage use means playing each track
+and pressing `M` on every one. `M` on an album sidebar entry should enqueue
+separation for all its tracks.
+
+Scope:
+
+1. **Queue model.** `StemJobs` in `src/tui/background.rs` serialises jobs by
+   superseding: dispatching a new job cancels the previous one, running or
+   queued. That is correct for interactive `M` (a new track's split should
+   kill the old one) and exactly wrong for a batch, where every item must
+   run to completion. Needs a real FIFO alongside the supersede path, and a
+   rule for how an interactive `M` interacts with a running batch —
+   suggest interactive preempts, batch resumes after.
+2. **Cache-first.** Skip tracks that already hit `cached_stems` for the
+   active recipe; report the skip count so a re-run of a mostly-warm album
+   is visibly cheap rather than mysteriously instant.
+3. **Progress.** Per-track percent already streams from the engine; the batch
+   needs an aggregate (`track 3/12, 40%`). The stem strip is per-track and
+   the wrong surface — the sync log or a progress line is the better fit.
+4. **Cancellation.** Reuse the group-kill path in `src/stems/process.rs`; a
+   batch cancel must stop the running child *and* drain the queue, not just
+   the current item.
+5. **Cache cap interaction.** A 12-track album at ~150-220 MB/track is
+   ~2-2.6 GB against a 10 GB default cap, so one bulk run can evict most of
+   the cache. `prune_stem_cache` logs every eviction, but a batch should
+   probably warn up-front when the projected size approaches the cap rather
+   than silently thrashing.
+6. **Disk/time honesty.** Confirm before starting: track count, projected
+   bytes, and that this is minutes-per-track on CPU. `hq-harmony` on a
+   12-track album is a very long, very hot operation.
+
+### Playing a paused track after splitting it clears stem state
+Splitting the paused track works — `on_stems_ready`
+(`src/tui/app/events.rs:238`) swaps into the stem mixer with pause state
+preserved — but "playing" it afterwards can silently exit stem mode. Space
+(`toggle_playback`, `src/tui/app.rs:3138`) resumes correctly; Enter on the
+track row does not: `handle_enter_key` (`src/tui/app/keys.rs:664`) always
+routes to `play_selected_track` (`src/tui/app.rs:3099`), which
+unconditionally calls `reset_stems_for_track_change()` and sends a fresh
+`AudioCommand::Play` — even when the selected track IS the currently loaded,
+paused `now_playing`. The user's active stems are torn down and the track
+restarts from 0:00.
+
+Scope:
+
+1. **Same-track detection.** In `play_selected_track` (or in
+   `handle_enter_key` before delegating), compare the selected track's path
+   against `playing_track_path()`. If they match and `now_playing` is
+   `Paused`, resume (`AudioCommand::Resume` + state flip, i.e. the
+   `toggle_playback` paused arm) instead of restarting. This preserves both
+   the stem mixer and the playback position.
+2. **Decide the Playing case.** Enter on the already-playing track currently
+   restarts it from the top — arguably intended (iTunes-style double-click
+   semantics). If restart is kept, it should still be a *stem-aware* restart:
+   scrub-to-zero on the live source (`AudioCommand::Scrub` rebuilds whichever
+   `NowSource` is live and keeps the gains `Arc`) rather than
+   `AudioCommand::Play`, so stem mode survives.
+3. **Skip accounting.** `play_selected_track` calls
+   `record_now_playing_skip()` before transitioning; a same-track resume must
+   not count as a skip (the `prev_track` restart path at
+   `src/tui/app.rs:3183` already models this distinction).
+4. **Regression test.** Pause → stems Active → Enter on the same row:
+   assert stems stay Active, no `AudioCommand::Play` is emitted, and state is
+   Playing. Mirror of the existing track-change tests around
+   `reset_stems_for_track_change`.
+
+### Model-checkpoint cache has no eviction
+`~/.cache/zytunes/models` (`default_model_file_dir`, `src/stems.rs` — passed
+as `--model_file_dir`) persists Roformer checkpoints that run 0.2–1 GB each,
+but nothing ever prunes it: `prune_stem_cache` only walks the stems dir, and
+the worker's cleanup only removes work dirs. The pinned-model doc comments
+(`MEL_ROFORMER_KARAOKE_MODEL`) explicitly anticipate checkpoint swaps — each
+one orphans the previous file forever.
+
+Scope:
+
+1. **Eviction policy first.** Unlike stems, checkpoints are not
+   re-derivable-in-minutes (they re-download, 0.2-1 GB), and audio-separator
+   may write sidecar files (yaml configs) next to them. Options: delete
+   files not named by any currently pinned model constant after a
+   successful separation, or LRU with a generous cap (e.g. 5 GB) mirroring
+   `prune_stem_cache`. Pinned-set cleanup is simpler and matches how the
+   constants are managed.
+2. **Fold the root resolution.** `default_model_file_dir` duplicates
+   `default_stem_cache_dir`'s `$HOME/.cache/zytunes` lookup byte-for-byte;
+   factor a shared `zytunes_cache_root()` and derive both leaves (and check
+   `cache.rs` / `art_cache.rs` / `local_plays.rs`, which carry the same
+   pattern).
+3. **Surface it in the future stem config panel** (see "Stem config panel
+   in the TUI" above): the uninstall flow already plans to offer model-cache
+   eviction with reclaimed-bytes reporting.

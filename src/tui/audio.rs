@@ -218,12 +218,12 @@ fn seek_source<S: rodio::Source>(mut src: S, pos: Duration) -> S {
     }
 }
 
-/// Open all six stem files and build the mixing source over them, each
-/// decoder pre-positioned at `seek`. Seeking happens per-decoder BEFORE
-/// the mixer wraps them: each decoder is independently at zero, so a
-/// per-decoder `eager_skip` fallback stays sample-consistent, whereas a
-/// mixer-level seek that failed halfway would leave the six stems at
-/// different positions with no way back.
+/// Open every stem file in the set's layout and build the mixing source
+/// over them, each decoder pre-positioned at `seek`. Seeking happens
+/// per-decoder BEFORE the mixer wraps them: each decoder is
+/// independently at zero, so a per-decoder `eager_skip` fallback stays
+/// sample-consistent, whereas a mixer-level seek that failed halfway
+/// would leave the stems at different positions with no way back.
 fn build_stem_mixer(
     stems: &StemSet,
     gains: &StemGains,
@@ -233,10 +233,7 @@ fn build_stem_mixer(
     for p in &stems.paths {
         decoders.push(seek_source(build_decoder(&p.to_string_lossy())?, seek));
     }
-    let arr: [_; zytunes::stems::NUM_STEMS] = decoders
-        .try_into()
-        .map_err(|_| "stem count mismatch".to_string())?;
-    StemMixerSource::new(arr, gains.clone())
+    StemMixerSource::new(decoders, gains.clone())
 }
 
 pub fn spawn(event_tx: mpsc::Sender<AudioEvent>) -> mpsc::Sender<AudioCommand> {
@@ -578,11 +575,11 @@ mod tests {
         // Cache entries are FLAC in production, but the mixer builder is
         // extension-driven via format_hint, so WAV fixtures exercise the
         // same open/decode path without an encoder dependency.
-        let stems = StemSet::from_dir(&dir, "wav");
+        let stems = StemSet::from_layout(&dir, "wav", zytunes::stems::SIX_STEM_LAYOUT);
         for p in &stems.paths {
             write_test_wav(p, 64);
         }
-        let gains = zytunes::stems::new_stem_gains(&[true; zytunes::stems::NUM_STEMS]);
+        let gains = zytunes::stems::new_stem_gains(&[true; 6]);
         let mixer = build_stem_mixer(&stems, &gains, Duration::ZERO).expect("all six stems decode");
         use rodio::Source;
         assert_eq!(mixer.channels().get(), 1);

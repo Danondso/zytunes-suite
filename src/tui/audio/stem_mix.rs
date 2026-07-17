@@ -15,23 +15,25 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use rodio::{ChannelCount, Sample, SampleRate, Source};
-use zytunes::stems::{StemGains, NUM_STEMS};
+use zytunes::stems::{StemGains, MAX_STEMS};
 
 /// Seconds a gain change takes to complete — long enough to avoid an
 /// audible click, short enough to feel instant.
 pub const RAMP_SECONDS: f32 = 0.010;
 
-/// Mixes [`NUM_STEMS`] equally-parameterised sources into one, applying
-/// a ramped per-stem gain read from `gains` at every frame boundary.
+/// Mixes a recipe layout's worth of equally-parameterised sources into
+/// one, applying a ramped per-stem gain read from `gains` at every frame
+/// boundary. Count-agnostic up to [`MAX_STEMS`] — six for the classic
+/// layouts, seven for harmony.
 ///
 /// Stems of unequal length pad with silence: the mix ends when the
 /// longest source ends, so a short stem never truncates the track.
 pub struct StemMixerSource<S: Source> {
-    sources: [S; NUM_STEMS],
-    done: [bool; NUM_STEMS],
+    sources: Vec<S>,
+    done: Vec<bool>,
     gains: StemGains,
     /// Smoothed per-stem gain currently applied.
-    ramp: [f32; NUM_STEMS],
+    ramp: Vec<f32>,
     /// Per-frame ramp increment: full 0→1 transition in [`RAMP_SECONDS`].
     ramp_step: f32,
     channels: ChannelCount,
@@ -43,10 +45,17 @@ pub struct StemMixerSource<S: Source> {
 }
 
 impl<S: Source> StemMixerSource<S> {
-    /// Build a mixer over six stems. All sources must agree on channel
-    /// count and sample rate (demucs output does; anything else is a
-    /// corrupt cache entry and errors here rather than playing garbage).
-    pub fn new(sources: [S; NUM_STEMS], gains: StemGains) -> Result<Self, String> {
+    /// Build a mixer over a layout's stems. All sources must agree on
+    /// channel count and sample rate (engine output does; anything else
+    /// is a corrupt cache entry and errors here rather than playing
+    /// garbage).
+    pub fn new(sources: Vec<S>, gains: StemGains) -> Result<Self, String> {
+        if sources.is_empty() || sources.len() > MAX_STEMS {
+            return Err(format!(
+                "stem mixer needs 1..={MAX_STEMS} sources, got {}",
+                sources.len()
+            ));
+        }
         let channels = sources[0].channels();
         let sample_rate = sources[0].sample_rate();
         for (i, s) in sources.iter().enumerate() {
@@ -66,10 +75,13 @@ impl<S: Source> StemMixerSource<S> {
             .iter()
             .map(|s| s.total_duration())
             .try_fold(Duration::ZERO, |acc, d| d.map(|d| acc.max(d)));
-        let ramp = std::array::from_fn(|i| f32::from_bits(gains[i].load(Ordering::Relaxed)));
+        let ramp = (0..sources.len())
+            .map(|i| f32::from_bits(gains[i].load(Ordering::Relaxed)))
+            .collect();
+        let done = vec![false; sources.len()];
         Ok(StemMixerSource {
             sources,
-            done: [false; NUM_STEMS],
+            done,
             gains,
             ramp,
             ramp_step: 1.0 / (RAMP_SECONDS * sample_rate.get() as f32),
@@ -88,7 +100,7 @@ impl<S: Source> Iterator for StemMixerSource<S> {
         // Chase the gain targets once per frame so every channel of a
         // frame gets the same gain (no intra-frame stereo imbalance).
         if self.channel_pos == 0 {
-            for i in 0..NUM_STEMS {
+            for i in 0..self.sources.len() {
                 let target = f32::from_bits(self.gains[i].load(Ordering::Relaxed));
                 let delta = target - self.ramp[i];
                 self.ramp[i] = if delta.abs() <= self.ramp_step {
@@ -104,7 +116,7 @@ impl<S: Source> Iterator for StemMixerSource<S> {
         // stem has ended so a short stem never truncates the track.
         let mut acc = 0.0;
         let mut any_live = false;
-        for i in 0..NUM_STEMS {
+        for i in 0..self.sources.len() {
             if self.done[i] {
                 continue;
             }
@@ -161,18 +173,35 @@ mod tests {
 
     /// Six mono stems where stem `i` is a constant `(i + 1) / 100` signal
     /// of `len` samples.
-    fn six_constant_stems(len: usize) -> [SamplesBuffer; NUM_STEMS] {
-        std::array::from_fn(|i| mono(vec![(i as f32 + 1.0) / 100.0; len]))
+    fn six_constant_stems(len: usize) -> Vec<SamplesBuffer> {
+        (0..6)
+            .map(|i| mono(vec![(i as f32 + 1.0) / 100.0; len]))
+            .collect()
     }
 
-    const ALL_ON: [bool; NUM_STEMS] = [true; NUM_STEMS];
+    const ALL_ON: [bool; 6] = [true; 6];
+
+    #[test]
+    fn seven_stem_mix_sums_all_enabled() {
+        // Harmony recipes feed seven decoders; the mixer is count-
+        // agnostic up to MAX_STEMS.
+        let stems: Vec<SamplesBuffer> = (0..7)
+            .map(|i| mono(vec![(i as f32 + 1.0) / 100.0; 4]))
+            .collect();
+        let mixer = StemMixerSource::new(stems, new_stem_gains(&[true; 7])).unwrap();
+        let out: Vec<f32> = mixer.collect();
+        let expected = (1..=7).map(|i| i as f32 / 100.0).sum::<f32>();
+        for s in out {
+            assert!((s - expected).abs() < 1e-6, "expected {expected}, got {s}");
+        }
+    }
 
     #[test]
     fn mix_sums_all_enabled_stems() {
         let mixer = StemMixerSource::new(six_constant_stems(8), new_stem_gains(&ALL_ON)).unwrap();
         let out: Vec<f32> = mixer.collect();
         assert_eq!(out.len(), 8);
-        let expected = (1..=NUM_STEMS).map(|i| i as f32 / 100.0).sum::<f32>();
+        let expected = (1..=6).map(|i| i as f32 / 100.0).sum::<f32>();
         for s in out {
             assert!((s - expected).abs() < 1e-6, "expected {expected}, got {s}");
         }
@@ -184,7 +213,7 @@ mod tests {
         enabled[0] = false; // drop the 0.01 stem
         let mixer = StemMixerSource::new(six_constant_stems(4), new_stem_gains(&enabled)).unwrap();
         let out: Vec<f32> = mixer.collect();
-        let expected = (2..=NUM_STEMS).map(|i| i as f32 / 100.0).sum::<f32>();
+        let expected = (2..=6).map(|i| i as f32 / 100.0).sum::<f32>();
         for s in out {
             assert!((s - expected).abs() < 1e-6, "expected {expected}, got {s}");
         }
@@ -253,7 +282,7 @@ mod tests {
         let mixer = StemMixerSource::new(stems, new_stem_gains(&ALL_ON)).unwrap();
         let out: Vec<f32> = mixer.collect();
         assert_eq!(out.len(), 8, "mix ends with the longest stem");
-        let full: f32 = 0.5 + (2..=NUM_STEMS).map(|i| i as f32 / 100.0).sum::<f32>();
+        let full: f32 = 0.5 + (2..=6).map(|i| i as f32 / 100.0).sum::<f32>();
         for s in &out[..4] {
             assert!((s - full).abs() < 1e-6);
         }
@@ -266,8 +295,7 @@ mod tests {
     fn all_muted_still_advances_and_ends() {
         // TrackEnded depends on the source ending even at full silence.
         let mixer =
-            StemMixerSource::new(six_constant_stems(4), new_stem_gains(&[false; NUM_STEMS]))
-                .unwrap();
+            StemMixerSource::new(six_constant_stems(4), new_stem_gains(&[false; 6])).unwrap();
         let out: Vec<f32> = mixer.collect();
         assert_eq!(out, vec![0.0; 4]);
     }
@@ -302,13 +330,15 @@ mod tests {
 
     #[test]
     fn reports_uniform_source_parameters() {
-        let stems: [SamplesBuffer; NUM_STEMS] = std::array::from_fn(|_| {
-            SamplesBuffer::new(
-                NonZero::new(2).unwrap(),
-                NonZero::new(44_100).unwrap(),
-                vec![0.0; 8],
-            )
-        });
+        let stems: Vec<SamplesBuffer> = (0..6)
+            .map(|_| {
+                SamplesBuffer::new(
+                    NonZero::new(2).unwrap(),
+                    NonZero::new(44_100).unwrap(),
+                    vec![0.0; 8],
+                )
+            })
+            .collect();
         let reference = SamplesBuffer::new(
             NonZero::new(2).unwrap(),
             NonZero::new(44_100).unwrap(),

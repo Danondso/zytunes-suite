@@ -84,6 +84,7 @@ impl App {
                     self.pending_bg_commands
                         .push(BgCommand::ProvisionStemEngine {
                             gen: self.stems.job_gen,
+                            engine: consent.engine,
                             package: consent.package,
                             gpu: consent.gpu,
                         });
@@ -99,21 +100,31 @@ impl App {
         true
     }
 
-    /// While stem playback is Active, keys `1`–`6` toggle the six stems
-    /// (they normally switch sidebar modes / jump panels). Everything
-    /// else falls through — this claims exactly those six keys, and `M`
-    /// in the global map exits stem mode. Claiming is additionally gated
-    /// on the strip being visible: with the player panel hidden (`P`
-    /// force-hidden, or a terminal too short for it), `1`/`2` silently
-    /// mutating invisible stems read as the sidebar keys going dead.
+    /// While stem playback is Active, digit keys `1..=layout.len()` (6 or
+    /// 7 per the active recipe layout) toggle stems — they normally
+    /// switch sidebar modes / jump panels. Everything else falls through:
+    /// digits beyond the layout (key `7` under six-stem layouts) keep
+    /// their global meaning, and `M` in the global map exits stem mode.
+    /// Claiming is additionally gated on the strip being visible: with
+    /// the player panel hidden (`P` force-hidden, or a terminal too short
+    /// for it), `1`/`2` silently mutating invisible stems read as the
+    /// sidebar keys going dead.
     fn handle_stem_key(&mut self, key: KeyEvent) -> bool {
         if self.stems.status != super::StemStatus::Active || !self.stem_strip_visible() {
             return false;
         }
         match key.code {
-            KeyCode::Char(c @ '1'..='6') => {
-                self.toggle_stem(c as usize - '1' as usize);
-                true
+            KeyCode::Char(c @ '1'..='8') => {
+                // Claim only digits inside the active layout: key 7
+                // toggles the harmony layout's 7th stem but must fall
+                // through to global handling under a six-stem layout.
+                let index = c as usize - '1' as usize;
+                if index < self.stems.layout.map_or(0, |l| l.len()) {
+                    self.toggle_stem(index);
+                    true
+                } else {
+                    false
+                }
             }
             _ => false,
         }

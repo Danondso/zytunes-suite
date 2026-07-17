@@ -24,7 +24,6 @@ use crate::app::{
 use crate::background::CdStatusEvent;
 use crate::theme;
 use zytunes::musicbrainz::render_artist_credit;
-use zytunes::stems::StemKind;
 
 /// Responsive layout dimensions computed from terminal size.
 ///
@@ -2151,9 +2150,11 @@ fn draw_now_playing(f: &mut Frame, app: &App, np: &NowPlaying, area: Rect, art_w
     }
 }
 
-/// One-line stem status for the now-playing panel. `Active` renders the
-/// six toggle cells (`[1 Voc ●]`, filled = audible / hollow = muted),
-/// dropping the labels below the ~66 columns the full form needs.
+/// One-line stem status for the now-playing panel. `Active` renders one
+/// toggle cell per stem in the active layout (`[1 Voc ●]`, filled =
+/// audible / hollow = muted), dropping the labels when the strip is
+/// narrower than the full form needs (66 cols for six stems, 76 for
+/// seven).
 fn stem_strip_line(app: &App, width: u16) -> Paragraph<'static> {
     let t = app.theme();
     let header = Span::styled(
@@ -2176,9 +2177,13 @@ fn stem_strip_line(app: &App, width: u16) -> Paragraph<'static> {
             Style::default().fg(t.progress_bar),
         )),
         StemStatus::Active => {
-            let wide = width >= 66;
-            for kind in StemKind::ALL {
-                let i = kind.index();
+            let layout = app.stems.layout.unwrap_or(zytunes::stems::SIX_STEM_LAYOUT);
+            // The wide form is the 7-cell " STEMS " header plus one
+            // 10-cell `[N Lbl ●] ` per stem, minus the last trailing
+            // space: 6 + 10·len (66 for six stems — the pre-layout
+            // constant — and 76 for harmony's seven).
+            let wide = width >= 6 + 10 * layout.len() as u16;
+            for (i, kind) in layout.iter().enumerate() {
                 let on = app.stems.enabled[i];
                 let dot = if on { "●" } else { "○" };
                 let cell = if wide {
@@ -2206,8 +2211,41 @@ fn stem_strip_line(app: &App, width: u16) -> Paragraph<'static> {
 fn draw_stem_consent(f: &mut Frame, app: &App, consent: &crate::app::StemConsent) {
     let t = app.theme();
     let area = f.area();
-    let w = 56u16.min(area.width.saturating_sub(4));
-    let h = 7u16.min(area.height.saturating_sub(2));
+    let audio_sep = consent.engine == zytunes::stems::provision::EngineKind::AudioSeparator;
+
+    let size_note = if consent.gpu {
+        "(GPU build — several GB, one-time)"
+    } else {
+        "(~1.5 GB one-time download)"
+    };
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(format!(
+            " Splitting tracks needs the {} engine.",
+            consent.package
+        )),
+        Line::from(format!(" Install it now via uv? {size_note}")),
+    ];
+    if audio_sep {
+        // The Roformer checkpoints download separately, on the first
+        // separation — name that cost here, not just the engine's.
+        lines.push(Line::from(Span::styled(
+            " Models (0.2-1 GB each) download on first split.",
+            t.modal_dim(),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " Enter/y:install  Esc/n:skip",
+        t.modal_dim(),
+    )));
+
+    // Size to content: the pinned audio-separator package spec makes the
+    // install line longer than the old fixed 56 columns, and clipping the
+    // exact package the user is consenting to is not acceptable.
+    let longest = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+    let w = (longest + 3).max(56).min(area.width.saturating_sub(4));
+    let h = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let rect = Rect::new(x, y, w, h);
@@ -2220,22 +2258,6 @@ fn draw_stem_consent(f: &mut Frame, app: &App, consent: &crate::app::StemConsent
         .border_style(t.success())
         .title(" Stem Playback ")
         .title_alignment(Alignment::Center);
-
-    let size_note = if consent.gpu {
-        "(GPU build — several GB, one-time)"
-    } else {
-        "(~1.5 GB one-time download)"
-    };
-    let lines = vec![
-        Line::from(""),
-        Line::from(format!(
-            " Splitting tracks needs the {} engine.",
-            consent.package
-        )),
-        Line::from(format!(" Install it now via uv? {size_note}")),
-        Line::from(""),
-        Line::from(Span::styled(" Enter/y:install  Esc/n:skip", t.modal_dim())),
-    ];
     let p = Paragraph::new(lines).block(block).style(t.modal());
     f.render_widget(p, rect);
 }
@@ -2376,6 +2398,20 @@ fn draw_help_overlay(f: &mut Frame, app: &App) {
 
     f.render_widget(Clear, rect);
 
+    // The stem digit range tracks the active layout (or, before any split,
+    // the configured recipe's) — a static "1-7" would advertise a key that
+    // falls through to nothing under the six-stem layouts.
+    let stem_count = app
+        .stems
+        .layout
+        .map(|l| l.len())
+        .or_else(|| app.stems_cfg.recipe_kind().ok().map(|r| r.layout().len()))
+        .unwrap_or(6);
+    let stem_toggle_line = if stem_count >= 7 {
+        "  1-7         Toggle stems while the mixer is active"
+    } else {
+        "  1-6         Toggle stems while the mixer is active"
+    };
     let help_text = vec![
         "",
         "  Navigation",
@@ -2393,7 +2429,7 @@ fn draw_help_overlay(f: &mut Frame, app: &App) {
         "  n / p       Next / previous track in playlist",
         "  < / >       Seek -/+ 5 seconds",
         "  M           Stem mixer (split vocals/drums/bass/…)",
-        "  1-6         Toggle stems while the mixer is active",
+        stem_toggle_line,
         "",
         "  Logs",
         "  PgUp/PgDn   Scroll sync log",

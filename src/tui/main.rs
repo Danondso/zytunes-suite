@@ -116,7 +116,7 @@ fn run_loop(
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         // Refresh the height snapshot key dispatch uses for visibility
-        // questions (e.g. whether the stem strip may claim keys 1-6).
+        // questions (e.g. whether the stem strip may claim the digit keys).
         app.last_term_height = terminal.size()?.height;
 
         // Pre-render album art for the area below the track list in album detail view.

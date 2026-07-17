@@ -199,7 +199,8 @@ impl App {
             return path_str;
         }
         if let Some(pending) = self.stems.pending_path.take() {
-            self.dispatch_separation(pending);
+            let recipe = self.stems_recipe();
+            self.dispatch_separation(pending, recipe);
         } else {
             // Track changed while installing: nothing to auto-split, but
             // the engine is now ready for the next M-press.
@@ -249,8 +250,9 @@ impl App {
             return;
         }
 
-        self.stems.enabled = [true; zytunes::stems::NUM_STEMS];
-        let gains = zytunes::stems::new_stem_gains(&self.stems.enabled);
+        self.stems.enabled = [true; zytunes::stems::MAX_STEMS];
+        let gains = zytunes::stems::new_stem_gains(&self.stems.enabled[..stems.layout.len()]);
+        self.stems.layout = Some(stems.layout);
         // One gapless swap: the audio thread pre-seeks the mixer to its
         // own live position (preserving pause state) before cutting over,
         // so no Scrub/Pause choreography is needed here.
@@ -262,7 +264,13 @@ impl App {
         });
         self.stems.gains = Some(gains);
         self.stems.status = StemStatus::Active;
-        self.set_toast("Stem mode — 1-6 toggle stems, M exits".into(), false);
+        self.set_toast(
+            format!(
+                "Stem mode — 1-{} toggle stems, M exits",
+                self.stems.layout.map_or(6, |l| l.len())
+            ),
+            false,
+        );
     }
 
     fn on_stems_failed(&mut self, gen: u64, track_path: String, error: String, cancelled: bool) {

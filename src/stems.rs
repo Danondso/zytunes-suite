@@ -1,41 +1,132 @@
-//! Stem separation via `demucs` shell-out, plus the on-disk stem cache.
+//! Stem separation — recipes, engines, and the on-disk stem cache.
 //!
-//! Separation is an offline, cached, background step — the usable models
-//! (Demucs family) run at or below real time on CPU, so nothing here is
+//! Separation is an offline, cached, background step; nothing here is
 //! invoked on the audio path. The TUI's background worker calls
 //! [`cached_stems`] first and only runs [`StemSeparator::separate`] on a
-//! miss; the resulting six FLACs land in the cache via [`store_stems`].
+//! miss; the resulting FLACs land in the cache via [`store_stems`].
+//!
+//! A [`RecipeKind`] names a pipeline: `demucs` (single [`DemucsCli`]
+//! pass), or the audio-separator recipes `hq` / `hq-harmony` (a
+//! [`CascadeSeparator`] executing [`RecipePass`] slices — Roformer
+//! vocals, demucs band, optionally a karaoke lead/backing split). Each
+//! recipe declares an ordered stem *layout* that drives filenames, UI
+//! cells, digit keys, and gain indices alike.
 //!
 //! Shelling out mirrors the ffmpeg precedent (video-sync, CD rip): the
-//! engine is an optional external tool, checked at use time with a
-//! friendly error. `DemucsCli` is the only separator today; the trait
-//! exists so an in-process backend can slot in later without touching
-//! the worker or the cache. See `docs/stem-splitting-plan.md`.
+//! engines are optional external tools, checked at use time with a
+//! friendly error; the trait keeps the worker and cache agnostic so an
+//! in-process backend can slot in later. See
+//! `docs/stem-splitting-plan.md` and `docs/stem-quality-upgrade-plan.md`.
 
+mod process;
 pub mod provision;
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
 use crate::cache::{FileFingerprint, Logger};
+pub use process::{kill_active_stem_children, parse_progress_percent};
+use process::{run_engine_process, EngineHooks, EngineOutcome};
 
-/// Number of stems produced by the 6-source Demucs models (`htdemucs_6s`).
-pub const NUM_STEMS: usize = 6;
+/// Capacity ceiling for per-stem state (gains, enabled flags). Fixed so
+/// the lock-free `[AtomicU32; MAX_STEMS]` gains array never reallocates;
+/// recipes occupy `layout().len()` slots and the rest idle muted.
+pub const MAX_STEMS: usize = 8;
+
+/// A named, versioned separation pipeline — the unit `[stems] recipe`
+/// selects. A recipe decides which engine runs ([`RecipeKind::engine`]),
+/// what the cache entry is keyed as ([`RecipeKind::cache_id`]), and (for
+/// multi-pass recipes) which model passes produce which stems. See
+/// `docs/stem-quality-upgrade-plan.md` §3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecipeKind {
+    /// The original single-pass demucs separation (default).
+    Demucs,
+    /// BS-Roformer vocals + `htdemucs_6s` band cascade via
+    /// audio-separator — same six stems, audibly better vocals.
+    Hq,
+    /// The `hq` cascade plus a Mel-Roformer karaoke pass splitting the
+    /// vocals into lead + backing (seven stems).
+    HqHarmony,
+}
+
+impl RecipeKind {
+    /// The engine executable this recipe drives.
+    pub fn engine(self) -> provision::EngineKind {
+        match self {
+            RecipeKind::Demucs => provision::EngineKind::Demucs,
+            RecipeKind::Hq | RecipeKind::HqHarmony => provision::EngineKind::AudioSeparator,
+        }
+    }
+
+    /// Cache identity stored in [`StemCacheMeta::model`] and compared for
+    /// equality on lookup. The demucs recipe's id IS the configured model
+    /// string so every pre-recipe cache entry stays a hit; multi-pass
+    /// recipes carry an explicit version — bump it when swapping a
+    /// checkpoint so stale mixes re-separate.
+    pub fn cache_id(self, demucs_model: &str) -> String {
+        match self {
+            RecipeKind::Demucs => demucs_model.to_string(),
+            RecipeKind::Hq => "hq/v1".to_string(),
+            RecipeKind::HqHarmony => "hq-harmony/v1".to_string(),
+        }
+    }
+
+    /// The ordered stems this recipe produces — the single source of
+    /// truth for UI cells, digit keys, gain indices, and stem filenames.
+    pub fn layout(self) -> &'static [StemKind] {
+        match self {
+            RecipeKind::Demucs | RecipeKind::Hq => SIX_STEM_LAYOUT,
+            RecipeKind::HqHarmony => HARMONY_STEM_LAYOUT,
+        }
+    }
+
+    /// The `[stems] recipe` config value (also the `Display` form).
+    pub fn config_value(self) -> &'static str {
+        match self {
+            RecipeKind::Demucs => "demucs",
+            RecipeKind::Hq => "hq",
+            RecipeKind::HqHarmony => "hq-harmony",
+        }
+    }
+}
+
+impl std::fmt::Display for RecipeKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.config_value())
+    }
+}
+
+impl std::str::FromStr for RecipeKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "demucs" => Ok(RecipeKind::Demucs),
+            "hq" => Ok(RecipeKind::Hq),
+            "hq-harmony" => Ok(RecipeKind::HqHarmony),
+            other => Err(other.to_string()),
+        }
+    }
+}
 
 /// File extension the cache stores stems as. `--flac` keeps them lossless
 /// at roughly half the disk of WAV.
 pub const STEM_EXT: &str = "flac";
 
-/// One of the six sources `htdemucs_6s` separates a track into.
-///
-/// Discriminant order is the UI order (keys `1`–`6`) and the index into
-/// [`StemSet::paths`]; [`StemKind::file_stem`] matches the output
-/// filenames demucs writes, so the two must stay in lockstep.
+/// One separated source. Which kinds a track splits into — and their
+/// order (UI cells, digit keys, gain indices, [`StemSet::paths`]) — is
+/// the recipe's *layout* ([`RecipeKind::layout`]); a kind's position in
+/// its layout is its index everywhere.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StemKind {
     Vocals,
+    /// Lead vocal line (harmony recipes split [`StemKind::Vocals`]).
+    LeadVocals,
+    /// Backing vocals / harmonies.
+    BackingVocals,
     Drums,
     Bass,
     Guitar,
@@ -43,25 +134,35 @@ pub enum StemKind {
     Other,
 }
 
+/// The classic six-source order every demucs-family separation uses.
+pub const SIX_STEM_LAYOUT: &[StemKind] = &[
+    StemKind::Vocals,
+    StemKind::Drums,
+    StemKind::Bass,
+    StemKind::Guitar,
+    StemKind::Piano,
+    StemKind::Other,
+];
+
+/// The seven-stem harmony order: the vocal take split into lead +
+/// backing, then the band.
+pub const HARMONY_STEM_LAYOUT: &[StemKind] = &[
+    StemKind::LeadVocals,
+    StemKind::BackingVocals,
+    StemKind::Drums,
+    StemKind::Bass,
+    StemKind::Guitar,
+    StemKind::Piano,
+    StemKind::Other,
+];
+
 impl StemKind {
-    pub const ALL: [StemKind; NUM_STEMS] = [
-        StemKind::Vocals,
-        StemKind::Drums,
-        StemKind::Bass,
-        StemKind::Guitar,
-        StemKind::Piano,
-        StemKind::Other,
-    ];
-
-    /// Index into [`StemSet::paths`] / the gains array.
-    pub fn index(self) -> usize {
-        self as usize
-    }
-
-    /// The filename (sans extension) demucs writes this stem as.
+    /// The filename (sans extension) this stem is stored as.
     pub fn file_stem(self) -> &'static str {
         match self {
             StemKind::Vocals => "vocals",
+            StemKind::LeadVocals => "lead",
+            StemKind::BackingVocals => "backing",
             StemKind::Drums => "drums",
             StemKind::Bass => "bass",
             StemKind::Guitar => "guitar",
@@ -74,6 +175,8 @@ impl StemKind {
     pub fn label(self) -> &'static str {
         match self {
             StemKind::Vocals => "Vocals",
+            StemKind::LeadVocals => "Lead Vocals",
+            StemKind::BackingVocals => "Backing Vocals",
             StemKind::Drums => "Drums",
             StemKind::Bass => "Bass",
             StemKind::Guitar => "Guitar",
@@ -82,10 +185,13 @@ impl StemKind {
         }
     }
 
-    /// Three-character label for the now-playing strip.
+    /// Three-character label for the now-playing strip ("LdV"/"BkV"
+    /// follow the sheet-notation LV/BV convention).
     pub fn short_label(self) -> &'static str {
         match self {
             StemKind::Vocals => "Voc",
+            StemKind::LeadVocals => "LdV",
+            StemKind::BackingVocals => "BkV",
             StemKind::Drums => "Drm",
             StemKind::Bass => "Bas",
             StemKind::Guitar => "Gtr",
@@ -95,18 +201,24 @@ impl StemKind {
     }
 }
 
-/// The six stem files for one track, indexed by [`StemKind::index`].
+/// The stem files for one track, ordered by `layout` — `paths[i]` is
+/// `layout[i]`'s file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StemSet {
-    pub paths: [PathBuf; NUM_STEMS],
+    pub layout: &'static [StemKind],
+    pub paths: Vec<PathBuf>,
 }
 
 impl StemSet {
-    /// Assemble the canonical `dir/{vocals,drums,…}.{ext}` layout — both
-    /// demucs' output directory and our cache entries use this shape.
-    pub fn from_dir(dir: &Path, ext: &str) -> StemSet {
+    /// Assemble `dir/{lead,backing,…}.{ext}` paths in `layout` order —
+    /// engine work dirs and cache entries share this shape.
+    pub fn from_layout(dir: &Path, ext: &str, layout: &'static [StemKind]) -> StemSet {
         StemSet {
-            paths: StemKind::ALL.map(|k| dir.join(format!("{}.{ext}", k.file_stem()))),
+            layout,
+            paths: layout
+                .iter()
+                .map(|k| dir.join(format!("{}.{ext}", k.file_stem())))
+                .collect(),
         }
     }
 
@@ -116,16 +228,20 @@ impl StemSet {
     }
 }
 
-/// Shared per-stem gain targets: `f32` bits stored in `AtomicU32`, indexed
-/// by [`StemKind::index`]. The app owns one clone and the audio thread's
-/// mixer another; toggling a stem is a lock-free store the mixer picks up
-/// on its next frame — no channel round-trip.
-pub type StemGains = Arc<[std::sync::atomic::AtomicU32; NUM_STEMS]>;
+/// Shared per-stem gain targets: `f32` bits stored in `AtomicU32`,
+/// indexed by layout position. Fixed [`MAX_STEMS`] capacity so the array
+/// stays lock-free and allocation-free; slots beyond the active layout
+/// idle at 0.0. The app owns one clone and the audio thread's mixer
+/// another; toggling a stem is a lock-free store the mixer picks up on
+/// its next frame — no channel round-trip.
+pub type StemGains = Arc<[std::sync::atomic::AtomicU32; MAX_STEMS]>;
 
-/// Fresh gains with each stem at `1.0` (enabled) or `0.0` (muted).
-pub fn new_stem_gains(enabled: &[bool; NUM_STEMS]) -> StemGains {
+/// Fresh gains with each of the first `enabled.len()` stems at `1.0`
+/// (enabled) or `0.0` (muted); remaining capacity muted.
+pub fn new_stem_gains(enabled: &[bool]) -> StemGains {
     Arc::new(std::array::from_fn(|i| {
-        std::sync::atomic::AtomicU32::new(if enabled[i] { 1.0f32 } else { 0.0f32 }.to_bits())
+        let on = enabled.get(i).copied().unwrap_or(false);
+        std::sync::atomic::AtomicU32::new(if on { 1.0f32 } else { 0.0f32 }.to_bits())
     }))
 }
 
@@ -218,6 +334,12 @@ pub trait StemSeparator {
 pub struct DemucsCli {
     pub command: PathBuf,
     pub model: String,
+    /// Stem layout the recipe expects the model to emit (from
+    /// [`RecipeKind::layout`]) — the recipe owns the layout decision, not
+    /// the engine. A model that emits fewer stems (e.g. 4-stem
+    /// `htdemucs` set via `[stems] model`) fails the post-run check with
+    /// a clear model/layout mismatch instead of a bare missing-file.
+    pub layout: &'static [StemKind],
 }
 
 /// Build the demucs argv tail: `-n <model> --flac -o <out_dir> <input>`.
@@ -243,243 +365,34 @@ pub fn expected_output_dir(out_dir: &Path, model: &str, input: &Path) -> PathBuf
     out_dir.join(model).join(track.as_ref())
 }
 
-/// Extract the most recent percentage tick from a chunk of demucs stderr.
-///
-/// demucs renders tqdm progress bars, `\r`-rewritten lines shaped like
-/// ` 26%|██▌       | 56.7/218.7 [00:12<00:35, 4.60seconds/s]`, so this
-/// scans raw chunk text (not lines) and returns the last `NN%` whose
-/// digits parse and clamp to 0..=100. Returns `None` when the chunk has
-/// no tick — callers keep the previous value.
-pub fn parse_progress_percent(chunk: &str) -> Option<u8> {
-    let bytes = chunk.as_bytes();
-    let mut last: Option<u8> = None;
-    for (i, b) in bytes.iter().enumerate() {
-        if *b != b'%' {
-            continue;
-        }
-        // Walk back over up to three ASCII digits.
-        let mut start = i;
-        while start > 0 && i - start < 3 && bytes[start - 1].is_ascii_digit() {
-            start -= 1;
-        }
-        if start == i {
-            continue; // '%' with no digits before it
-        }
-        if start > 0 && bytes[start - 1].is_ascii_digit() {
-            // A digit run longer than three ("1000%") isn't a percentage;
-            // taking its last three digits would report a bogus tick.
-            continue;
-        }
-        if let Ok(pct) = chunk[start..i].parse::<u16>() {
-            if pct <= 100 {
-                last = Some(pct as u8);
-            }
-        }
-    }
-    last
-}
-
-/// [`parse_progress_percent`] over a raw pipe stream: prepends the bytes
-/// carried from the previous read so a `NN%` straddling a 4096-byte
-/// chunk boundary isn't parsed as its trailing digits alone (` 26%`
-/// split after the `2` used to report a bogus 6% and visibly rewind the
-/// progress display). Keeps a few tail bytes for the next call.
-fn parse_progress_across_chunks(carry: &mut Vec<u8>, chunk: &[u8]) -> Option<u8> {
-    let mut buf = std::mem::take(carry);
-    buf.extend_from_slice(chunk);
-    let pct = parse_progress_percent(&String::from_utf8_lossy(&buf));
-    // 8 bytes comfortably covers a boundary-split " 100" plus a partial
-    // UTF-8 code point; re-parsing an already-reported tick from the
-    // carry is harmless (same value wins again).
-    let keep_from = buf.len().saturating_sub(8);
-    buf.drain(..keep_from);
-    *carry = buf;
-    pct
-}
-
-/// Isolate an engine/installer child for clean teardown. Two layers:
-///
-/// - **Own process group** (unix): the child (and everything it spawns —
-///   `curl | sh` pipeline stages, demucs' own workers) lands in one pgid,
-///   so cancellation can [`kill_child_group`] the whole tree. Killing
-///   only the direct child leaves grandchildren orphaned: a cancelled
-///   `sh -c "curl … | sh"` bootstrap kept downloading and installing.
-/// - **`PR_SET_PDEATHSIG`** (Linux): the direct child dies with this
-///   process even on hard death (SIGKILL, panic-abort). An orphaned
-///   demucs keeps holding the HuggingFace model-download file lock —
-///   silently wedging every future separation on the machine until
-///   someone finds and kills it.
-///
-/// macOS has no PDEATHSIG; the normal quit path covers it instead —
-/// [`kill_active_stem_children`] runs when the TUI run loop exits and
-/// SIGKILLs every registered child group. Only a hard kill of the TUI
-/// (SIGKILL, power loss) can still orphan the engine on macOS.
-pub(crate) fn isolate_child_process(cmd: &mut std::process::Command) {
-    // A child in its own process group must never read the TUI's
-    // terminal: the kernel answers a background-group TTY read with
-    // SIGTTIN, which STOPS the whole group. demucs hit exactly this —
-    // its m4a decode shells out to ffmpeg, which reads stdin for
-    // interactive commands by default, freezing every separation of a
-    // non-wav source at "Separating track…". Null stdin so any such
-    // read sees instant EOF instead.
-    cmd.stdin(std::process::Stdio::null());
-    #[cfg(unix)]
+/// Probe an engine binary by running it with a fast, side-effect-free
+/// flag and mapping the three outcomes (ran clean / ran and failed /
+/// couldn't spawn) onto one error shape. Shared by both engines so a fix
+/// to the probe (wording, a future hang guard) lands once.
+fn probe_engine(command: &Path, flag: &str) -> Result<(), String> {
+    match std::process::Command::new(command)
+        .arg(flag)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
     {
-        use std::os::unix::process::CommandExt;
-        // SAFETY: setpgid(0,0) and prctl are async-signal-safe and the
-        // closure does nothing else — the canonical pre_exec use. The
-        // new group also detaches the engine from terminal job-control
-        // signals, which is fine: the TUI runs raw-mode and delivers
-        // cancellation explicitly.
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::setpgid(0, 0);
-                #[cfg(target_os = "linux")]
-                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
-                Ok(())
-            });
-        }
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => Err(format!(
+            "{} {flag} exited with {:?}",
+            command.display(),
+            s.code()
+        )),
+        Err(e) => Err(format!(
+            "stem engine not found at {}: {e}",
+            command.display()
+        )),
     }
-    #[cfg(not(unix))]
-    {
-        let _ = cmd;
-    }
-}
-
-/// SIGKILL `child`'s entire process group (unix), falling back to the
-/// direct child, then reap it. Pairs with [`isolate_child_process`] —
-/// without the group kill, pipeline grandchildren survive a cancel and
-/// the pipe drain threads never see EOF (the orphans inherit the write
-/// ends), so the cancelling thread blocks until the orphan finishes.
-pub(crate) fn kill_child_group(child: &mut std::process::Child) {
-    #[cfg(unix)]
-    {
-        let pid = child.id() as libc::pid_t;
-        // SAFETY: plain kill(2) on the group we created at spawn. The
-        // child is unreaped (we hold the handle), so the pid can't have
-        // been reused.
-        unsafe {
-            libc::kill(-pid, libc::SIGKILL);
-        }
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-/// Pids of engine/installer children currently running, so the TUI quit
-/// path can take the whole set down. Registered via [`ChildGroupGuard`]
-/// by the spawn sites in this module and `provision.rs` — a process-wide
-/// registry because the children are spawned deep inside the lib crate
-/// while the quit decision happens in the TUI binary.
-static ACTIVE_CHILD_PIDS: std::sync::OnceLock<Mutex<Vec<u32>>> = std::sync::OnceLock::new();
-
-fn active_child_pids() -> &'static Mutex<Vec<u32>> {
-    ACTIVE_CHILD_PIDS.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-/// RAII registration of a spawned engine/installer child in the
-/// process-wide registry. Held by the job thread for the child's
-/// lifetime; dropping (normal reap path) deregisters.
-pub(crate) struct ChildGroupGuard {
-    pid: u32,
-}
-
-impl ChildGroupGuard {
-    pub(crate) fn register(child: &std::process::Child) -> Self {
-        let pid = child.id();
-        if let Ok(mut pids) = active_child_pids().lock() {
-            pids.push(pid);
-        }
-        ChildGroupGuard { pid }
-    }
-}
-
-impl Drop for ChildGroupGuard {
-    fn drop(&mut self) {
-        if let Ok(mut pids) = active_child_pids().lock() {
-            pids.retain(|p| *p != self.pid);
-        }
-    }
-}
-
-/// SIGKILL every registered engine/installer child group. Called by the
-/// TUI when the run loop exits so quitting mid-separation (or
-/// mid-install) never orphans a demucs/uv tree — the macOS answer to
-/// Linux's PDEATHSIG, and the fix for the orphan that wedged the
-/// HuggingFace download lock. Idempotent; racing the job thread's own
-/// kill is harmless (the pid stays valid until the holder reaps it).
-pub fn kill_active_stem_children() {
-    let pids: Vec<u32> = match active_child_pids().lock() {
-        Ok(p) => p.clone(),
-        Err(_) => return,
-    };
-    for pid in pids {
-        #[cfg(unix)]
-        // SAFETY: see kill_child_group — unreaped children, so no reuse.
-        unsafe {
-            libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
-            libc::kill(pid as libc::pid_t, libc::SIGKILL);
-        }
-        #[cfg(not(unix))]
-        let _ = pid;
-    }
-}
-
-/// Pull complete informational lines out of a pipe stream. `pending`
-/// carries a partial line across chunk boundaries; `\r` counts as a line
-/// terminator so tqdm rewrites don't glue everything together. Progress
-/// bars (`%|`) and blank lines are dropped — they go through the percent
-/// channel, not the log.
-fn extract_info_lines(pending: &mut Vec<u8>, chunk: &[u8]) -> Vec<String> {
-    pending.extend_from_slice(chunk);
-    let mut lines = Vec::new();
-    while let Some(pos) = pending.iter().position(|b| *b == b'\n' || *b == b'\r') {
-        let raw: Vec<u8> = pending.drain(..=pos).collect();
-        let text = String::from_utf8_lossy(&raw[..raw.len() - 1])
-            .trim()
-            .to_string();
-        if !text.is_empty() && !text.contains("%|") {
-            lines.push(text);
-        }
-    }
-    lines
-}
-
-/// Trim a captured stderr buffer down to the interesting tail for error
-/// reporting: tqdm progress lines (anything carrying a `%|` bar) are
-/// dropped, `\r` rewrites are treated as line breaks, and only the last
-/// few remaining lines are kept.
-fn stderr_tail(raw: &[u8]) -> String {
-    let text = String::from_utf8_lossy(raw);
-    let lines: Vec<&str> = text
-        .split(['\n', '\r'])
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.contains("%|"))
-        .collect();
-    let start = lines.len().saturating_sub(8);
-    lines[start..].join("\n")
 }
 
 impl StemSeparator for DemucsCli {
     fn available(&self) -> Result<(), String> {
         // `--help` is argparse-only (no torch import) so this stays fast.
-        match std::process::Command::new(&self.command)
-            .arg("--help")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-        {
-            Ok(s) if s.success() => Ok(()),
-            Ok(s) => Err(format!(
-                "{} --help exited with {:?}",
-                self.command.display(),
-                s.code()
-            )),
-            Err(e) => Err(format!(
-                "stem engine not found at {}: {e}",
-                self.command.display()
-            )),
-        }
+        probe_engine(&self.command, "--help")
     }
 
     fn separate(
@@ -491,165 +404,27 @@ impl StemSeparator for DemucsCli {
         on_line: &dyn Fn(&str),
     ) -> Result<StemSet, StemError> {
         std::fs::create_dir_all(out_dir).map_err(|e| StemError::Io(e.to_string()))?;
-        let args = build_demucs_args(&self.model, out_dir, src);
         let mut cmd = std::process::Command::new(&self.command);
-        cmd.args(&args)
-            // Python block-buffers stdout when it's a pipe, so demucs'
-            // informational banners ("Downloading:", "Separating track…")
-            // would sit in its own buffer until exit and never reach the
-            // log mid-run. Force unbuffered output.
-            .env("PYTHONUNBUFFERED", "1")
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        isolate_child_process(&mut cmd);
-        let mut child = cmd.spawn().map_err(|e| StemError::Spawn(e.to_string()))?;
-        let _group = ChildGroupGuard::register(&child);
-
+        cmd.args(build_demucs_args(&self.model, out_dir, src));
         // demucs writes its tqdm progress to stderr and informational
         // lines ("Selected model…", "Separating track…", download
-        // notices) to stdout. Both pipes are drained continuously so
-        // neither can fill and deadlock the child (the CD-rip lesson);
-        // stderr chunks additionally feed percentage ticks, and both
-        // pipes feed informational lines, through channels the
-        // cancel-poll loop below drains — no extra timer thread.
-        let (pct_tx, pct_rx) = std::sync::mpsc::channel::<u8>();
-        let (line_tx, line_rx) = std::sync::mpsc::channel::<String>();
-        // ZYTUNES_STEM_DEBUG=1 tees the engine's raw, unfiltered output
-        // (both pipes, interleaved) to a file — ground truth for "is the
-        // engine silent, or are we losing its output on the way in".
-        let debug_tee: Option<Arc<Mutex<std::fs::File>>> = std::env::var_os("ZYTUNES_STEM_DEBUG")
-            .and_then(|_| {
-                std::fs::File::create(std::env::temp_dir().join("zytunes-stem-engine.log"))
-                    .ok()
-                    .map(|f| Arc::new(Mutex::new(f)))
-            });
-        let tee = |dst: &Option<Arc<Mutex<std::fs::File>>>, bytes: &[u8]| {
-            if let Some(f) = dst {
-                if let Ok(mut f) = f.lock() {
-                    use std::io::Write;
-                    let _ = f.write_all(bytes);
-                    let _ = f.flush();
-                }
-            }
+        // notices) to stdout; the shared driver drains both pipes and
+        // owns the cancel poll, group kill, and quit-teardown registry.
+        let hooks = EngineHooks {
+            cancelled,
+            on_progress: Some(progress),
+            on_line,
         };
-        let stderr_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-        let stderr_handle = child.stderr.take().map(|mut pipe| {
-            let buf = Arc::clone(&stderr_buf);
-            let lines_tx = line_tx.clone();
-            let dbg = debug_tee.clone();
-            std::thread::spawn(move || {
-                use std::io::Read;
-                let mut chunk = [0u8; 4096];
-                let mut pending = Vec::new();
-                let mut pct_carry = Vec::new();
-                loop {
-                    match pipe.read(&mut chunk) {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            tee(&dbg, &chunk[..n]);
-                            if let Some(pct) =
-                                parse_progress_across_chunks(&mut pct_carry, &chunk[..n])
-                            {
-                                let _ = pct_tx.send(pct);
-                            }
-                            for line in extract_info_lines(&mut pending, &chunk[..n]) {
-                                let _ = lines_tx.send(line);
-                            }
-                            if let Ok(mut b) = buf.lock() {
-                                b.extend_from_slice(&chunk[..n]);
-                                // Only the filtered tail is ever read (the
-                                // last few lines on the failure path), but
-                                // tqdm rewrites its bar many times a second
-                                // for the whole multi-minute run — keep a
-                                // bounded window, not the full stream.
-                                if b.len() > 64 * 1024 {
-                                    let cut = b.len() - 32 * 1024;
-                                    b.drain(..cut);
-                                }
-                            }
-                        }
-                    }
-                }
-            })
-        });
-        let stdout_handle = child.stdout.take().map(|mut pipe| {
-            let lines_tx = line_tx;
-            let dbg = debug_tee.clone();
-            std::thread::spawn(move || {
-                use std::io::Read;
-                let mut chunk = [0u8; 4096];
-                let mut pending = Vec::new();
-                loop {
-                    match pipe.read(&mut chunk) {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            tee(&dbg, &chunk[..n]);
-                            for line in extract_info_lines(&mut pending, &chunk[..n]) {
-                                let _ = lines_tx.send(line);
-                            }
-                        }
-                    }
-                }
-            })
-        });
-
-        let drain_pct = |rx: &std::sync::mpsc::Receiver<u8>| {
-            while let Ok(pct) = rx.try_recv() {
-                progress(pct);
-            }
-        };
-        let drain_lines = |rx: &std::sync::mpsc::Receiver<String>| {
-            while let Ok(line) = rx.try_recv() {
-                on_line(&line);
-            }
-        };
-        let exit_outcome: Result<(), StemError> = loop {
-            drain_pct(&pct_rx);
-            drain_lines(&line_rx);
-            if cancelled() {
-                // Cancel-during-completion race: accept a child that
-                // already finished successfully instead of discarding a
-                // completed separation.
-                if let Ok(Some(status)) = child.try_wait() {
-                    if status.success() {
-                        break Ok(());
-                    }
-                    break Err(StemError::EngineFailed {
-                        exit_code: status.code(),
-                        stderr: String::new(),
-                    });
-                }
-                kill_child_group(&mut child);
-                break Err(StemError::Cancelled);
-            }
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    if status.success() {
-                        break Ok(());
-                    }
-                    break Err(StemError::EngineFailed {
-                        exit_code: status.code(),
-                        stderr: String::new(), // populated below from the drained buffer
-                    });
-                }
-                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
-                Err(e) => break Err(StemError::Spawn(e.to_string())),
-            }
-        };
-
-        if let Some(h) = stderr_handle {
-            let _ = h.join();
-        }
-        if let Some(h) = stdout_handle {
-            let _ = h.join();
-        }
-        drain_pct(&pct_rx);
-        drain_lines(&line_rx);
-
-        match exit_outcome {
-            Ok(()) => {
+        match run_engine_process(&mut cmd, &hooks) {
+            Err(e) => Err(StemError::Spawn(e)),
+            Ok(EngineOutcome::Cancelled) => Err(StemError::Cancelled),
+            Ok(EngineOutcome::Failed { exit_code, tail }) => Err(StemError::EngineFailed {
+                exit_code,
+                stderr: tail,
+            }),
+            Ok(EngineOutcome::Success) => {
                 let dir = expected_output_dir(out_dir, &self.model, src);
-                let set = StemSet::from_dir(&dir, STEM_EXT);
+                let set = StemSet::from_layout(&dir, STEM_EXT, self.layout);
                 for p in &set.paths {
                     if !p.is_file() {
                         return Err(StemError::MissingOutput(p.clone()));
@@ -658,15 +433,292 @@ impl StemSeparator for DemucsCli {
                 progress(100);
                 Ok(set)
             }
-            Err(StemError::EngineFailed { exit_code, .. }) => {
-                let stderr = stderr_buf
-                    .lock()
-                    .map(|b| stderr_tail(&b))
-                    .unwrap_or_default();
-                Err(StemError::EngineFailed { exit_code, stderr })
-            }
-            Err(other) => Err(other),
         }
+    }
+}
+
+/// The demucs 6-source model as audio-separator names it.
+pub const AUDIO_SEPARATOR_HTDEMUCS_MODEL: &str = "htdemucs_6s.yaml";
+
+/// Shell-out to `python-audio-separator`'s `audio-separator` CLI — the
+/// engine behind the `hq`/`hq-harmony` recipes. One invocation per model
+/// pass; `--custom_output_names` makes every pass emit our canonical
+/// stem filenames directly into `--output_dir`, so there is no
+/// engine-layout dance like demucs' model/track subdirectories.
+pub struct AudioSeparatorCli {
+    pub command: PathBuf,
+    /// Checkpoint download cache passed as `--model_file_dir`. The
+    /// engine's default is under `/tmp` (wiped on reboot), so callers
+    /// pass [`default_model_file_dir`] to persist checkpoints.
+    pub model_file_dir: PathBuf,
+}
+
+/// Where audio-separator model checkpoints persist:
+/// `~/.cache/zytunes/models`. Lives beside the stem cache and — like it —
+/// deliberately ignores `ZYTUNES_CACHE_DIR`: checkpoints are derived,
+/// shareable data every worktree should reuse (they run 200 MB–1 GB
+/// each).
+pub fn default_model_file_dir() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(
+        Path::new(&home)
+            .join(".cache")
+            .join("zytunes")
+            .join("models"),
+    )
+}
+
+/// Build the audio-separator argv for one model pass. `output_names`
+/// maps the model's stem names (e.g. `"Vocals"`) to the file stems we
+/// want on disk (e.g. `"vocals"`), serialized as the JSON
+/// `--custom_output_names` expects. FLAC output matches [`STEM_EXT`].
+pub fn build_audio_separator_args(
+    model: &str,
+    out_dir: &Path,
+    model_file_dir: &Path,
+    output_names: &[(&str, &str)],
+    input: &Path,
+) -> Vec<String> {
+    let names: serde_json::Map<String, serde_json::Value> = output_names
+        .iter()
+        .map(|(stem, file)| (stem.to_string(), serde_json::Value::from(*file)))
+        .collect();
+    vec![
+        input.to_string_lossy().into_owned(),
+        "-m".into(),
+        model.to_string(),
+        "--output_dir".into(),
+        out_dir.to_string_lossy().into_owned(),
+        "--output_format".into(),
+        STEM_EXT.into(),
+        "--model_file_dir".into(),
+        model_file_dir.to_string_lossy().into_owned(),
+        "--custom_output_names".into(),
+        serde_json::Value::Object(names).to_string(),
+    ]
+}
+
+/// The BS-Roformer vocals/instrumental checkpoint the `hq` recipes pin.
+/// Community-consensus best vocal model; also audio-separator's own
+/// default. Swapping it requires bumping the recipe version in
+/// [`RecipeKind::cache_id`] so cached mixes re-separate.
+pub const BS_ROFORMER_VOCALS_MODEL: &str = "model_bs_roformer_ep_317_sdr_12.9755.ckpt";
+
+/// The Mel-Roformer karaoke checkpoint (aufr33/viperx) that splits an
+/// isolated vocal take into lead + backing. Fed pass 1's full vocals —
+/// on vocals-only input its "Instrumental" output IS the backing
+/// vocals. Candidate for an A/B swap against the becruily karaoke model
+/// once live listening tests run; swapping bumps the recipe version.
+pub const MEL_ROFORMER_KARAOKE_MODEL: &str =
+    "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt";
+
+/// What feeds a [`RecipePass`]: the original source track, or a file an
+/// earlier pass produced into the work dir (named by file stem).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassInput {
+    Source,
+    Produced(&'static str),
+}
+
+/// One model pass of a multi-pass recipe. Passes are data, not code —
+/// a recipe is a slice of these and [`CascadeSeparator`] executes them
+/// in order into one shared work dir.
+pub struct RecipePass {
+    pub model: &'static str,
+    pub input: PassInput,
+    /// Engine stem name → output file stem (the `--custom_output_names`
+    /// mapping). Later passes may consume earlier passes' outputs by
+    /// file stem via [`PassInput::Produced`].
+    pub output_names: &'static [(&'static str, &'static str)],
+    /// Progress window `(start, end)` this pass's 0–100 ticks map onto,
+    /// so the strip advances smoothly across the whole cascade instead
+    /// of rewinding at each pass boundary.
+    pub window: (u8, u8),
+    /// Human label for the per-pass log line.
+    pub label: &'static str,
+}
+
+/// The `hq` recipe: BS-Roformer pulls vocals off the source, then
+/// htdemucs_6s separates the band from the devocalized instrumental —
+/// the community-standard cascade. Pass 2's own vocals output is
+/// near-silence by construction and maps to a discard name so it can't
+/// clobber the real vocals stem.
+pub fn hq_recipe_passes() -> &'static [RecipePass] {
+    static PASSES: [RecipePass; 2] = [
+        RecipePass {
+            model: BS_ROFORMER_VOCALS_MODEL,
+            input: PassInput::Source,
+            output_names: &[("Vocals", "vocals"), ("Instrumental", "instrumental")],
+            window: (0, 45),
+            label: "vocals (BS-Roformer)",
+        },
+        RecipePass {
+            model: AUDIO_SEPARATOR_HTDEMUCS_MODEL,
+            input: PassInput::Produced("instrumental"),
+            output_names: &[
+                ("Vocals", "band_vocals"),
+                ("Drums", "drums"),
+                ("Bass", "bass"),
+                ("Guitar", "guitar"),
+                ("Piano", "piano"),
+                ("Other", "other"),
+            ],
+            window: (45, 100),
+            label: "band (htdemucs_6s over the instrumental)",
+        },
+    ];
+    &PASSES
+}
+
+/// The `hq-harmony` recipe: the hq cascade with the vocal take routed
+/// to an intermediate, then split into lead + backing by the karaoke
+/// model. Window weights assume the two Roformer passes dominate on
+/// CPU; tune against live timings.
+pub fn hq_harmony_recipe_passes() -> &'static [RecipePass] {
+    static PASSES: [RecipePass; 3] = [
+        RecipePass {
+            model: BS_ROFORMER_VOCALS_MODEL,
+            input: PassInput::Source,
+            output_names: &[("Vocals", "vocals_full"), ("Instrumental", "instrumental")],
+            window: (0, 35),
+            label: "vocals (BS-Roformer)",
+        },
+        RecipePass {
+            model: AUDIO_SEPARATOR_HTDEMUCS_MODEL,
+            input: PassInput::Produced("instrumental"),
+            output_names: &[
+                ("Vocals", "band_vocals"),
+                ("Drums", "drums"),
+                ("Bass", "bass"),
+                ("Guitar", "guitar"),
+                ("Piano", "piano"),
+                ("Other", "other"),
+            ],
+            window: (35, 70),
+            label: "band (htdemucs_6s over the instrumental)",
+        },
+        RecipePass {
+            model: MEL_ROFORMER_KARAOKE_MODEL,
+            input: PassInput::Produced("vocals_full"),
+            output_names: &[("Vocals", "lead"), ("Instrumental", "backing")],
+            window: (70, 100),
+            label: "lead/backing split (Mel-Roformer karaoke)",
+        },
+    ];
+    &PASSES
+}
+
+impl AudioSeparatorCli {
+    /// Run one model pass: `input` separated by `model` into `out_dir`,
+    /// stems named per `output_names`. [`CascadeSeparator`] calls this
+    /// once per pass with its own progress-windowed hooks.
+    pub(crate) fn run_pass(
+        &self,
+        input: &Path,
+        model: &str,
+        out_dir: &Path,
+        output_names: &[(&str, &str)],
+        hooks: &EngineHooks<'_>,
+    ) -> Result<(), StemError> {
+        std::fs::create_dir_all(out_dir).map_err(|e| StemError::Io(e.to_string()))?;
+        std::fs::create_dir_all(&self.model_file_dir).map_err(|e| StemError::Io(e.to_string()))?;
+        let mut cmd = std::process::Command::new(&self.command);
+        cmd.args(build_audio_separator_args(
+            model,
+            out_dir,
+            &self.model_file_dir,
+            output_names,
+            input,
+        ));
+        match run_engine_process(&mut cmd, hooks) {
+            Err(e) => Err(StemError::Spawn(e)),
+            Ok(EngineOutcome::Cancelled) => Err(StemError::Cancelled),
+            Ok(EngineOutcome::Failed { exit_code, tail }) => Err(StemError::EngineFailed {
+                exit_code,
+                stderr: tail,
+            }),
+            Ok(EngineOutcome::Success) => Ok(()),
+        }
+    }
+
+    /// Cheap-ish availability probe. `--version` is the lightest no-op
+    /// the CLI offers; it still imports the package (unlike demucs'
+    /// argparse-only --help), so the first call after an install can
+    /// take a few seconds — it runs on the background worker, never the
+    /// UI thread.
+    pub fn available(&self) -> Result<(), String> {
+        probe_engine(&self.command, "--version")
+    }
+}
+
+/// Executes a recipe's passes in order through one [`AudioSeparatorCli`]
+/// into a shared work dir. Intermediates (e.g. the instrumental, the
+/// discarded band-vocals residue) are left in the work dir — the worker
+/// removes it on every outcome, and [`store_stems`] moves only the six
+/// canonical files into the cache.
+pub struct CascadeSeparator {
+    pub engine: AudioSeparatorCli,
+    pub passes: &'static [RecipePass],
+    /// Stem order of the final set — the recipe's layout.
+    pub layout: &'static [StemKind],
+}
+
+impl StemSeparator for CascadeSeparator {
+    fn available(&self) -> Result<(), String> {
+        self.engine.available()
+    }
+
+    fn separate(
+        &self,
+        src: &Path,
+        out_dir: &Path,
+        cancelled: &dyn Fn() -> bool,
+        progress: &dyn Fn(u8),
+        on_line: &dyn Fn(&str),
+    ) -> Result<StemSet, StemError> {
+        std::fs::create_dir_all(out_dir).map_err(|e| StemError::Io(e.to_string()))?;
+        let total = self.passes.len();
+        for (i, pass) in self.passes.iter().enumerate() {
+            let input = match pass.input {
+                PassInput::Source => src.to_path_buf(),
+                PassInput::Produced(stem) => {
+                    let p = out_dir.join(format!("{stem}.{STEM_EXT}"));
+                    if !p.is_file() {
+                        // An earlier pass exited zero without writing the
+                        // file this pass consumes — a model/name mismatch
+                        // worth naming precisely.
+                        return Err(StemError::MissingOutput(p));
+                    }
+                    p
+                }
+            };
+            on_line(&format!("pass {}/{total}: {}", i + 1, pass.label));
+            let (lo, hi) = pass.window;
+            let windowed = |p: u8| {
+                let span = hi.saturating_sub(lo) as u32;
+                progress(lo + (span * p.min(100) as u32 / 100) as u8);
+            };
+            self.engine.run_pass(
+                &input,
+                pass.model,
+                out_dir,
+                pass.output_names,
+                &EngineHooks {
+                    cancelled,
+                    on_progress: Some(&windowed),
+                    on_line,
+                },
+            )?;
+            progress(hi);
+        }
+        let set = StemSet::from_layout(out_dir, STEM_EXT, self.layout);
+        for p in &set.paths {
+            if !p.is_file() {
+                return Err(StemError::MissingOutput(p.clone()));
+            }
+        }
+        progress(100);
+        Ok(set)
     }
 }
 
@@ -726,18 +778,25 @@ fn write_meta(entry_dir: &Path, meta: &StemCacheMeta) -> Result<(), String> {
 /// Look up cached stems for `source` under `cache_dir`.
 ///
 /// A hit requires the meta sidecar to parse, its fingerprint to match the
-/// source file's current `(mtime, size)`, its model to match `model`, and
-/// all six stem files to exist. On a hit the meta is rewritten in place to
-/// bump its mtime — the LRU touch. Any mismatch is a miss (the caller
-/// re-separates and [`store_stems`] replaces the entry).
-pub fn cached_stems(cache_dir: &Path, source: &Path, model: &str, log: &Logger) -> Option<StemSet> {
+/// source file's current `(mtime, size)`, its model to match `model`
+/// (the recipe cache id), and every `layout` stem file to exist. On a
+/// hit the meta is rewritten in place to bump its mtime — the LRU touch.
+/// Any mismatch is a miss (the caller re-separates and [`store_stems`]
+/// replaces the entry).
+pub fn cached_stems(
+    cache_dir: &Path,
+    source: &Path,
+    model: &str,
+    layout: &'static [StemKind],
+    log: &Logger,
+) -> Option<StemSet> {
     let entry_dir = cache_dir.join(stem_cache_key(&source.to_string_lossy()));
     let meta = read_meta(&entry_dir)?;
     let current = FileFingerprint::from_path(source)?;
     if meta.fingerprint != current || meta.model != model {
         return None;
     }
-    let set = StemSet::from_dir(&entry_dir, STEM_EXT);
+    let set = StemSet::from_layout(&entry_dir, STEM_EXT, layout);
     if !set.all_exist() {
         log(&format!(
             "stem cache entry {} is incomplete; will re-separate",
@@ -779,7 +838,7 @@ pub fn store_stems(
     let _ = std::fs::remove_dir_all(&stage_dir);
     std::fs::create_dir_all(&stage_dir)
         .map_err(|e| format!("mkdir {} failed: {e}", stage_dir.display()))?;
-    let staged = StemSet::from_dir(&stage_dir, STEM_EXT);
+    let staged = StemSet::from_layout(&stage_dir, STEM_EXT, produced.layout);
     for (src_path, dst_path) in produced.paths.iter().zip(staged.paths.iter()) {
         // rename() first (same filesystem when the worker stages under the
         // cache root); fall back to copy+remove across mount points.
@@ -813,7 +872,7 @@ pub fn store_stems(
     })?;
 
     prune_stem_cache(cache_dir, max_bytes, Some(&key), log);
-    Ok(StemSet::from_dir(&entry_dir, STEM_EXT))
+    Ok(StemSet::from_layout(&entry_dir, STEM_EXT, produced.layout))
 }
 
 fn dir_size_bytes(dir: &Path) -> u64 {
@@ -909,110 +968,13 @@ mod tests {
         root
     }
 
-    /// Poll `pred` every 20 ms for up to ~5 s; panic with `what` if it
-    /// never turns true. Keeps the subprocess tests bounded instead of
-    /// hanging CI on a regression.
-    #[cfg(unix)]
-    fn wait_until(what: &str, pred: impl Fn() -> bool) {
-        for _ in 0..250 {
-            if pred() {
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        panic!("timed out waiting for {what}");
-    }
-
-    /// `kill(pid, 0)` existence probe: false once the process is gone.
-    #[cfg(unix)]
-    fn pid_alive(pid: libc::pid_t) -> bool {
-        // SAFETY: signal 0 delivers nothing; pure existence check.
-        unsafe { libc::kill(pid, 0) == 0 }
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn kill_child_group_takes_down_pipeline_grandchildren() {
-        // The uv bootstrap is `sh -c "curl … | sh"`: killing only the
-        // direct sh leaves the pipeline stages running (the original
-        // cancel bug — the install completed against the user's cancel).
-        // Model the shape with a shell that spawns a long-lived
-        // grandchild and reports its pid.
-        let root = temp_root("pgkill");
-        let pidfile = root.join("grandchild.pid");
-        let mut cmd = std::process::Command::new("sh");
-        cmd.arg("-c").arg(format!(
-            "sleep 30 & echo $! > {}; wait",
-            pidfile.to_string_lossy()
-        ));
-        isolate_child_process(&mut cmd);
-        let mut child = cmd.spawn().expect("spawn sh");
-
-        wait_until("grandchild pid file", || {
-            std::fs::read_to_string(&pidfile).is_ok_and(|s| !s.trim().is_empty())
-        });
-        let grandchild: libc::pid_t = std::fs::read_to_string(&pidfile)
-            .unwrap()
-            .trim()
-            .parse()
-            .expect("pid parses");
-        assert!(pid_alive(grandchild), "grandchild running before the kill");
-
-        kill_child_group(&mut child);
-        wait_until("grandchild death", || !pid_alive(grandchild));
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn isolated_child_stdin_is_null_not_the_terminal() {
-        // `read` off a null stdin sees instant EOF; off an inherited
-        // terminal it would block (and in a background process group the
-        // kernel would SIGTTIN-stop the child — the frozen-demucs bug).
-        let mut cmd = std::process::Command::new("sh");
-        cmd.arg("-c").arg("read -r line; exit 42");
-        isolate_child_process(&mut cmd);
-        let child = std::sync::Mutex::new(cmd.spawn().expect("spawn sh"));
-        wait_until("child exits on stdin EOF", || {
-            child.lock().unwrap().try_wait().is_ok_and(|s| s.is_some())
-        });
-        let status = child.into_inner().unwrap().wait().expect("wait");
-        assert_eq!(
-            status.code(),
-            Some(42),
-            "read must fail with EOF, not block"
-        );
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn quit_teardown_kills_registered_children_and_guard_deregisters() {
-        let mut cmd = std::process::Command::new("sh");
-        cmd.arg("-c").arg("sleep 30");
-        isolate_child_process(&mut cmd);
-        let mut child = cmd.spawn().expect("spawn sh");
-        let pid = child.id();
-        {
-            let _guard = ChildGroupGuard::register(&child);
-            assert!(active_child_pids().lock().unwrap().contains(&pid));
-
-            // The TUI quit path: every registered child group dies.
-            kill_active_stem_children();
-            let status = child.wait().expect("reap");
-            assert!(!status.success(), "sleeper was killed, not finished");
-        }
-        assert!(
-            !active_child_pids().lock().unwrap().contains(&pid),
-            "guard drop must deregister"
-        );
-    }
-
     /// Write a fake source track and a produced-stems dir, returning both.
     fn fake_separation(root: &Path, body: &[u8]) -> (PathBuf, StemSet) {
         let source = root.join("song.mp3");
         std::fs::write(&source, body).unwrap();
         let produced_dir = root.join("produced");
         std::fs::create_dir_all(&produced_dir).unwrap();
-        let produced = StemSet::from_dir(&produced_dir, STEM_EXT);
+        let produced = StemSet::from_layout(&produced_dir, STEM_EXT, SIX_STEM_LAYOUT);
         for p in &produced.paths {
             std::fs::write(p, b"flacdata").unwrap();
         }
@@ -1020,16 +982,52 @@ mod tests {
     }
 
     #[test]
-    fn stem_kind_order_matches_indices_and_filenames() {
-        // UI order (keys 1-6), gains indices, and demucs filenames all
-        // key off this array — a re-order must fail loudly.
-        let expected = ["vocals", "drums", "bass", "guitar", "piano", "other"];
-        assert_eq!(StemKind::ALL.len(), NUM_STEMS);
-        for (i, kind) in StemKind::ALL.iter().enumerate() {
-            assert_eq!(kind.index(), i);
-            assert_eq!(kind.file_stem(), expected[i]);
-            assert_eq!(kind.short_label().len(), 3, "strip layout assumes 3 chars");
+    fn recipe_parses_config_values_and_rejects_unknown() {
+        for (value, kind) in [
+            ("demucs", RecipeKind::Demucs),
+            ("hq", RecipeKind::Hq),
+            ("hq-harmony", RecipeKind::HqHarmony),
+        ] {
+            assert_eq!(value.parse::<RecipeKind>(), Ok(kind));
+            // Display round-trips to the config value.
+            assert_eq!(kind.to_string(), value);
         }
+        assert!("roformer".parse::<RecipeKind>().is_err());
+        assert!("".parse::<RecipeKind>().is_err());
+    }
+
+    #[test]
+    fn recipe_engine_mapping() {
+        use crate::stems::provision::EngineKind;
+        assert_eq!(RecipeKind::Demucs.engine(), EngineKind::Demucs);
+        assert_eq!(RecipeKind::Hq.engine(), EngineKind::AudioSeparator);
+        assert_eq!(RecipeKind::HqHarmony.engine(), EngineKind::AudioSeparator);
+    }
+
+    #[test]
+    fn recipe_cache_ids_preserve_demucs_and_version_the_rest() {
+        // The demucs recipe's cache id IS the configured model string so
+        // every pre-recipe cache entry (keyed "htdemucs_6s" or a custom
+        // model) stays a hit after upgrading.
+        assert_eq!(RecipeKind::Demucs.cache_id("htdemucs_6s"), "htdemucs_6s");
+        assert_eq!(RecipeKind::Demucs.cache_id("htdemucs"), "htdemucs");
+        // Multi-pass recipes carry an explicit version so a checkpoint
+        // swap can force re-separation by bumping it.
+        assert_eq!(RecipeKind::Hq.cache_id("htdemucs_6s"), "hq/v1");
+        assert_eq!(
+            RecipeKind::HqHarmony.cache_id("htdemucs_6s"),
+            "hq-harmony/v1"
+        );
+        // Distinct recipes must never collide in the cache.
+        let ids = [
+            RecipeKind::Demucs.cache_id("htdemucs_6s"),
+            RecipeKind::Hq.cache_id("htdemucs_6s"),
+            RecipeKind::HqHarmony.cache_id("htdemucs_6s"),
+        ];
+        assert_eq!(
+            ids.iter().collect::<std::collections::HashSet<_>>().len(),
+            3
+        );
     }
 
     #[test]
@@ -1048,8 +1046,8 @@ mod tests {
     }
 
     #[test]
-    fn stem_set_from_dir_assembles_demucs_layout() {
-        let set = StemSet::from_dir(Path::new("/cache/abc"), "flac");
+    fn stem_set_from_six_layout_assembles_demucs_shape() {
+        let set = StemSet::from_layout(Path::new("/cache/abc"), "flac", SIX_STEM_LAYOUT);
         assert_eq!(set.paths[0], Path::new("/cache/abc/vocals.flac"));
         assert_eq!(set.paths[5], Path::new("/cache/abc/other.flac"));
     }
@@ -1085,83 +1083,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_progress_handles_tqdm_chunks() {
-        // Typical tqdm rewrite chunk: several \r-separated frames; the
-        // last percentage wins.
-        let chunk = " 12%|█▏        | 26.1/218.7\r 26%|██▌       | 56.7/218.7 [00:12<00:35,  4.60seconds/s]";
-        assert_eq!(parse_progress_percent(chunk), Some(26));
-        assert_eq!(parse_progress_percent("100%|██████████|"), Some(100));
-        assert_eq!(parse_progress_percent("  5%|▌"), Some(5));
-        // No tick in the chunk → None (caller keeps previous value).
-        assert_eq!(parse_progress_percent("Separating track song.mp3"), None);
-        // A bare '%' without digits is not a tick.
-        assert_eq!(parse_progress_percent("weird % sign"), None);
-        // >100 can only come from garbage; ignore it.
-        assert_eq!(parse_progress_percent("999%|"), None);
-        // ...but a valid tick elsewhere in the same chunk still counts.
-        assert_eq!(parse_progress_percent("999%| then 42%|"), Some(42));
-        // A digit run longer than three isn't a percentage — taking its
-        // last three digits used to report "1000%" as 0 and "2050%" as
-        // 50, visibly rewinding the strip.
-        assert_eq!(parse_progress_percent("1000%|"), None);
-        assert_eq!(parse_progress_percent("2050%|"), None);
-    }
-
-    #[test]
-    fn parse_progress_survives_chunk_boundary_splits() {
-        // ' 26%' split mid-number across two pipe reads: chunk 2 alone
-        // would parse its trailing '6%' as 6 and rewind the display. The
-        // carry re-joins the digits.
-        let mut carry = Vec::new();
-        assert_eq!(
-            parse_progress_across_chunks(&mut carry, b" 12%|frame\r 2"),
-            Some(12)
-        );
-        assert_eq!(
-            parse_progress_across_chunks(&mut carry, b"6%|frame"),
-            Some(26)
-        );
-
-        // Split exactly before the '%' too.
-        let mut carry = Vec::new();
-        assert_eq!(parse_progress_across_chunks(&mut carry, b" 84"), None);
-        assert_eq!(parse_progress_across_chunks(&mut carry, b"%|"), Some(84));
-
-        // Digit-run rejection still applies across the boundary: "1000%"
-        // split as "10" + "00%" must not become 0.
-        let mut carry = Vec::new();
-        assert_eq!(parse_progress_across_chunks(&mut carry, b" 10"), None);
-        assert_eq!(parse_progress_across_chunks(&mut carry, b"00%|"), None);
-    }
-
-    #[test]
-    fn extract_info_lines_splits_and_filters() {
-        let mut pending = Vec::new();
-        // Partial line held across chunks; progress bars and blanks dropped.
-        let first = extract_info_lines(&mut pending, b"Downloading: \"https://x/htde");
-        assert!(first.is_empty(), "incomplete line must wait for its end");
-        let second = extract_info_lines(
-            &mut pending,
-            b"mucs_6s.th\"\n 10%|#  | bar\r\nSeparating track song.mp3\n",
-        );
-        assert_eq!(
-            second,
-            vec![
-                "Downloading: \"https://x/htdemucs_6s.th\"".to_string(),
-                "Separating track song.mp3".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn stderr_tail_drops_progress_bars_and_keeps_diagnostics() {
-        let raw = b" 10%|#         | x\r 20%|##        | y\nTraceback (most recent call last):\n  ValueError: bad model\n";
-        let tail = stderr_tail(raw);
-        assert!(tail.contains("ValueError: bad model"));
-        assert!(!tail.contains("%|"));
-    }
-
-    #[test]
     fn cache_key_is_stable_and_path_sensitive() {
         let a = stem_cache_key("/music/a.mp3");
         assert_eq!(a, stem_cache_key("/music/a.mp3"));
@@ -1182,7 +1103,8 @@ mod tests {
         // The produced files were moved, not copied.
         assert!(!produced.paths[0].exists());
 
-        let hit = cached_stems(&cache, &source, "htdemucs_6s", &log).expect("cache hit");
+        let hit =
+            cached_stems(&cache, &source, "htdemucs_6s", SIX_STEM_LAYOUT, &log).expect("cache hit");
         assert_eq!(hit, stored);
 
         let _ = std::fs::remove_dir_all(&root);
@@ -1197,11 +1119,11 @@ mod tests {
         store_stems(&cache, &source, "htdemucs_6s", &produced, u64::MAX, &log).unwrap();
 
         // Different model → miss even though files are present.
-        assert!(cached_stems(&cache, &source, "htdemucs", &log).is_none());
+        assert!(cached_stems(&cache, &source, "htdemucs", SIX_STEM_LAYOUT, &log).is_none());
 
         // Re-written source with a different size → fingerprint miss.
         std::fs::write(&source, b"mp3data-but-longer").unwrap();
-        assert!(cached_stems(&cache, &source, "htdemucs_6s", &log).is_none());
+        assert!(cached_stems(&cache, &source, "htdemucs_6s", SIX_STEM_LAYOUT, &log).is_none());
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1216,7 +1138,7 @@ mod tests {
             store_stems(&cache, &source, "htdemucs_6s", &produced, u64::MAX, &log).unwrap();
 
         std::fs::remove_file(&stored.paths[3]).unwrap();
-        assert!(cached_stems(&cache, &source, "htdemucs_6s", &log).is_none());
+        assert!(cached_stems(&cache, &source, "htdemucs_6s", SIX_STEM_LAYOUT, &log).is_none());
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1285,7 +1207,7 @@ mod tests {
         std::fs::write(&source, b"v2-longer").unwrap();
         let produced_dir = root.join("produced2");
         std::fs::create_dir_all(&produced_dir).unwrap();
-        let produced2 = StemSet::from_dir(&produced_dir, STEM_EXT);
+        let produced2 = StemSet::from_layout(&produced_dir, STEM_EXT, SIX_STEM_LAYOUT);
         for p in &produced2.paths {
             std::fs::write(p, b"newflac").unwrap();
         }
@@ -1293,10 +1215,344 @@ mod tests {
         assert!(stored.all_exist());
         assert_eq!(std::fs::read(&stored.paths[0]).unwrap(), b"newflac");
 
-        let hit = cached_stems(&cache, &source, "m", &log).expect("fresh entry hits");
+        let hit =
+            cached_stems(&cache, &source, "m", SIX_STEM_LAYOUT, &log).expect("fresh entry hits");
         assert_eq!(hit, stored);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn audio_separator_args_shape_and_output_names_json() {
+        let names = [("Vocals", "vocals"), ("Drums", "drums")];
+        let args = build_audio_separator_args(
+            "htdemucs_6s.yaml",
+            Path::new("/tmp/out"),
+            Path::new("/cache/models"),
+            &names,
+            Path::new("/music/a.flac"),
+        );
+        assert_eq!(args[0], "/music/a.flac", "input is positional and first");
+        for (flag, value) in [
+            ("-m", "htdemucs_6s.yaml"),
+            ("--output_dir", "/tmp/out"),
+            ("--output_format", "flac"),
+            ("--model_file_dir", "/cache/models"),
+        ] {
+            assert!(
+                args.windows(2).any(|w| w[0] == flag && w[1] == value),
+                "expected `{flag} {value}` in {args:?}"
+            );
+        }
+        // The output-name mapping must survive the JSON round trip; the
+        // exact key strings are the engine's stem names for the model.
+        let idx = args
+            .iter()
+            .position(|a| a == "--custom_output_names")
+            .expect("--custom_output_names present");
+        let parsed: serde_json::Value = serde_json::from_str(&args[idx + 1]).unwrap();
+        assert_eq!(parsed["Vocals"], "vocals");
+        assert_eq!(parsed["Drums"], "drums");
+        assert_eq!(parsed.as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn stem_layouts_shape() {
+        assert_eq!(SIX_STEM_LAYOUT.len(), 6);
+        assert_eq!(SIX_STEM_LAYOUT[0], StemKind::Vocals);
+        assert_eq!(
+            HARMONY_STEM_LAYOUT,
+            &[
+                StemKind::LeadVocals,
+                StemKind::BackingVocals,
+                StemKind::Drums,
+                StemKind::Bass,
+                StemKind::Guitar,
+                StemKind::Piano,
+                StemKind::Other,
+            ]
+        );
+        assert!(SIX_STEM_LAYOUT.len() <= MAX_STEMS);
+        assert!(HARMONY_STEM_LAYOUT.len() <= MAX_STEMS);
+
+        assert_eq!(RecipeKind::Demucs.layout(), SIX_STEM_LAYOUT);
+        assert_eq!(RecipeKind::Hq.layout(), SIX_STEM_LAYOUT);
+        assert_eq!(RecipeKind::HqHarmony.layout(), HARMONY_STEM_LAYOUT);
+
+        // The strip renderer assumes exactly-3-char short labels and
+        // unique file stems for every kind in every layout.
+        let mut seen = std::collections::HashSet::new();
+        for kind in HARMONY_STEM_LAYOUT.iter().chain(SIX_STEM_LAYOUT) {
+            assert_eq!(kind.short_label().chars().count(), 3, "{kind:?}");
+            seen.insert(kind.file_stem());
+        }
+        assert_eq!(seen.len(), 8, "8 distinct kinds across both layouts");
+    }
+
+    #[test]
+    fn harmony_passes_produce_exactly_the_harmony_layout() {
+        let passes = hq_harmony_recipe_passes();
+        assert_eq!(passes.len(), 3, "vocals, band, karaoke");
+
+        // Pass 1 extracts the full vocal take to an INTERMEDIATE name —
+        // the harmony layout has no plain "vocals" stem to collide with.
+        assert!(matches!(passes[0].input, PassInput::Source));
+        assert!(passes[0]
+            .output_names
+            .iter()
+            .any(|(_, v)| *v == "vocals_full"));
+
+        // Pass 3 splits that take into lead + backing with the pinned
+        // karaoke checkpoint.
+        assert!(matches!(
+            passes[2].input,
+            PassInput::Produced("vocals_full")
+        ));
+        assert_eq!(passes[2].model, MEL_ROFORMER_KARAOKE_MODEL);
+
+        // Union of outputs covers the harmony layout exactly once.
+        for kind in HARMONY_STEM_LAYOUT {
+            let count = passes
+                .iter()
+                .flat_map(|p| p.output_names.iter())
+                .filter(|(_, v)| *v == kind.file_stem())
+                .count();
+            assert_eq!(count, 1, "{kind:?} must be produced exactly once");
+        }
+
+        // Windows tile 0..=100.
+        assert_eq!(passes[0].window.0, 0);
+        assert_eq!(passes[0].window.1, passes[1].window.0);
+        assert_eq!(passes[1].window.1, passes[2].window.0);
+        assert_eq!(passes[2].window.1, 100);
+    }
+
+    #[test]
+    fn stem_set_from_layout_orders_paths() {
+        let set = StemSet::from_layout(Path::new("/cache/abc"), "flac", HARMONY_STEM_LAYOUT);
+        assert_eq!(set.paths.len(), 7);
+        assert_eq!(set.paths[0], Path::new("/cache/abc/lead.flac"));
+        assert_eq!(set.paths[1], Path::new("/cache/abc/backing.flac"));
+        assert_eq!(set.paths[6], Path::new("/cache/abc/other.flac"));
+        assert_eq!(set.layout, HARMONY_STEM_LAYOUT);
+    }
+
+    #[test]
+    fn stem_gains_pad_to_capacity() {
+        // A 7-stem layout fills 7 slots; the unused capacity idles muted.
+        let gains = new_stem_gains(&[true; 7]);
+        for i in 0..7 {
+            assert_eq!(stem_gain(&gains, i), 1.0);
+        }
+        assert_eq!(stem_gain(&gains, 7), 0.0, "unused slot stays silent");
+    }
+
+    #[test]
+    fn store_then_hit_roundtrip_with_harmony_layout() {
+        let root = temp_root("harmony-roundtrip");
+        let cache = root.join("cache");
+        let source = root.join("song.mp3");
+        std::fs::write(&source, b"mp3data").unwrap();
+        let produced_dir = root.join("produced");
+        std::fs::create_dir_all(&produced_dir).unwrap();
+        let produced = StemSet::from_layout(&produced_dir, STEM_EXT, HARMONY_STEM_LAYOUT);
+        for p in &produced.paths {
+            std::fs::write(p, b"flacdata").unwrap();
+        }
+        let log = default_logger();
+
+        let stored = store_stems(&cache, &source, "hq-harmony/v1", &produced, u64::MAX, &log)
+            .expect("store succeeds");
+        assert_eq!(stored.paths.len(), 7);
+        assert!(stored.all_exist());
+
+        let hit = cached_stems(&cache, &source, "hq-harmony/v1", HARMONY_STEM_LAYOUT, &log)
+            .expect("cache hit");
+        assert_eq!(hit, stored);
+
+        // The same entry looked up under the six-stem layout misses:
+        // there is no vocals.flac in a harmony entry.
+        assert!(cached_stems(&cache, &source, "hq-harmony/v1", SIX_STEM_LAYOUT, &log).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn hq_passes_produce_exactly_the_six_canonical_stems() {
+        let passes = hq_recipe_passes();
+        assert_eq!(passes.len(), 2, "vocals pass + band pass");
+
+        // Pass 1: BS-Roformer over the source, producing the vocals stem
+        // and the intermediate the band pass consumes.
+        assert!(matches!(passes[0].input, PassInput::Source));
+        assert_eq!(passes[0].model, BS_ROFORMER_VOCALS_MODEL);
+        assert!(passes[0]
+            .output_names
+            .iter()
+            .any(|(k, v)| *k == "Vocals" && *v == "vocals"));
+        assert!(passes[0]
+            .output_names
+            .iter()
+            .any(|(_, v)| *v == "instrumental"));
+
+        // Pass 2: htdemucs_6s over pass 1's instrumental.
+        assert!(matches!(
+            passes[1].input,
+            PassInput::Produced("instrumental")
+        ));
+        assert_eq!(passes[1].model, AUDIO_SEPARATOR_HTDEMUCS_MODEL);
+        // Its vocals output is residue (the input is already devocalized)
+        // and must NOT overwrite pass 1's real vocals stem.
+        let band_vocals = passes[1]
+            .output_names
+            .iter()
+            .find(|(k, _)| *k == "Vocals")
+            .expect("pass 2 must name its vocals output somewhere");
+        assert_ne!(
+            band_vocals.1, "vocals",
+            "residue may not clobber the real stem"
+        );
+
+        // Union of all pass outputs covers every canonical stem exactly once.
+        for kind in SIX_STEM_LAYOUT {
+            let count = passes
+                .iter()
+                .flat_map(|p| p.output_names.iter())
+                .filter(|(_, v)| *v == kind.file_stem())
+                .count();
+            assert_eq!(count, 1, "{kind:?} must be produced exactly once");
+        }
+
+        // Progress windows tile 0..=100 without gaps or overlap.
+        assert_eq!(passes[0].window.0, 0);
+        assert_eq!(passes[0].window.1, passes[1].window.0);
+        assert_eq!(passes[1].window.1, 100);
+    }
+
+    /// A stub `audio-separator` that honors `--output_dir` and
+    /// `--custom_output_names`: it creates one file per mapped output
+    /// name, so multi-pass plumbing (intermediates feeding later passes)
+    /// is exercised for real, engine-free.
+    #[cfg(unix)]
+    fn write_stub_audio_separator(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("audio-separator");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n\
+             out=\"\"; json=\"\"; prev=\"\"\n\
+             for a in \"$@\"; do\n\
+               case \"$prev\" in\n\
+                 --output_dir) out=\"$a\";;\n\
+                 --custom_output_names) json=\"$a\";;\n\
+               esac\n\
+               prev=\"$a\"\n\
+             done\n\
+             [ -n \"$out\" ] || exit 9\n\
+             mkdir -p \"$out\"\n\
+             echo \"$json\" | tr '{,}' '\\n\\n\\n' | sed -n 's/.*:\"\\([^\"]*\\)\".*/\\1/p' | \\\n\
+             while read -r f; do\n\
+               : > \"$out/$f.flac\"\n\
+             done\n\
+             printf ' 50%%|#####     |\\r' 1>&2\n\
+             echo done-stub\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cascade_runs_all_passes_and_windows_progress() {
+        let root = temp_root("cascade");
+        let src = root.join("song.flac");
+        std::fs::write(&src, b"flac").unwrap();
+        let out_dir = root.join("work");
+        let sep = CascadeSeparator {
+            engine: AudioSeparatorCli {
+                command: write_stub_audio_separator(&root),
+                model_file_dir: root.join("models"),
+            },
+            passes: hq_recipe_passes(),
+            layout: SIX_STEM_LAYOUT,
+        };
+        let ticks = std::sync::Mutex::new(Vec::new());
+        let lines = std::sync::Mutex::new(Vec::new());
+        let set = sep
+            .separate(
+                &src,
+                &out_dir,
+                &|| false,
+                &|p| ticks.lock().unwrap().push(p),
+                &|l: &str| lines.lock().unwrap().push(l.to_string()),
+            )
+            .expect("stub cascade succeeds");
+        assert!(set.all_exist());
+        assert_eq!(set.paths[0], out_dir.join("vocals.flac"));
+
+        // The stub emits a 50% tick per pass: windowed into (0,45) that
+        // is 22, into (45,100) it is 72. Ticks must be monotone within
+        // the run and end at 100.
+        let ticks = ticks.into_inner().unwrap();
+        assert!(ticks.contains(&22), "pass-1 windowed tick: {ticks:?}");
+        assert!(ticks.contains(&72), "pass-2 windowed tick: {ticks:?}");
+        assert_eq!(*ticks.last().unwrap(), 100);
+        assert!(
+            ticks.windows(2).all(|w| w[0] <= w[1]),
+            "monotone: {ticks:?}"
+        );
+
+        // Each pass announces itself in the log.
+        let lines = lines.into_inner().unwrap();
+        assert!(lines.iter().any(|l| l.contains("pass 1/2")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("pass 2/2")), "{lines:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cascade_missing_intermediate_is_missing_output_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_root("cascade-missing");
+        let src = root.join("song.flac");
+        std::fs::write(&src, b"flac").unwrap();
+        // Stub writes nothing: pass 1 "succeeds" but produces no
+        // instrumental, so pass 2's input is missing — the error must
+        // name that file, not a generic engine failure.
+        let script = root.join("audio-separator");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let sep = CascadeSeparator {
+            engine: AudioSeparatorCli {
+                command: script,
+                model_file_dir: root.join("models"),
+            },
+            passes: hq_recipe_passes(),
+            layout: SIX_STEM_LAYOUT,
+        };
+        let err = sep
+            .separate(&src, &root.join("work"), &|| false, &|_| {}, &|_| {})
+            .unwrap_err();
+        match err {
+            StemError::MissingOutput(p) => {
+                assert!(
+                    p.to_string_lossy().contains("instrumental"),
+                    "should name the missing intermediate: {p:?}"
+                )
+            }
+            other => panic!("expected MissingOutput, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn audio_separator_available_reports_missing_binary() {
+        let sep = AudioSeparatorCli {
+            command: PathBuf::from("/nonexistent/zytunes-audiosep-test"),
+            model_file_dir: PathBuf::from("/tmp"),
+        };
+        let err = sep.available().unwrap_err();
+        assert!(err.contains("not found"), "{err}");
     }
 
     /// Live-engine coverage (spawn/cancel/kill) requires a real demucs
@@ -1307,6 +1563,7 @@ mod tests {
         let sep = DemucsCli {
             command: PathBuf::from("/nonexistent/zytunes-demucs-test"),
             model: "htdemucs_6s".into(),
+            layout: SIX_STEM_LAYOUT,
         };
         let err = sep.available().unwrap_err();
         assert!(err.contains("not found"), "{err}");
