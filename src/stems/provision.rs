@@ -103,6 +103,10 @@ impl std::fmt::Display for ProvisionError {
 
 impl std::error::Error for ProvisionError {}
 
+/// A ready-to-spawn subprocess invocation: `(program, args, envs)` —
+/// the shape every `build_*_command` constructor here returns.
+pub type CommandSpec = (PathBuf, Vec<String>, Vec<(String, String)>);
+
 /// zytunes' private bin dir for managed executables (the bootstrapped
 /// `uv` and the `demucs` shim uv installs there via `UV_TOOL_BIN_DIR`).
 pub fn zytunes_bin_dir() -> Option<PathBuf> {
@@ -160,17 +164,101 @@ pub fn find_engine_with(
     path_env: &str,
     bin_dir: Option<&Path>,
 ) -> Option<PathBuf> {
+    discover_engine_with(engine, explicit, path_env, bin_dir).map(|(p, _)| p)
+}
+
+/// Which precedence rung engine discovery resolved a binary from. Shown
+/// by the stem settings panel so "why am I not being prompted to
+/// install" answers itself — a stale `[stems] command` is visibly the
+/// rung in charge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineSource {
+    /// The explicit `[stems] command` config value.
+    ConfigCommand,
+    /// Found as the engine's exe name on `PATH`.
+    PathEnv,
+    /// zytunes' managed install dir (`~/.local/share/zytunes/bin`).
+    Managed,
+}
+
+impl EngineSource {
+    /// Short human-readable rung name for the settings panel.
+    pub fn label(self) -> &'static str {
+        match self {
+            EngineSource::ConfigCommand => "[stems] command",
+            EngineSource::PathEnv => "PATH",
+            EngineSource::Managed => "managed install",
+        }
+    }
+}
+
+/// [`find_engine_with`] that also reports which precedence rung matched.
+pub fn discover_engine_with(
+    engine: EngineKind,
+    explicit: Option<&Path>,
+    path_env: &str,
+    bin_dir: Option<&Path>,
+) -> Option<(PathBuf, EngineSource)> {
     if let Some(cmd) = explicit {
         if is_executable(cmd) && command_matches_engine(cmd, engine) {
-            return Some(cmd.to_path_buf());
+            return Some((cmd.to_path_buf(), EngineSource::ConfigCommand));
         }
     }
     if let Some(found) = find_on_path_in(engine.exe_name(), path_env) {
-        return Some(found);
+        return Some((found, EngineSource::PathEnv));
     }
     bin_dir
         .map(|d| d.join(engine.exe_name()))
         .filter(|p| is_executable(p))
+        .map(|p| (p, EngineSource::Managed))
+}
+
+/// [`discover_engine_with`] against the real environment.
+pub fn discover_engine(
+    engine: EngineKind,
+    explicit: Option<&Path>,
+) -> Option<(PathBuf, EngineSource)> {
+    let path_env = std::env::var("PATH").unwrap_or_default();
+    discover_engine_with(engine, explicit, &path_env, zytunes_bin_dir().as_deref())
+}
+
+/// Build the `uv tool uninstall` invocation for an engine package spec.
+/// uv addresses installed tools by bare package name, never by the
+/// versioned/extra'd spec that installed them.
+pub fn build_uninstall_command(
+    uv: &Path,
+    package_spec: &str,
+    bin_dir: Option<&Path>,
+) -> Result<CommandSpec, String> {
+    let name = package_name(package_spec);
+    // `uv tool uninstall` is destructive and the spec is user config: a
+    // name uv would parse as a flag (`--all` removes every uv tool on
+    // the machine) must never reach argv.
+    if name.is_empty() || name.starts_with('-') {
+        return Err(format!(
+            "refusing to uninstall suspicious package name {name:?} from [stems] package"
+        ));
+    }
+    // Same UV_TOOL_BIN_DIR pin as the install: uv resolves the shim dir
+    // at run time, so an unpinned uninstall could leave a stale shim in
+    // the managed bin dir that discovery keeps "finding".
+    let envs = bin_dir
+        .map(|d| {
+            vec![(
+                "UV_TOOL_BIN_DIR".to_string(),
+                d.to_string_lossy().into_owned(),
+            )]
+        })
+        .unwrap_or_default();
+    Ok((
+        uv.to_path_buf(),
+        vec![
+            "tool".to_string(),
+            "uninstall".to_string(),
+            name.to_string(),
+        ],
+        envs,
+    ))
 }
 
 /// Whether an explicit `[stems] command` plausibly belongs to `engine`:
@@ -361,6 +449,79 @@ mod tests {
         std::fs::write(&p, b"#!/bin/sh\n").unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
         p
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_engine_reports_the_precedence_rung() {
+        let root = temp_dir("discover");
+        let cfg_dir = root.join("cfg");
+        let path_dir = root.join("path");
+        let managed = root.join("managed");
+        for d in [&cfg_dir, &path_dir, &managed] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let explicit = write_executable(&cfg_dir, "demucs");
+        let on_path = write_executable(&path_dir, "demucs");
+        let shim = write_executable(&managed, "demucs");
+        let path_env = path_dir.to_string_lossy().into_owned();
+
+        // Explicit config command wins and is labelled as such.
+        let (p, src) = discover_engine_with(
+            EngineKind::Demucs,
+            Some(&explicit),
+            &path_env,
+            Some(&managed),
+        )
+        .unwrap();
+        assert_eq!(p, explicit);
+        assert_eq!(src, EngineSource::ConfigCommand);
+
+        // No explicit → PATH.
+        let (p, src) =
+            discover_engine_with(EngineKind::Demucs, None, &path_env, Some(&managed)).unwrap();
+        assert_eq!(p, on_path);
+        assert_eq!(src, EngineSource::PathEnv);
+
+        // Nothing on PATH → the managed install dir.
+        let (p, src) = discover_engine_with(EngineKind::Demucs, None, "", Some(&managed)).unwrap();
+        assert_eq!(p, shim);
+        assert_eq!(src, EngineSource::Managed);
+
+        assert!(discover_engine_with(EngineKind::Demucs, None, "", None).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn build_uninstall_command_uses_the_bare_package_name() {
+        let (prog, args, envs) = build_uninstall_command(
+            Path::new("/u/uv"),
+            &format!("audio-separator[cpu]=={AUDIO_SEPARATOR_VERSION}"),
+            Some(Path::new("/managed/bin")),
+        )
+        .unwrap();
+        assert_eq!(prog, Path::new("/u/uv"));
+        assert_eq!(args, vec!["tool", "uninstall", "audio-separator"]);
+        assert_eq!(
+            envs,
+            vec![("UV_TOOL_BIN_DIR".to_string(), "/managed/bin".to_string())],
+            "uninstall pins the shim dir like the install does"
+        );
+        let (_, args, envs) = build_uninstall_command(Path::new("/u/uv"), "demucs", None).unwrap();
+        assert_eq!(args, vec!["tool", "uninstall", "demucs"]);
+        assert!(envs.is_empty());
+    }
+
+    #[test]
+    fn build_uninstall_command_rejects_flag_shaped_names() {
+        // `uv tool uninstall --all` removes every uv tool on the machine;
+        // a config value must never be able to smuggle a flag into argv.
+        for spec in ["--all", "-q", "", "  "] {
+            assert!(
+                build_uninstall_command(Path::new("/u/uv"), spec, None).is_err(),
+                "{spec:?} must be refused"
+            );
+        }
     }
 
     #[test]

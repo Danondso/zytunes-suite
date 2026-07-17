@@ -330,39 +330,34 @@ Tests: `cache_key_embeds_recipe_and_sanitizes_slashes`,
 `legacy_bare_hash_entry_migrates_losslessly_and_hits`,
 `legacy_migration_leaves_foreign_dirs_and_superseded_copies`.
 
-### Stem config panel in the TUI
-Recipe selection is config-file-only today (`[stems] recipe`, read via
-`StemsConfig::recipe_kind` in `src/tui/config.rs:123`), so trying a different
-recipe means quitting, hand-editing `~/.config/zytunes/config.toml`, and
-relaunching. There is no in-TUI affordance and no discovery path — a user who
-never reads the config docs will never learn `hq`/`hq-harmony` exist.
-
-Scope:
-
-1. **Overlay** in the existing modal cascade (`src/tui/app/keys.rs` —
-   bool-returning `handle_*_key` tried before the global map), following the
-   theme picker's shape since it is the closest analogue: a list, live
-   preview of the selection, persist-on-confirm.
-2. **Recipe picker.** List `RecipeKind` variants with their engine, stem
-   count, and a rough cost hint (`hq-harmony` = 3 passes + 2 checkpoint
-   downloads on first use). Persist via the same `update_contents` path the
-   theme picker uses — note it refuses to write an unparseable config file,
-   which is the desired behaviour here too.
-3. **Model overrides.** `[stems] model` is demucs-only; the Roformer
-   checkpoints are pinned consts (`BS_ROFORMER_VOCALS_MODEL`,
-   `MEL_ROFORMER_KARAOKE_MODEL`) deliberately, since `AUDIO_SEPARATOR_VERSION`
-   pins the argv contract alongside them. Exposing arbitrary checkpoint
-   strings invites unbootable combinations. Prefer a curated list per recipe
-   over a free-text field; if free-text lands, validate before persisting.
-4. **Uninstall.** `uv tool uninstall <package>` for the engine, plus optional
-   eviction of `~/.cache/zytunes/models` (Roformer checkpoints, hundreds of
-   MB) and `~/.cache/zytunes/stems`. Show reclaimed bytes per target; confirm
-   destructively. Must clear `[stems] command` on success — a stale path there
-   is exactly what suppresses the re-install consent prompt.
-5. **Engine state display.** Show what is currently discovered and via which
-   precedence rung (`[stems] command` -> PATH -> managed
-   `~/.local/share/zytunes/bin`). This alone would have explained the
-   "why am I not being prompted" confusion during bring-up.
+### ~~Stem config panel in the TUI~~ (done)
+`o` opens a Stem Settings modal (`StemPanel` in `src/tui/app.rs`,
+`handle_stem_panel_key` in the modal cascade, `draw_stem_panel` in
+`src/tui/ui/mod.rs`), following the theme picker's shape. Recipe picker
+lists all `ALL_RECIPES` rows with engine, stem count, and a cost hint;
+Enter persists via the same `config::update` path (in-memory/persist
+split like `cycle_show_player` so tests never write real config; takes
+effect on the next `M`). Engine state shows each engine's discovered
+binary and its precedence rung via the new
+`provision::discover_engine` / `EngineSource` (`[stems] command` → PATH
+→ managed install) — the "why am I not being prompted" answer. Pinned
+checkpoints render read-only (curated over free-text, per the scope
+note). `u` opens a destructive confirm: `y` runs
+`BgCommand::UninstallStemEngine` (worker shells `uv tool uninstall`
+via `build_uninstall_command`, evicts the audio-separator-owned model
+cache, reports reclaimed bytes), `Y` also deletes the stems cache
+(optional — cached stems stay playable engine-free). Refused while a
+stem job runs. On the `StemEngineUninstalled` event a `[stems] command`
+naming the uninstalled engine is cleared (a stale path there is exactly
+what suppresses the re-install consent) while the other engine's
+command survives. Tests: `stem_panel_opens_on_the_configured_recipe_and_wraps`,
+`stem_panel_confirm_updates_recipe_in_memory_and_closes`,
+`stem_panel_uninstall_needs_an_installed_engine`,
+`stem_panel_uninstall_dispatches_for_the_selected_recipes_engine`,
+`stem_panel_uninstall_blocked_while_a_job_runs`,
+`uninstall_event_clears_only_a_matching_command`,
+`discover_engine_reports_the_precedence_rung`,
+`build_uninstall_command_uses_the_bare_package_name`.
 
 ### Bulk stem separation for an album
 `M` is per-track and gated on `now_playing` (`StemState` in `src/tui/app.rs`),

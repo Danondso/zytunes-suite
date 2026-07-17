@@ -254,6 +254,14 @@ pub fn draw(f: &mut Frame, app: &App) {
         draw_stem_consent(f, app, consent);
     }
 
+    // Stem settings panel. Drawn before the toast: the panel raises
+    // refusal toasts while staying open ("a stem job is running", "not
+    // installed"), and both are centered rects — drawn after, the panel
+    // would fully cover its own feedback.
+    if let Some(ref panel) = app.stem_panel {
+        draw_stem_panel(f, app, panel);
+    }
+
     // Toast overlay.
     if let Some((ref msg, _, is_error)) = app.toast_message {
         draw_toast(f, app, msg, is_error);
@@ -1792,6 +1800,7 @@ fn draw_keys_panel(f: &mut Frame, app: &App, area: Rect) {
         ("T", "Art style"),
         ("P", "Player panel"),
         ("M", "Stem mixer"),
+        ("o", "Stem settings"),
         ("/", "Search"),
         ("c", "Connect"),
         ("X", "Clear cache"),
@@ -2257,6 +2266,150 @@ fn draw_stem_consent(f: &mut Frame, app: &App, consent: &crate::app::StemConsent
         .style(t.modal())
         .border_style(t.success())
         .title(" Stem Playback ")
+        .title_alignment(Alignment::Center);
+    let p = Paragraph::new(lines).block(block).style(t.modal());
+    f.render_widget(p, rect);
+}
+
+/// One human-readable size (MB below 1 GiB, GB above).
+fn human_bytes(bytes: u64) -> String {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if b >= GIB {
+        format!("{:.1} GB", b / GIB)
+    } else {
+        format!("{:.1} MB", b / (1024.0 * 1024.0))
+    }
+}
+
+/// Per-recipe cost hint for the settings panel rows.
+fn recipe_cost_hint(recipe: zytunes::stems::RecipeKind) -> &'static str {
+    use zytunes::stems::RecipeKind;
+    match recipe {
+        RecipeKind::Demucs => "1 pass — fastest on CPU",
+        RecipeKind::Hq => "2 passes, Roformer vocals — slow on CPU",
+        RecipeKind::HqHarmony => "3 passes + 2 checkpoints on first use",
+    }
+}
+
+fn draw_stem_panel(f: &mut Frame, app: &App, panel: &crate::app::StemPanel) {
+    use zytunes::stems::ALL_RECIPES;
+    let t = app.theme();
+    let area = f.area();
+
+    let mut lines: Vec<Line> = vec![Line::from("")];
+
+    if panel.confirm_uninstall {
+        let engine = ALL_RECIPES[panel.selected].engine();
+        lines.push(Line::from(format!(
+            " Uninstall {} via uv?",
+            engine.exe_name()
+        )));
+        lines.push(Line::from(""));
+        // The worker only evicts the checkpoint cache for the engine
+        // that owns it (audio-separator); promising it for demucs would
+        // display reclaimable bytes that never get reclaimed.
+        if engine == zytunes::stems::provision::EngineKind::AudioSeparator {
+            lines.push(Line::from(format!(
+                " Also removes model checkpoints ({}).",
+                human_bytes(panel.models_cache_bytes)
+            )));
+        }
+        lines.push(Line::from(Span::styled(
+            format!(
+                " Cached stems ({}) stay playable without an engine;",
+                human_bytes(panel.stems_cache_bytes)
+            ),
+            t.modal_dim(),
+        )));
+        lines.push(Line::from(Span::styled(
+            " Y deletes them too.",
+            t.modal_dim(),
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            " Enter/y:uninstall  Y:+ stem cache  Esc/n:back",
+            t.modal_dim(),
+        )));
+    } else {
+        let configured = app
+            .stems_cfg
+            .recipe_kind()
+            .unwrap_or(zytunes::stems::RecipeKind::Demucs);
+        for (i, recipe) in ALL_RECIPES.iter().enumerate() {
+            let marker = if *recipe == configured { "●" } else { " " };
+            let row = format!(
+                " {marker} {:<10} {} stems · {} · {}",
+                recipe.to_string(),
+                recipe.layout().len(),
+                recipe.engine().exe_name(),
+                recipe_cost_hint(*recipe),
+            );
+            let style = if i == panel.selected {
+                t.selected()
+            } else {
+                t.modal()
+            };
+            lines.push(Line::from(Span::styled(row, style)));
+        }
+        lines.push(Line::from(""));
+        for (engine, found) in &panel.engines {
+            match found {
+                Some((path, source)) => lines.push(Line::from(format!(
+                    " {:<15} {} (via {})",
+                    engine.exe_name(),
+                    path.display(),
+                    source.label()
+                ))),
+                None => lines.push(Line::from(Span::styled(
+                    format!(" {:<15} not installed", engine.exe_name()),
+                    t.modal_dim(),
+                ))),
+            }
+        }
+        lines.push(Line::from(""));
+        // Curated checkpoints, read-only: arbitrary strings invite
+        // unbootable model/version combinations.
+        lines.push(Line::from(Span::styled(
+            format!(
+                " Pinned models: {}",
+                [
+                    zytunes::stems::AUDIO_SEPARATOR_HTDEMUCS_MODEL,
+                    zytunes::stems::BS_ROFORMER_VOCALS_MODEL,
+                    zytunes::stems::MEL_ROFORMER_KARAOKE_MODEL,
+                ]
+                .join(", ")
+            ),
+            t.modal_dim(),
+        )));
+        lines.push(Line::from(Span::styled(
+            format!(
+                " Stems cache: {} · Checkpoints: {}",
+                human_bytes(panel.stems_cache_bytes),
+                human_bytes(panel.models_cache_bytes)
+            ),
+            t.modal_dim(),
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            " ↑↓:select  Enter:set recipe  u:uninstall engine  Esc:close",
+            t.modal_dim(),
+        )));
+    }
+
+    let longest = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+    let w = (longest + 3).max(56).min(area.width.saturating_sub(4));
+    let h = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let rect = Rect::new(x, y, w, h);
+
+    f.render_widget(Clear, rect);
+    let block = t
+        .block()
+        .style(t.modal())
+        .border_style(t.active_border())
+        .title(" Stem Settings ")
         .title_alignment(Alignment::Center);
     let p = Paragraph::new(lines).block(block).style(t.modal());
     f.render_widget(p, rect);

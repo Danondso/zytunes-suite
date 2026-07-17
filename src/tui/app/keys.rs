@@ -45,6 +45,7 @@ impl App {
             || self.handle_playlist_delete_key(key)
             || self.handle_search_key(key)
             || self.handle_theme_picker_key(key)
+            || self.handle_stem_panel_key(key)
             || self.handle_cache_clear_key(key)
             || self.handle_stem_consent_key(key)
             || self.handle_removal_confirm_key(key, cmd_tx)
@@ -284,6 +285,36 @@ impl App {
         true
     }
 
+    /// Stem settings panel (`o`). A real modal: claims every key while
+    /// open. The uninstall confirmation is a sub-state — `y`/Enter
+    /// uninstalls the engine and evicts its model checkpoints, `Y`
+    /// additionally deletes the separated-stems cache, `n`/Esc backs out.
+    fn handle_stem_panel_key(&mut self, key: KeyEvent) -> bool {
+        let Some(panel) = self.stem_panel.as_mut() else {
+            return false;
+        };
+        if panel.confirm_uninstall {
+            match key.code {
+                KeyCode::Enter | KeyCode::Char('y') => self.stem_panel_uninstall(false),
+                KeyCode::Char('Y') => self.stem_panel_uninstall(true),
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                    panel.confirm_uninstall = false;
+                }
+                _ => {}
+            }
+            return true;
+        }
+        match key.code {
+            KeyCode::Esc => self.stem_panel = None,
+            KeyCode::Enter => self.stem_panel_confirm(),
+            KeyCode::Up | KeyCode::Char('k') => self.stem_panel_move(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.stem_panel_move(1),
+            KeyCode::Char('u') => self.stem_panel_request_uninstall(),
+            _ => {}
+        }
+        true
+    }
+
     /// Playback-cache clear confirmation (`X`).
     fn handle_cache_clear_key(&mut self, key: KeyEvent) -> bool {
         if !self.pending_cache_clear {
@@ -427,6 +458,9 @@ impl App {
             }
             KeyCode::Char('4') if !self.sync.queue.is_empty() => {
                 self.active_panel = Panel::SyncQueue;
+            }
+            KeyCode::Char('o') => {
+                self.open_stem_panel();
             }
             KeyCode::Char('t') => {
                 self.open_theme_picker();

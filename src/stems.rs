@@ -93,6 +93,10 @@ impl RecipeKind {
     }
 }
 
+/// Every recipe, in the order the settings panel lists them.
+pub const ALL_RECIPES: [RecipeKind; 3] =
+    [RecipeKind::Demucs, RecipeKind::Hq, RecipeKind::HqHarmony];
+
 impl std::fmt::Display for RecipeKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.config_value())
@@ -1055,6 +1059,32 @@ pub fn store_stems(
 
     prune_stem_cache(cache_dir, max_bytes, Some(&key), log);
     Ok(StemSet::from_layout(&entry_dir, STEM_EXT, produced.layout))
+}
+
+/// Total bytes of regular files under `dir`, recursively. Used by the
+/// stem settings panel (cache-size display) and the uninstall flow's
+/// reclaimed-bytes accounting.
+pub fn dir_size_recursive(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|e| {
+            // file_type() does NOT follow symlinks (metadata() does) — a
+            // symlinked dir under the cache must not be traversed, both
+            // to avoid cycles and to keep the count honest about what
+            // deleting the cache would actually reclaim.
+            let Ok(ft) = e.file_type() else { return 0 };
+            if ft.is_file() {
+                e.metadata().map(|m| m.len()).unwrap_or(0)
+            } else if ft.is_dir() {
+                dir_size_recursive(&e.path())
+            } else {
+                0
+            }
+        })
+        .sum()
 }
 
 fn dir_size_bytes(dir: &Path) -> u64 {

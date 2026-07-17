@@ -169,7 +169,77 @@ impl App {
                 error,
                 cancelled,
             } => self.on_stems_failed(gen, track_path, error, cancelled),
+            BgEvent::StemEngineUninstalled {
+                engine,
+                reclaimed_bytes,
+                error,
+            } => self.on_stem_engine_uninstalled(engine, reclaimed_bytes, error),
         }
+    }
+
+    /// Engine uninstall finished: surface the outcome and — on success
+    /// only — clear a `[stems] command` that pointed at the removed
+    /// engine (in memory and in config.toml).
+    fn on_stem_engine_uninstalled(
+        &mut self,
+        engine: zytunes::stems::provision::EngineKind,
+        reclaimed_bytes: u64,
+        error: Option<String>,
+    ) {
+        if self.stem_engine_uninstalled_in_memory(engine, reclaimed_bytes, error) {
+            crate::config::update(|c| c.stems.command = None);
+        }
+    }
+
+    /// In-memory half of [`Self::on_stem_engine_uninstalled`] (the
+    /// `cycle_show_player` pattern). Returns whether `[stems] command`
+    /// was cleared and should be persisted: a stale path there is exactly
+    /// what would suppress the reinstall consent prompt later, but a
+    /// command belonging to the *other* engine must survive — and so
+    /// must the command after a FAILED uninstall (uv missing, non-uv
+    /// install), where the engine is still on disk and forgetting its
+    /// path would orphan a working install.
+    pub(crate) fn stem_engine_uninstalled_in_memory(
+        &mut self,
+        engine: zytunes::stems::provision::EngineKind,
+        reclaimed_bytes: u64,
+        error: Option<String>,
+    ) -> bool {
+        let mb = reclaimed_bytes as f64 / (1024.0 * 1024.0);
+        let failed = error.is_some();
+        match error {
+            Some(e) => {
+                self.sync.log.push(format!("[stems] uninstall: {e}"));
+                self.set_toast(format!("Uninstall failed: {e}"), true);
+            }
+            None => {
+                self.set_toast(
+                    format!("Uninstalled {} — reclaimed {mb:.1} MB", engine.exe_name()),
+                    false,
+                );
+            }
+        }
+        let matches_engine = !failed
+            && self
+                .stems_cfg
+                .command
+                .as_deref()
+                .and_then(|c| {
+                    std::path::Path::new(c)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.contains(engine.exe_name()))
+                })
+                .unwrap_or(false);
+        if matches_engine {
+            self.stems_cfg.command = None;
+        }
+        // Refresh the panel's engine rows if it's open (reopened panels
+        // re-resolve anyway; this keeps a visible one honest).
+        if self.stem_panel.is_some() {
+            self.open_stem_panel();
+        }
+        matches_engine
     }
 
     /// Engine install finished: persist the resolved path (in memory and

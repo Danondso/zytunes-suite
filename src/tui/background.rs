@@ -265,6 +265,18 @@ pub enum BgCommand {
     },
     /// Cancel the active separation or engine install. No-op when idle.
     CancelSeparation,
+    /// Uninstall a stem engine via `uv tool uninstall` and reclaim its
+    /// derived caches. The model-checkpoint cache is evicted whenever the
+    /// engine that owns it (audio-separator) is removed; `evict_stems`
+    /// additionally deletes the separated-stems cache (optional — cached
+    /// stems stay playable without any engine). Answered by
+    /// [`BgEvent::StemEngineUninstalled`].
+    UninstallStemEngine {
+        engine: zytunes::stems::provision::EngineKind,
+        /// pip requirement spec; uv is addressed with its bare name.
+        package: String,
+        evict_stems: bool,
+    },
 }
 
 /// Payload for [`BgCommand::RipAndImport`]. Constructed by the TUI from
@@ -477,6 +489,15 @@ pub enum BgEvent {
         track_path: String,
         error: String,
         cancelled: bool,
+    },
+    /// Terminal event for [`BgCommand::UninstallStemEngine`]. `error`
+    /// carries the uv failure when the package step went wrong; cache
+    /// eviction runs regardless (derived data), so `reclaimed_bytes` is
+    /// meaningful in both cases.
+    StemEngineUninstalled {
+        engine: zytunes::stems::provision::EngineKind,
+        reclaimed_bytes: u64,
+        error: Option<String>,
     },
 }
 
@@ -1753,6 +1774,56 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                 BgCommand::CancelSeparation => {
                     stem_jobs.cancel_active();
                 }
+                BgCommand::UninstallStemEngine {
+                    engine,
+                    package,
+                    evict_stems,
+                } => {
+                    // Route through StemJobs like install/separation: the
+                    // app-side busy guard can't see a DETACHED separation
+                    // (track change sets stem status Off while the job
+                    // runs on), and uninstalling under a live engine
+                    // process — or remove_dir_all'ing the cache root a
+                    // job is staging into — is exactly what the guard
+                    // exists to prevent. Superseding cancels that job and
+                    // `acquire()` waits it out; the job thread also keeps
+                    // the multi-second uv run + up-to-10 GB delete off
+                    // this dispatch loop, so Connect/sync stay live.
+                    let token = stem_jobs.supersede();
+                    let jobs = stem_jobs.clone();
+                    let tx = event_tx.clone();
+                    thread::spawn(move || {
+                        let _guard = jobs.acquire();
+                        // No token check: unlike separations, an uninstall
+                        // the user confirmed must run even if another stem
+                        // command lands while we wait for the lock.
+                        let _ = token;
+                        let error = run_engine_uninstall(&package, &tx);
+                        let mut reclaimed: u64 = 0;
+                        // The checkpoint cache belongs to audio-separator;
+                        // a demucs uninstall must not wipe another
+                        // engine's downloads.
+                        if engine == zytunes::stems::provision::EngineKind::AudioSeparator {
+                            reclaimed += remove_cache_dir(
+                                zytunes::stems::default_model_file_dir(),
+                                "model cache",
+                                &tx,
+                            );
+                        }
+                        if evict_stems {
+                            reclaimed += remove_cache_dir(
+                                zytunes::stems::default_stem_cache_dir(),
+                                "stem cache",
+                                &tx,
+                            );
+                        }
+                        let _ = tx.send(BgEvent::StemEngineUninstalled {
+                            engine,
+                            reclaimed_bytes: reclaimed,
+                            error,
+                        });
+                    });
+                }
                 BgCommand::MbSearchReleases {
                     token,
                     artist,
@@ -2594,6 +2665,72 @@ struct SeparationJob<'a> {
     cache_id: &'a str,
     cache_dir: &'a std::path::Path,
     max_bytes: u64,
+}
+
+/// Run `uv tool uninstall` for `package`, returning the failure message
+/// if the step went wrong. A missing uv or a non-zero exit is reported,
+/// not swallowed — the caller still reclaims caches either way.
+fn run_engine_uninstall(package: &str, event_tx: &mpsc::Sender<BgEvent>) -> Option<String> {
+    let Some(uv) = zytunes::stems::provision::find_uv() else {
+        return Some("uv not found — remove the engine manually".to_string());
+    };
+    let bin_dir = zytunes::stems::provision::zytunes_bin_dir();
+    let (prog, args, envs) = match zytunes::stems::provision::build_uninstall_command(
+        &uv,
+        package,
+        bin_dir.as_deref(),
+    ) {
+        Ok(cmd) => cmd,
+        Err(e) => return Some(e),
+    };
+    match std::process::Command::new(&prog)
+        .args(&args)
+        .envs(envs)
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                "[stems] uninstalled {}",
+                zytunes::stems::provision::package_name(package)
+            )));
+            None
+        }
+        Ok(out) => Some(format!(
+            "uv tool uninstall failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+        Err(e) => Some(format!("failed to run {}: {e}", prog.display())),
+    }
+}
+
+/// Delete a derived-cache dir, logging what was reclaimed. Returns the
+/// byte count freed (0 for a missing dir or on failure).
+fn remove_cache_dir(
+    dir: Option<std::path::PathBuf>,
+    what: &str,
+    event_tx: &mpsc::Sender<BgEvent>,
+) -> u64 {
+    let Some(dir) = dir else { return 0 };
+    let bytes = zytunes::stems::dir_size_recursive(&dir);
+    if bytes == 0 && !dir.exists() {
+        return 0;
+    }
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => {
+            let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                "[stems] evicted {what} ({:.1} MB)",
+                bytes as f64 / (1024.0 * 1024.0)
+            )));
+            bytes
+        }
+        Err(e) => {
+            let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                "[stems] failed to evict {what} at {}: {e}",
+                dir.display()
+            )));
+            0
+        }
+    }
 }
 
 /// Cache-first separation driver: answer from the stem cache when the

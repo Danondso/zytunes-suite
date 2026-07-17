@@ -337,6 +337,32 @@ pub struct StemConsent {
     pub engine: zytunes::stems::provision::EngineKind,
 }
 
+/// Source-aware engine discovery: `(engine, explicit command)` → the
+/// resolved binary and the precedence rung that produced it.
+pub type EngineDiscoveryFn = fn(
+    zytunes::stems::provision::EngineKind,
+    Option<&std::path::Path>,
+) -> Option<(PathBuf, zytunes::stems::provision::EngineSource)>;
+
+/// Stem settings panel (`o`): recipe picker, engine state, uninstall.
+pub struct StemPanel {
+    /// Selected row in [`zytunes::stems::ALL_RECIPES`].
+    pub selected: usize,
+    /// `true` while the destructive uninstall confirmation is showing.
+    pub confirm_uninstall: bool,
+    /// Discovery result per engine, resolved once at open: the binary
+    /// path and which precedence rung produced it ([`stems] command` →
+    /// PATH → managed install), or `None` when not installed.
+    pub engines: Vec<(
+        zytunes::stems::provision::EngineKind,
+        Option<(PathBuf, zytunes::stems::provision::EngineSource)>,
+    )>,
+    /// Size of `~/.cache/zytunes/stems` at open time.
+    pub stems_cache_bytes: u64,
+    /// Size of `~/.cache/zytunes/models` at open time.
+    pub models_cache_bytes: u64,
+}
+
 /// Stem-split playback state (`M` in the player). Pattern-matches
 /// `DeviceState`/`SyncState`: one sub-struct so `App` stays navigable.
 pub struct StemState {
@@ -1095,6 +1121,13 @@ pub struct App {
     /// value is [`zytunes::stems::provision::find_engine`].
     pub stem_engine_finder:
         fn(zytunes::stems::provision::EngineKind, Option<&std::path::Path>) -> Option<PathBuf>,
+    /// Source-aware engine discovery for the stem settings panel (which
+    /// precedence rung found the binary). Injectable like
+    /// `stem_engine_finder`; production value is
+    /// [`zytunes::stems::provision::discover_engine`].
+    pub stem_engine_discovery: EngineDiscoveryFn,
+    /// Stem settings panel (`o`); `Some` = modal open.
+    pub stem_panel: Option<StemPanel>,
     /// User-authored playlists (manual + generated). Loaded once at TUI
     /// launch via `load_playlists_from_disk`; `App::new()` leaves this empty
     /// so unit tests don't pick up developer-machine state.
@@ -1348,6 +1381,8 @@ impl App {
             // whatever sidecar exists on the developer's machine.
             local_plays_save_path: None,
             stem_engine_finder: zytunes::stems::provision::find_engine,
+            stem_engine_discovery: zytunes::stems::provision::discover_engine,
+            stem_panel: None,
             local_plays: LocalPlays::default(),
             playlists: PlaylistStore::default(),
             playlists_save_path: None,
@@ -3381,6 +3416,130 @@ impl App {
             model: self.stems_cfg.model(),
             cache_max_bytes: self.stems_cfg.cache_max_bytes(),
         });
+    }
+
+    // -- Stem settings panel (`o`) --
+
+    /// Open the settings panel: resolve engine discovery (path + rung)
+    /// for both engines and stat the stem/model caches once, so the
+    /// renderer never touches the filesystem per frame.
+    pub fn open_stem_panel(&mut self) {
+        use zytunes::stems::provision::EngineKind;
+        let explicit = self.stems_cfg.command_path();
+        let engines = [EngineKind::Demucs, EngineKind::AudioSeparator]
+            .into_iter()
+            .map(|e| (e, (self.stem_engine_discovery)(e, explicit.as_deref())))
+            .collect();
+        let recipe = self.stems_recipe();
+        let selected = zytunes::stems::ALL_RECIPES
+            .iter()
+            .position(|r| *r == recipe)
+            .unwrap_or(0);
+        let stems_cache_bytes = zytunes::stems::default_stem_cache_dir()
+            .map(|d| zytunes::stems::dir_size_recursive(&d))
+            .unwrap_or(0);
+        let models_cache_bytes = zytunes::stems::default_model_file_dir()
+            .map(|d| zytunes::stems::dir_size_recursive(&d))
+            .unwrap_or(0);
+        self.stem_panel = Some(StemPanel {
+            selected,
+            confirm_uninstall: false,
+            engines,
+            stems_cache_bytes,
+            models_cache_bytes,
+        });
+    }
+
+    /// Move the recipe selection, wrapping.
+    pub fn stem_panel_move(&mut self, delta: isize) {
+        let len = zytunes::stems::ALL_RECIPES.len() as isize;
+        if let Some(panel) = self.stem_panel.as_mut() {
+            panel.selected = (panel.selected as isize + delta).rem_euclid(len) as usize;
+        }
+    }
+
+    /// Persist the selected recipe and close the panel.
+    pub fn stem_panel_confirm(&mut self) {
+        if let Some(value) = self.stem_panel_confirm_in_memory() {
+            crate::config::update(move |c| c.stems.recipe = Some(value));
+        }
+    }
+
+    /// In-memory half of [`Self::stem_panel_confirm`] (the
+    /// `cycle_show_player` pattern): applies the recipe to `stems_cfg`,
+    /// closes the panel, and returns the config value the wrapper
+    /// persists. The change takes effect on the next `M` — an active
+    /// split keeps playing its current layout.
+    pub(crate) fn stem_panel_confirm_in_memory(&mut self) -> Option<String> {
+        let panel = self.stem_panel.take()?;
+        let recipe = zytunes::stems::ALL_RECIPES[panel.selected];
+        let value = recipe.config_value().to_string();
+        self.stems_cfg.recipe = Some(value.clone());
+        self.set_toast(
+            format!("Stem recipe: {recipe} (takes effect on next M)"),
+            false,
+        );
+        Some(value)
+    }
+
+    /// The engine the currently selected recipe drives, with its
+    /// discovery result from panel-open time.
+    fn stem_panel_selected_engine(
+        &self,
+    ) -> Option<(
+        zytunes::stems::provision::EngineKind,
+        Option<(PathBuf, zytunes::stems::provision::EngineSource)>,
+    )> {
+        let panel = self.stem_panel.as_ref()?;
+        let engine = zytunes::stems::ALL_RECIPES[panel.selected].engine();
+        let found = panel
+            .engines
+            .iter()
+            .find(|(e, _)| *e == engine)
+            .and_then(|(_, f)| f.clone());
+        Some((engine, found))
+    }
+
+    /// `u` in the panel: open the destructive uninstall confirmation for
+    /// the selected recipe's engine. Refused while a stem job is running
+    /// (uninstalling would rip the engine out from under it) or when the
+    /// engine isn't installed.
+    pub fn stem_panel_request_uninstall(&mut self) {
+        match self.stems.status {
+            StemStatus::Provisioning | StemStatus::Separating { .. } => {
+                self.set_toast("A stem job is running — cancel it first (M)".into(), true);
+                return;
+            }
+            StemStatus::Off | StemStatus::Active => {}
+        }
+        let Some((engine, found)) = self.stem_panel_selected_engine() else {
+            return;
+        };
+        if found.is_none() {
+            self.set_toast(format!("{} is not installed", engine.exe_name()), true);
+            return;
+        }
+        if let Some(panel) = self.stem_panel.as_mut() {
+            panel.confirm_uninstall = true;
+        }
+    }
+
+    /// Confirmed uninstall: dispatch to the worker and close the panel
+    /// (the result arrives as a `StemEngineUninstalled` event).
+    /// `evict_stems` additionally deletes the separated-stems cache —
+    /// optional because cached stems remain playable without any engine.
+    pub fn stem_panel_uninstall(&mut self, evict_stems: bool) {
+        let Some((engine, _)) = self.stem_panel_selected_engine() else {
+            return;
+        };
+        self.pending_bg_commands
+            .push(BgCommand::UninstallStemEngine {
+                engine,
+                package: self.stems_cfg.resolved_package(engine),
+                evict_stems,
+            });
+        self.stem_panel = None;
+        self.set_toast(format!("Uninstalling {}…", engine.exe_name()), false);
     }
 
     /// Swap live stem playback back to the original file, gaplessly — the
@@ -11344,6 +11503,146 @@ mod tests {
         assert!(
             app.local_plays.get(7).is_some(),
             "moving to another track records the abandoned session as a skip"
+        );
+    }
+
+    /// Hermetic app for stem-settings-panel tests: no real engine
+    /// discovery, no real config.
+    fn stem_panel_app() -> App {
+        let mut app = stem_playing_app("/lib/song.mp3");
+        app.stem_engine_discovery = |_, _| None;
+        app
+    }
+
+    #[test]
+    fn stem_panel_opens_on_the_configured_recipe_and_wraps() {
+        let mut app = stem_panel_app();
+        app.stems_cfg.recipe = Some("hq".into());
+        app.open_stem_panel();
+        assert_eq!(
+            app.stem_panel.as_ref().unwrap().selected,
+            1,
+            "opens with the configured recipe selected"
+        );
+        app.stem_panel_move(-1);
+        assert_eq!(app.stem_panel.as_ref().unwrap().selected, 0);
+        app.stem_panel_move(-1);
+        assert_eq!(
+            app.stem_panel.as_ref().unwrap().selected,
+            zytunes::stems::ALL_RECIPES.len() - 1,
+            "selection wraps"
+        );
+    }
+
+    #[test]
+    fn stem_panel_confirm_updates_recipe_in_memory_and_closes() {
+        let mut app = stem_panel_app();
+        app.open_stem_panel();
+        app.stem_panel_move(1); // demucs → hq
+        let persisted = app.stem_panel_confirm_in_memory();
+        assert_eq!(persisted.as_deref(), Some("hq"));
+        assert_eq!(app.stems_cfg.recipe.as_deref(), Some("hq"));
+        assert!(app.stem_panel.is_none(), "panel closes on confirm");
+    }
+
+    #[test]
+    fn stem_panel_uninstall_needs_an_installed_engine() {
+        let mut app = stem_panel_app();
+        app.open_stem_panel();
+        app.stem_panel_request_uninstall();
+        assert!(
+            !app.stem_panel.as_ref().unwrap().confirm_uninstall,
+            "no engine discovered → nothing to uninstall"
+        );
+    }
+
+    #[test]
+    fn stem_panel_uninstall_dispatches_for_the_selected_recipes_engine() {
+        use zytunes::stems::provision::{EngineKind, EngineSource};
+        let mut app = stem_panel_app();
+        app.stem_engine_discovery = |engine, _| {
+            Some((
+                PathBuf::from(format!("/x/{}", engine.exe_name())),
+                EngineSource::PathEnv,
+            ))
+        };
+        app.open_stem_panel();
+        app.stem_panel_move(1); // hq → audio-separator
+        app.stem_panel_request_uninstall();
+        assert!(app.stem_panel.as_ref().unwrap().confirm_uninstall);
+        app.stem_panel_uninstall(false);
+        assert!(matches!(
+            app.pending_bg_commands.as_slice(),
+            [BgCommand::UninstallStemEngine {
+                engine: EngineKind::AudioSeparator,
+                evict_stems: false,
+                ..
+            }]
+        ));
+        assert!(
+            app.stem_panel.is_none(),
+            "panel closes; result arrives as an event"
+        );
+    }
+
+    #[test]
+    fn stem_panel_uninstall_blocked_while_a_job_runs() {
+        use zytunes::stems::provision::EngineSource;
+        let mut app = stem_panel_app();
+        app.stem_engine_discovery =
+            |_, _| Some((PathBuf::from("/x/demucs"), EngineSource::PathEnv));
+        app.stems.status = StemStatus::Separating { pct: Some(10) };
+        app.open_stem_panel();
+        app.stem_panel_request_uninstall();
+        assert!(
+            !app.stem_panel.as_ref().unwrap().confirm_uninstall,
+            "uninstalling mid-separation would rip the engine out from under the job"
+        );
+    }
+
+    #[test]
+    fn uninstall_event_clears_only_a_matching_command() {
+        use zytunes::stems::provision::EngineKind;
+        // An audio-separator uninstall clears an audio-separator command…
+        let mut app = stem_panel_app();
+        app.stems_cfg.command = Some("/x/bin/audio-separator".into());
+        let cleared = app.stem_engine_uninstalled_in_memory(
+            EngineKind::AudioSeparator,
+            3 * 1024 * 1024,
+            None,
+        );
+        assert!(
+            cleared,
+            "stale command would suppress the reinstall consent"
+        );
+        assert!(app.stems_cfg.command.is_none());
+
+        // …but a demucs command survives an audio-separator uninstall.
+        let mut app = stem_panel_app();
+        app.stems_cfg.command = Some("/x/bin/demucs".into());
+        let cleared = app.stem_engine_uninstalled_in_memory(EngineKind::AudioSeparator, 0, None);
+        assert!(!cleared);
+        assert_eq!(app.stems_cfg.command.as_deref(), Some("/x/bin/demucs"));
+    }
+
+    #[test]
+    fn failed_uninstall_keeps_the_engine_command() {
+        use zytunes::stems::provision::EngineKind;
+        // uv missing / non-zero exit: the engine is still on disk, so
+        // forgetting its configured path would orphan a working install
+        // and invite a duplicate-install consent on the next M-press.
+        let mut app = stem_panel_app();
+        app.stems_cfg.command = Some("/x/bin/audio-separator".into());
+        let cleared = app.stem_engine_uninstalled_in_memory(
+            EngineKind::AudioSeparator,
+            0,
+            Some("uv not found — remove the engine manually".into()),
+        );
+        assert!(!cleared, "a failed uninstall must not persist a clear");
+        assert_eq!(
+            app.stems_cfg.command.as_deref(),
+            Some("/x/bin/audio-separator"),
+            "the still-installed engine's path survives"
         );
     }
 
