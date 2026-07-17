@@ -262,6 +262,10 @@ pub fn draw(f: &mut Frame, app: &App) {
         draw_stem_panel(f, app, panel);
     }
 
+    if let Some(ref confirm) = app.stem_bulk_confirm {
+        draw_stem_bulk_confirm(f, app, confirm);
+    }
+
     // Toast overlay.
     if let Some((ref msg, _, is_error)) = app.toast_message {
         draw_toast(f, app, msg, is_error);
@@ -1799,7 +1803,7 @@ fn draw_keys_panel(f: &mut Frame, app: &App, area: Rect) {
         ("t", "Theme picker"),
         ("T", "Art style"),
         ("P", "Player panel"),
-        ("M", "Stem mixer"),
+        ("M", "Stem mixer/batch"),
         ("o", "Stem settings"),
         ("/", "Search"),
         ("c", "Connect"),
@@ -2415,6 +2419,66 @@ fn draw_stem_panel(f: &mut Frame, app: &App, panel: &crate::app::StemPanel) {
     f.render_widget(p, rect);
 }
 
+fn draw_stem_bulk_confirm(f: &mut Frame, app: &App, confirm: &crate::app::StemBulkConfirm) {
+    let t = app.theme();
+    let area = f.area();
+    let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
+
+    let to_do = confirm.track_paths.len() - confirm.cached;
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(format!(
+            " Separate all of {} — {}?",
+            confirm.artist, confirm.album
+        )),
+        Line::from(""),
+        Line::from(format!(
+            " {} track(s): {} to separate, {} already cached",
+            confirm.track_paths.len(),
+            to_do,
+            confirm.cached
+        )),
+        Line::from(format!(
+            " ~{:.0} MB of new stems (cache: {:.0} MB of {:.0} MB cap)",
+            mb(confirm.projected_bytes),
+            mb(confirm.cache_used_bytes),
+            mb(confirm.cap_bytes)
+        )),
+    ];
+    if confirm.cache_used_bytes + confirm.projected_bytes > confirm.cap_bytes {
+        lines.push(Line::from(Span::styled(
+            " Exceeds the cache cap — oldest cached stems will be evicted.",
+            t.error(),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        " Separation is minutes per track on CPU; runs in the background.",
+        t.modal_dim(),
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " Enter/y:separate  Esc/n:cancel",
+        t.modal_dim(),
+    )));
+
+    let longest = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+    let w = (longest + 3).max(56).min(area.width.saturating_sub(4));
+    let h = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let rect = Rect::new(x, y, w, h);
+
+    f.render_widget(Clear, rect);
+    let block = t
+        .block()
+        .style(t.modal())
+        .border_style(t.success())
+        .title(" Album Stems ")
+        .title_alignment(Alignment::Center);
+    let p = Paragraph::new(lines).block(block).style(t.modal());
+    f.render_widget(p, rect);
+}
+
 fn draw_footer(f: &mut Frame, app: &App, area: Rect, footer_left_width: u16) {
     let t = app.theme();
     let block = t.block().style(t.footer());
@@ -2437,6 +2501,14 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect, footer_left_width: u16) {
         }
         BrowseMode::Playlists => format!(" {} playlists", app.playlists.len()),
     };
+    let batch_prefix = app.stems_batch.as_ref().map(|b| {
+        let pct = b.pct.map(|p| format!(" ({p}%)")).unwrap_or_default();
+        if b.suspended {
+            format!("Stems {}: paused | ", b.album)
+        } else {
+            format!("Stems {}/{}{pct} | ", b.current.max(1), b.total)
+        }
+    });
     let right = match app.browse_mode {
         BrowseMode::Device => "v:cycle | a:queue rm | D:delete | C:clr | ?:help".to_string(),
         BrowseMode::Playlists => {
@@ -2449,6 +2521,11 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect, footer_left_width: u16) {
                 "v:cycle | a:add | +:playlist | S:sync | q:quit | ?:help".to_string()
             }
         }
+    };
+
+    let right = match batch_prefix {
+        Some(prefix) => format!("{prefix}{right}"),
+        None => right,
     };
 
     let chunks = Layout::default()

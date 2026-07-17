@@ -162,18 +162,45 @@ impl App {
                 gen,
                 track_path,
                 stems,
-            } => self.on_stems_ready(gen, track_path, *stems),
+            } => {
+                self.on_stems_ready(gen, track_path, *stems);
+                self.maybe_resume_stem_batch();
+            }
             BgEvent::StemsFailed {
                 gen,
                 track_path,
                 error,
                 cancelled,
-            } => self.on_stems_failed(gen, track_path, error, cancelled),
+            } => {
+                self.on_stems_failed(gen, track_path, error, cancelled);
+                self.maybe_resume_stem_batch();
+            }
             BgEvent::StemEngineUninstalled {
                 engine,
                 reclaimed_bytes,
                 error,
             } => self.on_stem_engine_uninstalled(engine, reclaimed_bytes, error),
+            BgEvent::StemBatchProgress {
+                gen,
+                current,
+                total,
+                pct,
+            } => {
+                if let Some(batch) = self.stems_batch.as_mut() {
+                    if gen == batch.gen {
+                        batch.current = current;
+                        batch.total = total;
+                        batch.pct = pct;
+                    }
+                }
+            }
+            BgEvent::StemBatchDone {
+                gen,
+                separated,
+                skipped,
+                failed,
+                cancelled,
+            } => self.on_stem_batch_done(gen, separated, skipped, failed, cancelled),
         }
     }
 
@@ -300,6 +327,59 @@ impl App {
         self.stems.reset();
         self.stems.pending_path = None;
         self.set_toast(format!("Stem engine install failed: {err}"), true);
+    }
+
+    /// Terminal event for an album batch. A suspended batch's
+    /// cancelled-Done is the supersede completing — the state survives
+    /// (banking this round's separations) and the interactive job's own
+    /// terminal event resumes it. A stale gen (batch already
+    /// cancelled/replaced app-side) is ignored.
+    fn on_stem_batch_done(
+        &mut self,
+        gen: u64,
+        separated: usize,
+        skipped: usize,
+        failed: usize,
+        cancelled: bool,
+    ) {
+        let Some(batch) = self.stems_batch.as_mut() else {
+            return;
+        };
+        if gen != batch.gen {
+            return;
+        }
+        if cancelled && batch.suspended {
+            batch.separated_so_far += separated;
+            self.sync.log.push(format!(
+                "[stems] batch paused ({separated} done so far this round)"
+            ));
+            return;
+        }
+        let album = batch.album.clone();
+        let prior = batch.separated_so_far;
+        self.stems_batch = None;
+        if cancelled {
+            self.sync.log.push(format!(
+                "[stems] batch cancelled ({} separated)",
+                prior + separated
+            ));
+            return;
+        }
+        // The final round re-counts tracks separated before a suspend as
+        // cache hits — shift them back so the toast reports true work.
+        let total_separated = prior + separated;
+        let already_cached = skipped.saturating_sub(prior);
+        let mut parts = vec![format!("{total_separated} separated")];
+        if already_cached > 0 {
+            parts.push(format!("{already_cached} already cached"));
+        }
+        if failed > 0 {
+            parts.push(format!("{failed} failed"));
+        }
+        self.set_toast(
+            format!("Stems for {album}: {}", parts.join(", ")),
+            failed > 0,
+        );
     }
 
     /// Separation finished. If we're still waiting on this exact track and

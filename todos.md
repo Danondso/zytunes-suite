@@ -359,38 +359,34 @@ command survives. Tests: `stem_panel_opens_on_the_configured_recipe_and_wraps`,
 `discover_engine_reports_the_precedence_rung`,
 `build_uninstall_command_uses_the_bare_package_name`.
 
-### Bulk stem separation for an album
-`M` is per-track and gated on `now_playing` (`StemState` in `src/tui/app.rs`),
-so pre-warming an album for offline or on-stage use means playing each track
-and pressing `M` on every one. `M` on an album sidebar entry should enqueue
-separation for all its tracks.
-
-Scope:
-
-1. **Queue model.** `StemJobs` in `src/tui/background.rs` serialises jobs by
-   superseding: dispatching a new job cancels the previous one, running or
-   queued. That is correct for interactive `M` (a new track's split should
-   kill the old one) and exactly wrong for a batch, where every item must
-   run to completion. Needs a real FIFO alongside the supersede path, and a
-   rule for how an interactive `M` interacts with a running batch —
-   suggest interactive preempts, batch resumes after.
-2. **Cache-first.** Skip tracks that already hit `cached_stems` for the
-   active recipe; report the skip count so a re-run of a mostly-warm album
-   is visibly cheap rather than mysteriously instant.
-3. **Progress.** Per-track percent already streams from the engine; the batch
-   needs an aggregate (`track 3/12, 40%`). The stem strip is per-track and
-   the wrong surface — the sync log or a progress line is the better fit.
-4. **Cancellation.** Reuse the group-kill path in `src/stems/process.rs`; a
-   batch cancel must stop the running child *and* drain the queue, not just
-   the current item.
-5. **Cache cap interaction.** A 12-track album at ~150-220 MB/track is
-   ~2-2.6 GB against a 10 GB default cap, so one bulk run can evict most of
-   the cache. `prune_stem_cache` logs every eviction, but a batch should
-   probably warn up-front when the projected size approaches the cap rather
-   than silently thrashing.
-6. **Disk/time honesty.** Confirm before starting: track count, projected
-   bytes, and that this is minutes-per-track on CPU. `hq-harmony` on a
-   12-track album is a very long, very hot operation.
+### ~~Bulk stem separation for an album~~ (done)
+`M` on an album sidebar entry (Library browse) opens a disk/time-honesty
+confirm — track count, cached-vs-to-separate split, projected bytes
+against the cache cap (`EST_STEM_BYTES_PER_TRACK` estimate; an explicit
+over-cap warning line), and the minutes-per-track-on-CPU note — then
+dispatches `BgCommand::SeparateStemsBatch`. Queue model: the whole batch
+is ONE superseding worker job (`run_stem_batch` — cache-first per track
+via the new read-only `stem_cache_contains`/`cached_stems`, skips
+counted, one terminal `StemBatchDone`); an interactive `M` supersedes it
+worker-side while the app marks the batch state suspended and
+re-dispatches the FULL list once the interactive job's terminal event
+lands — cache-first skipping makes resume cost only the remainder, so
+no worker-side FIFO/resume machinery exists to drift. `M` on an album
+entry while a batch runs cancels it (token trip + state drop + gen bump
+so late events are ignored); a mid-track cancel reuses the engine
+group-kill and does not count the interrupted track as failed.
+Aggregate progress (`track 3/12 (40%)`) renders in the footer;
+per-track starts and the end summary (separated / already cached /
+failed) land in the log and a toast. Batches never emit `StemsReady` —
+they pre-warm the cache, never hijack playback. Engine must already be
+installed (no consent flow hidden behind a batch keypress). Tests:
+`stem_batch_skips_cached_and_stores_the_rest`,
+`stem_batch_cancel_reports_cancelled_without_counting_failures`,
+`m_on_album_sidebar_entry_opens_bulk_confirm`,
+`bulk_accept_requires_an_engine`, `bulk_accept_dispatches_the_batch`,
+`m_on_album_cancels_a_running_batch`,
+`interactive_split_suspends_the_batch_and_resumes_after`,
+`batch_done_clears_state_and_toasts_a_summary`.
 
 ### ~~Playing a paused track after splitting it clears stem state~~ (done)
 `play_selected_track` now detects when the selected row IS the loaded

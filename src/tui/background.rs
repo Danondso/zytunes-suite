@@ -277,6 +277,22 @@ pub enum BgCommand {
         package: String,
         evict_stems: bool,
     },
+    /// Separate every track of an album into the stem cache, cache-first
+    /// (already-cached tracks are skipped and counted). Runs as ONE
+    /// superseding job: a new interactive `SeparateStems` cancels it
+    /// (the app re-dispatches the remainder afterwards — resume is
+    /// cheap because cache hits skip instantly). No `StemsReady` is
+    /// emitted; results land in the cache only.
+    SeparateStemsBatch {
+        /// Batch generation echoed on `StemBatch*` events (independent
+        /// of the per-track job gen).
+        gen: u64,
+        track_paths: Vec<String>,
+        engine_command: Option<PathBuf>,
+        recipe: zytunes::stems::RecipeKind,
+        model: String,
+        cache_max_bytes: u64,
+    },
 }
 
 /// Payload for [`BgCommand::RipAndImport`]. Constructed by the TUI from
@@ -498,6 +514,24 @@ pub enum BgEvent {
         engine: zytunes::stems::provision::EngineKind,
         reclaimed_bytes: u64,
         error: Option<String>,
+    },
+    /// Aggregate tick for a running album batch: which track is being
+    /// worked (1-indexed) and its engine percent when available.
+    StemBatchProgress {
+        gen: u64,
+        current: usize,
+        total: usize,
+        pct: Option<u8>,
+    },
+    /// Terminal event for [`BgCommand::SeparateStemsBatch`]. `cancelled`
+    /// covers both an explicit cancel and a supersede by an interactive
+    /// split — the app distinguishes via its own suspended flag.
+    StemBatchDone {
+        gen: u64,
+        separated: usize,
+        skipped: usize,
+        failed: usize,
+        cancelled: bool,
     },
 }
 
@@ -1684,48 +1718,19 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                     command.display()
                                 )));
                                 let cache_id = recipe.cache_id(&model);
-                                let separator: Box<dyn StemSeparator> = match recipe {
-                                    zytunes::stems::RecipeKind::Demucs => {
-                                        Box::new(zytunes::stems::DemucsCli {
-                                            command,
-                                            model: model.clone(),
-                                            layout: recipe.layout(),
-                                        })
-                                    }
-                                    zytunes::stems::RecipeKind::Hq
-                                    | zytunes::stems::RecipeKind::HqHarmony => {
-                                        // cache_dir being Some proves $HOME
-                                        // resolves, so the model dir does too.
-                                        let model_file_dir =
-                                            match zytunes::stems::default_model_file_dir() {
-                                                Some(d) => d,
-                                                None => {
-                                                    let _ = tx.send(BgEvent::StemsFailed {
-                                                        gen,
-                                                        track_path,
-                                                        error: "cannot resolve $HOME for the \
-                                                                model cache"
-                                                            .into(),
-                                                        cancelled: false,
-                                                    });
-                                                    return;
-                                                }
-                                            };
-                                        Box::new(zytunes::stems::CascadeSeparator {
-                                            engine: zytunes::stems::AudioSeparatorCli {
-                                                command,
-                                                model_file_dir,
-                                            },
-                                            passes: match recipe {
-                                                zytunes::stems::RecipeKind::HqHarmony => {
-                                                    zytunes::stems::hq_harmony_recipe_passes()
-                                                }
-                                                _ => zytunes::stems::hq_recipe_passes(),
-                                            },
-                                            layout: recipe.layout(),
-                                        })
-                                    }
-                                };
+                                let separator =
+                                    match build_recipe_separator(recipe, &model, command) {
+                                        Ok(s) => s,
+                                        Err(error) => {
+                                            let _ = tx.send(BgEvent::StemsFailed {
+                                                gen,
+                                                track_path,
+                                                error,
+                                                cancelled: false,
+                                            });
+                                            return;
+                                        }
+                                    };
                                 run_separation(
                                     &SeparationJob {
                                         gen,
@@ -1822,6 +1827,77 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                             reclaimed_bytes: reclaimed,
                             error,
                         });
+                    });
+                }
+                BgCommand::SeparateStemsBatch {
+                    gen,
+                    track_paths,
+                    engine_command,
+                    recipe,
+                    model,
+                    cache_max_bytes,
+                } => {
+                    let token = stem_jobs.supersede();
+                    let jobs = stem_jobs.clone();
+                    let tx = event_tx.clone();
+                    thread::spawn(move || {
+                        let _guard = jobs.acquire();
+                        let total = track_paths.len();
+                        let bail = |failed: usize, cancelled: bool| {
+                            let _ = tx.send(BgEvent::StemBatchDone {
+                                gen,
+                                separated: 0,
+                                skipped: 0,
+                                failed,
+                                cancelled,
+                            });
+                        };
+                        if token.load(Ordering::SeqCst) {
+                            bail(0, true);
+                            return;
+                        }
+                        let Some(cache_dir) = zytunes::stems::default_stem_cache_dir() else {
+                            let _ = tx.send(BgEvent::SyncMessage(
+                                "[stems] batch: cannot resolve $HOME for the stem cache".into(),
+                            ));
+                            bail(total, false);
+                            return;
+                        };
+                        // The app checks the engine before dispatching, so a
+                        // miss here is a race (engine removed since) — report
+                        // every track as failed rather than pretending.
+                        let Some(command) = zytunes::stems::provision::find_engine(
+                            recipe.engine(),
+                            engine_command.as_deref(),
+                        ) else {
+                            let _ = tx.send(BgEvent::SyncMessage(
+                                "[stems] batch: stem engine not installed".into(),
+                            ));
+                            bail(total, false);
+                            return;
+                        };
+                        let separator = match build_recipe_separator(recipe, &model, command) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                let _ =
+                                    tx.send(BgEvent::SyncMessage(format!("[stems] batch: {e}")));
+                                bail(total, false);
+                                return;
+                            }
+                        };
+                        run_stem_batch(
+                            &StemBatchJob {
+                                gen,
+                                track_paths: &track_paths,
+                                layout: recipe.layout(),
+                                cache_id: &recipe.cache_id(&model),
+                                cache_dir: &cache_dir,
+                                max_bytes: cache_max_bytes,
+                            },
+                            separator.as_ref(),
+                            &|| token.load(Ordering::SeqCst),
+                            &tx,
+                        );
                     });
                 }
                 BgCommand::MbSearchReleases {
@@ -2650,6 +2726,141 @@ impl StemJobs {
     }
 }
 
+/// Build the separator a recipe drives: `DemucsCli` for the demucs
+/// recipe, a `CascadeSeparator` over audio-separator for the hq
+/// recipes. `Err` carries a user-visible message.
+fn build_recipe_separator(
+    recipe: zytunes::stems::RecipeKind,
+    model: &str,
+    command: std::path::PathBuf,
+) -> Result<Box<dyn StemSeparator>, String> {
+    Ok(match recipe {
+        zytunes::stems::RecipeKind::Demucs => Box::new(zytunes::stems::DemucsCli {
+            command,
+            model: model.to_string(),
+            layout: recipe.layout(),
+        }),
+        zytunes::stems::RecipeKind::Hq | zytunes::stems::RecipeKind::HqHarmony => {
+            let model_file_dir = zytunes::stems::default_model_file_dir()
+                .ok_or_else(|| "cannot resolve $HOME for the model cache".to_string())?;
+            Box::new(zytunes::stems::CascadeSeparator {
+                engine: zytunes::stems::AudioSeparatorCli {
+                    command,
+                    model_file_dir,
+                },
+                passes: match recipe {
+                    zytunes::stems::RecipeKind::HqHarmony => {
+                        zytunes::stems::hq_harmony_recipe_passes()
+                    }
+                    _ => zytunes::stems::hq_recipe_passes(),
+                },
+                layout: recipe.layout(),
+            })
+        }
+    })
+}
+
+/// One album batch — the whole batch is ONE worker job (one supersede
+/// token), so an interactive `SeparateStems` cancels it as a unit and
+/// the app re-dispatches the remainder afterwards.
+struct StemBatchJob<'a> {
+    gen: u64,
+    track_paths: &'a [String],
+    layout: &'static [zytunes::stems::StemKind],
+    cache_id: &'a str,
+    cache_dir: &'a std::path::Path,
+    max_bytes: u64,
+}
+
+/// Cache-first batch driver: skip tracks whose stems are already cached
+/// for this recipe (counted, so a mostly-warm album is visibly cheap),
+/// separate the rest into the cache, and emit aggregate
+/// [`BgEvent::StemBatchProgress`] ticks plus exactly one terminal
+/// [`BgEvent::StemBatchDone`]. Never emits `StemsReady` — a batch
+/// pre-warms the cache, it must not hijack playback.
+fn run_stem_batch(
+    job: &StemBatchJob<'_>,
+    separator: &dyn StemSeparator,
+    cancelled: &dyn Fn() -> bool,
+    event_tx: &mpsc::Sender<BgEvent>,
+) {
+    let StemBatchJob {
+        gen,
+        track_paths,
+        layout,
+        cache_id,
+        cache_dir,
+        max_bytes,
+    } = *job;
+    let log_tx = event_tx.clone();
+    let log: zytunes::cache::Logger = Arc::new(move |msg: &str| {
+        let _ = log_tx.send(BgEvent::SyncMessage(format!("[stems] {msg}")));
+    });
+    let total = track_paths.len();
+    let (mut separated, mut skipped, mut failed) = (0usize, 0usize, 0usize);
+    let mut was_cancelled = false;
+    for (i, track) in track_paths.iter().enumerate() {
+        if cancelled() {
+            was_cancelled = true;
+            break;
+        }
+        let current = i + 1;
+        let _ = event_tx.send(BgEvent::StemBatchProgress {
+            gen,
+            current,
+            total,
+            pct: None,
+        });
+        let source = std::path::Path::new(track);
+        if cached_stems(cache_dir, source, cache_id, layout, &log).is_some() {
+            skipped += 1;
+            continue;
+        }
+        log(&format!("batch {current}/{total}: separating {track}"));
+        let work_dir = cache_dir.join("work").join(stem_cache_key(track, cache_id));
+        let _ = std::fs::remove_dir_all(&work_dir);
+        let progress_tx = event_tx.clone();
+        let on_progress = move |pct: u8| {
+            let _ = progress_tx.send(BgEvent::StemBatchProgress {
+                gen,
+                current,
+                total,
+                pct: Some(pct),
+            });
+        };
+        let on_line = |line: &str| log(line);
+        let outcome = separator.separate(source, &work_dir, cancelled, &on_progress, &on_line);
+        match outcome {
+            Ok(produced) => {
+                match store_stems(cache_dir, source, cache_id, &produced, max_bytes, &log) {
+                    Ok(_) => separated += 1,
+                    Err(e) => {
+                        failed += 1;
+                        log(&format!("batch: store failed for {track}: {e}"));
+                    }
+                }
+            }
+            Err(StemError::Cancelled) => {
+                was_cancelled = true;
+                let _ = std::fs::remove_dir_all(&work_dir);
+                break;
+            }
+            Err(e) => {
+                failed += 1;
+                log(&format!("batch: {track}: {e}"));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&work_dir);
+    }
+    let _ = event_tx.send(BgEvent::StemBatchDone {
+        gen,
+        separated,
+        skipped,
+        failed,
+        cancelled: was_cancelled,
+    });
+}
+
 /// Everything that names a separation job: which job it is (`gen`), what
 /// it splits, and where results live. Groups the parameters that ride
 /// every [`run_separation`] call so the driver's signature stays small.
@@ -3034,6 +3245,121 @@ mod tests {
         // A job dispatched after a cancel starts with a clear token.
         let next = jobs.supersede();
         assert!(!next.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn stem_batch_skips_cached_and_stores_the_rest() {
+        let dir = fresh_dir("stems-batch-mixed");
+        let cache = dir.join("cache");
+        let a = dir.join("a.mp3");
+        let b = dir.join("b.mp3");
+        std::fs::write(&a, b"mp3a").unwrap();
+        std::fs::write(&b, b"mp3b").unwrap();
+        // Pre-warm track A so the batch's cache-first check skips it.
+        let produced_dir = dir.join("prewarm");
+        std::fs::create_dir_all(&produced_dir).unwrap();
+        let produced = StemSet::from_layout(
+            &produced_dir,
+            zytunes::stems::STEM_EXT,
+            zytunes::stems::SIX_STEM_LAYOUT,
+        );
+        for p in &produced.paths {
+            std::fs::write(p, b"warm").unwrap();
+        }
+        let log = zytunes::cache::default_logger();
+        zytunes::stems::store_stems(&cache, &a, "m", &produced, u64::MAX, &log).unwrap();
+
+        let (event_tx, event_rx) = mpsc::channel();
+        let sep = FakeSeparator::ok();
+        let tracks = vec![
+            a.to_string_lossy().into_owned(),
+            b.to_string_lossy().into_owned(),
+        ];
+        run_stem_batch(
+            &StemBatchJob {
+                gen: 3,
+                track_paths: &tracks,
+                layout: zytunes::stems::SIX_STEM_LAYOUT,
+                cache_id: "m",
+                cache_dir: &cache,
+                max_bytes: u64::MAX,
+            },
+            &sep,
+            &|| false,
+            &event_tx,
+        );
+
+        assert_eq!(sep.calls.get(), 1, "cached track never reaches the engine");
+        let mut done = None;
+        let mut progressed = Vec::new();
+        for ev in event_rx.try_iter() {
+            match ev {
+                BgEvent::StemBatchProgress { current, total, .. } => {
+                    progressed.push((current, total))
+                }
+                BgEvent::StemBatchDone {
+                    gen,
+                    separated,
+                    skipped,
+                    failed,
+                    cancelled,
+                } => {
+                    assert!(done.is_none(), "exactly one terminal event");
+                    done = Some((gen, separated, skipped, failed, cancelled));
+                }
+                BgEvent::SyncMessage(_) => {}
+                _ => panic!("unexpected event kind"),
+            }
+        }
+        assert_eq!(done, Some((3, 1, 1, 0, false)));
+        assert!(progressed.contains(&(1, 2)) && progressed.contains(&(2, 2)));
+        // Track B's stems landed in the cache.
+        assert!(zytunes::stems::cached_stems(
+            &cache,
+            &b,
+            "m",
+            zytunes::stems::SIX_STEM_LAYOUT,
+            &log
+        )
+        .is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stem_batch_cancel_reports_cancelled_without_counting_failures() {
+        let dir = fresh_dir("stems-batch-cancel");
+        let cache = dir.join("cache");
+        let a = dir.join("a.mp3");
+        std::fs::write(&a, b"mp3").unwrap();
+        let (event_tx, event_rx) = mpsc::channel();
+        let sep = FakeSeparator::ok();
+        let tracks = vec![a.to_string_lossy().into_owned()];
+        run_stem_batch(
+            &StemBatchJob {
+                gen: 4,
+                track_paths: &tracks,
+                layout: zytunes::stems::SIX_STEM_LAYOUT,
+                cache_id: "m",
+                cache_dir: &cache,
+                max_bytes: u64::MAX,
+            },
+            &sep,
+            &|| true, // cancelled before the first track
+            &event_tx,
+        );
+        assert_eq!(sep.calls.get(), 0);
+        let done = event_rx.try_iter().find_map(|ev| match ev {
+            BgEvent::StemBatchDone {
+                separated,
+                skipped,
+                failed,
+                cancelled,
+                ..
+            } => Some((separated, skipped, failed, cancelled)),
+            _ => None,
+        });
+        assert_eq!(done, Some((0, 0, 0, true)));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

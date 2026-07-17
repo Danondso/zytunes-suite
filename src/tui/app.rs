@@ -363,6 +363,50 @@ pub struct StemPanel {
     pub models_cache_bytes: u64,
 }
 
+/// Bulk-separation confirmation modal (`M` on an album sidebar entry).
+pub struct StemBulkConfirm {
+    pub artist: String,
+    pub album: String,
+    pub track_paths: Vec<String>,
+    /// Recipe parsed once when the modal opened — accept and dispatch
+    /// reuse it instead of re-parsing (and re-logging) per call.
+    pub recipe: zytunes::stems::RecipeKind,
+    /// How many tracks already have a cached entry for the active recipe.
+    pub cached: usize,
+    /// Estimated NEW bytes the batch will add to the stem cache.
+    pub projected_bytes: u64,
+    /// Stem cache size right now.
+    pub cache_used_bytes: u64,
+    /// `[stems] cache_max_gb` in bytes.
+    pub cap_bytes: u64,
+}
+
+/// A running (or suspended) album batch. The full track list is kept so
+/// a suspend/resume cycle just re-dispatches it — cache-first skipping
+/// makes the re-run cost only the unfinished remainder.
+pub struct StemBatchState {
+    /// Batch generation echoed by `StemBatch*` events; stale events are
+    /// ignored (mirrors `StemState::job_gen`).
+    pub gen: u64,
+    pub album: String,
+    pub track_paths: Vec<String>,
+    /// 1-indexed track the worker is on.
+    pub current: usize,
+    pub total: usize,
+    /// Engine percent within the current track, when the engine emits one.
+    pub pct: Option<u8>,
+    /// An interactive `M` superseded the batch worker-side; the state
+    /// survives here and re-dispatches once the interactive job ends.
+    pub suspended: bool,
+    /// Recipe the batch started with — a resume re-dispatches the same
+    /// recipe even if config changed mid-batch.
+    pub recipe: zytunes::stems::RecipeKind,
+    /// Tracks separated in earlier rounds (before suspends). The final
+    /// round re-counts them as cache hits, so the completion toast adds
+    /// this back to report true separations.
+    pub separated_so_far: usize,
+}
+
 /// Stem-split playback state (`M` in the player). Pattern-matches
 /// `DeviceState`/`SyncState`: one sub-struct so `App` stays navigable.
 pub struct StemState {
@@ -1098,6 +1142,12 @@ pub struct App {
     pub pending_audio_commands: Vec<AudioCommand>,
     /// Stem-split playback state (`M`).
     pub stems: StemState,
+    /// Bulk-separation confirm modal; `Some` = modal open.
+    pub stem_bulk_confirm: Option<StemBulkConfirm>,
+    /// Running/suspended album batch, if any.
+    pub stems_batch: Option<StemBatchState>,
+    /// Monotonic batch generation (independent of `StemState::job_gen`).
+    pub stem_batch_gen: u64,
     /// Terminal height as of the most recent frame, refreshed by the run
     /// loop (and the test harness) before input handling. Lets key
     /// dispatch answer visibility questions — the stem strip claims keys
@@ -1407,6 +1457,9 @@ impl App {
             tag_manager: None,
             pending_audio_commands: Vec::new(),
             stems: StemState::default(),
+            stem_bulk_confirm: None,
+            stems_batch: None,
+            stem_batch_gen: 0,
             // Overwritten with the real height every tick; a typical
             // default keeps pre-first-frame (and unit-test) behaviour on
             // the "panel visible" path.
@@ -3352,6 +3405,168 @@ impl App {
         }
     }
 
+    /// `M` on an album sidebar entry. Three states: a batch is running →
+    /// cancel it; the entry resolves to tracks → open the disk/time
+    /// honesty confirm; otherwise fall through silently.
+    pub fn press_stem_mode_on_album(&mut self) {
+        if self.stems_batch.is_some() {
+            // Running or suspended: M on the album means cancel either way.
+            self.cancel_stem_batch();
+            return;
+        }
+        let Some(SidebarEntry::Album { artist, album }) =
+            self.sidebar_items.get(self.sidebar_selected).cloned()
+        else {
+            return;
+        };
+        let Some(lib) = &self.library else {
+            return;
+        };
+        let track_paths: Vec<String> = lib
+            .album_tracks_by_artist(&artist, &album)
+            .filter_map(|t| t.location.clone())
+            .collect();
+        if track_paths.is_empty() {
+            self.set_toast("No file paths for this album".into(), true);
+            return;
+        }
+        let recipe = self.stems_recipe();
+        let cache_id = recipe.cache_id(&self.stems_cfg.model());
+        let layout = recipe.layout();
+        let cache_dir = zytunes::stems::default_stem_cache_dir();
+        let cached = cache_dir
+            .as_deref()
+            .map(|d| {
+                track_paths
+                    .iter()
+                    .filter(|p| {
+                        zytunes::stems::stem_cache_contains(
+                            d,
+                            std::path::Path::new(p.as_str()),
+                            &cache_id,
+                            layout,
+                        )
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        let cache_used_bytes = cache_dir
+            .as_deref()
+            .map(zytunes::stems::stem_cache_used_bytes)
+            .unwrap_or(0);
+        let projected_bytes =
+            zytunes::stems::EST_STEM_BYTES_PER_TRACK * (track_paths.len() - cached) as u64;
+        self.stem_bulk_confirm = Some(StemBulkConfirm {
+            artist,
+            album,
+            track_paths,
+            recipe,
+            cached,
+            projected_bytes,
+            cache_used_bytes,
+            cap_bytes: self.stems_cfg.cache_max_bytes(),
+        });
+    }
+
+    /// Confirmed bulk separation. The engine must already be installed —
+    /// the batch deliberately has no consent/install flow of its own
+    /// (compounding a 1.5 GB install into an hours-long batch is not a
+    /// choice to hide behind one keypress).
+    pub fn stem_bulk_confirm_accept(&mut self) {
+        let Some(confirm) = self.stem_bulk_confirm.take() else {
+            return;
+        };
+        if (self.stem_engine_finder)(
+            confirm.recipe.engine(),
+            self.stems_cfg.command_path().as_deref(),
+        )
+        .is_none()
+        {
+            self.set_toast(
+                "Stem engine not installed — press M on a playing track first".into(),
+                true,
+            );
+            return;
+        }
+        let total = confirm.track_paths.len();
+        self.dispatch_stem_batch(confirm.album, confirm.track_paths, confirm.recipe, 0);
+        self.set_toast(
+            format!("Separating {total} track(s) in the background…"),
+            false,
+        );
+    }
+
+    /// Queue a batch job. Also the resume path — cache-first skipping
+    /// makes re-dispatching the full list cost only the remainder.
+    /// Takes the already-parsed recipe (re-parsing logs the
+    /// unknown-recipe warning per call, and a resumed batch must keep
+    /// the recipe it started with). `separated_so_far` carries the
+    /// earlier rounds' tally across a resume.
+    fn dispatch_stem_batch(
+        &mut self,
+        album: String,
+        track_paths: Vec<String>,
+        recipe: zytunes::stems::RecipeKind,
+        separated_so_far: usize,
+    ) {
+        self.stem_batch_gen += 1;
+        self.pending_bg_commands
+            .push(BgCommand::SeparateStemsBatch {
+                gen: self.stem_batch_gen,
+                track_paths: track_paths.clone(),
+                engine_command: self.stems_cfg.command_path(),
+                recipe,
+                model: self.stems_cfg.model(),
+                cache_max_bytes: self.stems_cfg.cache_max_bytes(),
+            });
+        let total = track_paths.len();
+        self.stems_batch = Some(StemBatchState {
+            gen: self.stem_batch_gen,
+            album,
+            track_paths,
+            current: 0,
+            total,
+            pct: None,
+            suspended: false,
+            recipe,
+            separated_so_far,
+        });
+    }
+
+    /// Cancel the batch: drop the state so nothing resumes later (a
+    /// cancel means cancel, not suspend). Late events are ignored via
+    /// the gen bump. The worker token is only tripped for a RUNNING
+    /// batch — a suspended one has no worker job, and `CancelSeparation`
+    /// would hit the most recently dispatched job instead: the user's
+    /// interactive split, killed as collateral.
+    pub fn cancel_stem_batch(&mut self) {
+        self.stem_batch_gen += 1;
+        let suspended = self.stems_batch.take().is_some_and(|b| b.suspended);
+        if !suspended {
+            self.pending_bg_commands.push(BgCommand::CancelSeparation);
+        }
+        self.set_toast("Album stem batch cancelled".into(), false);
+    }
+
+    /// Resume a suspended batch once no per-track job is in flight.
+    /// Called from the interactive job's terminal-event handlers.
+    pub(crate) fn maybe_resume_stem_batch(&mut self) {
+        let idle = matches!(self.stems.status, StemStatus::Off | StemStatus::Active);
+        if !idle || !self.stems_batch.as_ref().is_some_and(|b| b.suspended) {
+            return;
+        }
+        let batch = self.stems_batch.take().expect("checked above");
+        self.sync
+            .log
+            .push(format!("[stems] resuming album batch: {}", batch.album));
+        self.dispatch_stem_batch(
+            batch.album,
+            batch.track_paths,
+            batch.recipe,
+            batch.separated_so_far,
+        );
+    }
+
     /// Recipe from config; an unknown value falls back to demucs with a
     /// log line rather than silently downgrading (the parse error keeps
     /// the raw string for exactly this message).
@@ -3405,6 +3620,7 @@ impl App {
     /// already-parsed recipe — re-parsing here logged the unknown-recipe
     /// warning twice per M-press.
     pub(crate) fn dispatch_separation(&mut self, path: String, recipe: zytunes::stems::RecipeKind) {
+        self.suspend_batch_for_interactive();
         self.stems.job_gen += 1;
         self.stems.status = StemStatus::Separating { pct: None };
         self.stems.for_path = Some(path.clone());
@@ -3540,6 +3756,22 @@ impl App {
             });
         self.stem_panel = None;
         self.set_toast(format!("Uninstalling {}…", engine.exe_name()), false);
+    }
+
+    /// An interactive stem job (separation or the engine install that
+    /// precedes one) supersedes a running album batch worker-side; keep
+    /// its state as suspended so the terminal event of the interactive
+    /// job resumes it instead of the batch dying with a log line.
+    pub(crate) fn suspend_batch_for_interactive(&mut self) {
+        if let Some(batch) = self.stems_batch.as_mut() {
+            if !batch.suspended {
+                batch.suspended = true;
+                self.sync.log.push(
+                    "[stems] album batch suspended for the interactive split — resumes after"
+                        .to_string(),
+                );
+            }
+        }
     }
 
     /// Swap live stem playback back to the original file, gaplessly — the
@@ -11514,6 +11746,30 @@ mod tests {
         app
     }
 
+    /// App with a two-track album library, the album selected in the
+    /// sidebar, and hermetic stem config/discovery.
+    fn bulk_stem_app() -> App {
+        let mut app = stem_playing_app("/lib/song.mp3");
+        let mk = |name: &str, loc: &str| zytunes::library::Track {
+            id: 1,
+            name: name.into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            location: Some(loc.into()),
+            ..Default::default()
+        };
+        app.library = Some(Box::new(VecLibrary {
+            tracks: vec![mk("One", "/lib/one.mp3"), mk("Two", "/lib/two.mp3")],
+        }));
+        app.sidebar_items = vec![SidebarEntry::Album {
+            artist: "Artist".into(),
+            album: "Album".into(),
+        }];
+        app.sidebar_selected = 0;
+        app.active_panel = Panel::Library;
+        app
+    }
+
     #[test]
     fn stem_panel_opens_on_the_configured_recipe_and_wraps() {
         let mut app = stem_panel_app();
@@ -11644,6 +11900,178 @@ mod tests {
             Some("/x/bin/audio-separator"),
             "the still-installed engine's path survives"
         );
+    }
+
+    #[test]
+    fn m_on_album_sidebar_entry_opens_bulk_confirm() {
+        let mut app = bulk_stem_app();
+        app.press_stem_mode_on_album();
+        let confirm = app.stem_bulk_confirm.as_ref().expect("confirm modal opens");
+        assert_eq!(confirm.album, "Album");
+        assert_eq!(confirm.track_paths.len(), 2);
+        assert_eq!(confirm.cached, 0, "fake paths are never cached");
+        assert!(confirm.projected_bytes > 0);
+    }
+
+    #[test]
+    fn bulk_accept_requires_an_engine() {
+        let mut app = bulk_stem_app();
+        app.press_stem_mode_on_album();
+        app.stem_bulk_confirm_accept(); // finder is hermetic None
+        assert!(app.stem_bulk_confirm.is_none(), "modal closes");
+        assert!(app.stems_batch.is_none(), "nothing dispatched");
+        assert!(app.pending_bg_commands.is_empty());
+        assert!(app.toast_message.is_some(), "user told to install first");
+    }
+
+    #[test]
+    fn bulk_accept_dispatches_the_batch() {
+        let mut app = bulk_stem_app();
+        app.stem_engine_finder = |_, _| Some(std::path::PathBuf::from("/bin/engine"));
+        app.press_stem_mode_on_album();
+        app.stem_bulk_confirm_accept();
+        assert!(app.stem_bulk_confirm.is_none());
+        let batch = app.stems_batch.as_ref().expect("batch state set");
+        assert_eq!(batch.total, 2);
+        assert!(!batch.suspended);
+        assert!(matches!(
+            app.pending_bg_commands.as_slice(),
+            [BgCommand::SeparateStemsBatch { track_paths, .. }] if track_paths.len() == 2
+        ));
+    }
+
+    #[test]
+    fn m_on_album_cancels_a_running_batch() {
+        let mut app = bulk_stem_app();
+        app.stem_engine_finder = |_, _| Some(std::path::PathBuf::from("/bin/engine"));
+        app.press_stem_mode_on_album();
+        app.stem_bulk_confirm_accept();
+        app.pending_bg_commands.clear();
+        app.press_stem_mode_on_album(); // second press = cancel
+        assert!(app.stems_batch.is_none(), "batch state cleared");
+        assert!(matches!(
+            app.pending_bg_commands.as_slice(),
+            [BgCommand::CancelSeparation]
+        ));
+    }
+
+    #[test]
+    fn interactive_split_suspends_the_batch_and_resumes_after() {
+        let mut app = bulk_stem_app();
+        app.stem_engine_finder = |_, _| Some(std::path::PathBuf::from("/bin/engine"));
+        app.press_stem_mode_on_album();
+        app.stem_bulk_confirm_accept();
+        let batch_gen = app.stems_batch.as_ref().unwrap().gen;
+        app.pending_bg_commands.clear();
+
+        // Interactive M on the playing track supersedes the batch...
+        app.dispatch_separation("/lib/song.mp3".into(), zytunes::stems::RecipeKind::Demucs);
+        assert!(app.stems_batch.as_ref().unwrap().suspended);
+
+        // ...whose worker thread reports its cancellation; the state
+        // survives because it's suspended, not dead.
+        app.handle_bg_event(BgEvent::StemBatchDone {
+            gen: batch_gen,
+            separated: 1,
+            skipped: 0,
+            failed: 0,
+            cancelled: true,
+        });
+        assert!(app.stems_batch.is_some(), "suspended batch survives");
+
+        // The interactive job's terminal event frees the worker; the
+        // batch re-dispatches (cache-first makes the re-run cheap).
+        app.pending_bg_commands.clear();
+        let gen = app.stems.job_gen;
+        app.handle_bg_event(BgEvent::StemsFailed {
+            gen,
+            track_path: "/lib/song.mp3".into(),
+            error: "cancelled".into(),
+            cancelled: true,
+        });
+        let batch = app.stems_batch.as_ref().expect("batch resumed");
+        assert!(!batch.suspended);
+        assert!(batch.gen > batch_gen, "resume is a fresh worker job");
+        assert_eq!(
+            batch.separated_so_far, 1,
+            "pre-suspend separations are banked across the resume"
+        );
+        assert!(matches!(
+            app.pending_bg_commands.as_slice(),
+            [BgCommand::SeparateStemsBatch { .. }]
+        ));
+
+        // The final round re-counts the banked track as a cache hit; the
+        // completion toast must shift it back to "separated".
+        let resumed_gen = app.stems_batch.as_ref().unwrap().gen;
+        app.handle_bg_event(BgEvent::StemBatchDone {
+            gen: resumed_gen,
+            separated: 1,
+            skipped: 1,
+            failed: 0,
+            cancelled: false,
+        });
+        assert!(app.stems_batch.is_none());
+        let (msg, _, _) = app.toast_message.as_ref().expect("summary toast");
+        assert!(
+            msg.contains("2 separated") && !msg.contains("already cached"),
+            "toast reports true separations, not the resume's re-count: {msg}"
+        );
+    }
+
+    #[test]
+    fn cancel_of_a_suspended_batch_spares_the_interactive_job() {
+        let mut app = bulk_stem_app();
+        app.stem_engine_finder = |_, _| Some(std::path::PathBuf::from("/bin/engine"));
+        app.press_stem_mode_on_album();
+        app.stem_bulk_confirm_accept();
+
+        // Interactive split suspends the batch; the batch has no worker
+        // job now — the most recently dispatched job is the user's.
+        app.dispatch_separation("/lib/song.mp3".into(), zytunes::stems::RecipeKind::Demucs);
+        assert!(app.stems_batch.as_ref().unwrap().suspended);
+        app.pending_bg_commands.clear();
+
+        // M on the album cancels the batch — but must NOT push a
+        // CancelSeparation, which would kill the interactive split as
+        // collateral (StemJobs cancels the most recent dispatch).
+        app.press_stem_mode_on_album();
+        assert!(app.stems_batch.is_none(), "batch state dropped");
+        assert!(
+            app.pending_bg_commands.is_empty(),
+            "no CancelSeparation for a suspended batch ({} queued)",
+            app.pending_bg_commands.len()
+        );
+    }
+
+    #[test]
+    fn batch_done_clears_state_and_toasts_a_summary() {
+        let mut app = bulk_stem_app();
+        app.stem_engine_finder = |_, _| Some(std::path::PathBuf::from("/bin/engine"));
+        app.press_stem_mode_on_album();
+        app.stem_bulk_confirm_accept();
+        let gen = app.stems_batch.as_ref().unwrap().gen;
+        app.handle_bg_event(BgEvent::StemBatchProgress {
+            gen,
+            current: 2,
+            total: 2,
+            pct: Some(40),
+        });
+        assert_eq!(app.stems_batch.as_ref().unwrap().current, 2);
+        app.handle_bg_event(BgEvent::StemBatchDone {
+            gen,
+            separated: 1,
+            skipped: 1,
+            failed: 0,
+            cancelled: false,
+        });
+        assert!(app.stems_batch.is_none());
+        let (msg, _, is_error) = app.toast_message.as_ref().unwrap();
+        assert!(
+            msg.contains("1") && msg.contains("cached"),
+            "summary names skips: {msg}"
+        );
+        assert!(!is_error);
     }
 
     #[test]

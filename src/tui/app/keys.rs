@@ -48,6 +48,7 @@ impl App {
             || self.handle_stem_panel_key(key)
             || self.handle_cache_clear_key(key)
             || self.handle_stem_consent_key(key)
+            || self.handle_stem_bulk_confirm_key(key)
             || self.handle_removal_confirm_key(key, cmd_tx)
             || self.handle_help_key(key)
         {
@@ -80,6 +81,11 @@ impl App {
         match key.code {
             KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
                 if let Some(consent) = self.stems.consent.take() {
+                    // The install job supersedes a running batch
+                    // worker-side just like a separation does — suspend
+                    // it so the install's follow-on separation resumes
+                    // it instead of the batch dying with a log line.
+                    self.suspend_batch_for_interactive();
                     self.stems.job_gen += 1;
                     self.stems.status = super::StemStatus::Provisioning;
                     self.pending_bg_commands
@@ -264,6 +270,24 @@ impl App {
             KeyCode::Char(c) => {
                 self.search_query.push(c);
                 self.apply_sidebar_filter();
+            }
+            _ => {}
+        }
+        true
+    }
+
+    /// Album bulk-separation confirmation (`M` on an album entry). A
+    /// real modal: claims every key while open.
+    fn handle_stem_bulk_confirm_key(&mut self, key: KeyEvent) -> bool {
+        if self.stem_bulk_confirm.is_none() {
+            return false;
+        }
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.stem_bulk_confirm_accept();
+            }
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.stem_bulk_confirm = None;
             }
             _ => {}
         }
@@ -479,7 +503,21 @@ impl App {
                 self.open_tag_manager(cmd_tx);
             }
             KeyCode::Char('M') => {
-                self.press_stem_mode();
+                // On an album sidebar entry (Library browse), M means
+                // "pre-warm this whole album" — or cancels the batch
+                // already doing so. Everywhere else it drives the
+                // per-track stem mode.
+                let on_album_entry = self.browse_mode == BrowseMode::Library
+                    && self.active_panel == Panel::Library
+                    && matches!(
+                        self.sidebar_items.get(self.sidebar_selected),
+                        Some(crate::app::SidebarEntry::Album { .. })
+                    );
+                if on_album_entry {
+                    self.press_stem_mode_on_album();
+                } else {
+                    self.press_stem_mode();
+                }
             }
             KeyCode::Char('P') => {
                 let label = self.cycle_show_player();

@@ -951,6 +951,81 @@ pub fn migrate_legacy_stem_entries(cache_dir: &Path, log: &Logger) {
     }
 }
 
+/// Read-only version of [`cached_stems`]: does a fresh entry exist for
+/// `(source, model, layout)`? No LRU touch — counting an album for the
+/// bulk-confirm estimate must not count as use.
+pub fn stem_cache_contains(
+    cache_dir: &Path,
+    source: &Path,
+    model: &str,
+    layout: &'static [StemKind],
+) -> bool {
+    let entry_dir = cache_dir.join(stem_cache_key(&source.to_string_lossy(), model));
+    let Some(meta) = read_meta(&entry_dir) else {
+        return false;
+    };
+    let Some(current) = FileFingerprint::from_path(source) else {
+        return false;
+    };
+    meta.fingerprint == current
+        && meta.model == model
+        && StemSet::from_layout(&entry_dir, STEM_EXT, layout).all_exist()
+}
+
+/// Rough on-disk size of one separated track (six/seven FLACs) for the
+/// bulk-confirm projection — real entries run ~150-250 MB.
+pub const EST_STEM_BYTES_PER_TRACK: u64 = 220 * 1024 * 1024;
+
+/// Total bytes of regular files under `dir`, recursively. Used by the
+/// stem settings panel (cache-size display), the uninstall flow's
+/// reclaimed-bytes accounting, and the bulk-confirm cap warning.
+pub fn dir_size_recursive(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|e| {
+            // file_type() does NOT follow symlinks (metadata() does) — a
+            // symlinked dir under the cache must not be traversed, both
+            // to avoid cycles and to keep the count honest about what
+            // deleting the cache would actually reclaim.
+            let Ok(ft) = e.file_type() else { return 0 };
+            if ft.is_file() {
+                e.metadata().map(|m| m.len()).unwrap_or(0)
+            } else if ft.is_dir() {
+                dir_size_recursive(&e.path())
+            } else {
+                0
+            }
+        })
+        .sum()
+}
+
+/// Cache usage as the cap/pruner sees it: cache entry dirs only,
+/// excluding the transient `work/` output and crashed-store `{key}.tmp`
+/// stages — counting those against `cache_max_gb` would fire the
+/// bulk-confirm's over-cap warning on bytes the LRU never manages.
+pub fn stem_cache_used_bytes(cache_dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(cache_dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|e| {
+            let path = e.path();
+            // `file_type()` (not `path.is_dir()`, which follows links) so
+            // a symlinked dir at the cache root is never traversed —
+            // matching the invariant `dir_size_recursive` holds for
+            // nested entries.
+            e.file_type().is_ok_and(|t| t.is_dir())
+                && path.file_name().is_none_or(|n| n != "work")
+                && !path.extension().is_some_and(|ext| ext == "tmp")
+        })
+        .map(|e| dir_size_recursive(&e.path()))
+        .sum()
+}
+
 fn read_meta(entry_dir: &Path) -> Option<StemCacheMeta> {
     let data = std::fs::read(entry_dir.join(META_NAME)).ok()?;
     serde_json::from_slice(&data).ok()
@@ -1059,32 +1134,6 @@ pub fn store_stems(
 
     prune_stem_cache(cache_dir, max_bytes, Some(&key), log);
     Ok(StemSet::from_layout(&entry_dir, STEM_EXT, produced.layout))
-}
-
-/// Total bytes of regular files under `dir`, recursively. Used by the
-/// stem settings panel (cache-size display) and the uninstall flow's
-/// reclaimed-bytes accounting.
-pub fn dir_size_recursive(dir: &Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    entries
-        .flatten()
-        .map(|e| {
-            // file_type() does NOT follow symlinks (metadata() does) — a
-            // symlinked dir under the cache must not be traversed, both
-            // to avoid cycles and to keep the count honest about what
-            // deleting the cache would actually reclaim.
-            let Ok(ft) = e.file_type() else { return 0 };
-            if ft.is_file() {
-                e.metadata().map(|m| m.len()).unwrap_or(0)
-            } else if ft.is_dir() {
-                dir_size_recursive(&e.path())
-            } else {
-                0
-            }
-        })
-        .sum()
 }
 
 fn dir_size_bytes(dir: &Path) -> u64 {
@@ -1608,6 +1657,26 @@ mod tests {
         assert!(dir.join("5c90dfd2-34c22ccb.th").exists(), ".th untouched");
         assert!(dir.join("model-data.json").exists(), "loose json untouched");
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cache_used_bytes_ignores_work_and_stage_dirs() {
+        let root = temp_root("used-bytes");
+        let cache = root.join("cache");
+        // One real entry, one crashed stage, one work dir, one symlink-free
+        // loose file at the root (not counted — the cap manages entry dirs).
+        let entry = cache.join("aabbccdd00112233");
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(entry.join("vocals.flac"), vec![0u8; 100]).unwrap();
+        let stage = cache.join("deadbeef.tmp");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(stage.join("vocals.flac"), vec![0u8; 999]).unwrap();
+        let work = cache.join("work").join("k");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(work.join("partial.flac"), vec![0u8; 999]).unwrap();
+
+        assert_eq!(stem_cache_used_bytes(&cache), 100);
         let _ = std::fs::remove_dir_all(&root);
     }
 
