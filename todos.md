@@ -412,28 +412,24 @@ Regression tests: `enter_on_paused_split_track_resumes_and_keeps_stems`,
 `enter_on_a_different_track_still_resets_stems` (the full transition path
 — skip + stem reset + fresh `Play` — still fires for a different row).
 
-### Model-checkpoint cache has no eviction
-`~/.cache/zytunes/models` (`default_model_file_dir`, `src/stems.rs` — passed
-as `--model_file_dir`) persists Roformer checkpoints that run 0.2–1 GB each,
-but nothing ever prunes it: `prune_stem_cache` only walks the stems dir, and
-the worker's cleanup only removes work dirs. The pinned-model doc comments
-(`MEL_ROFORMER_KARAOKE_MODEL`) explicitly anticipate checkpoint swaps — each
-one orphans the previous file forever.
-
-Scope:
-
-1. **Eviction policy first.** Unlike stems, checkpoints are not
-   re-derivable-in-minutes (they re-download, 0.2-1 GB), and audio-separator
-   may write sidecar files (yaml configs) next to them. Options: delete
-   files not named by any currently pinned model constant after a
-   successful separation, or LRU with a generous cap (e.g. 5 GB) mirroring
-   `prune_stem_cache`. Pinned-set cleanup is simpler and matches how the
-   constants are managed.
-2. **Fold the root resolution.** `default_model_file_dir` duplicates
-   `default_stem_cache_dir`'s `$HOME/.cache/zytunes` lookup byte-for-byte;
-   factor a shared `zytunes_cache_root()` and derive both leaves (and check
-   `cache.rs` / `art_cache.rs` / `local_plays.rs`, which carry the same
-   pattern).
-3. **Surface it in the future stem config panel** (see "Stem config panel
-   in the TUI" above): the uninstall flow already plans to offer model-cache
-   eviction with reclaimed-bytes reporting.
+### ~~Model-checkpoint cache has no eviction~~ (done — pinned-set cleanup)
+`prune_model_cache(model_dir, pinned, log)` in `src/stems.rs` implements
+the pinned-set policy: a `.ckpt` whose filename is absent from
+`pinned_model_files()` (derived from the same constants the recipes are
+built on, so a checkpoint swap automatically retires the old file) is
+provably retired and is deleted along with its same-stem sidecars (the
+`.yaml`/`.json` configs the engine downloads alongside). Files with any
+other extension are never touched — audio-separator also stores
+engine-managed data there (demucs weight segments, registry json) whose
+names we don't control, and deleting those would force silent
+re-downloads; a belt-and-braces guard also refuses to delete any file
+whose full name is pinned. The worker sweeps after every audio-separator
+separation (retired files are never referenced by a running engine, so a
+cancelled run can't lose anything). Every eviction logs its size. Root
+resolution folded into `paths::zytunes_cache_root()`, now shared by
+`default_model_file_dir`, `default_stem_cache_dir`, `cache.rs`,
+`art_cache.rs`, and `local_plays.rs`. Surfacing reclaimed-bytes in the
+stem config panel remains with that panel's todo. Tests:
+`pinned_model_files_names_every_recipe_checkpoint`,
+`prune_model_cache_removes_retired_ckpts_and_their_sidecars`,
+`prune_model_cache_tolerates_missing_dir`.

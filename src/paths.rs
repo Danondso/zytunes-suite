@@ -31,6 +31,18 @@ pub fn override_cache_dir() -> Option<PathBuf> {
     Some(path)
 }
 
+/// Root of the shared (non-device-scoped) cache tree:
+/// `$HOME/.cache/zytunes`. Deliberately does **not** consult
+/// `ZYTUNES_CACHE_DIR` — everything under this root (dirlib scans, album
+/// art, stems, model checkpoints, play history) is derived from source
+/// data that sibling worktrees share, so isolating it per-worktree would
+/// only multiply expensive regeneration. Device-scoped caches go through
+/// [`device_cache_base`] instead. Returns `None` when `HOME` is unset.
+pub fn zytunes_cache_root() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(Path::new(&home).join(".cache").join("zytunes"))
+}
+
 /// Base directory for device-scoped cache dotfiles (track cache, library
 /// cache, sync progress). Honors `ZYTUNES_CACHE_DIR`; falls back to `$HOME`
 /// so existing installations keep reading `~/.zytunes-*-cache-{serial}`.

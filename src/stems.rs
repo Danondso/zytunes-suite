@@ -459,13 +459,115 @@ pub struct AudioSeparatorCli {
 /// shareable data every worktree should reuse (they run 200 MB–1 GB
 /// each).
 pub fn default_model_file_dir() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(
-        Path::new(&home)
-            .join(".cache")
-            .join("zytunes")
-            .join("models"),
-    )
+    Some(crate::paths::zytunes_cache_root()?.join("models"))
+}
+
+/// Every model file a current recipe can reference. Derived from the same
+/// pinned constants the recipes are built on, so a checkpoint swap
+/// automatically retires the old file for [`prune_model_cache`].
+pub fn pinned_model_files() -> [&'static str; 3] {
+    [
+        AUDIO_SEPARATOR_HTDEMUCS_MODEL,
+        BS_ROFORMER_VOCALS_MODEL,
+        MEL_ROFORMER_KARAOKE_MODEL,
+    ]
+}
+
+/// Evict retired model checkpoints from `model_dir`.
+///
+/// A checkpoint swap (bumping [`BS_ROFORMER_VOCALS_MODEL`] etc.) orphans
+/// the previous 0.2–1 GB file forever — nothing else walks this dir. The
+/// policy is pinned-set cleanup rather than LRU: Roformer checkpoints are
+/// pinned constants, not user config, so a `.ckpt` whose filename is not
+/// in `pinned` — and whose stem no pinned file owns — is provably
+/// retired. A retired checkpoint is deleted together with its
+/// `.yaml`/`.yml`/`.json` sidecar configs (same stem); any other file is
+/// never touched: audio-separator also stores engine-managed data here
+/// (demucs weight segments, registry json, download locks) whose names
+/// we don't control, and deleting those would force silent re-downloads.
+///
+/// Retirement only covers `.ckpt` models. If the yaml-named
+/// [`AUDIO_SEPARATOR_HTDEMUCS_MODEL`] is ever swapped, the old yaml and
+/// its hash-named demucs weight segments are NOT reclaimed — hash-named
+/// weights can't be attributed to a model by this policy, so a future
+/// model bump must clean those up by other means.
+pub fn prune_model_cache(model_dir: &Path, pinned: &[&str], log: &Logger) {
+    let Ok(entries) = std::fs::read_dir(model_dir) else {
+        return;
+    };
+    let files: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .collect();
+
+    let has_ext = |p: &Path, ext: &str| {
+        p.extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case(ext))
+    };
+
+    // Stems owned by pinned files are never retire-able: a stray
+    // non-pinned `htdemucs_6s.ckpt` beside the pinned `htdemucs_6s.yaml`
+    // must not drag the live model's sidecars into the sweep. Leaking
+    // the stray file is the safe failure mode.
+    let pinned_stems: std::collections::HashSet<&std::ffi::OsStr> = pinned
+        .iter()
+        .filter_map(|n| Path::new(n).file_stem())
+        .collect();
+
+    // A retired stem: a .ckpt present on disk whose filename no current
+    // recipe references and whose stem no pinned file owns.
+    let retired: std::collections::HashSet<&std::ffi::OsStr> = files
+        .iter()
+        .filter(|p| has_ext(p, "ckpt"))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| !pinned.contains(&n))
+        })
+        .filter_map(|p| p.file_stem())
+        .filter(|s| !pinned_stems.contains(s))
+        .collect();
+    if retired.is_empty() {
+        return;
+    }
+
+    for path in &files {
+        if !path.file_stem().is_some_and(|s| retired.contains(s)) {
+            continue;
+        }
+        // Only the checkpoint and its config sidecars — a same-stem file
+        // with any other extension is engine-managed and stays.
+        if !(has_ext(path, "ckpt")
+            || has_ext(path, "yaml")
+            || has_ext(path, "yml")
+            || has_ext(path, "json"))
+        {
+            continue;
+        }
+        // Belt-and-braces: never delete a file whose full name is pinned,
+        // even if it shares a stem with a retired checkpoint.
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| pinned.contains(&n))
+        {
+            continue;
+        }
+        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        match std::fs::remove_file(path) {
+            Ok(()) => log(&format!(
+                "model cache: evicted retired {} ({:.1} MB)",
+                path.display(),
+                size as f64 / (1024.0 * 1024.0)
+            )),
+            Err(e) => log(&format!(
+                "model cache: failed to evict {}: {e}",
+                path.display()
+            )),
+        }
+    }
 }
 
 /// Build the audio-separator argv for one model pass. `output_names`
@@ -746,13 +848,7 @@ const META_NAME: &str = "meta.json";
 /// sibling worktrees pointed at the same `~/Music` should share one copy
 /// of these large files.
 pub fn default_stem_cache_dir() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(
-        Path::new(&home)
-            .join(".cache")
-            .join("zytunes")
-            .join("stems"),
-    )
+    Some(crate::paths::zytunes_cache_root()?.join("stems"))
 }
 
 /// Cache entry directory name for a `(source path, recipe cache id)`
@@ -1423,6 +1519,113 @@ mod tests {
         assert!(!cache.join(&keys[2]).exists());
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pinned_model_files_names_every_recipe_checkpoint() {
+        let pinned = pinned_model_files();
+        for name in [
+            AUDIO_SEPARATOR_HTDEMUCS_MODEL,
+            BS_ROFORMER_VOCALS_MODEL,
+            MEL_ROFORMER_KARAOKE_MODEL,
+        ] {
+            assert!(pinned.contains(&name), "{name} must be in the pinned set");
+        }
+    }
+
+    #[test]
+    fn prune_model_cache_removes_retired_ckpts_and_their_sidecars() {
+        let root = temp_root("model-prune");
+        let dir = root.join("models");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Currently pinned checkpoint + its engine-downloaded config.
+        std::fs::write(dir.join(BS_ROFORMER_VOCALS_MODEL), b"pinned").unwrap();
+        let pinned_yaml = format!(
+            "{}.yaml",
+            Path::new(BS_ROFORMER_VOCALS_MODEL)
+                .file_stem()
+                .unwrap()
+                .to_str()
+                .unwrap()
+        );
+        std::fs::write(dir.join(&pinned_yaml), b"cfg").unwrap();
+        // A checkpoint retired by a pin bump, plus its sidecar config —
+        // and a same-stem engine-managed file outside the sidecar
+        // allowlist, which must survive the sweep.
+        std::fs::write(dir.join("old_roformer_sdr_1.0.ckpt"), b"retired").unwrap();
+        std::fs::write(dir.join("old_roformer_sdr_1.0.yaml"), b"cfg").unwrap();
+        std::fs::write(dir.join("old_roformer_sdr_1.0.th"), b"weights").unwrap();
+        // Engine-managed files whose names we don't control — never touched.
+        std::fs::write(dir.join("5c90dfd2-34c22ccb.th"), b"demucs-weights").unwrap();
+        std::fs::write(dir.join("model-data.json"), b"registry").unwrap();
+
+        prune_model_cache(&dir, &pinned_model_files(), &default_logger());
+
+        assert!(dir.join(BS_ROFORMER_VOCALS_MODEL).exists(), "pinned stays");
+        assert!(dir.join(&pinned_yaml).exists(), "pinned sidecar stays");
+        assert!(
+            !dir.join("old_roformer_sdr_1.0.ckpt").exists(),
+            "retired checkpoint evicted"
+        );
+        assert!(
+            !dir.join("old_roformer_sdr_1.0.yaml").exists(),
+            "retired sidecar evicted with it"
+        );
+        assert!(
+            dir.join("old_roformer_sdr_1.0.th").exists(),
+            "same-stem file outside the sidecar allowlist stays"
+        );
+        assert!(dir.join("5c90dfd2-34c22ccb.th").exists(), ".th untouched");
+        assert!(dir.join("model-data.json").exists(), "loose json untouched");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prune_model_cache_never_retires_a_pinned_stem() {
+        // AUDIO_SEPARATOR_HTDEMUCS_MODEL is pinned by its *yaml* name. A
+        // stray non-pinned same-stem .ckpt must not mark that stem
+        // retired — the sweep would otherwise take the live model's
+        // sidecars with it, forcing a silent re-download. Leaking the
+        // stray file is the safe outcome.
+        let root = temp_root("model-prune-pinned-stem");
+        let dir = root.join("models");
+        std::fs::create_dir_all(&dir).unwrap();
+        let stem = Path::new(AUDIO_SEPARATOR_HTDEMUCS_MODEL)
+            .file_stem()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        std::fs::write(dir.join(AUDIO_SEPARATOR_HTDEMUCS_MODEL), b"pinned").unwrap();
+        std::fs::write(dir.join(format!("{stem}.ckpt")), b"stray").unwrap();
+        std::fs::write(dir.join(format!("{stem}.json")), b"engine-cfg").unwrap();
+
+        prune_model_cache(&dir, &pinned_model_files(), &default_logger());
+
+        assert!(
+            dir.join(AUDIO_SEPARATOR_HTDEMUCS_MODEL).exists(),
+            "pinned yaml stays"
+        );
+        assert!(
+            dir.join(format!("{stem}.ckpt")).exists(),
+            "stray same-stem ckpt is leaked, not retired"
+        );
+        assert!(
+            dir.join(format!("{stem}.json")).exists(),
+            "live model's sidecar survives"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prune_model_cache_tolerates_missing_dir() {
+        // No models dir yet (demucs-only user) — must be a silent no-op.
+        prune_model_cache(
+            Path::new("/nonexistent/zytunes-models"),
+            &pinned_model_files(),
+            &default_logger(),
+        );
     }
 
     #[test]

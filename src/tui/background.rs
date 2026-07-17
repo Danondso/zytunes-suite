@@ -1718,6 +1718,34 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                     &|| token.load(Ordering::SeqCst),
                                     &tx,
                                 );
+                                // Checkpoint swaps orphan the previous
+                                // 0.2–1 GB file; sweep retired ones now
+                                // that the engine is done with the dir.
+                                // Only .ckpt files absent from the
+                                // pinned set (plus their same-stem
+                                // sidecars) are touched, so a cancelled
+                                // run can't lose anything a recipe
+                                // still needs.
+                                if recipe.engine()
+                                    == zytunes::stems::provision::EngineKind::AudioSeparator
+                                {
+                                    if let Some(model_dir) =
+                                        zytunes::stems::default_model_file_dir()
+                                    {
+                                        let log_tx = tx.clone();
+                                        let log: zytunes::cache::Logger =
+                                            Arc::new(move |msg: &str| {
+                                                let _ = log_tx.send(BgEvent::SyncMessage(format!(
+                                                    "[stems] {msg}"
+                                                )));
+                                            });
+                                        zytunes::stems::prune_model_cache(
+                                            &model_dir,
+                                            &zytunes::stems::pinned_model_files(),
+                                            &log,
+                                        );
+                                    }
+                                }
                             }
                         }
                     });

@@ -295,8 +295,7 @@ impl LocalPlays {
 }
 
 fn sidecar_dir() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(Path::new(&home).join(".cache").join("zytunes"))
+    crate::paths::zytunes_cache_root()
 }
 
 /// Default location of the sidecar (`~/.cache/zytunes/local-plays.json`).

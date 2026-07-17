@@ -46,10 +46,7 @@ impl ArtCache {
     /// at the same `~/Music` reuse one cache. Returns `None` when `HOME` is
     /// unset (the tests rely on the explicit-root constructor instead).
     pub fn default_location() -> Option<Self> {
-        let home = std::env::var("HOME").ok()?;
-        Some(Self::new(
-            Path::new(&home).join(".cache").join("zytunes").join("art"),
-        ))
+        Some(Self::new(crate::paths::zytunes_cache_root()?.join("art")))
     }
 
     fn key(artist: &str, album: &str) -> String {

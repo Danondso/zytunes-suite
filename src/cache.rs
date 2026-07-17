@@ -90,11 +90,10 @@ struct CachedLibrary {
 fn cache_dir() -> Option<std::path::PathBuf> {
     // The dirlib cache is keyed by a hash of the scan root (see
     // `dirlib_cache_name`), so identical `~/Music` scans from different
-    // worktrees can safely share one entry. Keeping this at `$HOME/.cache`
-    // — and *not* consulting `ZYTUNES_CACHE_DIR` — avoids re-running the
-    // lofty pass for large libraries every time a new worktree spins up.
-    let home = std::env::var("HOME").ok()?;
-    Some(Path::new(&home).join(".cache").join("zytunes"))
+    // worktrees can safely share one entry. `zytunes_cache_root` does not
+    // consult `ZYTUNES_CACHE_DIR`, which avoids re-running the lofty pass
+    // for large libraries every time a new worktree spins up.
+    crate::paths::zytunes_cache_root()
 }
 
 fn cache_path(name: &str) -> Option<std::path::PathBuf> {
