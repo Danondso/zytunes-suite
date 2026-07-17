@@ -311,31 +311,24 @@ batch mode is its own follow-up.
 
 ## Stem-split follow-ups
 
-### Stem cache holds one entry per track, so recipe A/B re-separates every flip
-`stem_cache_key` (`src/stems.rs:762`) hashes the source path alone, and
-`store_stems` `remove_dir_all`s the previous entry before renaming the new
-stage in (`src/stems.rs:867`). Model-change invalidation itself already works
-— `cached_stems` misses on `meta.model != model` and re-separates, and the
-stale entry is deleted rather than orphaned. The gap is that the two recipes'
-outputs cannot coexist: switching `demucs` -> `hq` -> `demucs` pays a full
-multi-minute separation each way, which makes comparing recipes on the same
-track far more expensive than it should be.
-
-Fold the model id into the key (`{path_hash}-{cache_id}`) so entries are
-per-(track, recipe). Consequences to handle:
-
-1. **Migration.** Existing entries are keyed by bare path hash and would all
-   become invisible misses — dead bytes the LRU never reclaims because
-   `prune_stem_cache` only sees them as unreadable dirs. Either sweep
-   unrecognised key shapes on first run, or accept one re-separation and
-   have the prune pass evict legacy dirs by mtime.
-2. **Cache cap pressure.** N recipes x ~150-220 MB per track against the same
-   `cache_max_gb` default of 10. The LRU handles it, but the effective
-   track count at the cap drops by the number of recipes in play; worth a
-   note in the config docs.
-3. **`prune_stem_cache` keep_key.** Still correct (it keeps the just-stored
-   key), but the `Some(&key)` exemption now protects one recipe's entry only
-   — verify a store under a cap smaller than two entries still plays.
+### ~~Stem cache holds one entry per track, so recipe A/B re-separates every flip~~ (done)
+`stem_cache_key` now takes the recipe cache id and produces
+`{path_hash}-{sanitised_cache_id}` (slashes in versioned ids like `hq/v1`
+mapped to `-`, kept readable rather than hashed), so entries are
+per-(track, recipe) and an A/B flip hits both ways. Migration is
+lossless: a legacy bare-hash entry's own `meta.model` already records its
+cache id, so `migrate_legacy_stem_entries` (run by the worker before
+every lookup; no-op readdir after the first sweep) renames it into the
+new scheme — no re-separation. A legacy dir whose new-key twin already
+exists is removed as dead bytes; metaless dirs are not provably ours and
+are left alone. Cap-pressure note added to the README config docs (each
+recipe in play holds its own ~150–250 MB per track against the same
+`cache_max_gb`). `prune_stem_cache` `keep_key` still protects exactly the
+just-stored entry (now one recipe's), covered by the existing prune test.
+Tests: `cache_key_embeds_recipe_and_sanitizes_slashes`,
+`two_recipes_coexist_for_the_same_track`,
+`legacy_bare_hash_entry_migrates_losslessly_and_hits`,
+`legacy_migration_leaves_foreign_dirs_and_superseded_copies`.
 
 ### Stem config panel in the TUI
 Recipe selection is config-file-only today (`[stems] recipe`, read via

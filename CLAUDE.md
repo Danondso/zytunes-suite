@@ -83,7 +83,7 @@ CLI commands: `ls [path]`, `push <files...>`, `rm <paths...>`, `sync <type> <nam
 **Cache locations:**
 - Device-scoped caches (`~/.zytunes-track-cache-{serial}`, `~/.zytunes-library-cache-{serial}`, `~/.zytunes-sync-progress-{serial}`) are redirected by `ZYTUNES_CACHE_DIR` — set automatically per-worktree via `.cargo/config.toml` to `./.zytunes-cache`.
 - The dirlib metadata cache at `$HOME/.cache/zytunes` intentionally ignores that override so worktrees sharing a `~/Music` root reuse one lofty scan.
-- The stem cache at `$HOME/.cache/zytunes/stems/` (six or seven FLACs per track, ~150–250 MB each) also ignores the override for the same reason; capped at `[stems] cache_max_gb` (default 10) with oldest-first LRU pruning.
+- The stem cache at `$HOME/.cache/zytunes/stems/` (six or seven FLACs per track, ~150–250 MB each) also ignores the override for the same reason; capped at `[stems] cache_max_gb` (default 10) with oldest-first LRU pruning. Entries are keyed `{path_hash}-{cache_id}` so recipes coexist per-track (an A/B flip never re-separates); pre-recipe bare-hash entries are losslessly renamed by `migrate_legacy_stem_entries` before each worker lookup.
 - The model-checkpoint cache at `$HOME/.cache/zytunes/models/` (audio-separator's `--model_file_dir`; Roformer checkpoints run 200 MB–1 GB) ignores the override too — the engine's own default is under `/tmp`, wiped on reboot.
 - The TUI album-art cache at `$HOME/.cache/zytunes/art/` is keyed on `(artist, album)` and fingerprinted by `(mtime, size)` so re-tagging a source file invalidates the cached rendering automatically. Repeat views of the same album skip tag parsing entirely.
 

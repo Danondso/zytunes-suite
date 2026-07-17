@@ -2596,6 +2596,11 @@ fn run_separation(
     });
     let source = std::path::Path::new(track_path);
 
+    // Rename any pre-recipe-key entries into the `{hash}-{cache_id}`
+    // scheme before looking up — a legacy entry is a rename away from
+    // being a hit, never a re-separation. No-op after the first sweep.
+    zytunes::stems::migrate_legacy_stem_entries(cache_dir, &log);
+
     if let Some(stems) = cached_stems(cache_dir, source, cache_id, layout, &log) {
         let _ = event_tx.send(BgEvent::StemsReady {
             gen,
@@ -2608,7 +2613,9 @@ fn run_separation(
     // Work dir keyed like the cache entry so concurrent runs on different
     // tracks can't collide; removed whatever the outcome (partial demucs
     // output must never look like a cache).
-    let work_dir = cache_dir.join("work").join(stem_cache_key(track_path));
+    let work_dir = cache_dir
+        .join("work")
+        .join(stem_cache_key(track_path, cache_id));
     let _ = std::fs::remove_dir_all(&work_dir);
 
     let progress_tx = event_tx.clone();
