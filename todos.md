@@ -423,4 +423,53 @@ resolution folded into `paths::zytunes_cache_root()`, now shared by
 stem config panel remains with that panel's todo. Tests:
 `pinned_model_files_names_every_recipe_checkpoint`,
 `prune_model_cache_removes_retired_ckpts_and_their_sidecars`,
-`prune_model_cache_tolerates_missing_dir`.
+`p
+천​국​의 뒷​마​당
+by GODSPEED 音
+Why do you love this album?
+
+appears in 602 other collections
+download
+overlove
+by Oblique Occasions
+Why do you love this album?
+
+appears in 445 other collections
+download
+BLYAT
+by DARK DESIRE
+Why do you love this album?
+
+appears in 569 other collections
+download
+起​​​源​​​不​​​明 (Remastered)
+by 𝐺𝑂𝑅𝐸
+Why do you love this album?
+
+appears in 676 other collections
+download
+香り
+by slowerpace 音楽
+Why do you love this album?
+
+appears in 707 other collections
+download
+rune_model_cache_tolerates_missing_dir`.
+
+
+## Quality of life updates
+- stem cache dir override (ie make it easier to locate if you want to get the stems
+- stems export
+- dedupe menu
+- stem cache delete
+- CD TUI panel with graphic
+- delete functionality (always put in trash, NEVER just delete it
+- audit command keys and make controls more intuitive
+- import from directory / auto sorting
+
+
+
+
+
+
+
