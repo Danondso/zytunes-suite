@@ -1020,7 +1020,7 @@ pub fn stem_cache_used_bytes(cache_dir: &Path) -> u64 {
             // nested entries.
             e.file_type().is_ok_and(|t| t.is_dir())
                 && path.file_name().is_none_or(|n| n != "work")
-                && !path.extension().is_some_and(|ext| ext == "tmp")
+                && path.extension().is_none_or(|ext| ext != "tmp")
         })
         .map(|e| dir_size_recursive(&e.path()))
         .sum()

@@ -180,6 +180,10 @@ impl App {
                 reclaimed_bytes,
                 error,
             } => self.on_stem_engine_uninstalled(engine, reclaimed_bytes, error),
+            BgEvent::StemCacheCleared {
+                reclaimed_bytes,
+                error,
+            } => self.on_stem_cache_cleared(reclaimed_bytes, error),
             BgEvent::StemBatchProgress {
                 gen,
                 current,
@@ -215,6 +219,30 @@ impl App {
     ) {
         if self.stem_engine_uninstalled_in_memory(engine, reclaimed_bytes, error) {
             crate::config::update(|c| c.stems.command = None);
+        }
+    }
+
+    /// Stem-cache clear finished: surface the outcome. Confirming a clear
+    /// closes the panel (like uninstall), so normally there is nothing to
+    /// refresh here — but if the user has reopened it (`o`) before this
+    /// async result landed, re-stat so its cache-size line reflects the
+    /// post-clear reality (zero, or the remainder on a partial failure)
+    /// rather than the size captured when they reopened.
+    fn on_stem_cache_cleared(&mut self, reclaimed_bytes: u64, error: Option<String>) {
+        match error {
+            Some(e) => {
+                self.sync.log.push(format!("[stems] clear cache: {e}"));
+                self.set_toast(format!("Clear stem cache failed: {e}"), true);
+            }
+            None => {
+                let mb = reclaimed_bytes as f64 / (1024.0 * 1024.0);
+                self.set_toast(format!("Cleared stem cache — reclaimed {mb:.1} MB"), false);
+            }
+        }
+        // Only fires on the reopen-before-event race above; re-stats the
+        // caches so a panel the user reopened stays honest.
+        if self.stem_panel.is_some() {
+            self.open_stem_panel();
         }
     }
 

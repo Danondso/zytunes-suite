@@ -93,6 +93,12 @@ pub struct StemsConfig {
     pub gpu: Option<bool>,
     /// Stem cache size cap in GiB (LRU-pruned).
     pub cache_max_gb: Option<u64>,
+    /// Override for the stem-cache directory. Unset (default) keeps the
+    /// cache under `~/.cache/zytunes/stems`. Point it at another location
+    /// to relocate the (large, per-track FLAC) cache onto a roomier disk,
+    /// or somewhere easy to reach when you want to grab the separated
+    /// stems by hand. A blank string behaves like unset.
+    pub cache_dir: Option<String>,
     /// Separation recipe: `"demucs"` (default), `"hq"` (the Roformer
     /// vocals / demucs band cascade), or `"hq-harmony"` (adds
     /// lead/backing vocal stems). Its `cache_id` is recorded in each
@@ -124,6 +130,18 @@ impl StemsConfig {
 
     pub fn cache_max_bytes(&self) -> u64 {
         self.cache_max_gb.unwrap_or(10).saturating_mul(1 << 30)
+    }
+
+    /// Effective stem-cache root: the `cache_dir` override when set and
+    /// non-empty, else the default `~/.cache/zytunes/stems`. `None` only
+    /// when no override is set *and* `$HOME` can't be resolved.
+    pub fn stem_cache_dir(&self) -> Option<std::path::PathBuf> {
+        self.cache_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from)
+            .or_else(zytunes::stems::default_stem_cache_dir)
     }
 
     /// Parsed `recipe`, blank/unset defaulting to demucs. `Err` carries
@@ -427,6 +445,38 @@ music_dir = "/home/user/Music"
         assert!(!cfg.stems.gpu());
         assert_eq!(cfg.stems.cache_max_bytes(), 10 * (1 << 30));
         assert!(cfg.stems.command_path().is_none());
+    }
+
+    #[test]
+    fn stem_cache_dir_honors_override_and_treats_blank_as_unset() {
+        // Unset falls back to the default under ~/.cache/zytunes/stems
+        // (present whenever $HOME resolves, which it does under test).
+        let cfg = StemsConfig::default();
+        assert_eq!(
+            cfg.stem_cache_dir(),
+            zytunes::stems::default_stem_cache_dir()
+        );
+
+        // An explicit path wins over the default.
+        let cfg = StemsConfig {
+            cache_dir: Some("/mnt/big/stems".into()),
+            ..StemsConfig::default()
+        };
+        assert_eq!(
+            cfg.stem_cache_dir(),
+            Some(std::path::PathBuf::from("/mnt/big/stems"))
+        );
+
+        // Blank / whitespace-only behaves like unset, not like a cache at
+        // the filesystem root.
+        let cfg = StemsConfig {
+            cache_dir: Some("   ".into()),
+            ..StemsConfig::default()
+        };
+        assert_eq!(
+            cfg.stem_cache_dir(),
+            zytunes::stems::default_stem_cache_dir()
+        );
     }
 
     #[test]

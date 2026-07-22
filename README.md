@@ -36,8 +36,8 @@ A Rust tool for syncing music (and photos/videos on Zune) to a Microsoft Zune or
   - `hq` — the same six stems via a two-pass cascade through [`audio-separator`](https://github.com/nomadkaraoke/python-audio-separator): BS-Roformer pulls the vocals (audibly cleaner than demucs), then `htdemucs_6s` separates the band from the devocalized instrumental
   - `hq-harmony` — seven stems, keys `1`–`7`: a Mel-Roformer karaoke pass additionally splits the vocals into **lead** and **backing/harmony**
 
-  Engines are Python subprocesses; on first use zytunes offers a one-time managed install via `uv` (CPU-only PyTorch, ~1.5 GB; the Roformer recipes also download model checkpoints of 200 MB–1 GB on first separation) after explicit consent — nothing installs at startup or during the library scan. Heads-up: Roformer inference on CPU is markedly slower than demucs — the `hq` recipes really want `gpu = true`. Configure via the `[stems]` table in `~/.config/zytunes/config.toml` (`recipe`, `command`, `package`, `model`, `gpu`, `cache_max_gb`, `provision = "manual"` to opt out of auto-install). Separated stems are cached per **(track, recipe)** so flipping `recipe` back and forth replays instantly instead of re-separating — but each recipe in play keeps its own ~150–250 MB per track against the same `cache_max_gb` (default 10), so comparing recipes across many tracks fills the cap correspondingly faster
-- **Stem settings panel** — press `o` to pick the separation recipe in-TUI (engine, stem count, and CPU-cost hints per row; persists to config and takes effect on the next `M`), see which binary each engine resolved to and via which precedence rung (`[stems] command` → PATH → managed install), and uninstall an engine (`u`) with its model checkpoints — optionally the stem cache too — with reclaimed space reported
+  Engines are Python subprocesses; on first use zytunes offers a one-time managed install via `uv` (CPU-only PyTorch, ~1.5 GB; the Roformer recipes also download model checkpoints of 200 MB–1 GB on first separation) after explicit consent — nothing installs at startup or during the library scan. Heads-up: Roformer inference on CPU is markedly slower than demucs — the `hq` recipes really want `gpu = true`. Configure via the `[stems]` table in `~/.config/zytunes/config.toml` (`recipe`, `command`, `package`, `model`, `gpu`, `cache_max_gb`, `cache_dir` to relocate the stem cache off the default `~/.cache/zytunes/stems` — onto a roomier disk, or somewhere easy to grab the separated FLACs by hand — and `provision = "manual"` to opt out of auto-install). Separated stems are cached per **(track, recipe)** so flipping `recipe` back and forth replays instantly instead of re-separating — but each recipe in play keeps its own ~150–250 MB per track against the same `cache_max_gb` (default 10), so comparing recipes across many tracks fills the cap correspondingly faster
+- **Stem settings panel** — press `o` to pick the separation recipe in-TUI (engine, stem count, and CPU-cost hints per row; persists to config and takes effect on the next `M`), see which binary each engine resolved to and via which precedence rung (`[stems] command` → PATH → managed install), and see the resolved stem-cache directory and its size. Two maintenance actions from the panel: uninstall an engine (`u`) with its model checkpoints — optionally the stem cache too — or clear just the separated-stems cache (`c`) without touching any engine (the FLACs are derived data — they re-separate on the next split). Both confirm before deleting and report reclaimed space
 - **Album stem pre-warming** — press `M` on an album in the sidebar to separate every track into the stem cache in the background (for offline or on-stage use). A confirmation shows track count, how many are already cached, projected disk against the cache cap, and the CPU-time expectation; progress shows in the footer (`3/12 (40%)`). Splitting a single track mid-batch suspends the batch and it resumes automatically afterwards; `M` on the album again cancels
 - **Track-info inspector** — press `I` on any library track to open a centered, scrollable popup with all parsed metadata: title/artist/album, composer / conductor / lyricist, ISRC / barcode / catalog number, all seven MusicBrainz IDs, ReplayGain values, audio properties (sample rate, bit depth, bitrate, channels), file size, encoder, and a lyrics preview. Sections are suppressed when empty so lightly-tagged tracks stay terse. Long values (file paths, MB UUIDs) marquee-scroll inside the value column
 - **Log export** — press `L` to dump the live log to `/tmp/zytunes-log.txt` and copy the path to the system clipboard
@@ -133,10 +133,21 @@ The album detail view shows a ZIP disk ASCII art with album metadata (artist, al
 |-----|--------|
 | `p` | Play / pause selected track |
 | `P` | Cycle now-playing panel (auto → hidden → always on) |
-| `M` | Stem mixer — split the playing track into stems (first use offers a one-time engine install); press again to cancel a running job or return to normal playback |
+| `M` | Stem mixer — split the playing track into stems (first use offers a one-time engine install); press again to cancel a running job or return to normal playback. On an album in the sidebar, pre-warms every track into the stem cache |
 | `1`–`7` | Toggle stems while the stem mixer is active (six under `demucs`/`hq`; seven — lead vocals / backing vocals / drums / bass / guitar / piano / other — under `hq-harmony`) |
+| `o` | Open the stem settings panel (pick recipe, view resolved engine + cache dir/size, uninstall engine, clear stem cache) |
 | `T` | Toggle album-art style (halfblock / ASCII) |
 | `L` | Dump log to `/tmp/zytunes-log.txt` and copy path to clipboard |
+
+Inside the stem settings panel (`o`):
+
+| Key | Action |
+|-----|--------|
+| `↑` / `↓` (or `k` / `j`) | Move recipe selection |
+| `Enter` | Set the highlighted recipe (takes effect on the next `M`) |
+| `u` | Uninstall the selected recipe's engine — `Enter`/`y` removes the engine + model checkpoints, `Y` also deletes the stem cache |
+| `c` | Clear the separated-stems cache only (confirm with `Enter`/`y`); no engine is touched |
+| `Esc` | Close the panel |
 
 **CD import**
 

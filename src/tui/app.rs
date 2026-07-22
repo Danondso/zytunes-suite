@@ -350,6 +350,8 @@ pub struct StemPanel {
     pub selected: usize,
     /// `true` while the destructive uninstall confirmation is showing.
     pub confirm_uninstall: bool,
+    /// `true` while the stem-cache clear confirmation is showing.
+    pub confirm_clear_cache: bool,
     /// Discovery result per engine, resolved once at open: the binary
     /// path and which precedence rung produced it ([`stems] command` →
     /// PATH → managed install), or `None` when not installed.
@@ -357,10 +359,13 @@ pub struct StemPanel {
         zytunes::stems::provision::EngineKind,
         Option<(PathBuf, zytunes::stems::provision::EngineSource)>,
     )>,
-    /// Size of `~/.cache/zytunes/stems` at open time.
+    /// Size of the stem cache at open time.
     pub stems_cache_bytes: u64,
     /// Size of `~/.cache/zytunes/models` at open time.
     pub models_cache_bytes: u64,
+    /// Resolved stem-cache directory (`[stems].cache_dir` override or the
+    /// default), shown so the FLACs are easy to find on disk.
+    pub stems_cache_path: Option<PathBuf>,
 }
 
 /// Bulk-separation confirmation modal (`M` on an album sidebar entry).
@@ -3433,7 +3438,7 @@ impl App {
         let recipe = self.stems_recipe();
         let cache_id = recipe.cache_id(&self.stems_cfg.model());
         let layout = recipe.layout();
-        let cache_dir = zytunes::stems::default_stem_cache_dir();
+        let cache_dir = self.stems_cfg.stem_cache_dir();
         let cached = cache_dir
             .as_deref()
             .map(|d| {
@@ -3518,6 +3523,7 @@ impl App {
                 recipe,
                 model: self.stems_cfg.model(),
                 cache_max_bytes: self.stems_cfg.cache_max_bytes(),
+                cache_dir: self.stems_cfg.stem_cache_dir(),
             });
         let total = track_paths.len();
         self.stems_batch = Some(StemBatchState {
@@ -3631,6 +3637,7 @@ impl App {
             recipe,
             model: self.stems_cfg.model(),
             cache_max_bytes: self.stems_cfg.cache_max_bytes(),
+            cache_dir: self.stems_cfg.stem_cache_dir(),
         });
     }
 
@@ -3651,8 +3658,10 @@ impl App {
             .iter()
             .position(|r| *r == recipe)
             .unwrap_or(0);
-        let stems_cache_bytes = zytunes::stems::default_stem_cache_dir()
-            .map(|d| zytunes::stems::dir_size_recursive(&d))
+        let stems_cache_path = self.stems_cfg.stem_cache_dir();
+        let stems_cache_bytes = stems_cache_path
+            .as_deref()
+            .map(zytunes::stems::dir_size_recursive)
             .unwrap_or(0);
         let models_cache_bytes = zytunes::stems::default_model_file_dir()
             .map(|d| zytunes::stems::dir_size_recursive(&d))
@@ -3660,9 +3669,11 @@ impl App {
         self.stem_panel = Some(StemPanel {
             selected,
             confirm_uninstall: false,
+            confirm_clear_cache: false,
             engines,
             stems_cache_bytes,
             models_cache_bytes,
+            stems_cache_path,
         });
     }
 
@@ -3753,9 +3764,55 @@ impl App {
                 engine,
                 package: self.stems_cfg.resolved_package(engine),
                 evict_stems,
+                stem_cache_dir: self.stems_cfg.stem_cache_dir(),
             });
         self.stem_panel = None;
         self.set_toast(format!("Uninstalling {}…", engine.exe_name()), false);
+    }
+
+    /// Arm the stem-cache clear confirmation (`c` in the panel). Refuses
+    /// while a stem job is running for the same reason uninstall does —
+    /// deleting the cache root out from under a staging separation is the
+    /// race the worker's `StemJobs` routing guards against, and the toast
+    /// is clearer than a silently cancelled job.
+    pub fn stem_panel_request_clear_cache(&mut self) {
+        match self.stems.status {
+            StemStatus::Provisioning | StemStatus::Separating { .. } => {
+                self.set_toast("A stem job is running — cancel it first (M)".into(), true);
+                return;
+            }
+            StemStatus::Off | StemStatus::Active => {}
+        }
+        // Re-stat the cache now rather than trusting the open-time
+        // snapshot: a detached separation can have populated (or a prune
+        // emptied) the dir since the panel opened, and both the empty
+        // guard and the confirm dialog's size must reflect what's actually
+        // on disk before we offer to delete it.
+        let bytes = self
+            .stems_cfg
+            .stem_cache_dir()
+            .as_deref()
+            .map(zytunes::stems::dir_size_recursive)
+            .unwrap_or(0);
+        if bytes == 0 {
+            self.set_toast("Stem cache is already empty".into(), false);
+            return;
+        }
+        if let Some(panel) = self.stem_panel.as_mut() {
+            panel.stems_cache_bytes = bytes;
+            panel.confirm_clear_cache = true;
+        }
+    }
+
+    /// Confirmed stem-cache clear: dispatch to the worker and close the
+    /// panel (the result arrives as a `StemCacheCleared` event). The
+    /// engine is left untouched — only the derived FLACs are removed.
+    pub fn stem_panel_clear_cache(&mut self) {
+        self.pending_bg_commands.push(BgCommand::ClearStemCache {
+            cache_dir: self.stems_cfg.stem_cache_dir(),
+        });
+        self.stem_panel = None;
+        self.set_toast("Clearing stem cache…".into(), false);
     }
 
     /// An interactive stem job (separation or the engine install that
@@ -11548,6 +11605,7 @@ mod tests {
                 recipe,
                 model,
                 cache_max_bytes,
+                cache_dir,
             }] => {
                 assert_eq!(*gen, app.stems.job_gen, "command carries the new gen");
                 assert_eq!(track_path, "/lib/song.mp3");
@@ -11555,6 +11613,7 @@ mod tests {
                 assert_eq!(*recipe, zytunes::stems::RecipeKind::Demucs);
                 assert_eq!(model, "htdemucs_6s");
                 assert_eq!(*cache_max_bytes, 10 * (1u64 << 30));
+                assert!(cache_dir.is_some(), "resolved stem cache dir rides along");
             }
             other => panic!("expected one SeparateStems, got {} commands", other.len()),
         }
@@ -11853,6 +11912,92 @@ mod tests {
         assert!(
             !app.stem_panel.as_ref().unwrap().confirm_uninstall,
             "uninstalling mid-separation would rip the engine out from under the job"
+        );
+    }
+
+    /// A temp stem-cache dir holding one byte so `stem_cache_dir()`
+    /// re-stats as non-empty. Returned path is unique per `tag` + pid.
+    fn nonempty_stem_cache(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "zytunes-test-clearcache-{tag}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("stem.flac"), b"x").unwrap();
+        dir
+    }
+
+    #[test]
+    fn stem_panel_clear_cache_arms_confirm_then_dispatches_and_closes() {
+        let mut app = stem_panel_app();
+        // Point the cache at a real non-empty dir so the live re-stat in
+        // the request path sees bytes and the "already empty" guard passes.
+        let dir = nonempty_stem_cache("arms");
+        app.stems_cfg.cache_dir = Some(dir.to_string_lossy().into_owned());
+        app.open_stem_panel();
+
+        app.stem_panel_request_clear_cache();
+        assert!(
+            app.stem_panel.as_ref().unwrap().confirm_clear_cache,
+            "first press arms the confirmation rather than deleting outright"
+        );
+        assert!(
+            app.stem_panel.as_ref().unwrap().stems_cache_bytes > 0,
+            "confirm dialog shows the freshly re-stat'd size, not a stale zero"
+        );
+        assert!(
+            app.pending_bg_commands.is_empty(),
+            "nothing dispatched until confirmed"
+        );
+
+        app.stem_panel_clear_cache();
+        assert!(matches!(
+            app.pending_bg_commands.as_slice(),
+            [BgCommand::ClearStemCache { cache_dir }] if cache_dir.is_some()
+        ));
+        assert!(
+            app.stem_panel.is_none(),
+            "panel closes; result arrives as a StemCacheCleared event"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stem_panel_clear_cache_blocked_while_a_job_runs() {
+        let mut app = stem_panel_app();
+        // Even with a non-empty cache, a running job short-circuits the
+        // request before the empty/size check — the status guard wins.
+        let dir = nonempty_stem_cache("blocked");
+        app.stems_cfg.cache_dir = Some(dir.to_string_lossy().into_owned());
+        app.stems.status = StemStatus::Separating { pct: Some(10) };
+        app.open_stem_panel();
+        app.stem_panel_request_clear_cache();
+        assert!(
+            !app.stem_panel.as_ref().unwrap().confirm_clear_cache,
+            "clearing the cache mid-separation would delete the dir it's staging into"
+        );
+        assert!(app.pending_bg_commands.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stem_panel_clear_cache_noop_when_already_empty() {
+        let mut app = stem_panel_app();
+        // An absent cache dir re-stats to zero bytes, so the request must
+        // no-op with a toast rather than arm a pointless destructive
+        // confirmation — regardless of any stale panel snapshot.
+        let dir = std::env::temp_dir().join(format!(
+            "zytunes-test-clearcache-empty-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        app.stems_cfg.cache_dir = Some(dir.to_string_lossy().into_owned());
+        app.open_stem_panel();
+        app.stem_panel.as_mut().unwrap().stems_cache_bytes = 4 * 1024 * 1024;
+        app.stem_panel_request_clear_cache();
+        assert!(
+            !app.stem_panel.as_ref().unwrap().confirm_clear_cache,
+            "an empty cache doesn't warrant a destructive confirmation"
         );
     }
 

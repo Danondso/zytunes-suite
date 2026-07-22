@@ -2335,6 +2335,36 @@ fn draw_stem_panel(f: &mut Frame, app: &App, panel: &crate::app::StemPanel) {
             " Enter/y:uninstall  Y:+ stem cache  Esc/n:back",
             t.modal_dim(),
         )));
+    } else if panel.confirm_clear_cache {
+        lines.push(Line::from(format!(
+            " Delete the stem cache ({})?",
+            human_bytes(panel.stems_cache_bytes)
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            " Removes the separated FLACs only — no engine is touched.",
+            t.modal_dim(),
+        )));
+        lines.push(Line::from(Span::styled(
+            " They re-separate on the next split.",
+            t.modal_dim(),
+        )));
+        // Show exactly which directory gets removed — a relocated (or
+        // relative) [stems] cache_dir override means the target isn't the
+        // familiar ~/.cache path, so name it before the user confirms.
+        if let Some(path) = &panel.stems_cache_path {
+            let shown = std::path::absolute(path).unwrap_or_else(|_| path.clone());
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!(" Path: {}", shown.display()),
+                t.modal_dim(),
+            )));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            " Enter/y:delete  Esc/n:back",
+            t.modal_dim(),
+        )));
     } else {
         let configured = app
             .stems_cfg
@@ -2394,9 +2424,15 @@ fn draw_stem_panel(f: &mut Frame, app: &App, panel: &crate::app::StemPanel) {
             ),
             t.modal_dim(),
         )));
+        if let Some(path) = &panel.stems_cache_path {
+            lines.push(Line::from(Span::styled(
+                format!(" Stems dir: {}", path.display()),
+                t.modal_dim(),
+            )));
+        }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            " ↑↓:select  Enter:set recipe  u:uninstall engine  Esc:close",
+            " ↑↓:select  Enter:set recipe  u:uninstall engine  c:clear stem cache  Esc:close",
             t.modal_dim(),
         )));
     }

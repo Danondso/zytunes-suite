@@ -328,12 +328,25 @@ impl App {
             }
             return true;
         }
+        if panel.confirm_clear_cache {
+            match key.code {
+                KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.stem_panel_clear_cache()
+                }
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                    panel.confirm_clear_cache = false;
+                }
+                _ => {}
+            }
+            return true;
+        }
         match key.code {
             KeyCode::Esc => self.stem_panel = None,
             KeyCode::Enter => self.stem_panel_confirm(),
             KeyCode::Up | KeyCode::Char('k') => self.stem_panel_move(-1),
             KeyCode::Down | KeyCode::Char('j') => self.stem_panel_move(1),
             KeyCode::Char('u') => self.stem_panel_request_uninstall(),
+            KeyCode::Char('c') => self.stem_panel_request_clear_cache(),
             _ => {}
         }
         true

@@ -10,8 +10,48 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# The change-detection gate reads the PR's changed-file list via the GitHub
+# API (dorny/paths-filter), which needs `pull-requests: read`. The default
+# workflow token is contents-only, so grant it explicitly. Everything else
+# only needs to read the repo to check out.
+permissions:
+  contents: read
+  pull-requests: read
+
 jobs:
+  # Change-detection gate: is anything other than Markdown in the diff?
+  # Docs-only pushes/PRs skip every heavy job below (needless runner time).
+  # We gate with a per-job `if:` rather than a top-level `paths-ignore` on
+  # purpose: `paths-ignore` skips the WHOLE workflow, so a required check
+  # never reports and a docs-only PR deadlocks waiting on it. A job skipped
+  # via `if:` still reports its check (as "skipped"), which branch
+  # protection treats as passing — so the merge stays unblocked.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          # `code` is true when any changed file is NOT a .md file. When
+          # the diff is Markdown-only, no file matches the negated pattern
+          # and `code` is false, so the jobs below skip. If the base can't
+          # be resolved (e.g. first push), the action treats everything as
+          # changed → `code` true → jobs run, which is the safe direction.
+          filters: |
+            code:
+              - '!**/*.md'
+
   fmt:
+    needs: changes
+    # Skip ONLY when the gate positively reported docs-only (`code == false`).
+    # Any other state — code true, or the gate itself failing/erroring
+    # (empty output) — runs the job, so a broken gate fails safe toward
+    # running CI rather than deadlocking required checks. `!cancelled()`
+    # lets this evaluate even when `needs.changes` didn't succeed.
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -21,6 +61,13 @@ jobs:
       - run: cargo fmt --all -- --check
 
   clippy:
+    needs: changes
+    # Skip ONLY when the gate positively reported docs-only (`code == false`).
+    # Any other state — code true, or the gate itself failing/erroring
+    # (empty output) — runs the job, so a broken gate fails safe toward
+    # running CI rather than deadlocking required checks. `!cancelled()`
+    # lets this evaluate even when `needs.changes` didn't succeed.
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -40,6 +87,13 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
+    needs: changes
+    # Skip ONLY when the gate positively reported docs-only (`code == false`).
+    # Any other state — code true, or the gate itself failing/erroring
+    # (empty output) — runs the job, so a broken gate fails safe toward
+    # running CI rather than deadlocking required checks. `!cancelled()`
+    # lets this evaluate even when `needs.changes` didn't succeed.
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -69,6 +123,13 @@ jobs:
         run: cargo doc --workspace --no-deps
 
   coverage:
+    needs: changes
+    # Skip ONLY when the gate positively reported docs-only (`code == false`).
+    # Any other state — code true, or the gate itself failing/erroring
+    # (empty output) — runs the job, so a broken gate fails safe toward
+    # running CI rather than deadlocking required checks. `!cancelled()`
+    # lets this evaluate even when `needs.changes` didn't succeed.
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -88,6 +149,13 @@ jobs:
           fail_ci_if_error: false
 
   security:
+    needs: changes
+    # Skip ONLY when the gate positively reported docs-only (`code == false`).
+    # Any other state — code true, or the gate itself failing/erroring
+    # (empty output) — runs the job, so a broken gate fails safe toward
+    # running CI rather than deadlocking required checks. `!cancelled()`
+    # lets this evaluate even when `needs.changes` didn't succeed.
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

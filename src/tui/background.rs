@@ -262,6 +262,9 @@ pub enum BgCommand {
         /// multi-pass recipes ignore it in favor of pinned checkpoints).
         model: String,
         cache_max_bytes: u64,
+        /// Resolved stem-cache root (`[stems].cache_dir` override or the
+        /// default). `None` only when `$HOME` can't be resolved.
+        cache_dir: Option<PathBuf>,
     },
     /// Cancel the active separation or engine install. No-op when idle.
     CancelSeparation,
@@ -276,6 +279,19 @@ pub enum BgCommand {
         /// pip requirement spec; uv is addressed with its bare name.
         package: String,
         evict_stems: bool,
+        /// Resolved stem-cache root, evicted when `evict_stems`. Rides on
+        /// the command so the worker stays config-agnostic.
+        stem_cache_dir: Option<PathBuf>,
+    },
+    /// Delete the separated-stems cache without touching any engine. The
+    /// cached FLACs are derived data — playable while present, re-created
+    /// on the next split when gone. Routed through `StemJobs` like
+    /// uninstall so it can't race a separation staging into the cache.
+    /// Answered by [`BgEvent::StemCacheCleared`].
+    ClearStemCache {
+        /// Resolved stem-cache root (`[stems].cache_dir` override or the
+        /// default). `None` only when `$HOME` can't be resolved.
+        cache_dir: Option<PathBuf>,
     },
     /// Separate every track of an album into the stem cache, cache-first
     /// (already-cached tracks are skipped and counted). Runs as ONE
@@ -292,6 +308,9 @@ pub enum BgCommand {
         recipe: zytunes::stems::RecipeKind,
         model: String,
         cache_max_bytes: u64,
+        /// Resolved stem-cache root (`[stems].cache_dir` override or the
+        /// default). `None` only when `$HOME` can't be resolved.
+        cache_dir: Option<PathBuf>,
     },
 }
 
@@ -512,6 +531,13 @@ pub enum BgEvent {
     /// meaningful in both cases.
     StemEngineUninstalled {
         engine: zytunes::stems::provision::EngineKind,
+        reclaimed_bytes: u64,
+        error: Option<String>,
+    },
+    /// Terminal event for [`BgCommand::ClearStemCache`]. `error` carries
+    /// the removal failure (e.g. a permissions problem on a relocated
+    /// cache dir); `reclaimed_bytes` is what the sweep freed.
+    StemCacheCleared {
         reclaimed_bytes: u64,
         error: Option<String>,
     },
@@ -1659,6 +1685,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                     recipe,
                     model,
                     cache_max_bytes,
+                    cache_dir,
                 } => {
                     let token = stem_jobs.supersede();
                     let jobs = stem_jobs.clone();
@@ -1678,7 +1705,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                             return;
                         }
                         match (
-                            zytunes::stems::default_stem_cache_dir(),
+                            cache_dir,
                             zytunes::stems::provision::find_engine(
                                 recipe.engine(),
                                 engine_command.as_deref(),
@@ -1783,6 +1810,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                     engine,
                     package,
                     evict_stems,
+                    stem_cache_dir,
                 } => {
                     // Route through StemJobs like install/separation: the
                     // app-side busy guard can't see a DETACHED separation
@@ -1805,6 +1833,12 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                         let _ = token;
                         let error = run_engine_uninstall(&package, &tx);
                         let mut reclaimed: u64 = 0;
+                        // Cache eviction is best-effort here: the terminal
+                        // `error` reflects the ENGINE uninstall (surfacing a
+                        // delete failure through it would mislabel a good
+                        // uninstall as failed and skip clearing the stale
+                        // `command` path). A delete failure is still logged
+                        // inside remove_cache_dir, so drop the Err to 0.
                         // The checkpoint cache belongs to audio-separator;
                         // a demucs uninstall must not wipe another
                         // engine's downloads.
@@ -1813,17 +1847,45 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                 zytunes::stems::default_model_file_dir(),
                                 "model cache",
                                 &tx,
-                            );
+                            )
+                            .unwrap_or(0);
                         }
                         if evict_stems {
-                            reclaimed += remove_cache_dir(
-                                zytunes::stems::default_stem_cache_dir(),
-                                "stem cache",
-                                &tx,
-                            );
+                            reclaimed +=
+                                remove_cache_dir(stem_cache_dir, "stem cache", &tx).unwrap_or(0);
                         }
                         let _ = tx.send(BgEvent::StemEngineUninstalled {
                             engine,
+                            reclaimed_bytes: reclaimed,
+                            error,
+                        });
+                    });
+                }
+                BgCommand::ClearStemCache { cache_dir } => {
+                    // Route through StemJobs for the same reason uninstall
+                    // does: a detached separation may be staging into the
+                    // cache root, and remove_dir_all'ing it out from under
+                    // that job is exactly the race the guard prevents.
+                    // Superseding cancels it; `acquire()` waits it out.
+                    let token = stem_jobs.supersede();
+                    let jobs = stem_jobs.clone();
+                    let tx = event_tx.clone();
+                    thread::spawn(move || {
+                        let _guard = jobs.acquire();
+                        // No token check: a clear the user confirmed must
+                        // run even if another stem command lands meanwhile.
+                        let _ = token;
+                        let (reclaimed, error) = match cache_dir {
+                            Some(dir) => match remove_cache_dir(Some(dir), "stem cache", &tx) {
+                                Ok(bytes) => (bytes, None),
+                                Err(msg) => (0, Some(msg)),
+                            },
+                            None => (
+                                0,
+                                Some("cannot resolve $HOME for the stem cache".to_string()),
+                            ),
+                        };
+                        let _ = tx.send(BgEvent::StemCacheCleared {
                             reclaimed_bytes: reclaimed,
                             error,
                         });
@@ -1836,6 +1898,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                     recipe,
                     model,
                     cache_max_bytes,
+                    cache_dir,
                 } => {
                     let token = stem_jobs.supersede();
                     let jobs = stem_jobs.clone();
@@ -1856,7 +1919,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                             bail(0, true);
                             return;
                         }
-                        let Some(cache_dir) = zytunes::stems::default_stem_cache_dir() else {
+                        let Some(cache_dir) = cache_dir else {
                             let _ = tx.send(BgEvent::SyncMessage(
                                 "[stems] batch: cannot resolve $HOME for the stem cache".into(),
                             ));
@@ -2914,17 +2977,20 @@ fn run_engine_uninstall(package: &str, event_tx: &mpsc::Sender<BgEvent>) -> Opti
     }
 }
 
-/// Delete a derived-cache dir, logging what was reclaimed. Returns the
-/// byte count freed (0 for a missing dir or on failure).
+/// Delete `dir` and report the bytes reclaimed. `Ok(0)` when there is
+/// nothing to remove (no dir, or an already-absent path). On a real
+/// removal failure returns `Err(msg)` AND logs it — callers that surface
+/// a terminal event (clear/uninstall) must propagate the `Err` so a
+/// failed delete doesn't read back to the user as success.
 fn remove_cache_dir(
     dir: Option<std::path::PathBuf>,
     what: &str,
     event_tx: &mpsc::Sender<BgEvent>,
-) -> u64 {
-    let Some(dir) = dir else { return 0 };
+) -> Result<u64, String> {
+    let Some(dir) = dir else { return Ok(0) };
     let bytes = zytunes::stems::dir_size_recursive(&dir);
     if bytes == 0 && !dir.exists() {
-        return 0;
+        return Ok(0);
     }
     match std::fs::remove_dir_all(&dir) {
         Ok(()) => {
@@ -2932,14 +2998,12 @@ fn remove_cache_dir(
                 "[stems] evicted {what} ({:.1} MB)",
                 bytes as f64 / (1024.0 * 1024.0)
             )));
-            bytes
+            Ok(bytes)
         }
         Err(e) => {
-            let _ = event_tx.send(BgEvent::SyncMessage(format!(
-                "[stems] failed to evict {what} at {}: {e}",
-                dir.display()
-            )));
-            0
+            let msg = format!("failed to evict {what} at {}: {e}", dir.display());
+            let _ = event_tx.send(BgEvent::SyncMessage(format!("[stems] {msg}")));
+            Err(msg)
         }
     }
 }
@@ -3067,6 +3131,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn remove_cache_dir_reports_reclaimed_bytes_on_success() {
+        let dir = fresh_dir("remove-ok");
+        std::fs::write(dir.join("stem.flac"), vec![0u8; 4096]).unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let got = remove_cache_dir(Some(dir.clone()), "stem cache", &tx);
+        assert_eq!(got, Ok(4096), "returns the bytes it freed");
+        assert!(!dir.exists(), "the cache dir is gone");
+    }
+
+    #[test]
+    fn remove_cache_dir_ok_zero_when_nothing_to_remove() {
+        let (tx, _rx) = mpsc::channel();
+        assert_eq!(remove_cache_dir(None, "stem cache", &tx), Ok(0));
+        let absent =
+            std::env::temp_dir().join(format!("zytunes-remove-absent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&absent);
+        assert_eq!(remove_cache_dir(Some(absent), "stem cache", &tx), Ok(0));
+    }
+
+    #[test]
+    fn remove_cache_dir_returns_err_on_failed_removal() {
+        // Regression: a failed delete used to return 0 and only log,
+        // which the ClearStemCache handler then reported to the user as a
+        // green "reclaimed 0.0 MB" success. remove_dir_all on a plain file
+        // (ENOTDIR) is a deterministic failure — it must surface as Err so
+        // the terminal event carries the error instead of masking it.
+        let dir = fresh_dir("remove-err");
+        let file = dir.join("not-a-dir");
+        std::fs::write(&file, b"x").unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let got = remove_cache_dir(Some(file), "stem cache", &tx);
+        assert!(got.is_err(), "a failed removal is not silently a success");
     }
 
     #[test]

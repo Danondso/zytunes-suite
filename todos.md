@@ -458,10 +458,10 @@ rune_model_cache_tolerates_missing_dir`.
 
 
 ## Quality of life updates
-- stem cache dir override (ie make it easier to locate if you want to get the stems
+- ~~stem cache dir override (ie make it easier to locate if you want to get the stems~~ (done — `[stems] cache_dir` config, resolved via `StemsConfig::stem_cache_dir()`; the `o` panel now shows the resolved stem-cache path)
 - stems export
 - dedupe menu
-- stem cache delete
+- ~~stem cache delete~~ (done — `c` in the stem settings panel clears the separated-stems cache without touching the engine; routed through `StemJobs` so it can't race a staging separation)
 - CD TUI panel with graphic
 - delete functionality (always put in trash, NEVER just delete it
 - audit command keys and make controls more intuitive
