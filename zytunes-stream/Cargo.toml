@@ -1,0 +1,26 @@
+[package]
+name = "zytunes-stream"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+description = "HTTP streaming server for the zytunes music library"
+license = "MIT"
+
+[[bin]]
+name = "zytunes-serve"
+path = "src/main.rs"
+
+[dependencies]
+zytunes = { path = ".." }
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-util", "net"] }
+tokio-util = { version = "0.7", features = ["io"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["trace"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+lofty = "0.22"
+toml = "0.8"
+
+[dev-dependencies]
+http-body-util = "0.1"

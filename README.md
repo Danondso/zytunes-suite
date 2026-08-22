@@ -44,6 +44,7 @@ A Rust tool for syncing music (and photos/videos on Zune) to a Microsoft Zune or
 - **USB resilience (macOS)** — the native IOKit backend recovers from transient pipe stalls via `ClearPipeStall` with a one-shot retry on both read and write paths. Read timeouts clear stalls on both bulk endpoints so the OUT pipe stays in sync with the device. When a sync/remove cascade indicates the USB session is truly gone (device unplug, `NotResponding`, unrecoverable stall, read timeout) the TUI aborts remaining work, clears the session, and prompts the user to replug
 - **Theming** — 16 built-in color themes (iTunes 2004, Gruvbox Dark/Light, Everforest Dark/Light, Tokyo Night, IBM Mainframe, Amber CRT, Windows 95, System 7, BIOS, Red Sands, Newport Lights, NeXTSTEP, WinAmp Classic, Zune Original) plus user-defined themes via `[themes."Name"]` tables in `~/.config/zytunes/config.toml`. Press `t` to open the theme picker
 - **Native IOKit USB backend** — the `zune-mtp` crate provides direct MTP/MTPZ communication via Apple's IOKit framework, bypassing libusb. This is the sole transport for Zune device operations on macOS — supporting listing, import, removal, and track collection. A libusb transport is present for Linux but does not yet match the IOKit stall-recovery behaviour
+- **LAN streaming server** — `zytunes-serve` (the `zytunes-stream` crate) exposes the library over HTTP: browse/search/stream/download tracks with byte-`Range` seeking, plus on-demand stem splits served from the same cache the TUI's `M` key writes to. Ships with a `Dockerfile` and `docker-compose.yml` that bind-mount the host music directory read-only, so the container reads tracks in place rather than copying them into a volume. See [What works: Streaming server](#streaming-server-zytunes-serve) and [`docs/stream-api.md`](docs/stream-api.md)
 
 ## Interactive TUI
 
@@ -233,6 +234,40 @@ default_fidelity   = "flac"  # preselected fidelity in the overlay: "mp3-cbr-320
 cd_auto_eject      = true    # eject after a successful rip (defaults to true)
 ```
 
+## Streaming server (zytunes-serve)
+
+A separate binary (`zytunes-stream` crate) exposes the library over a LAN
+HTTP API — browse/search/stream/download tracks, plus on-demand stem splits
+served from the same cache the TUI's `M` key writes to. Full API reference:
+[`docs/stream-api.md`](docs/stream-api.md).
+
+```bash
+zytunes-serve [--bind 0.0.0.0] [--port 9847] [--token SECRET] [--music-dir PATH] [--allow-insecure]
+```
+
+Configurable via CLI flags, `ZYTUNES_STREAM_*` environment variables, or a
+`[stream]` table in `~/.config/zytunes/config.toml` (in that precedence
+order). A **non-empty** token or `--allow-insecure` is required for any bind
+— including loopback, which is reachable by other users on a shared host.
+Empty `[stream] token` values count as unset. Serving is HTTP; put TLS in
+front on untrusted networks. The server refuses to start otherwise, since
+`POST /tracks/{id}/stems` alone would let any unauthenticated client
+trigger CPU-heavy separation jobs.
+
+### Docker
+
+```bash
+cp .env.example .env   # set ZYTUNES_MUSIC_DIR and ZYTUNES_STREAM_TOKEN
+docker compose up --build
+```
+
+`docker-compose.yml` builds `zytunes-stream/Dockerfile` and **bind-mounts**
+your music directory read-only into the container — the library is read
+straight from the host path, nothing is copied into a Docker volume. A
+separate named volume persists the library/art/stem caches across restarts.
+See the [Docker section of `docs/stream-api.md`](docs/stream-api.md#docker)
+for the plain `docker build`/`docker run` equivalent.
+
 ## Claude Code Skills
 
 This project includes custom [Claude Code](https://claude.ai/code) skills in `.claude/skills/`:
@@ -295,7 +330,7 @@ The scanner reads tags via [lofty](https://crates.io/crates/lofty) for all commo
 ./install.sh
 ```
 
-This builds a release binary and installs both `zytunes` (CLI) and `zytunes-tui` (interactive TUI) to `/usr/local/bin/`. To uninstall:
+This builds release binaries and installs `zytunes` (CLI), `zytunes-tui` (interactive TUI), and `zytunes-serve` (LAN streaming server) to `/usr/local/bin/`. To uninstall:
 
 ```
 ./uninstall.sh

@@ -1,0 +1,27 @@
+target
+.git
+.github
+.claude
+.zytunes-cache
+tools
+
+# Docs not needed inside the build context
+DEBUG.md
+TODO.md
+todos.md
+RECOMMENDER_DESIGN.md
+findings.md
+
+# Music/test fixtures and secrets — never belong in an image layer
+*.mp3
+*.flac
+*.m4a
+*.wma
+*.aac
+*.ogg
+*.wav
+*.opus
+*.alac
+*.aiff
+.mtpz-data
+.env

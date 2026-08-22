@@ -172,4 +172,9 @@ pub trait MusicLibrary {
     fn all_tracks(&self) -> Box<dyn Iterator<Item = &Track> + '_>;
     /// The music folder path, if known.
     fn music_folder(&self) -> Option<&str>;
+    /// Look up a track by its stable path-hash id. Default walks `all_tracks`;
+    /// backends keyed by id should override for O(1).
+    fn track_by_id(&self, id: u64) -> Option<&Track> {
+        self.all_tracks().find(|t| t.id == id)
+    }
 }

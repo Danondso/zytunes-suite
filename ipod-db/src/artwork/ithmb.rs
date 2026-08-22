@@ -192,7 +192,7 @@ mod tests {
         let rgb565 = encode_rgb565(&png_bytes, 4, 4).unwrap();
         assert_eq!(rgb565.len(), 4 * 4 * 2);
         // Every pixel should be 0xF800 LE.
-        for chunk in rgb565.chunks_exact(2) {
+        for chunk in rgb565.as_chunks::<2>().0 {
             assert_eq!(chunk, &0xF800u16.to_le_bytes());
         }
     }

@@ -628,7 +628,7 @@ impl App {
             Some(zytunes::device::DeviceFamily::Ipod) => self.experimental_playlist_sync,
             None => false,
         };
-        let drained: Vec<_> = self.pending_playlist_imports.drain(..).collect();
+        let drained = std::mem::take(&mut self.pending_playlist_imports);
         for spec in drained {
             if allow {
                 self.sync

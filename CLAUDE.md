@@ -16,8 +16,8 @@ cargo test -p zune-mtp        # Run zune-mtp crate tests only
 cargo test -p ipod-db         # Run ipod-db crate tests only
 cargo fmt                     # Format code
 cargo clippy                  # Lint
-./install.sh                  # Build release + install both zytunes and zytunes-tui to /usr/local/bin
-./uninstall.sh                # Remove both zytunes and zytunes-tui from /usr/local/bin
+./install.sh                  # Build release (--workspace) + install zytunes, zytunes-tui, and zytunes-serve to /usr/local/bin
+./uninstall.sh                # Remove zytunes, zytunes-tui, and zytunes-serve from /usr/local/bin
 
 ```
 

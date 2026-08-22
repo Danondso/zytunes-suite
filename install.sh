@@ -44,11 +44,15 @@ clean_stale_native_deps() {
 clean_stale_native_deps
 
 echo "Building zytunes (release)..."
-cargo build --release
+# --workspace: a bare `cargo build` in a workspace with a root package
+# builds only that package — zytunes-stream (zytunes-serve) would be
+# skipped and the install would fail at the binary check below.
+cargo build --release --workspace
 
 INSTALL_DIR="/usr/local/bin"
 CLI_BINARY="target/release/zytunes"
 TUI_BINARY="target/release/zytunes-tui"
+SERVE_BINARY="target/release/zytunes-serve"
 
 if [ ! -f "$CLI_BINARY" ]; then
     echo "Error: build failed — $CLI_BINARY not found"
@@ -60,11 +64,18 @@ if [ ! -f "$TUI_BINARY" ]; then
     exit 1
 fi
 
+if [ ! -f "$SERVE_BINARY" ]; then
+    echo "Error: build failed — $SERVE_BINARY not found"
+    exit 1
+fi
+
 echo "Installing to $INSTALL_DIR..."
 sudo cp "$CLI_BINARY" "$INSTALL_DIR/zytunes"
 sudo cp "$TUI_BINARY" "$INSTALL_DIR/zytunes-tui"
-sudo chmod 755 "$INSTALL_DIR/zytunes" "$INSTALL_DIR/zytunes-tui"
+sudo cp "$SERVE_BINARY" "$INSTALL_DIR/zytunes-serve"
+sudo chmod 755 "$INSTALL_DIR/zytunes" "$INSTALL_DIR/zytunes-tui" "$INSTALL_DIR/zytunes-serve"
 
 echo "Done."
-echo "  zytunes      — CLI (run 'zytunes help')"
-echo "  zytunes-tui  — Interactive TUI"
+echo "  zytunes        — CLI (run 'zytunes help')"
+echo "  zytunes-tui    — Interactive TUI"
+echo "  zytunes-serve  — Library HTTP streaming server"

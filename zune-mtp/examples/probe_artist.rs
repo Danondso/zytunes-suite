@@ -86,8 +86,10 @@ fn parse_mtp_string(data: &[u8], offset: &mut usize) -> Option<String> {
         return None;
     }
     let chars: Vec<u16> = data[*offset..*offset + byte_len]
-        .chunks_exact(2)
-        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| u16::from_le_bytes(*b))
         .filter(|&c| c != 0)
         .collect();
     *offset += byte_len;

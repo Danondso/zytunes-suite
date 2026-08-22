@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "zune-mtp", "ipod-db"]
+members = [".", "zune-mtp", "ipod-db", "zytunes-stream"]
 
 [package]
 name = "zytunes"

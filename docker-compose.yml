@@ -1,0 +1,50 @@
+services:
+  zytunes-serve:
+    build:
+      context: .
+      dockerfile: zytunes-stream/Dockerfile
+    image: zytunes-serve
+    container_name: zytunes-serve
+    restart: unless-stopped
+    ports:
+      - "${ZYTUNES_STREAM_PORT:-9847}:9847"
+    environment:
+      # The library is mounted at the SAME absolute path as on the host —
+      # stem-cache entries are keyed by a hash of the track's absolute
+      # path, so this is what lets the container serve splits made in
+      # zytunes-tui. Don't remap to /music.
+      ZYTUNES_MUSIC_DIR: ${ZYTUNES_MUSIC_DIR}
+      ZYTUNES_STREAM_BIND: 0.0.0.0
+      ZYTUNES_STREAM_PORT: 9847
+      # Required unless ZYTUNES_STREAM_ALLOW_INSECURE=true: empty
+      # tokens are treated as unset. Set it in a .env file next to
+      # this compose file.
+      # (see .env.example), or export ZYTUNES_STREAM_ALLOW_INSECURE=true
+      # instead if you're on a network you fully trust.
+      ZYTUNES_STREAM_TOKEN: ${ZYTUNES_STREAM_TOKEN:?Set ZYTUNES_STREAM_TOKEN in a .env file — see .env.example}
+    volumes:
+      # Bind mount, not a named volume: the container reads tracks
+      # straight from this host path — nothing gets copied or moved.
+      # Read-only since zytunes-serve never writes into the library.
+      # Mounted at the identical host path (see ZYTUNES_MUSIC_DIR above).
+      - ${ZYTUNES_MUSIC_DIR}:${ZYTUNES_MUSIC_DIR}:ro
+      # Named volume so the library/art caches under ~/.cache/zytunes
+      # survive a container restart instead of forcing a full rescan.
+      - zytunes-cache:/home/zytunes/.cache/zytunes
+      # The host's TUI stem cache: every split made (or album pre-warmed)
+      # with M in zytunes-tui is served to clients immediately. The image
+      # ships no Python engine, so cache misses report "press M in
+      # zytunes-tui". Mounted at BOTH the container-default location and
+      # the identical host path, because a [stems] cache_dir override in
+      # config.toml is resolved verbatim inside the container. If your
+      # config sets cache_dir, set ZYTUNES_STEMS_DIR to the same path in
+      # .env; otherwise the host default is used.
+      - ${ZYTUNES_STEMS_DIR:-${HOME}/.cache/zytunes/stems}:/home/zytunes/.cache/zytunes/stems
+      - ${ZYTUNES_STEMS_DIR:-${HOME}/.cache/zytunes/stems}:${ZYTUNES_STEMS_DIR:-${HOME}/.cache/zytunes/stems}
+      # Host config, so the server resolves the same [stems] recipe/model
+      # as the TUI — a different recipe means a different cache id and
+      # every lookup would miss.
+      - ${HOME}/.config/zytunes:/home/zytunes/.config/zytunes:ro
+
+volumes:
+  zytunes-cache:

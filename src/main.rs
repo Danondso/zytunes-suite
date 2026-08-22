@@ -117,6 +117,7 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("  library [query]        Browse the music library");
             println!("  scan                   Pre-warm the dirlib cache without opening the TUI");
             println!("  help                   Show this help");
+            println!("\nAlso: zytunes-serve — HTTP API for browse/search/stream (see docs/stream-api.md)");
             println!("\nSync types:");
             println!("  sync artist <name>     Sync all tracks by an artist");
             println!("  sync album <name>      Sync all tracks in an album");

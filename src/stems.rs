@@ -203,6 +203,22 @@ impl StemKind {
             StemKind::Other => "Oth",
         }
     }
+
+    /// Inverse of [`StemKind::file_stem`] — the URL slug / cache filename
+    /// without extension (`"lead"` → `LeadVocals`).
+    pub fn from_file_stem(name: &str) -> Option<Self> {
+        match name {
+            "vocals" => Some(StemKind::Vocals),
+            "lead" => Some(StemKind::LeadVocals),
+            "backing" => Some(StemKind::BackingVocals),
+            "drums" => Some(StemKind::Drums),
+            "bass" => Some(StemKind::Bass),
+            "guitar" => Some(StemKind::Guitar),
+            "piano" => Some(StemKind::Piano),
+            "other" => Some(StemKind::Other),
+            _ => None,
+        }
+    }
 }
 
 /// The stem files for one track, ordered by `layout` — `paths[i]` is
@@ -767,6 +783,39 @@ pub struct CascadeSeparator {
     pub passes: &'static [RecipePass],
     /// Stem order of the final set — the recipe's layout.
     pub layout: &'static [StemKind],
+}
+
+/// Build the separator a recipe drives: `DemucsCli` for the demucs
+/// recipe, a `CascadeSeparator` over audio-separator for the hq recipes.
+/// `Err` carries a user-visible message. Shared by the TUI worker and
+/// `zytunes-serve` so a checkpoint / layout change cannot drift.
+pub fn recipe_separator(
+    recipe: RecipeKind,
+    demucs_model: &str,
+    command: PathBuf,
+) -> Result<Box<dyn StemSeparator + Send>, String> {
+    Ok(match recipe {
+        RecipeKind::Demucs => Box::new(DemucsCli {
+            command,
+            model: demucs_model.to_string(),
+            layout: recipe.layout(),
+        }),
+        RecipeKind::Hq | RecipeKind::HqHarmony => {
+            let model_file_dir = default_model_file_dir()
+                .ok_or_else(|| "cannot resolve $HOME for the model cache".to_string())?;
+            Box::new(CascadeSeparator {
+                engine: AudioSeparatorCli {
+                    command,
+                    model_file_dir,
+                },
+                passes: match recipe {
+                    RecipeKind::HqHarmony => hq_harmony_recipe_passes(),
+                    _ => hq_recipe_passes(),
+                },
+                layout: recipe.layout(),
+            })
+        }
+    })
 }
 
 impl StemSeparator for CascadeSeparator {
@@ -1830,9 +1879,11 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for kind in HARMONY_STEM_LAYOUT.iter().chain(SIX_STEM_LAYOUT) {
             assert_eq!(kind.short_label().chars().count(), 3, "{kind:?}");
+            assert_eq!(StemKind::from_file_stem(kind.file_stem()), Some(*kind));
             seen.insert(kind.file_stem());
         }
         assert_eq!(seen.len(), 8, "8 distinct kinds across both layouts");
+        assert!(StemKind::from_file_stem("vocals-lead").is_none());
     }
 
     #[test]

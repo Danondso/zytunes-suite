@@ -84,7 +84,7 @@ use zytunes::mtp::parse::DeviceEntry;
 use zytunes::mtp::{DeviceError, DeviceSession};
 use zytunes::musicbrainz::{MbError, MusicBrainzClient, Release};
 use zytunes::stems::{
-    cached_stems, stem_cache_key, store_stems, StemError, StemSeparator, StemSet,
+    cached_stems, recipe_separator, stem_cache_key, store_stems, StemError, StemSeparator, StemSet,
 };
 use zytunes::{
     collect_photo_files_with_logger, collect_video_files_with_logger, make_transcode_temp_dir,
@@ -1745,19 +1745,18 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                     command.display()
                                 )));
                                 let cache_id = recipe.cache_id(&model);
-                                let separator =
-                                    match build_recipe_separator(recipe, &model, command) {
-                                        Ok(s) => s,
-                                        Err(error) => {
-                                            let _ = tx.send(BgEvent::StemsFailed {
-                                                gen,
-                                                track_path,
-                                                error,
-                                                cancelled: false,
-                                            });
-                                            return;
-                                        }
-                                    };
+                                let separator = match recipe_separator(recipe, &model, command) {
+                                    Ok(s) => s,
+                                    Err(error) => {
+                                        let _ = tx.send(BgEvent::StemsFailed {
+                                            gen,
+                                            track_path,
+                                            error,
+                                            cancelled: false,
+                                        });
+                                        return;
+                                    }
+                                };
                                 run_separation(
                                     &SeparationJob {
                                         gen,
@@ -1939,7 +1938,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                             bail(total, false);
                             return;
                         };
-                        let separator = match build_recipe_separator(recipe, &model, command) {
+                        let separator = match recipe_separator(recipe, &model, command) {
                             Ok(s) => s,
                             Err(e) => {
                                 let _ =
@@ -2787,40 +2786,6 @@ impl StemJobs {
     fn acquire(&self) -> std::sync::MutexGuard<'_, ()> {
         self.lock.lock().unwrap_or_else(|e| e.into_inner())
     }
-}
-
-/// Build the separator a recipe drives: `DemucsCli` for the demucs
-/// recipe, a `CascadeSeparator` over audio-separator for the hq
-/// recipes. `Err` carries a user-visible message.
-fn build_recipe_separator(
-    recipe: zytunes::stems::RecipeKind,
-    model: &str,
-    command: std::path::PathBuf,
-) -> Result<Box<dyn StemSeparator>, String> {
-    Ok(match recipe {
-        zytunes::stems::RecipeKind::Demucs => Box::new(zytunes::stems::DemucsCli {
-            command,
-            model: model.to_string(),
-            layout: recipe.layout(),
-        }),
-        zytunes::stems::RecipeKind::Hq | zytunes::stems::RecipeKind::HqHarmony => {
-            let model_file_dir = zytunes::stems::default_model_file_dir()
-                .ok_or_else(|| "cannot resolve $HOME for the model cache".to_string())?;
-            Box::new(zytunes::stems::CascadeSeparator {
-                engine: zytunes::stems::AudioSeparatorCli {
-                    command,
-                    model_file_dir,
-                },
-                passes: match recipe {
-                    zytunes::stems::RecipeKind::HqHarmony => {
-                        zytunes::stems::hq_harmony_recipe_passes()
-                    }
-                    _ => zytunes::stems::hq_recipe_passes(),
-                },
-                layout: recipe.layout(),
-            })
-        }
-    })
 }
 
 /// One album batch — the whole batch is ONE worker job (one supersede

@@ -713,6 +713,10 @@ impl MusicLibrary for DirectoryLibrary {
     fn music_folder(&self) -> Option<&str> {
         Some(&self.root)
     }
+
+    fn track_by_id(&self, id: u64) -> Option<&Track> {
+        self.tracks.get(&id)
+    }
 }
 
 #[cfg(test)]
@@ -770,6 +774,22 @@ mod tests {
         assert_eq!(lib.track_count(), 2);
         assert_eq!(lib.artists(), vec!["Artist"]);
         assert_eq!(lib.albums(), vec![("Artist", "Album")]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn track_by_id_hit_and_miss() {
+        let dir = std::env::temp_dir().join("zytunes-dirlib-by-id");
+        let _ = fs::remove_dir_all(&dir);
+        let album = dir.join("Artist").join("Album");
+        fs::create_dir_all(&album).unwrap();
+        fs::write(album.join("01 Song.mp3"), b"fake").unwrap();
+
+        let lib = DirectoryLibrary::scan(dir.to_str().unwrap()).unwrap();
+        let id = lib.all_tracks().next().unwrap().id;
+        let hit = lib.track_by_id(id).expect("known id must resolve");
+        assert_eq!(hit.name, "Song");
+        assert!(lib.track_by_id(id.wrapping_add(1)).is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 

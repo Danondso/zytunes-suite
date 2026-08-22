@@ -22,10 +22,15 @@
 # MTPZ keys (sensitive)
 .mtpz-data
 
+# docker compose secrets (see .env.example)
+.env
+
 # macOS
 .DS_Store
 
 # Editor
+.idea/
+.diag/
 *.swp
 *.swo
 *~
