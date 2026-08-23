@@ -30,6 +30,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       code: ${{ steps.filter.outputs.code }}
+      mobile: ${{ steps.filter.outputs.mobile }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
@@ -43,6 +44,9 @@ jobs:
           filters: |
             code:
               - '!**/*.md'
+            mobile:
+              - 'mobile/**'
+              - '.github/workflows/ci.yml'
 
   fmt:
     needs: changes
@@ -147,6 +151,24 @@ jobs:
         with:
           files: lcov.info
           fail_ci_if_error: false
+
+  flutter:
+    needs: changes
+    # Same fail-safe as the Rust jobs: skip only when the gate positively
+    # reported "no mobile change". Empty/broken gate output still runs.
+    if: ${{ !cancelled() && needs.changes.outputs.mobile != 'false' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mobile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - run: flutter pub get
+      - run: flutter test
 
   security:
     needs: changes

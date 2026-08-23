@@ -2,7 +2,7 @@
 
 ## Next up
 
-- **Device playlist browsing and removal** — MTP playlists as first-class objects in the device view (currently we browse artists/albums/tracks only). Would need to list playlist objects, show their track references, and support playlist-level removal. Separate from rodio in-memory queue.
+- **Mobile: album view** — replace `_TrackList` with an album page: cover (`/tracks/{id}/art` of a representative track), title, artist (link to artist view), year/duration/track count when cheap, Play album (sets queue to the sorted track list). Track rows show number, title, duration; highlight the playing track; group by `disc_number` when present. Widget tests for play-album and now-playing highlight. Out of scope: shuffle/repeat (queue follow-up), lyrics, multi-artist “Various” special cases beyond `album_artist`.
 
 ## Future
 
@@ -81,6 +81,10 @@
 
 ## Done
 
+- **Mobile: play counts** — Flutter LAN client. `POST /tracks/{id}/play` after the iTunes threshold (50% of duration or 4 minutes), matching the TUI. Completing a track is a fallback for short clips; skip before the threshold does not count. Same sidecar as the TUI (`local-plays.json`).
+- **Mobile: artist view** — Flutter LAN client. Artist page with name header, album count, Play (queues every album in list order), and album rows with cover/`year`/`track_count` from `GET /albums` (`art_url` of the first sorted track). Tapping an album still opens the track list (dedicated album page is next).
+- **Mobile: crossfade** — Flutter LAN client. `CrossfadePlayback` wraps two engines (`just_audio` / `media_kit`) and overlaps the last N seconds into the preloaded next queue item. Skip/play cut immediately; seek does not start a fade. Duration cycles Off/4s/8s/12s on the player screen and persists in SharedPreferences (`crossfade_ms`).
+- **Mobile: play queue** — Flutter LAN client (`mobile/`). User-managed Up Next: row tap still plays the album/search list from that track; overflow menu has Play next / Add to queue; player queue sheet reorders and removes. `Session.queueIndex` is positional so duplicate ids skip correctly. Auto-advance on completion unchanged. Shuffle/repeat still a follow-up.
 - **Library-side "on device" indicator** — library track list prefixes `✓` for tracks already on the connected device (`src/tui/ui.rs:887`), and the sidebar shows `✓`/`◐` for full/partial coverage (`src/tui/ui.rs:405`).
 - **Scrubber / seek controls** — `AudioCommand::Scrub { delta_ms }` with ±5s bindings (`src/tui/audio.rs:26`, `src/tui/main.rs:347`).
 - **Bespoke album art panel** — panel resizes horizontally to art width with right-anchored layout and custom border junctions (`src/tui/ui.rs:664`).
