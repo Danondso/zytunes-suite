@@ -386,7 +386,7 @@ The `zune-mtp/` workspace crate provides a pure-Rust native IOKit MTP/MTPZ imple
 - **proplist.rs** — MTP ObjectPropList builder for SendObjectPropList: constructs binary property list payloads with string, u16, and u32 property types
 - **iokit_ffi.rs** — Raw FFI declarations for IOKit/CoreFoundation (IOUSBDeviceInterface, IOUSBInterfaceInterface vtables)
 
-The `NativeSession` in `src/mtp/native.rs` wraps `zune-mtp` and implements the `DeviceSession` trait, providing ls, import, rm, and track collection. Track cache is stored at `~/.zytunes-track-cache-{serial}`.
+The `NativeSession` in `app/src/mtp/native.rs` wraps `zune-mtp` and implements the `DeviceSession` trait, providing ls, import, rm, and track collection. Track cache is stored at `~/.zytunes-track-cache-{serial}`.
 
 ## What's known
 
@@ -427,6 +427,39 @@ Error codes encountered during development and what they mean in the Zune contex
 ## Project structure
 
 ```
+app/                 — CLI + TUI (Cargo package name `zytunes`)
+  src/
+    main.rs          — CLI entry point, commands (ls, push, rm, sync, library, photo-sync, video-sync)
+    lib.rs           — public API, sync engine, SyncType enum, audio transcoding (symphonia + LAME), video transcoding (ffmpeg shell-out)
+    device/
+      mod.rs         — DeviceBackend trait, DeviceCapabilities, DeviceFamily
+      zune.rs        — ZuneBackend: rusb-based scan, opens NativeSession
+      ipod.rs        — IpodBackend: mounted-volume scan, opens IpodSession
+    mtp/
+      mod.rs         — DeviceSession trait, TrackMeta
+      native.rs      — Zune session (NativeSession on zune-mtp)
+      ipod_session.rs— iPod session (IpodSession on ipod-db)
+      parse.rs       — DeviceEntry struct and parsing utilities
+      zmdb.rs        — Zune Metadata Database parser (vendor op 0x9217)
+    library.rs       — MusicLibrary trait and shared Track type
+    dirlib.rs        — DirectoryLibrary: recursive folder scanner (lofty tags + path fallback)
+    cache.rs         — on-disk cache for the directory scanner
+    paths.rs         — device-scoped cache paths (ZYTUNES_CACHE_DIR aware)
+    stems.rs         — recipes, engines (demucs / audio-separator), stem cache (LRU)
+    stems/
+      process.rs     — shared engine-subprocess driver (drains, cancel, teardown)
+      provision.rs   — stem-engine discovery + uv-managed install
+    tui/
+      main.rs        — TUI entry point (zytunes-tui binary)
+      app.rs         — application state, panel navigation, event handling
+      ui.rs          — ratatui widget rendering (layout, panels, overlays, album-art cache)
+      background.rs  — background worker thread (device I/O, sync, removal, library loading, album-art load)
+      anim.rs        — theme-aware animations
+      audio.rs       — local audio playback (rodio), stem playback commands
+      audio/
+        stem_mix.rs  — stem mixing Source with live per-stem gains
+      theme.rs       — Theme struct, built-in presets, user-theme merge
+      config.rs      — TOML config file (~/.config/zytunes/config.toml)
 zune-mtp/            — native MTP/MTPZ library (workspace crate)
   src/
     lib.rs           — crate root, public API, MtpError
@@ -450,38 +483,8 @@ ipod-db/             — pure-Rust iTunesDB parser/writer (workspace crate)
     fs.rs            — iPod_Control path helpers
     hash.rs          — hash58 signing
     encoding.rs      — UTF-16 helpers
-src/
-  main.rs            — CLI entry point, commands (ls, push, rm, sync, library, photo-sync, video-sync)
-  lib.rs             — public API, sync engine, SyncType enum, audio transcoding (symphonia + LAME), video transcoding (ffmpeg shell-out)
-  device/
-    mod.rs           — DeviceBackend trait, DeviceCapabilities, DeviceFamily
-    zune.rs          — ZuneBackend: rusb-based scan, opens NativeSession
-    ipod.rs          — IpodBackend: mounted-volume scan, opens IpodSession
-  mtp/
-    mod.rs           — DeviceSession trait, TrackMeta
-    native.rs        — Zune session (NativeSession on zune-mtp)
-    ipod_session.rs  — iPod session (IpodSession on ipod-db)
-    parse.rs         — DeviceEntry struct and parsing utilities
-    zmdb.rs          — Zune Metadata Database parser (vendor op 0x9217)
-  library.rs         — MusicLibrary trait and shared Track type
-  dirlib.rs          — DirectoryLibrary: recursive folder scanner (lofty tags + path fallback)
-  cache.rs           — on-disk cache for the directory scanner
-  paths.rs           — device-scoped cache paths (ZYTUNES_CACHE_DIR aware)
-  stems.rs           — recipes, engines (demucs / audio-separator), stem cache (LRU)
-  stems/
-    process.rs       — shared engine-subprocess driver (drains, cancel, teardown)
-    provision.rs     — stem-engine discovery + uv-managed install
-  tui/
-    main.rs          — TUI entry point (zytunes-tui binary)
-    app.rs           — application state, panel navigation, event handling
-    ui.rs            — ratatui widget rendering (layout, panels, overlays, album-art cache)
-    background.rs    — background worker thread (device I/O, sync, removal, library loading, album-art load)
-    anim.rs          — theme-aware animations
-    audio.rs         — local audio playback (rodio), stem playback commands
-    audio/
-      stem_mix.rs    — stem mixing Source with live per-stem gains
-    theme.rs         — Theme struct, built-in presets, user-theme merge
-    config.rs        — TOML config file (~/.config/zytunes/config.toml)
+zytunes-stream/      — LAN HTTP server (`zytunes-serve` binary)
+mobile/              — Flutter LAN client
 ```
 
 ## Reference libraries

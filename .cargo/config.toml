@@ -4,11 +4,11 @@
 # this `.cargo/` folder, so each Conductor worktree (or any cargo invocation
 # from a cloned tree) gets its own device-cache dir rather than sharing
 # `$HOME`. Device-scoped files (track lists, library handles, sync
-# progress) key off `ZYTUNES_CACHE_DIR` — see `src/paths.rs`.
+# progress) key off `ZYTUNES_CACHE_DIR` — see `app/src/paths.rs`.
 #
 # The dirlib music-library metadata cache is intentionally *not* scoped by
 # this var: it stays under `$HOME/.cache/zytunes` so a big library scan is
-# reused across worktrees. See `src/cache.rs`.
+# reused across worktrees. See `app/src/cache.rs`.
 #
 # This is a default, not a force: if the user already exports
 # `ZYTUNES_CACHE_DIR` (e.g., to a shared sccache-like location), cargo leaves

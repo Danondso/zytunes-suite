@@ -36,7 +36,7 @@ substitute their own builds of these libraries by setting `PKG_CONFIG_PATH`
 or `LD_LIBRARY_PATH` (Linux) / `DYLD_LIBRARY_PATH` (macOS) at runtime.
 
 - **[libdiscid](https://musicbrainz.org/doc/libdiscid)** (LGPL-2.1+) — used
-  by `src/cd/drive.rs` via the [`discid`](https://crates.io/crates/discid)
+  by `app/src/cd/drive.rs` via the [`discid`](https://crates.io/crates/discid)
   Rust crate for reading audio-CD tables of contents. Install via
   `brew install libdiscid` (macOS) or `apt install libdiscid-dev` (Debian/
   Ubuntu). Upstream source:

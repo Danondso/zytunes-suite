@@ -5,13 +5,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build & Development Commands
 
 ```bash
-# Rust (zytunes workspace)
-cargo build                   # Debug build (all workspace crates)
+# Rust (zytunes workspace; default-members is `app`)
+cargo build                   # Debug build (app / CLI + TUI)
+cargo build --workspace       # All workspace crates including zytunes-stream
 cargo build --release         # Release build
 cargo check                   # Fast type-check without building
 cargo run -- <command>        # Run CLI with arguments (ls, push, rm, sync, library, photo-sync, video-sync, help)
 cargo run --bin zytunes-tui   # Run interactive TUI
-cargo test                    # Run tests (all workspace crates)
+cargo test                    # app crate tests
+cargo test --workspace        # All workspace crates
 cargo test -p zune-mtp        # Run zune-mtp crate tests only
 cargo test -p ipod-db         # Run ipod-db crate tests only
 cargo fmt                     # Format code
@@ -31,9 +33,9 @@ CLI commands: `ls [path]`, `push <files...>`, `rm <paths...>`, `sync <type> <nam
 
 ## Architecture
 
-**Workspace layout:** The project is a Cargo workspace with three members: the root `zytunes` crate, the `zune-mtp` MTPZ library crate, and the `ipod-db` iTunesDB parser/writer crate. All workspace crates specify `rust-version = "1.95"`. A `tools/mtp-probe` directory (gitignored) contains the MTP vendor operation probe tool used for reverse engineering.
+**Workspace layout:** Virtual Cargo workspace at the repo root. Sibling members: `app/` (package name `zytunes` — CLI + TUI), `zune-mtp/` (MTPZ library), `ipod-db/` (iTunesDB parser/writer), `zytunes-stream/` (`zytunes-serve` HTTP server). `mobile/` is the Flutter LAN client (not a Cargo member). All Rust crates specify `rust-version = "1.95"`. A `tools/mtp-probe` directory (gitignored) contains the MTP vendor operation probe tool used for reverse engineering.
 
-**Device abstraction:** `src/device/` defines `DeviceBackend` (detect + open session) and `DeviceCapabilities` (family, supported formats, transcode target, **`lossless_target`** for FLAC→ALAC-style lossless promotion on push, music root, max art dims). `ZuneBackend` (MTPZ-over-IOKit, `lossless_target = None`) and `IpodBackend` (USB mass storage + iTunesDB, `lossless_target = Some("alac")`) both implement it, so CLI and TUI iterate backends instead of hardcoding Zune. `DetectedDevice` carries a type-erased `backend_data: Box<dyn Any>` that the backend downcasts when opening a session.
+**Device abstraction:** `app/src/device/` defines `DeviceBackend` (detect + open session) and `DeviceCapabilities` (family, supported formats, transcode target, **`lossless_target`** for FLAC→ALAC-style lossless promotion on push, music root, max art dims). `ZuneBackend` (MTPZ-over-IOKit, `lossless_target = None`) and `IpodBackend` (USB mass storage + iTunesDB, `lossless_target = Some("alac")`) both implement it, so CLI and TUI iterate backends instead of hardcoding Zune. `DetectedDevice` carries a type-erased `backend_data: Box<dyn Any>` that the backend downcasts when opening a session.
 
 **USB strategy:** `rusb` handles device detection (descriptor reads only). For Zune MTP/MTPZ communication, the `zune-mtp` crate provides direct IOKit FFI, bypassing libusb (which fails on data-out USB operations that the Zune's MTPZ handshake requires). iPods mount as normal USB mass-storage and are driven through the filesystem — no MTP involved.
 
@@ -48,7 +50,7 @@ CLI commands: `ls [path]`, `push <files...>`, `rm <paths...>`, `sync <type> <nam
 - `proplist.rs` — MTP ObjectPropList builder for SendObjectPropList (0x9808): constructs binary property list payloads with string, u16, and u32 property types. Property constants for object filename, name, artist, track, genre, artist ID, date authored, and representative sample data
 - `iokit_ffi.rs` — Raw FFI: IOUSBDeviceInterface and IOUSBInterfaceInterface vtable structs, CoreFoundation helpers (CFString, CFUUID, CFNumber), IOKit service matching functions
 
-**Key modules:**
+**Key modules:** (all under `app/src/` unless noted)
 - `device/mod.rs` — `DeviceBackend` trait, `DeviceCapabilities`, `DeviceFamily` (`Zune` | `Ipod`), `DetectedDevice` with type-erased `backend_data`
 - `device/zune.rs` — `ZuneBackend` / `ZuneDevice` / `ZuneDeviceData`. rusb-based scan for VID `0x045e`, opens a `NativeSession` over IOKit
 - `device/ipod.rs` — `IpodBackend` / `IpodDeviceData`. Detects a mounted classic iPod's `iPod_Control/` root, opens an `IpodSession`
@@ -91,7 +93,7 @@ CLI commands: `ls [path]`, `push <files...>`, `rm <paths...>`, `sync <type> <nam
 
 **External tool dependencies:** `libusb` (via rusb), `libdiscid` (via the LGPL [`discid`](https://crates.io/crates/discid) crate, dynamically linked — `brew install libdiscid` on macOS, `apt install libdiscid-dev` on Linux). Optional: `ffmpeg` — **required** for `video-sync` (wmv2/wmav2 transcode to the Zune's native video format) and for the CD-import ripping pipeline (Phase 3), optional for TUI playback of WMA files. Audio sync uses pure-Rust transcoding and does not need ffmpeg. Stem-split playback (`M` in the TUI) shells out to a Python engine — `demucs` for the default recipe, `audio-separator` for `hq`/`hq-harmony` — never required at startup; discovered at use time and offered as a one-time consented `uv`-managed install (see `stems/provision.rs`). Roformer inference on CPU is markedly slower than demucs; the hq recipes want `[stems] gpu = true`.
 
-**Audio transcoding:** Lives in `src/transcode.rs` (re-exported from the crate root). Selection happens in `transcode_for_device` (3-way: lossless promotion → MP3 fallback → passthrough). When the device declares `lossless_target = Some("alac")` (iPod) and the source is a `.flac`, the file is shelled through ffmpeg (`-c:a alac -vn`) into an `.m4a` so the lossless tier survives the push instead of dropping to lossy MP3. Otherwise, non-native formats (FLAC, OGG, WAV, M4A, OPUS, ALAC, AIFF) are automatically transcoded to MP3 using pure Rust libraries (symphonia for decoding, mp3lame-encoder for encoding, lofty for metadata). Native formats (MP3, WMA, AAC) skip transcoding entirely. Album art is resized to 200x200 JPEG via the image crate (Zune rejects larger art with error `0xa803`). The M4A/ALAC path trims trailing silence leaked by symphonia's isomp4 demuxer: edit-list (`elst`) atoms parse but never apply, so the trimmed region decodes to bit-exact zeros and LAME would re-encode it as real silence. The transcoder holds back zero-valued frames during encoding and drops them at EOF; they only reach LAME once a later non-zero sample proves they were mid-track, preserving intentional silence between audio regions. Also: `FlushGap` (not `FlushNoGap`) on standalone-track flush, and mono sources route through `MonoPcm` instead of the stereo-hardcoded `InterleavedPcm`.
+**Audio transcoding:** Lives in `app/src/transcode.rs` (re-exported from the crate root). Selection happens in `transcode_for_device` (3-way: lossless promotion → MP3 fallback → passthrough). When the device declares `lossless_target = Some("alac")` (iPod) and the source is a `.flac`, the file is shelled through ffmpeg (`-c:a alac -vn`) into an `.m4a` so the lossless tier survives the push instead of dropping to lossy MP3. Otherwise, non-native formats (FLAC, OGG, WAV, M4A, OPUS, ALAC, AIFF) are automatically transcoded to MP3 using pure Rust libraries (symphonia for decoding, mp3lame-encoder for encoding, lofty for metadata). Native formats (MP3, WMA, AAC) skip transcoding entirely. Album art is resized to 200x200 JPEG via the image crate (Zune rejects larger art with error `0xa803`). The M4A/ALAC path trims trailing silence leaked by symphonia's isomp4 demuxer: edit-list (`elst`) atoms parse but never apply, so the trimmed region decodes to bit-exact zeros and LAME would re-encode it as real silence. The transcoder holds back zero-valued frames during encoding and drops them at EOF; they only reach LAME once a later non-zero sample proves they were mid-track, preserving intentional silence between audio regions. Also: `FlushGap` (not `FlushNoGap`) on standalone-track flush, and mono sources route through `MonoPcm` instead of the stereo-hardcoded `InterleavedPcm`.
 
 ## Claude Code Slash Commands
 

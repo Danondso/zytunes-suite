@@ -44,9 +44,9 @@ clean_stale_native_deps() {
 clean_stale_native_deps
 
 echo "Building zytunes (release)..."
-# --workspace: a bare `cargo build` in a workspace with a root package
-# builds only that package — zytunes-stream (zytunes-serve) would be
-# skipped and the install would fail at the binary check below.
+# --workspace: default-members is just `app`, so a bare `cargo build`
+# skips zytunes-stream (zytunes-serve) and the install would fail at
+# the binary check below.
 cargo build --release --workspace
 
 INSTALL_DIR="/usr/local/bin"
