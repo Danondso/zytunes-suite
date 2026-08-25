@@ -32,10 +32,13 @@ class MemoryCredentialsStore implements CredentialsStore {
 abstract class SettingsStore {
   Future<Duration> loadCrossfade();
   Future<void> saveCrossfade(Duration duration);
+  Future<String> loadThemeId();
+  Future<void> saveThemeId(String id);
 }
 
 class MemorySettingsStore implements SettingsStore {
   Duration crossfade = Duration.zero;
+  String themeId = 'bedfellow-light';
 
   @override
   Future<Duration> loadCrossfade() async => crossfade;
@@ -43,5 +46,13 @@ class MemorySettingsStore implements SettingsStore {
   @override
   Future<void> saveCrossfade(Duration duration) async {
     crossfade = duration;
+  }
+
+  @override
+  Future<String> loadThemeId() async => themeId;
+
+  @override
+  Future<void> saveThemeId(String id) async {
+    themeId = id;
   }
 }

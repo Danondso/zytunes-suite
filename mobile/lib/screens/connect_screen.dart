@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import '../api/client.dart';
 import '../session.dart';
 import '../storage.dart';
+import '../theme.dart';
 
 class ConnectScreen extends StatefulWidget {
   const ConnectScreen({super.key, required this.session});
@@ -69,6 +70,8 @@ class _ConnectScreenState extends State<ConnectScreen> {
           return ListView(
             padding: const EdgeInsets.all(24),
             children: [
+              ThemePicker(session: widget.session),
+              const SizedBox(height: 24),
               ServerCredentialFields(
                 host: _host,
                 port: _port,
@@ -93,6 +96,28 @@ class _ConnectScreenState extends State<ConnectScreen> {
           );
         },
       ),
+    );
+  }
+}
+
+class ThemePicker extends StatelessWidget {
+  const ThemePicker({super.key, required this.session});
+
+  final Session session;
+
+  @override
+  Widget build(BuildContext context) {
+    return DropdownButtonFormField<String>(
+      key: const Key('themePicker'),
+      initialValue: resolveThemeId(session.themeId),
+      decoration: const InputDecoration(labelText: 'Theme'),
+      items: [
+        for (final theme in appThemes)
+          DropdownMenuItem(value: theme.id, child: Text(theme.name)),
+      ],
+      onChanged: (id) {
+        if (id != null) session.setTheme(id);
+      },
     );
   }
 }
@@ -213,10 +238,17 @@ class _ServerSettingsDialogState extends State<ServerSettingsDialog> {
         return AlertDialog(
           title: const Text('Server'),
           content: SingleChildScrollView(
-            child: ServerCredentialFields(
-              host: _host,
-              port: _port,
-              token: _token,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                ThemePicker(session: widget.session),
+                const SizedBox(height: 16),
+                ServerCredentialFields(
+                  host: _host,
+                  port: _port,
+                  token: _token,
+                ),
+              ],
             ),
           ),
           actions: [

@@ -12,21 +12,20 @@ class ZytunesApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'zytunes',
-      theme: bedfellowTheme(),
-      home: ListenableBuilder(
-        listenable: session,
-        builder: (context, _) {
-          if (session.phase == SessionPhase.connected) {
-            return LibraryScreen(
-              key: const ValueKey('library'),
-              session: session,
-            );
-          }
-          return ConnectScreen(session: session);
-        },
-      ),
+    return ListenableBuilder(
+      listenable: session,
+      builder: (context, _) {
+        return MaterialApp(
+          title: 'zytunes',
+          theme: themeDataFor(session.themeId),
+          home: session.phase == SessionPhase.connected
+              ? LibraryScreen(
+                  key: const ValueKey('library'),
+                  session: session,
+                )
+              : ConnectScreen(session: session),
+        );
+      },
     );
   }
 }

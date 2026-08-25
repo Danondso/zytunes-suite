@@ -646,6 +646,37 @@ void main() {
       await session.cycleCrossfade();
       expect(session.crossfade, Duration.zero);
     });
+
+    test('restore loads the persisted theme id', () async {
+      final settings = MemorySettingsStore()..themeId = 'tokyo-night';
+      final session = Session(
+        httpClient: MockClient((_) async => http.Response('', 500)),
+        playback: FakePlayback(),
+        store: MemoryCredentialsStore(),
+        settings: settings,
+      );
+
+      await session.restore();
+      expect(session.themeId, 'tokyo-night');
+    });
+
+    test('setTheme persists a catalog id and rejects unknown ids', () async {
+      final settings = MemorySettingsStore();
+      final session = Session(
+        httpClient: MockClient((_) async => http.Response('', 500)),
+        playback: FakePlayback(),
+        store: MemoryCredentialsStore(),
+        settings: settings,
+      );
+
+      await session.setTheme('zune-original');
+      expect(session.themeId, 'zune-original');
+      expect(settings.themeId, 'zune-original');
+
+      await session.setTheme('not-a-theme');
+      expect(session.themeId, 'bedfellow-light');
+      expect(settings.themeId, 'bedfellow-light');
+    });
   });
 
   group('playThresholdMs', () {

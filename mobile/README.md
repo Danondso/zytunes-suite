@@ -35,5 +35,8 @@ On Android, playback holds a foreground notification so the OS does not
 kill the process when the app is backgrounded. iOS uses the `audio`
 background mode.
 
-Colors follow Bedfellow's brand palette: teal primary, sage secondary, rust
-errors, and warm sand text on dark brown surfaces.
+Themes: Bedfellow Light (default) and Bedfellow Dark, plus every TUI preset
+(iTunes 2004, Gruvbox, Everforest, Tokyo Night, IBM Mainframe, Amber CRT,
+Windows 95, System 7, BIOS, Red Sands, Newport Lights, NeXTSTEP, WinAmp
+Classic, Zune Original). Pick one on the connect screen or in the library
+gear menu; the choice is saved in SharedPreferences.

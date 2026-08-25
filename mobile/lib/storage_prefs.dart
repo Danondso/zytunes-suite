@@ -49,6 +49,7 @@ class PrefsSettingsStore implements SettingsStore {
   PrefsSettingsStore({required SharedPreferences prefs}) : _prefs = prefs;
 
   static const _crossfadeKey = 'crossfade_ms';
+  static const _themeKey = 'theme_id';
   static const defaultCrossfade = Duration(seconds: 4);
 
   final SharedPreferences _prefs;
@@ -63,5 +64,15 @@ class PrefsSettingsStore implements SettingsStore {
   @override
   Future<void> saveCrossfade(Duration duration) async {
     await _prefs.setInt(_crossfadeKey, duration.inMilliseconds.clamp(0, 60000));
+  }
+
+  @override
+  Future<String> loadThemeId() async {
+    return _prefs.getString(_themeKey) ?? 'bedfellow-light';
+  }
+
+  @override
+  Future<void> saveThemeId(String id) async {
+    await _prefs.setString(_themeKey, id);
   }
 }

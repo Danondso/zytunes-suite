@@ -10,6 +10,7 @@ import 'playback_keepalive.dart';
 import 'stem_cache.dart';
 import 'stem_playback.dart';
 import 'storage.dart';
+import 'theme.dart';
 
 enum SessionPhase { disconnected, connecting, connected }
 
@@ -72,6 +73,7 @@ class Session extends ChangeNotifier {
   SavedServer? saved;
   ZytunesClient? client;
   Duration crossfade = Duration.zero;
+  String themeId = defaultThemeId;
 
   static const crossfadeSteps = [0, 4, 8, 12];
 
@@ -126,6 +128,7 @@ class Session extends ChangeNotifier {
   Future<void> restore() async {
     crossfade = await settings.loadCrossfade();
     playback.crossfade = crossfade;
+    themeId = resolveThemeId(await settings.loadThemeId());
     saved = await store.load();
     notifyListeners();
     final next = saved;
@@ -564,6 +567,12 @@ class Session extends ChangeNotifier {
     playback.crossfade = crossfade;
     await settings.saveCrossfade(crossfade);
     notifyListeners();
+  }
+
+  Future<void> setTheme(String id) async {
+    themeId = resolveThemeId(id);
+    notifyListeners();
+    await settings.saveThemeId(themeId);
   }
 
   Future<void> cycleCrossfade() async {
