@@ -8,6 +8,7 @@ import 'package:http/testing.dart';
 import 'package:zytunes_mobile/app.dart';
 import 'package:zytunes_mobile/playback.dart';
 import 'package:zytunes_mobile/session.dart';
+import 'package:zytunes_mobile/speed_scroll.dart';
 import 'package:zytunes_mobile/storage.dart';
 
 void main() {
@@ -84,6 +85,54 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(tester.testTextInput.isVisible, isFalse);
+  });
+
+  testWidgets('artist list jumps by letter after twenty rows', (tester) async {
+    final session = sessionFor((req) {
+      if (req.url.path == '/health') return jsonOk({'ok': true});
+      if (req.url.path == '/artists') {
+        return jsonOk([
+          for (var i = 0; i < 40; i++) 'Alpha $i',
+          'Beta',
+          'Gamma',
+        ]);
+      }
+      fail('unexpected ${req.url}');
+    });
+
+    await tester.pumpWidget(app(session));
+    await tester.enterText(find.byKey(const Key('hostField')), '10.0.0.8');
+    await tester.tap(find.byKey(const Key('connectButton')));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Beta'), findsNothing);
+
+    final gesture = await tester.startGesture(
+      tester.getCenter(find.text('Alpha 0')),
+    );
+    await tester.pump();
+    for (var i = 0; i < SpeedScroll.thresholdItems + 1; i++) {
+      await gesture.moveBy(const Offset(0, -SpeedScroll.rowExtent));
+      await tester.pump();
+    }
+
+    expect(find.byKey(const Key('artistSpeedScrollLetter')), findsOneWidget);
+    expect(find.text('Beta'), findsNothing);
+
+    await tester.pump(SpeedScroll.tickHold);
+    await gesture.moveBy(const Offset(0, -SpeedScroll.letterStep));
+    await tester.pump();
+
+    expect(find.byKey(const Key('artistSpeedScrollLetter')), findsOneWidget);
+    expect(find.text('Beta'), findsOneWidget);
+
+    await gesture.up();
+    await tester.pump();
+    // A flick coasts; wait for the wheel to run down instead of pumpAndSettle
+    // (the coast ticker would never go idle).
+    await tester.pump(const Duration(seconds: 2));
+
+    expect(find.byKey(const Key('artistSpeedScrollLetter')), findsNothing);
   });
 
   testWidgets('failed restore prefills the connect form', (tester) async {

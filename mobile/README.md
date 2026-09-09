@@ -40,3 +40,9 @@ Themes: Bedfellow Light (default) and Bedfellow Dark, plus every TUI preset
 Windows 95, System 7, BIOS, Red Sands, Newport Lights, NeXTSTEP, WinAmp
 Classic, Zune Original). Pick one on the connect screen or in the library
 gear menu; the choice is saved in SharedPreferences.
+
+The artist list speed-scrolls like an iPod click wheel. After about 20
+names in one flick, further dragging ticks by first letter (A→B→C) with
+a haptic click per letter, a large overlay, and the list jumping only on
+those ticks. A hard flick keeps ticking after you lift, slowing down
+until it stops. Lifting slowly returns to ordinary scrolling.

@@ -1,9 +1,11 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
+import 'package:flutter/services.dart';
 
 import '../api/models.dart';
 import '../session.dart';
+import '../speed_scroll.dart';
 import 'connect_screen.dart';
-import 'play_count_meter.dart';
 import 'player_screen.dart';
 
 class LibraryScreen extends StatefulWidget {
@@ -82,13 +84,130 @@ class _ArtistList extends StatefulWidget {
   State<_ArtistList> createState() => _ArtistListState();
 }
 
-class _ArtistListState extends State<_ArtistList> {
+class _ArtistListState extends State<_ArtistList>
+    with SingleTickerProviderStateMixin {
   final _search = TextEditingController();
+  final _scroll = ScrollController();
+  final _speed = SpeedScroll();
+  Ticker? _coastTicker;
+  var _ignoreJump = false;
+  String? _letter;
+
+  Duration get _now => SchedulerBinding.instance.currentSystemFrameTimeStamp;
 
   @override
   void dispose() {
+    _coastTicker?.dispose();
     _search.dispose();
+    _scroll.dispose();
     super.dispose();
+  }
+
+  bool _onArtistScroll(ScrollNotification notification) {
+    if (_ignoreJump) return false;
+    final names = widget.session.artists;
+    if (notification is ScrollStartNotification) {
+      _coastTicker?.stop();
+      _coastTicker?.dispose();
+      _coastTicker = null;
+      _speed.begin();
+      if (_letter != null) setState(() => _letter = null);
+      return false;
+    }
+    if (notification is ScrollEndNotification) {
+      _releaseScrub();
+      return false;
+    }
+    if (notification is ScrollUpdateNotification && names.isNotEmpty) {
+      final delta = notification.scrollDelta ?? 0;
+      _speed.ensureBegan();
+      final currentIndex = (notification.metrics.pixels / SpeedScroll.rowExtent)
+          .floor();
+      final tick = _speed.addDelta(delta, names, currentIndex, _now);
+      if (tick != null) {
+        HapticFeedback.selectionClick();
+        final idx = tick.clamp(0, names.length - 1);
+        final letter = letterOf(names[idx]);
+        if (_letter != letter) setState(() => _letter = letter);
+        _holdAt(idx);
+      } else if (_speed.jumping) {
+        // Stay parked on the last click until the next haptic tick.
+        _absorb(delta);
+      }
+    }
+    return false;
+  }
+
+  void _releaseScrub() {
+    if (_speed.coasting) return;
+    if (_speed.release(_now)) {
+      _cancelBallistic();
+      _startCoast();
+    } else {
+      _stopScrub();
+    }
+  }
+
+  void _startCoast() {
+    _coastTicker?.dispose();
+    _coastTicker = createTicker(_onCoastTick)..start();
+  }
+
+  void _onCoastTick(Duration _) {
+    final names = widget.session.artists;
+    if (names.isEmpty) {
+      _stopScrub();
+      return;
+    }
+    final tick = _speed.advance(names, _now);
+    if (tick != null) {
+      HapticFeedback.selectionClick();
+      final idx = tick.clamp(0, names.length - 1);
+      final letter = letterOf(names[idx]);
+      if (_letter != letter) setState(() => _letter = letter);
+      _holdAt(idx);
+    } else if (!_speed.coasting) {
+      _stopScrub();
+    }
+  }
+
+  void _cancelBallistic() {
+    if (!_scroll.hasClients) return;
+    _ignoreJump = true;
+    _scroll.jumpTo(_scroll.offset);
+    _ignoreJump = false;
+  }
+
+  void _stopScrub() {
+    _coastTicker?.stop();
+    _coastTicker?.dispose();
+    _coastTicker = null;
+    _speed.end();
+    if (_letter != null) setState(() => _letter = null);
+  }
+
+  void _absorb(double delta) {
+    if (!_scroll.hasClients || delta.abs() < 0.5) return;
+    _ignoreJump = true;
+    _scroll.position.correctBy(-delta);
+    _ignoreJump = false;
+  }
+
+  void _holdAt(int index) {
+    if (!_scroll.hasClients) return;
+    final pos = _scroll.position;
+    final target = (index * SpeedScroll.rowExtent).clamp(
+      0.0,
+      pos.maxScrollExtent,
+    );
+    final correction = target - pos.pixels;
+    if (correction.abs() < 0.5) return;
+    // jumpTo kills the active drag. correctBy keeps the gesture; we only
+    // snap here on a haptic tick, not on every pointer move.
+    _ignoreJump = true;
+    pos.correctBy(correction);
+    pos.notifyListeners();
+    _ignoreJump = false;
   }
 
   @override
@@ -197,17 +316,57 @@ class _ArtistListState extends State<_ArtistList> {
                           ],
                         ],
                       )
-                    : ListView.builder(
-                        keyboardDismissBehavior:
-                            ScrollViewKeyboardDismissBehavior.onDrag,
-                        itemCount: session.artists.length,
-                        itemBuilder: (context, index) {
-                          final artist = session.artists[index];
-                          return ListTile(
-                            title: Text(artist),
-                            onTap: () => _openArtist(context, session, artist),
-                          );
-                        },
+                    : Stack(
+                        children: [
+                          Listener(
+                            onPointerUp: (_) => _releaseScrub(),
+                            onPointerCancel: (_) => _stopScrub(),
+                            child: NotificationListener<ScrollNotification>(
+                              onNotification: _onArtistScroll,
+                              child: ListView.builder(
+                                key: const Key('artistList'),
+                                controller: _scroll,
+                                itemExtent: SpeedScroll.rowExtent,
+                                keyboardDismissBehavior:
+                                    ScrollViewKeyboardDismissBehavior.onDrag,
+                                itemCount: session.artists.length,
+                                itemBuilder: (context, index) {
+                                  final artist = session.artists[index];
+                                  return ListTile(
+                                    title: Text(artist),
+                                    onTap: () =>
+                                        _openArtist(context, session, artist),
+                                  );
+                                },
+                              ),
+                            ),
+                          ),
+                          if (_letter != null)
+                            IgnorePointer(
+                              child: Center(
+                                child: Material(
+                                  key: const Key('artistSpeedScrollLetter'),
+                                  color: Theme.of(context)
+                                      .colorScheme
+                                      .surfaceContainerHigh,
+                                  elevation: 8,
+                                  borderRadius: BorderRadius.circular(12),
+                                  child: Padding(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 28,
+                                      vertical: 12,
+                                    ),
+                                    child: Text(
+                                      _letter!,
+                                      style: Theme.of(context)
+                                          .textTheme
+                                          .displayLarge,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
+                        ],
                       ),
               ),
             ],
@@ -457,7 +616,7 @@ class _TrackQueueMenu extends StatelessWidget {
   }
 }
 
-class _NowPlayingBar extends StatelessWidget {
+class _NowPlayingBar extends StatefulWidget {
   const _NowPlayingBar({
     required this.session,
     required this.track,
@@ -469,56 +628,70 @@ class _NowPlayingBar extends StatelessWidget {
   final VoidCallback onOpen;
 
   @override
+  State<_NowPlayingBar> createState() => _NowPlayingBarState();
+}
+
+class _NowPlayingBarState extends State<_NowPlayingBar> {
+  double _dragDy = 0;
+
+  void _onDragEnd(DragEndDetails details) {
+    final flickedUp = (details.primaryVelocity ?? 0) < -200;
+    final swipedUp = _dragDy < -48;
+    _dragDy = 0;
+    if (flickedUp || swipedUp) widget.onOpen();
+  }
+
+  @override
   Widget build(BuildContext context) {
     final textTheme = Theme.of(context).textTheme;
-    return Material(
-      key: const Key('nowPlaying'),
-      color: Theme.of(context).colorScheme.surfaceContainerHigh,
-      child: SafeArea(
-        top: false,
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(8, 8, 8, 4),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              InkWell(
-                key: const Key('nowPlayingTrack'),
-                onTap: onOpen,
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 8,
-                    vertical: 4,
-                  ),
-                  child: Column(
-                    children: [
-                      Text(
-                        track.name,
-                        textAlign: TextAlign.center,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: textTheme.titleMedium,
-                      ),
-                      Text(
-                        track.artist,
-                        textAlign: TextAlign.center,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: textTheme.bodySmall,
-                      ),
-                      if (session.displayedPlayCount != null)
-                        PlayCountMeter(
-                          key: ValueKey(track.id),
-                          count: session.displayedPlayCount!,
-                          compact: true,
+    return GestureDetector(
+      onVerticalDragStart: (_) => _dragDy = 0,
+      onVerticalDragUpdate: (details) => _dragDy += details.delta.dy,
+      onVerticalDragEnd: _onDragEnd,
+      onVerticalDragCancel: () => _dragDy = 0,
+      child: Material(
+        key: const Key('nowPlaying'),
+        color: Theme.of(context).colorScheme.surfaceContainerHigh,
+        child: SafeArea(
+          top: false,
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(8, 8, 8, 4),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                InkWell(
+                  key: const Key('nowPlayingTrack'),
+                  onTap: widget.onOpen,
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 4,
+                    ),
+                    child: Column(
+                      children: [
+                        Text(
+                          widget.track.album,
+                          textAlign: TextAlign.center,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: textTheme.titleMedium,
                         ),
-                    ],
+                        Text(
+                          widget.track.artist,
+                          textAlign: TextAlign.center,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: textTheme.bodySmall,
+                        ),
+                      ],
+                    ),
                   ),
                 ),
-              ),
-              SeekBar(session: session, compact: true),
-              PlayerControls(session: session, compact: true),
-            ],
+                SeekBar(session: widget.session, compact: true),
+                PlayerControls(session: widget.session, compact: true),
+              ],
+            ),
           ),
         ),
       ),
