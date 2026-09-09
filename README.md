@@ -306,13 +306,14 @@ On Debian/Ubuntu: `apt install libusb-1.0-0-dev libdiscid-dev ffmpeg`.
 
 Stem-split playback (`M` in the TUI) additionally needs a Python engine: `demucs` for the default recipe, or [`audio-separator`](https://github.com/nomadkaraoke/python-audio-separator) for the `hq`/`hq-harmony` recipes. You don't have to preinstall either — on first use zytunes offers a one-time managed install via [`uv`](https://docs.astral.sh/uv/) — but an existing install works too: point `[stems] command` in `~/.config/zytunes/config.toml` at the engine binary. Roformer model checkpoints download automatically on first separation into `~/.cache/zytunes/models/`.
 
-### MTPZ keys (Zune only)
+### Zune authentication
 
-Zune sync needs MTPZ authentication. zytunes does **not** ship the keys
-file. Obtain `.mtpz-data` from [libmtp-zune](https://github.com/kbhomes/libmtp-zune)
-(`src/.mtpz-data` in that repo) and place it at `~/.mtpz-data`. Without
-it, Zune connect/sync fails at the handshake. The iPod backend does not
-use these keys.
+Zune sync needs an MTPZ handshake before the session can do useful work.
+zytunes does **not** ship the credentials that handshake needs. Put them
+at `~/.mtpz-data` in the format used by the existing MTPZ / libmtp
+ecosystem. Without that file, Zune connect/sync fails at the handshake.
+The iPod backend does not use it. See [libmtp-zune](https://github.com/kbhomes/libmtp-zune)
+for protocol notes.
 
 ### Music library
 
@@ -491,7 +492,7 @@ mobile/              — Flutter LAN client
 
 | Library | Role | Link |
 |---|---|---|
-| **libmtp-zune** | Protocol documentation. The `mtpz.md` file has the most detailed public description of the MTPZ handshake. Obtain `.mtpz-data` from that project; zytunes does not vendor the keys. | [kbhomes/libmtp-zune](https://github.com/kbhomes/libmtp-zune) |
+| **libmtp-zune** | Protocol documentation. The `mtpz.md` file has the most detailed public description of the MTPZ handshake. zytunes does not vendor handshake credentials. | [kbhomes/libmtp-zune](https://github.com/kbhomes/libmtp-zune) |
 
 ### Other references
 

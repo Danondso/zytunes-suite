@@ -349,36 +349,25 @@ Music was syncing. Then I looked at the album browser.
 Hackerman
 ===
 
-TODO maybe remove this section or shorten it to being about building tooling to understand how sync works for the Zune, 
-
 <!-- alignment: center -->
 
 <!-- pause -->
 
-Second instinct, once "gracefully" started meaning "worse": open the
-the device and write probes.
+Second instinct, once "gracefully" started meaning "worse": stop
+guessing and write small probes against the device.
+
+List the props the firmware actually serves. Dump a working sync.
+Diff that against ours. Repeat.
 
 <!-- pause -->
 
-Not to patch this build — to understand how firmware versioning and the
-older train worked at all, because the build I actually wanted
-lived on the *other side* of an update I'd taken.
+The glyph coverage I needed showed up on **1.4**. That's the box I
+used for the rest of this work — the useful lesson for zytunes
+was the probe loop.
 
-Later Zune firmware trains differ in what they ship, so it wasn't just
-"switch trains overnight."
-
-<!-- pause -->
-
-Working through the protocol with small probes — what it advertises, what it
-trusts — turned "not possible" into "possible, carefully."
-
-<!-- pause -->
-
-Boom. Cash money. I did the rest of this work on firmware **1.4**.
-
-1.4 doesn't fix the font table on its own — but it's old enough, and
-different enough, that the glyph set it ships actually covers more of
-what I needed.
+1.4 doesn't rewrite the font table — but the glyph set it ships
+covers more of what I needed, and the MTP/MTPZ stack is the same one
+the rest of this talk is about.
 
 - TODO add firmware tradeoffs (the ones you care about)
 
@@ -631,8 +620,8 @@ not the code.
 <!-- pause -->
 
 An LLM didn't replace the USB traces or the nights of "why does this
-it replaced the eight other things that would've made me give up before
-getting to them.
+one JPEG hang the pipe" — it replaced the eight other things that
+would've made me give up before getting to them.
 
 <!-- pause -->
 

@@ -89,7 +89,7 @@ CLI commands: `ls [path]`, `push <files...>`, `rm <paths...>`, `sync <type> <nam
 - The model-checkpoint cache at `$HOME/.cache/zytunes/models/` (audio-separator's `--model_file_dir`; Roformer checkpoints run 200 MB–1 GB) ignores the override too — the engine's own default is under `/tmp`, wiped on reboot.
 - The TUI album-art cache at `$HOME/.cache/zytunes/art/` is keyed on `(artist, album)` and fingerprinted by `(mtime, size)` so re-tagging a source file invalidates the cached rendering automatically. Repeat views of the same album skip tag parsing entirely.
 
-**Licensing:** MIT license (`LICENSE`). Third-party attribution in `THIRD_PARTY.md` (MTPZ keys from libmtp-zune, mhit writer ported from libgpod).
+**Licensing:** MIT license (`LICENSE`). Third-party attribution in `THIRD_PARTY.md` (MTPZ protocol notes from libmtp-zune, mhit writer informed by libgpod).
 
 **External tool dependencies:** `libusb` (via rusb), `libdiscid` (via the LGPL [`discid`](https://crates.io/crates/discid) crate, dynamically linked — `brew install libdiscid` on macOS, `apt install libdiscid-dev` on Linux). Optional: `ffmpeg` — **required** for `video-sync` (wmv2/wmav2 transcode to the Zune's native video format) and for the CD-import ripping pipeline (Phase 3), optional for TUI playback of WMA files. Audio sync uses pure-Rust transcoding and does not need ffmpeg. Stem-split playback (`M` in the TUI) shells out to a Python engine — `demucs` for the default recipe, `audio-separator` for `hq`/`hq-harmony` — never required at startup; discovered at use time and offered as a one-time consented `uv`-managed install (see `stems/provision.rs`). Roformer inference on CPU is markedly slower than demucs; the hq recipes want `[stems] gpu = true`.
 
@@ -160,7 +160,7 @@ Scopes are optional: `feat(tui): add theme picker` is fine. Commits that don't m
 ## Zune Constraints
 
 - Only accepts MP3, WMA, AAC formats
-- MTPZ keys must exist at `~/.mtpz-data` (not shipped; obtain from libmtp-zune). iPod sync does not need them
+- MTPZ handshake credentials must exist at `~/.mtpz-data` (not shipped). iPod sync does not need them
 - Device auto-opens MTP session on USB connect (OpenSession returns `0x201d` — this is normal)
 - GetDeviceInfo is not supported by the Zune (returns `0x2006`) — skip it and go straight to OpenSession
 - MTPZ handshake requires SessionInitiatorVersionInfo (`0xD406`) to be set before beginning authentication

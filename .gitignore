@@ -19,7 +19,7 @@
 *.alac
 *.aiff
 
-# MTPZ keys — never vendor; users obtain ~/.mtpz-data from libmtp-zune
+# Local MTPZ credentials — never vendor
 .mtpz-data
 mtpz-data.example
 
