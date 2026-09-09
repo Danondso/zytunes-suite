@@ -1,227 +1,219 @@
 ---
-title: zytunes
-sub_title: 
-author: Danondso
+title: Rusty Spaghetti
+sub_title: Or - zytunes - building the music player I never thought I've always wanted while selling my soul to Anthropic while some bangin' tunes play oh and Rust is there too 🦀 (and maybe a snake 🐍)
+author: Dublin Anondson
 date: 2026-08-29
 theme:
-  name: tokyonight-storm
+  name: terminal-dark
 ---
 
+
+New Presentation Who Dis?
+===
+<!-- alignment: center -->
+Dublin
+<!-- pause -->
+- Senior Engineer on growth team at a SaaS startup in Nebraska
+<!-- pause -->
+- BA in Computer Science @uark, December 2015
+<!-- speaker_note: when I started I was debugging JSF servers using ICEfaces and now AI is eating everything and claude writes it all for me, golly  -->
+<!-- pause -->
+- two cats
+<!-- pause -->
+- 11 chickens
+<!-- pause -->
+<!-- end_slide -->
 How Did I Get Here?
 ===
-
 <!-- alignment: center -->
-
+<!-- speaker_note: why am i giving a talk about ferrous pasta and old stuff -->
 <!-- pause -->
-
-I love tinkering and modding stuff. 
-
-<!-- Pics of my iPod collection here -->
-
+<!-- speaker_note: Growing up in NJ I had access to lots of things to mess around with, stripping down old bikes and not putting them back together -->
+- Tinkering and modding stuff.
 <!-- pause -->
-
-Started buying way to much shit from FreeGeek down in Fayetteville.
-
-<!-- speaker_note: I'm a third generation hoarder and love collecting stuff -->
-
+- Rebuilt and softmodded a PSP
+- pic of psp 200
 <!-- pause -->
-
-RIP my wallet.
-
-<!-- speaker_note: Might work with other devices, I haven't tried lol -->
-
+- Modding guitars literally found on the side of the street
+- pic of my stratocaster
 <!-- pause -->
+- I enjoy using items that do more than they're supposed to. 
+- It's radical to see things used longer than our capitalist overlords intended.
 
-Started going in around every Friday to see what's new.
-
-Fast forwards a couple months and this is happening
-
-<!-- todo: picture of ipod collection here -->
-
-
-
-<!-- pause -->
-
-I want to make my own
-
-<!-- speaker_note: Hold up the actual devices here if you brought them — Zune, iPod Classic. Physical props sell the "I still use these" premise immediately. -->
-
+<!-- speaker_note: I'm really old -->
 <!-- end_slide -->
 
+Getting My Start
+===
+<!-- pause -->
+<!-- speaker_note: Lovely little place down in Fayetteville called FreeGeek -->
+![](assets/fgar.png)
+<!-- alignment: center -->
+<!-- pause -->
+- 521 W Ash St, Fayetteville, AR 72703 (down the road from Fossil Cove)
+<!-- pause -->
+<!-- speaker_note: they take almost any electronic item, even car batteries, someone dropped off a telephone switchboard one time -->
+- e-waste recycling
+<!-- pause -->
+<!-- speaker_note: reimage machines and put linux on them so they can be re-sold -->
+<!-- speaker_note: similar to geeksquad -->
+- IT support
+<!-- pause -->
+<!-- speaker_note: testing and pricing electronic items for sale in the thrift store -->
+<!-- speaker_note: depending on skillset you can specialize in certain tech -->
+<!-- speaker_note: volunteer hours count towards class credits -->
+- volunteering
+<!-- pause -->
+- enabling my crippling addiction to hoarding outdated technology
+
+<!-- end_slide -->
+Reject modernity; return to ~~monke~~ froot
+===
+<!-- alignment: center -->
+<!-- pause -->
+<!-- speaker_note: this is the first one I picked up, a 5.5th Gen iPod (if it has search then it's 5.5th gen!) -->
+<!-- speaker_note: I was so excited, I hadn't had one since 2011, I had a large music collection leftover from highschool that I've been carrying around on HDDs I can explore again -->
+<!-- speaker_note: No more using spotify, I was free -->
+<!-- column_layout: [3, 2] -->
+<!-- column: 0 -->
+2024
+![image:width:100%](assets/IMG_3924.jpeg)
+<!-- column: 1 -->
+<!-- pause -->
+Walking out the store like:
+![image:width:100%](assets/thrifting.gif)
+![image:width:100%](assets/happy.gif)
+<!-- reset_layout -->
+<!-- pause -->
+But wait..
+<!-- pause -->
+is it enough?
+<!-- end_slide -->
+Time To Upgrade
+===
+<!-- column_layout: [3, 3] -->
+<!-- alignment: center -->
+<!-- pause -->
+
+<!-- column: 0 -->
+- 30GB stock, small boi
+<!-- pause -->
+<!-- speaker_note: using ALAC for a lot of my music, blows their estimation of 4min @128Kbps mp3 back in the elder days -->
+- 320GB library, many lossless formatted
+<!-- pause -->
+![image:width:100%](assets/iflash.png)
+<!-- pause -->
+Don't tear the ribbon cables!
+<!-- column: 1 -->
+<!-- speaker_note: the hardware is designed to interface with the iPods, so they have a ZIF connector, just pop out the old ZIF drive and put the new one in -->
+
+<!-- pause -->
+- iFlash Solo
+<!-- pause -->
+- 512GB SD Card
+<!-- pause -->
+![image:width:100%](assets/evil-ipod-dance.gif)
+- whole library fits!
+- we're done!
+<!-- reset_layout -->
+<!-- pause -->
+![image:width:100%](assets/so-much-space.gif)
+I am enjoying this.
+<!-- end_slide -->
+
+The End
+===
+<!-- pause -->
+<!-- alignment: center -->
+<!-- speaker_note: and... another -->
+<!-- end_slide -->
+
+A few months later
+===
+![image:width:60%](assets/IMG_3926.jpeg)
+<!-- alignment: center -->
+RIP my wallet. Change the pic to the whole collection too
+<!-- pause -->
+<!-- speaker_note: Fast forward a few months, and things have dengenerated, I have this giant pile of devices, I've upgraded / repaired a lot of them, some are just hunks of junk because of activation lock. -->
+<!-- end_slide -->
+
+The Ingredients
+===
+<!-- alignment: center -->
+<!-- pause -->
+Accumulated a lot of devices
+<!-- pause -->
+<!-- speaker_note: nothing much to cover in the way of upgrading Zunes other than they can't read greater than 120GB if I remember right, and you can only use a few select SSD type ZIF Drives, iPod Classics and Zunes share similar batteries though! -->
+iPods, Zunes, GoGears
+<!-- pause -->
+Upgrades, Repairs, and Lost Causes
+<!-- speaker_note: as far as I can tell, you cannot purchase the screen to repair a Philips GoGear 30GB -->
+<!-- pause -->
+Obnoxious compatibility, make this a word art PNG
+
+<!-- end_slide -->
 I. The problem
 ===
 
-<!-- alignment: center -->
+<!-- speaker_note: I have a fun set of constraints, also I may have missed an app in the ecosystem that would have made this easier but I was already thinking about the recipe, in my dreams --> 
 
+Constraints: 
+<!-- alignment: left -->
+<!-- pause -->
+- Windows has the best compatibility
+<!-- pause -->
+  - I don't use it  
+- macos has ipod support
+  - Apple Music is subpar for iPods lately
+  - no Zune support
+<!-- pause -->
+- Rockbox is a good alternative and works on Linux
+  - my exp was tricky
+- Other bizarre alternatives:
+<!-- pause -->
+  - buy an old mac and upgrade the SSD and manually manage music on it
+<!-- pause -->
+  - VM (it's just not as fun, Mom!)
+  - Learning the naming algorithm and manually adding songs yourself TODO check if this is actually something you can do
 <!-- pause -->
 
-
+Goals: 
+- macos and Linux compatible application
+- TUI because I'm cracked out on LLM heroine and saw a coworker build a terminal app and I wanted the cyberpunk aesthetic
+- Rust native
+<!-- pause -->
+  - this will change later
 
 <!-- pause -->
-
-I like owning my music. I want to keep using the devices I grew up with.
-
-<!-- pause -->
-
-But they have — or are slowly becoming — **abandonware**.
+![image:width:20%](assets/evil-snake.gif)
 
 <!-- end_slide -->
 
-A. The Zune
+
+Disclaimer: 
 ===
-
 <!-- alignment: center -->
+<!-- pause -->
+I cobbled this together from commit logs because I was an Enter pressing machine and just focused on QA. 
 
 <!-- pause -->
-
-Got
-
-<!-- pause -->
-
-RIP in peace 2006-2012, went the way of the GoGear, Zen, 
-
-<!-- pause -->
-
-
+This was earlier(?) on when I started using LLMs for coding, and I was exercising how much I could let go and how much I could get done.
+- I'm still really lazy sob emoji
 
 <!-- end_slide -->
 
-B. The iPod
+MVP
 ===
 
 <!-- alignment: center -->
+- Export the Library.xml from Apple music, claude go make it
 
-Apple still "supports" the ecosystem, technically.
 
-<!-- pause -->
+From here we need to start digging into the phases of the work that was done so the git history aligns with it. 
 
-But actually managing a **local** library on a **classic** iPod — no
-streaming, no cloud, just your own files — gets harder every macOS
-release. iTunes is gone. Sync is an afterthought bolted onto Finder.
-
-<!-- pause -->
-
-Nominally alive. Practically neglected.
-
-<!-- end_slide -->
-
-C. Windows sucks
-===
-
-<!-- alignment: center -->
-
-I use macOS and Linux. I don't want to boot Windows to manage a music
-player.
-
-<!-- pause -->
-
-I tried **Rockbox**. USB sessions kept timing out mid-transfer, which
-makes copying a whole album over reliably... not fun.
-
-<!-- pause -->
-
-So: no first-party tooling worth using, no good third-party alternative
-for my OS. Fine. I'll write it myself.
-
-<!-- end_slide -->
-
-D. LLMs make this trivial
-===
-
-<!-- alignment: center -->
-
-<!-- pause -->
-
-Reverse-engineered protocol docs, decades-old file formats, obscure C
-libraries — the kind of project that used to take a determined person a
-*year* of nights and weekends.
-
-<!-- pause -->
-
-With an LLM doing the tedious parts alongside me? Suddenly this looks
-like a weekend project that turns into a few months, instead of a few
-months that turns into never.
-
-<!-- end_slide -->
-
-II. Goals
-===
-
-<!-- alignment: center -->
-
-<!-- pause -->
-
-**Terminal-based**, just because — I like living in a terminal.
-
-<!-- pause -->
-
-**Entirely Rust.** Even the C libraries some amazing people wrote —
-because without them this project genuinely wouldn't exist — get ported
-or wrapped, never vendored as-is.
-
-<!-- end_slide -->
-
-II.B The timeline
-===
-
-<!-- alignment: center -->
-
-This felt like a two-year project.
-
-<!-- pause -->
-
-It was three months.
-
-<!-- pause -->
-
-That's the whole pitch for pairing with an LLM on something like this:
-not that it writes better code than you, but that it collapses the
-"I'll get to that eventually" projects into "I got to that this weekend."
-
-<!-- pause -->
-
-Vibe coding. Woohoo.
-
-<!-- end_slide -->
-
-III. zytunes
-===
-
-<!-- alignment: center -->
-
-<!-- pause -->
-
-Where it actually starts: the smallest possible thing that could sync a
-song to a device.
-
-<!-- end_slide -->
-
-A. The MVP
-===
-
-<!-- alignment: center -->
-
-Step one: get *some* library into the tool.
-
-<!-- pause -->
-
-The fastest path was Apple Music's **Library.xml** export — point at the
-file, parse it, get artist/album/track metadata for free.
-
-<!-- pause -->
-
-It worked. It also turned out to be a mistake I'd pay for later. More on
-that in a bit.
-
-<!-- end_slide -->
-
-B. Built on giants
-===
-
-<!-- alignment: center -->
-
-Rust has quietly assembled a real audio ecosystem. zytunes leans on it
-hard:
+- Initial implementation
+- Transition away from aft-mtp-cli and IOKit
+- TODO fill this out with what was made first
 
 <!-- pause -->
 
@@ -234,46 +226,43 @@ hard:
 
 <!-- end_slide -->
 
-C. Themes!
+Yay Themes
 ===
 
 <!-- alignment: center -->
-
-Because a terminal app with one grey color scheme is a terminal app I
-won't open twice.
-
+- I wanted to emulate winamp with crazy themes
+- find winamp picture 
 <!-- pause -->
-
-16 built-in themes — iTunes 2004, Gruvbox, Tokyo Night, Windows 95,
-System 7, BIOS, Zune Original — plus user-defined themes via
-`~/.config/zytunes/config.toml`. `t` to pick, live preview.
+- it's a TUI though so only color and ASCII visuals 
+<!-- pause -->
+- add a video here of the TUI themes being toggled while a song is playing
 
 <!-- end_slide -->
 
-D. Album art
+Album Art
 ===
 
 <!-- alignment: center -->
-
 Terminals aren't known for pictures. Do it anyway.
-
 <!-- pause -->
-
-Two renderers — unicode **halfblock** and a 10-character luminance-ramp
-**ascii** fallback for terminals that can't do better — cached per
-`(artist, album)` and invalidated on `(mtime, size)` so re-tagging a
-file refreshes the art automatically.
+It looks terrible, and it fits the cyberpunk aesthetic!
+<!-- pause -->
+Why not render them using [``](https://crates.io/crates/)
+<!-- pause -->
+I don't want to.
+- TODO add screenshot of the album art
 
 <!-- end_slide -->
 
-IV. The Zune
+Zune Support
 ===
 
 <!-- alignment: center -->
 
 <!-- pause -->
 
-This is where "weekend project" stopped being funny.
+What does it take to make a Zune talk to other OSes?
+- TODO maybe add info about how the zune works
 
 <!-- end_slide -->
 
@@ -282,13 +271,18 @@ A. Rewriting libmtp-zune in Rust
 
 <!-- alignment: center -->
 
-The Zune doesn't speak plain MTP. It speaks **MTPZ** — Microsoft's
-encrypted variant — and the only real documentation of that handshake
-is [`libmtp-zune`](https://github.com/kbhomes/libmtp-zune), a
+The Zune doesn't speak plain MTP (Media Transfer Protocol). It speaks **MTPZ** — Microsoft's
+encrypted variant — [`libmtp-zune`](https://github.com/kbhomes/libmtp-zune), a
 reverse-engineering project in C.
+
+- C!? We can't be having that here. Sorry Dennis Richie :'(
 
 <!-- pause -->
 
+<!-- pause -->
+Port it to Rust!
+
+<!-- pause -->
 `zune-mtp` ports that protocol knowledge — RSA-1024 signing, a
 PSS-like certificate exchange, AES-128-CBC, CMAC key extraction — into
 a native IOKit transport, bypassing libusb entirely because libusb
@@ -296,43 +290,42 @@ can't do the data-out operations the handshake needs.
 
 <!-- end_slide -->
 
-B. The one where Claude makes tools
+Claude build me a hammer
 ===
 
 <!-- alignment: center -->
 
-Reverse-engineering a firmware needs experiments, not production code.
+I wanted to start from scratch and I'm clueless so I asked Claude to take a look.
+It suggested probing the device to understand what it support and do research on what's been done already.
 
 <!-- pause -->
 
-So the actual workflow became: describe a hypothesis to Claude, have it
-scaffold a throwaway probe binary, run it once against the real device,
-read the result, delete or keep the probe.
+- Have Claude scaffold a throwaway probe binary, run it once against the real device,
+read the result, delete or keep if it works.
+
+- Honestly surprised I didn't brick it
 
 <!-- pause -->
 
-`tools/mtp-probe` is what survived that process — a diagnostic CLI with
-subcommands for exactly the kind of "does the firmware actually support
-this" questions that used to mean bricking a device to find out.
+- `tools/mtp-probe` is where everything that worked ended up
+- TODO if this isn't committed to the repo then we shouldn't reference the file
 
 <!-- end_slide -->
 
-C. Syncing, finally
+Everything IS a nail when you have a Claude Hammer
 ===
 
 <!-- alignment: center -->
 
-Handshake works. Session opens. `SendObjectInfo` → `SendObject` → a song
-is *on the device*.
-
+- We poke around and finally get the handshake woring.
 <!-- pause -->
-
-Music library sync, push, remove, device browsing — the boring, load-bearing
-CRUD that makes this an actual tool instead of a proof of concept.
+- `SendObjectInfo` → `SendObject` → a song is *on the device*.
+- Sync, push, remove, device browsing
+- aww CRUD, it works
 
 <!-- end_slide -->
 
-The firmware rabbit hole
+What the □□□□
 ===
 
 <!-- alignment: center -->
@@ -341,50 +334,24 @@ The firmware rabbit hole
 
 Music was syncing. Then I looked at the album browser.
 
-<!-- end_slide -->
+- Why are my vaporwave tracks rendering as blocks?
 
-1. Wait, why are there blocks?
-===
-
-<!-- alignment: center -->
-
-Every non-ASCII character in a track or artist name rendered as a solid
-block glyph on the device's screen.
-
+- Deep in the past the true wizards crafted a workaround for this
 <!-- pause -->
+- for Zune 1.4
 
-Not a crash. Not an error. Just... boxes, where an "é" or an em dash
-should be.
+- v1 firmware family was a Windows CE flavor
+- You can load font files onto the device and they'll pick up the right glyphs
+- All my zunes are v3.3, this can't work
 
 <!-- end_slide -->
 
-2. Sorry, kid
+Hackerman
 ===
 
-<!-- alignment: center -->
-
-Asked Claude what was going on. The honest answer, after digging through
-what the firmware actually ships:
-
-<!-- pause -->
-
-*"Sorry, kid — there's no font support here."*
-
-<!-- pause -->
-
-The bitmap font table baked into this firmware build simply doesn't have
-glyphs past the ASCII range. Nothing to patch at the protocol level. The
-problem is baked into the binary on the device.
-
-<!-- end_slide -->
-
-3. Hacks, then probes
-===
+TODO maybe remove this section or shorten it to being about building tooling to understand how sync works for the Zune, 
 
 <!-- alignment: center -->
-
-First instinct: work around it in software. Transliterate, strip
-accents, degrade gracefully.
 
 <!-- pause -->
 
@@ -396,13 +363,6 @@ the device and write probes.
 Not to patch this build — to understand how firmware versioning and the
 older train worked at all, because the build I actually wanted
 lived on the *other side* of an update I'd taken.
-
-<!-- end_slide -->
-
-4. – 5. An older firmware train
-===
-
-<!-- alignment: center -->
 
 Later Zune firmware trains differ in what they ship, so it wasn't just
 "switch trains overnight."
@@ -416,59 +376,20 @@ trusts — turned "not possible" into "possible, carefully."
 
 Boom. Cash money. I did the rest of this work on firmware **1.4**.
 
-<!-- end_slide -->
-
-6. – 7. Font hack time
-===
-
-<!-- alignment: center -->
-
 1.4 doesn't fix the font table on its own — but it's old enough, and
 different enough, that the glyph set it ships actually covers more of
 what I needed.
 
-<!-- pause -->
-
-Patched, flashed, synced a track with an accented title.
+- TODO add firmware tradeoffs (the ones you care about)
 
 <!-- pause -->
-
-Oh wow. **Fonts!**
 
 <!-- end_slide -->
 
-8. The tradeoffs
+Zune 3.0 looks clean though
 ===
 
 <!-- alignment: center -->
-
-Nothing on a reverse-engineered abandonware device is free.
-
-<!-- pause -->
-
-v1.4 firmware has its own scars, which is exactly why `findings.md` in
-this repo exists:
-
-* `SetObjectPropValue` on certain album-art JPEGs just... hangs, forever,
-  until the 45s timeout fires and desyncs the USB pipes
-* Pre-3.0 firmware rejects the sync-progress vendor op outright — has to
-  fail silently instead of logging a scary warning every sync
-* The album browser reads cover art from a separate prop store, not the
-  embedded ID3 tag most tools rely on
-
-<!-- pause -->
-
-Every one of these is a firmware-version tradeoff I made on purpose, in
-exchange for actually being able to read a track name.
-
-<!-- end_slide -->
-
-G. But I still like the 3.0 theme
-===
-
-<!-- alignment: center -->
-
-All that, and I'll admit it: Zune 3.0's on-device UI just looks nicer.
 
 <!-- pause -->
 
@@ -502,7 +423,7 @@ ported from `libgpod` from scratch in the `ipod-db` crate.
 
 <!-- end_slide -->
 
-VI. Shifting foundations
+Shifting foundations
 ===
 
 <!-- alignment: center -->
@@ -605,26 +526,6 @@ Using Python. Because I have to.
 Section II said "entirely Rust." Section VII is about to spend its whole
 budget on stem separation, and the state of the art for that lives in
 PyTorch. Purity lost to pragmatism, and I'm at peace with it.
-
-<!-- end_slide -->
-
-VII. The Candy Store
-===
-
-<!-- alignment: center -->
-
-<!-- pause -->
-
-So — I've made a music app I actually like using. Works on both
-platforms. Tracks the metadata I care about.
-
-<!-- pause -->
-
-We're done, right?
-
-<!-- pause -->
-
-...right?
 
 <!-- end_slide -->
 
