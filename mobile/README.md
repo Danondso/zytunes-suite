@@ -1,7 +1,7 @@
 # zytunes_mobile
 
 Flutter LAN client for `zytunes-serve`. Browse artists/albums, search, and
-stream tracks over HTTP with an optional Bearer token.
+stream tracks over HTTP with a required Bearer token.
 
 Streaming does not bump play count (`Range` seeks would inflate it). After
 50% of the track or 4 minutes, whichever first, the app `POST`s

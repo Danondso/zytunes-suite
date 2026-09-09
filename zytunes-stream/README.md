@@ -17,12 +17,12 @@ cargo run -p zytunes-stream -- --token SECRET --music-dir /path/to/Music
 Release install (`./install.sh`) puts `zytunes-serve` next to `zytunes` and `zytunes-tui` in `/usr/local/bin`:
 
 ```bash
-zytunes-serve [--bind 0.0.0.0] [--port 9847] [--token SECRET] [--music-dir PATH] [--allow-insecure]
+zytunes-serve [--bind 0.0.0.0] [--port 9847] --token SECRET [--music-dir PATH]
 ```
 
 Music directory resolution matches the rest of zytunes: `--music-dir`, then `ZYTUNES_MUSIC_DIR`, then `music_dir` in `~/.config/zytunes/config.toml`.
 
-Default listen address is `0.0.0.0:9847`. The process **refuses to start** without a non-empty token unless you pass `--allow-insecure`. Empty or whitespace `[stream] token` values count as unset. Loopback is not exempt: other users on a shared host can still connect to `127.0.0.1`. `POST /tracks/{id}/stems` can kick off unbounded CPU-heavy jobs, so an open bind is not a safe default.
+Default listen address is `0.0.0.0:9847`. The process **refuses to start** without a non-empty token. Empty or whitespace `[stream] token` values count as unset. Loopback is not exempt: other users on a shared host can still connect to `127.0.0.1`. There is no `--allow-insecure` escape hatch — leftover copies of that flag, `[stream] allow_insecure = true`, or `ZYTUNES_STREAM_ALLOW_INSECURE` fail the process. `POST /tracks/{id}/stems` can kick off unbounded CPU-heavy jobs, so an open bind is not a safe default.
 
 When a token is set, every request needs:
 
@@ -41,8 +41,7 @@ Flags win over environment variables, which win over `config.toml`.
 [stream]
 bind = "0.0.0.0"
 port = 9847
-token = "optional-shared-secret"
-allow_insecure = false
+token = "shared-secret"
 ```
 
 | Variable | Equivalent |
@@ -51,7 +50,6 @@ allow_insecure = false
 | `ZYTUNES_STREAM_BIND` | `--bind` / `[stream] bind` |
 | `ZYTUNES_STREAM_PORT` | `--port` / `[stream] port` |
 | `ZYTUNES_STREAM_TOKEN` | `--token` / `[stream] token` |
-| `ZYTUNES_STREAM_ALLOW_INSECURE` | `--allow-insecure` (`true` / `1` / `yes`) |
 
 ## Stems
 
@@ -91,7 +89,7 @@ cp .env.example .env   # ZYTUNES_MUSIC_DIR + ZYTUNES_STREAM_TOKEN
 docker compose up --build
 ```
 
-[`docker-compose.yml`](../docker-compose.yml) bind-mounts the host music dir read-only **at its host path** (stem-cache entries are keyed by a hash of the absolute track path, so matching the host path is what makes TUI-made splits cache hits), keeps library/art caches in a named volume, and mounts the host's stem cache and `~/.config/zytunes` so stems and the `[stems]` recipe are shared with the TUI. If your config overrides `[stems] cache_dir`, set `ZYTUNES_STEMS_DIR` in `.env` to the same path (it defaults to `~/.cache/zytunes/stems`). The image ships no Python engine — split (or album-pre-warm) with `M` in `zytunes-tui` and the server picks it up. Compose refuses to start without `ZYTUNES_STREAM_TOKEN`. On a network you trust, drop the token and set `ZYTUNES_STREAM_ALLOW_INSECURE=true` instead.
+[`docker-compose.yml`](../docker-compose.yml) bind-mounts the host music dir read-only **at its host path** (stem-cache entries are keyed by a hash of the absolute track path, so matching the host path is what makes TUI-made splits cache hits), keeps library/art caches in a named volume, and mounts the host's stem cache and `~/.config/zytunes` so stems and the `[stems]` recipe are shared with the TUI. If your config overrides `[stems] cache_dir`, set `ZYTUNES_STEMS_DIR` in `.env` to the same path (it defaults to `~/.cache/zytunes/stems`). The image ships no Python engine — split (or album-pre-warm) with `M` in `zytunes-tui` and the server picks it up. Compose refuses to start without `ZYTUNES_STREAM_TOKEN`.
 
 Without Compose:
 

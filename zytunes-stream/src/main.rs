@@ -45,7 +45,7 @@ async fn run() -> Result<(), String> {
         )
         .with_listen_log(zytunes::listen_log::ListenLog::load());
 
-    if let Some(err) = insecure_bind_error(&opts.bind, opts.token.is_some(), opts.allow_insecure) {
+    if let Some(err) = insecure_bind_error(&opts.bind, opts.token.is_some()) {
         return Err(err);
     }
 
@@ -53,18 +53,10 @@ async fn run() -> Result<(), String> {
         .parse()
         .map_err(|e| format!("invalid bind address: {e}"))?;
 
-    if opts.token.is_some() && !is_loopback_host(&opts.bind) {
+    if !is_loopback_host(&opts.bind) {
         eprintln!(
             "warning: serving over HTTP on {bind} — Authorization Bearer tokens \
              are visible on the path; terminate TLS (Caddy/nginx) on untrusted networks"
-        );
-    }
-    if opts.allow_insecure && opts.token.is_none() {
-        eprintln!(
-            "warning: listening on {bind} with no auth token (--allow-insecure) — \
-             anyone who can reach this address can browse, download, trigger stem \
-             splits, and write play history (loopback is reachable by other users \
-             on this host)"
         );
     }
 
@@ -85,19 +77,33 @@ fn is_loopback_host(bind: &str) -> bool {
     bind == "127.0.0.1" || bind == "localhost" || bind == "::1"
 }
 
-/// `Some(message)` when the requested bind has neither a non-empty token
-/// nor `--allow-insecure`. Loopback is not exempt: other local users on a
-/// shared host can connect to `127.0.0.1` just as a LAN client can connect
-/// to `0.0.0.0`.
-fn insecure_bind_error(bind: &str, has_token: bool, allow_insecure: bool) -> Option<String> {
-    if has_token || allow_insecure {
+/// `Some(message)` when the requested bind has no non-empty token.
+/// Loopback is not exempt: other local users on a shared host can connect
+/// to `127.0.0.1` just as a LAN client can connect to `0.0.0.0`.
+fn insecure_bind_error(bind: &str, has_token: bool) -> Option<String> {
+    if has_token {
         return None;
     }
     Some(format!(
-        "refusing to bind {bind} without an auth token — set [stream] token / --token, \
-         or pass --allow-insecure to accept unauthenticated access (loopback is still \
+        "refusing to bind {bind} without an auth token — set --token, \
+         [stream] token, or ZYTUNES_STREAM_TOKEN (loopback is still \
          reachable by other users on this host)"
     ))
+}
+
+const ALLOW_INSECURE_REMOVED: &str = "allow-insecure was removed: a non-empty token is required \
+     (--token / [stream] token / ZYTUNES_STREAM_TOKEN). \
+     Unauthenticated binds are not supported";
+
+/// Leftover `--allow-insecure` / `[stream] allow_insecure = true` /
+/// `ZYTUNES_STREAM_ALLOW_INSECURE=true` used to be an escape hatch.
+/// Fail closed so a stale flag cannot quietly open the library.
+fn leftover_insecure_opt_in(cli_flag: bool, cfg_or_env: Option<bool>) -> Option<&'static str> {
+    if cli_flag || cfg_or_env == Some(true) {
+        Some(ALLOW_INSECURE_REMOVED)
+    } else {
+        None
+    }
 }
 
 /// Treat missing, empty, and whitespace-only secrets as "no token" so
@@ -131,7 +137,6 @@ struct ServeOpts {
     music_dir: Option<String>,
     /// Explicit `--music-dir`. Wins over `ZYTUNES_MUSIC_DIR` and config.
     music_dir_cli: Option<String>,
-    allow_insecure: bool,
 }
 
 impl ServeOpts {
@@ -149,11 +154,13 @@ impl ServeOpts {
             // beat `ZYTUNES_MUSIC_DIR` (which `resolve_music_dir` prefers).
             music_dir: cfg.music_dir,
             music_dir_cli: None,
-            allow_insecure: env
-                .allow_insecure
-                .or(cfg.stream.allow_insecure)
-                .unwrap_or(false),
         };
+
+        if let Some(err) =
+            leftover_insecure_opt_in(false, env.allow_insecure.or(cfg.stream.allow_insecure))
+        {
+            return Err(err.to_string());
+        }
 
         let mut i = 1;
         while i < args.len() {
@@ -180,7 +187,7 @@ impl ServeOpts {
                         Some(args.get(i).ok_or("--music-dir requires a value")?.clone());
                 }
                 "--allow-insecure" => {
-                    opts.allow_insecure = true;
+                    return Err(ALLOW_INSECURE_REMOVED.to_string());
                 }
                 "-h" | "--help" => {
                     print_help();
@@ -292,22 +299,20 @@ fn print_help() {
     println!("Options:");
     println!("  --bind <addr>       Listen address (default: 0.0.0.0 or [stream] bind)");
     println!("  --port <port>       Listen port (default: 9847 or [stream] port)");
-    println!("  --token <secret>    Require Authorization: Bearer <secret>");
+    println!("  --token <secret>    Require Authorization: Bearer <secret> (required)");
     println!("  --music-dir <path>  Override music library path (wins over ZYTUNES_MUSIC_DIR)");
-    println!("  --allow-insecure    Allow binding with no token (any address)");
     println!("  -h, --help          Show this help");
-    println!("\nA non-empty token is required unless you pass --allow-insecure.");
+    println!("\nA non-empty token is required on every bind, including loopback.");
     println!("Loopback is not a multi-user boundary — other accounts on this host");
     println!("can still connect. Serving is HTTP; put TLS in front on untrusted networks.");
     println!("\nConfig (~/.config/zytunes/config.toml):");
     println!("  [stream]");
     println!("  bind = \"0.0.0.0\"");
     println!("  port = 9847");
-    println!("  token = \"optional-shared-secret\"");
-    println!("  allow_insecure = false");
+    println!("  token = \"shared-secret\"");
     println!("\nOr environment variables (checked before config.toml, e.g. for Docker):");
     println!("  ZYTUNES_STREAM_BIND, ZYTUNES_STREAM_PORT, ZYTUNES_STREAM_TOKEN,");
-    println!("  ZYTUNES_STREAM_ALLOW_INSECURE=true, and ZYTUNES_MUSIC_DIR for the library path.");
+    println!("  and ZYTUNES_MUSIC_DIR for the library path.");
     println!("\nStems use the TUI [stems] recipe and ~/.cache/zytunes/stems.");
     println!("The server will not install demucs — press M in zytunes-tui once.");
 }
@@ -317,22 +322,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bind_without_token_or_opt_in_is_refused() {
-        assert!(insecure_bind_error("127.0.0.1", false, false).is_some());
-        assert!(insecure_bind_error("localhost", false, false).is_some());
-        assert!(insecure_bind_error("::1", false, false).is_some());
-        assert!(insecure_bind_error("0.0.0.0", false, false).is_some());
+    fn bind_without_token_is_refused() {
+        assert!(insecure_bind_error("127.0.0.1", false).is_some());
+        assert!(insecure_bind_error("localhost", false).is_some());
+        assert!(insecure_bind_error("::1", false).is_some());
+        assert!(insecure_bind_error("0.0.0.0", false).is_some());
     }
 
     #[test]
-    fn loopback_with_token_or_opt_in_is_allowed() {
-        assert!(insecure_bind_error("127.0.0.1", true, false).is_none());
-        assert!(insecure_bind_error("127.0.0.1", false, true).is_none());
+    fn loopback_with_token_is_allowed() {
+        assert!(insecure_bind_error("127.0.0.1", true).is_none());
     }
 
     #[test]
-    fn lan_bind_without_token_or_opt_in_is_refused() {
-        assert!(insecure_bind_error("0.0.0.0", false, false).is_some());
+    fn lan_bind_without_token_is_refused() {
+        assert!(insecure_bind_error("0.0.0.0", false).is_some());
     }
 
     #[test]
@@ -356,12 +360,21 @@ mod tests {
 
     #[test]
     fn lan_bind_with_token_is_allowed() {
-        assert!(insecure_bind_error("0.0.0.0", true, false).is_none());
+        assert!(insecure_bind_error("0.0.0.0", true).is_none());
     }
 
     #[test]
-    fn lan_bind_with_explicit_opt_in_is_allowed() {
-        assert!(insecure_bind_error("0.0.0.0", false, true).is_none());
+    fn leftover_allow_insecure_is_refused() {
+        assert_eq!(
+            leftover_insecure_opt_in(true, None),
+            Some(ALLOW_INSECURE_REMOVED)
+        );
+        assert_eq!(
+            leftover_insecure_opt_in(false, Some(true)),
+            Some(ALLOW_INSECURE_REMOVED)
+        );
+        assert_eq!(leftover_insecure_opt_in(false, Some(false)), None);
+        assert_eq!(leftover_insecure_opt_in(false, None), None);
     }
 
     #[test]

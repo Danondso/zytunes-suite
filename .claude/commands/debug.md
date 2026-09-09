@@ -42,7 +42,7 @@ Not every problem needs every angle. Pick 2–4 from:
 - **Codebase** — where the code path lives, call sites, invariants, recent edits. Use `Explore` subagent.
 - **Git history** — `git log -p`, `git blame`, commits touching the affected symbols. When a regression is suspected. Use `general-purpose` subagent with explicit commands.
 - **Protocol / spec / external docs** — MTP op codes, IOKit error codes, firmware behavior, third-party library semantics. Use `general-purpose` subagent with `WebSearch`/`WebFetch`.
-- **Prior art in this repo** — existing entries in `DEBUG.md`, memory files under `the local Claude memory directory`, and `todos.md`. Use `Explore` subagent.
+- **Prior art in this repo** — existing entries in `DEBUG.md` and `todos.md`. Use `Explore` subagent.
 - **Reproduction** — a minimal command or test that reliably triggers the symptom. Use `general-purpose` subagent if a programmatic repro is feasible.
 
 Skip angles where the answer is already in hand.

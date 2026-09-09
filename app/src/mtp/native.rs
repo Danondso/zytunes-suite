@@ -1183,7 +1183,7 @@ impl DeviceSession for NativeSession {
                     ));
                     // Deleting the folder orphans the cached abstract-album
                     // handle — drop it or the next sync of this album feeds a
-                    // dead handle to send_object_prop_list (findings.md).
+                    // dead handle to send_object_prop_list.
                     self.invalidate_library_for_path(&format!(
                         "/Music/{}/{}",
                         artist_info.filename, album_info.filename
@@ -1844,7 +1844,7 @@ impl NativeSession {
     /// re-save the cache. Without this, a subsequent sync re-uses stale
     /// MTP handles for the deleted parent folder — on v1.4 firmware the
     /// resulting `send_object_prop_list` against a dead parent halts the
-    /// OUT bulk pipe and cascades every queued track. See findings.md.
+    /// OUT bulk pipe and cascades every queued track.
     fn invalidate_library_for_path(&mut self, device_path: &str) {
         if self.library.is_none() {
             self.library = self.load_library_cache();

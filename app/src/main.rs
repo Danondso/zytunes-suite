@@ -894,7 +894,7 @@ fn probe_all_props(
         println!("No playcount-adjacent props in the response.");
         println!("If GetObjectPropsSupported also didn't list them, this Zune doesn't expose");
         println!("playcount via standard MTP-AAS. Try `probe vendor-op` to survey the");
-        println!("Microsoft 0x91xx range (carefully — see findings.md for known-bad codes).");
+        println!("Microsoft 0x91xx range (carefully — 0x9180 USB-resets v1.4).");
     } else {
         println!("Playcount-adjacent props found:");
         for (code, label, e) in found {

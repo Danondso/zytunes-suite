@@ -19,8 +19,12 @@
 *.alac
 *.aiff
 
-# MTPZ keys (sensitive)
+# MTPZ keys — never vendor; users obtain ~/.mtpz-data from libmtp-zune
 .mtpz-data
+mtpz-data.example
+
+# Field notes kept out of the public tree
+findings.md
 
 # docker compose secrets (see .env.example)
 .env

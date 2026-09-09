@@ -160,7 +160,7 @@ Scopes are optional: `feat(tui): add theme picker` is fine. Commits that don't m
 ## Zune Constraints
 
 - Only accepts MP3, WMA, AAC formats
-- MTPZ keys must exist at `~/.mtpz-data`
+- MTPZ keys must exist at `~/.mtpz-data` (not shipped; obtain from libmtp-zune). iPod sync does not need them
 - Device auto-opens MTP session on USB connect (OpenSession returns `0x201d` — this is normal)
 - GetDeviceInfo is not supported by the Zune (returns `0x2006`) — skip it and go straight to OpenSession
 - MTPZ handshake requires SessionInitiatorVersionInfo (`0xD406`) to be set before beginning authentication
@@ -168,7 +168,7 @@ Scopes are optional: `feat(tui): add theme picker` is fine. Commits that don't m
 - `SetObjectPropValue` commits (especially album art to flash) can take tens of seconds; `zune-mtp` uses a 45 s response timeout on this op. A single failing art payload can poison the MTP session, so `NativeSession` disables art for the remainder of the session after the first failure
 - Pre-3.0 firmware rejects the `GetDeviceSyncProgress` vendor op; `save_sync_progress` must stay silent in that case rather than logging a user-visible warning every sync
 - Fatal USB cascades (`0xe00002c0`, `0xe00002ed`, a failed `ClearPipeStall` retry, or a `ReadPipe` timeout) mean the session is dead until physical replug — the IOKit transport classifies these as `MtpError::UsbFatal` → `DeviceError::DeviceGone`; the TUI's `is_device_gone` in `tui/background.rs` matches the typed variant (with a string-sniffing fallback) and aborts remaining work
-- Folder deletes do not cascade: `DeleteObject` on an `ASSOCIATION_FORMAT` handle leaves children orphaned on flash. `rm` must walk the hierarchy post-order (`delete_recursive`) AND invalidate the library cache for the deleted path (`invalidate_library_for_path`) — stale cached artist/album handles fed into `send_object_prop_list` halt the OUT pipe on v1.4 and cascade every queued track. See `findings.md` for the full incident writeup
+- Folder deletes do not cascade: `DeleteObject` on an `ASSOCIATION_FORMAT` handle leaves children orphaned on flash. `rm` must walk the hierarchy post-order (`delete_recursive`) AND invalidate the library cache for the deleted path (`invalidate_library_for_path`) — stale cached artist/album handles fed into `send_object_prop_list` halt the OUT pipe on v1.4 and cascade every queued track
 
 ## CD Import Constraints
 

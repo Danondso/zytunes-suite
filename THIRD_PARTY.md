@@ -3,10 +3,12 @@
 ## MTPZ keys
 
 The Zune requires MTPZ authentication keys (`~/.mtpz-data`) to complete
-its handshake. These keys are **not distributed** with zytunes. Obtain them
-from the [libmtp-zune](https://github.com/kbhomes/libmtp-zune) project, which
-reverse-engineered the Zune MTPZ protocol. See `README.md` for setup
-instructions.
+its handshake. These keys are **not distributed** with zytunes — the
+file is not in this repository, and we will not add it. Obtain it from
+the [libmtp-zune](https://github.com/kbhomes/libmtp-zune) project
+(`src/.mtpz-data`), which reverse-engineered the Zune MTPZ protocol.
+See `README.md` for setup instructions. The iPod backend does not use
+these keys.
 
 ## Reference sources
 

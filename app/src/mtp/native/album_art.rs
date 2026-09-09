@@ -39,8 +39,8 @@ pub(super) fn extract_album_art(path: &str) -> Option<Vec<u8>> {
 
     // Round-trip pass: decode the freshly encoded JPEG and re-encode at the
     // same quality. mtp-probe album-art-check showed v1.4 firmware hangs on
-    // certain first-pass byte patterns (e.g. a ~21 KB first-pass JPEG) but
-    // accepts the round-tripped output (20938 bytes) from the same source.
+    // certain first-pass JPEG byte patterns (a ~21 KB encode) but accepts
+    // the slightly smaller round-tripped output from the same source.
     // Re-encoding from already-quantized DCT data smooths the high-frequency
     // content just enough to dodge the firmware's prop-handler bug.
     let final_buf = match image::load_from_memory(&jpeg_buf) {

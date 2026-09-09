@@ -15,8 +15,8 @@ extension match is case-sensitive.
 **Fix**: one line in `ipod-db/src/fs.rs::hash_filename` — `.to_lowercase()`
 on the extension before constructing the filename.
 
-MP3 imports always worked because the an existing MP3 source already had
-lowercase `.mp3`. Only `.M4A` in the Music collection tripped this.
+MP3 imports always worked because an existing MP3 source already had
+lowercase `.mp3`. Only `.M4A` in the library tripped this.
 
 ---
 

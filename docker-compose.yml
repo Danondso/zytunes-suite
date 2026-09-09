@@ -16,11 +16,8 @@ services:
       ZYTUNES_MUSIC_DIR: ${ZYTUNES_MUSIC_DIR}
       ZYTUNES_STREAM_BIND: 0.0.0.0
       ZYTUNES_STREAM_PORT: 9847
-      # Required unless ZYTUNES_STREAM_ALLOW_INSECURE=true: empty
-      # tokens are treated as unset. Set it in a .env file next to
-      # this compose file.
-      # (see .env.example), or export ZYTUNES_STREAM_ALLOW_INSECURE=true
-      # instead if you're on a network you fully trust.
+      # Required. Empty tokens are treated as unset. Set it in a
+      # .env file next to this compose file (see .env.example).
       ZYTUNES_STREAM_TOKEN: ${ZYTUNES_STREAM_TOKEN:?Set ZYTUNES_STREAM_TOKEN in a .env file — see .env.example}
     volumes:
       # Bind mount, not a named volume: the container reads tracks

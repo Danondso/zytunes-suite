@@ -9,7 +9,7 @@ FLACs and mixes them from local files — N concurrent HTTP streams drift.
 ## Run
 
 ```bash
-zytunes-serve [--bind 0.0.0.0] [--port 9847] [--token SECRET] [--music-dir PATH] [--allow-insecure]
+zytunes-serve [--bind 0.0.0.0] [--port 9847] --token SECRET [--music-dir PATH]
 ```
 
 Music directory resolution: `--music-dir`, then `ZYTUNES_MUSIC_DIR`, then
@@ -22,18 +22,19 @@ Optional config:
 [stream]
 bind = "0.0.0.0"
 port = 9847
-token = "optional-shared-secret"
-allow_insecure = false
+token = "shared-secret"
 ```
 
-Default bind is `0.0.0.0:9847`, but the server **refuses to start** without a
-non-empty token unless `--allow-insecure` / `[stream] allow_insecure = true`
-is set. Empty or whitespace-only `[stream] token` values are treated as
+Default bind is `0.0.0.0:9847`, and the server **refuses to start** without a
+non-empty token. Empty or whitespace-only `[stream] token` values are treated as
 unset (they must not satisfy the bind guard). Loopback
 (`127.0.0.1`/`localhost`/`::1`) is **not** exempt — other local users on a
-shared host can connect. This exists because `POST /tracks/{id}/stems` alone
-lets an unauthenticated client trigger unbounded CPU-heavy separation jobs,
-and `POST /tracks/{id}/play` can grow on-disk play history.
+shared host can connect. There is no `--allow-insecure` escape hatch;
+leftover copies of that flag, `[stream] allow_insecure = true`, or
+`ZYTUNES_STREAM_ALLOW_INSECURE` fail the process. This exists because
+`POST /tracks/{id}/stems` alone lets an unauthenticated client trigger
+unbounded CPU-heavy separation jobs, and `POST /tracks/{id}/play` can grow
+on-disk play history.
 
 The server speaks **HTTP**. When a token is configured, clients send it as:
 
@@ -53,7 +54,6 @@ The same settings are also readable from the environment (checked before
 | `ZYTUNES_STREAM_BIND` | `--bind` / `[stream] bind` |
 | `ZYTUNES_STREAM_PORT` | `--port` / `[stream] port` |
 | `ZYTUNES_STREAM_TOKEN` | `--token` / `[stream] token` |
-| `ZYTUNES_STREAM_ALLOW_INSECURE` | `--allow-insecure` / `[stream] allow_insecure` (`true`/`1`/`yes`) |
 
 CLI flags still win over environment variables, which win over `config.toml`.
 
@@ -74,9 +74,7 @@ container restart doesn't force a full library rescan.
 `docker compose up` refuses to start without `ZYTUNES_STREAM_TOKEN` set (in
 `.env` or the environment), matching the binary's own refusal to start
 without a non-empty token — `docker-compose.yml`'s default bind is
-`0.0.0.0` inside the container network. To skip the token requirement on a
-network you trust, remove that env var and set
-`ZYTUNES_STREAM_ALLOW_INSECURE=true` instead.
+`0.0.0.0` inside the container network.
 
 Without Compose:
 
@@ -196,7 +194,7 @@ file_size_bytes, MusicBrainz / ReplayGain fields when present) and:
 
 ### Play count
 
-`GET /stream` does not increment play count — Range seeks, buffering, and retries would inflate it. Clients `POST /tracks/{id}/play` once per listen after the iTunes threshold (50% of duration or 4 minutes, whichever first — `play_threshold_ms` in `zytunes::local_plays`). A second POST for the same track within 30 seconds returns the existing counts without writing (so retries and `--allow-insecure` loops cannot inflate the sidecar). More than 60 recorded plays in a rolling minute returns `429`.
+`GET /stream` does not increment play count — Range seeks, buffering, and retries would inflate it. Clients `POST /tracks/{id}/play` once per listen after the iTunes threshold (50% of duration or 4 minutes, whichever first — `play_threshold_ms` in `zytunes::local_plays`). A second POST for the same track within 30 seconds returns the existing counts without writing (so retries cannot inflate the sidecar). More than 60 recorded plays in a rolling minute returns `429`.
 
 ```json
 { "play_count": 1, "last_played_at_ms": 1700000000000 }

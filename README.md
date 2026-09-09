@@ -245,17 +245,19 @@ notification so backgrounding the app does not kill the stream. Full API referen
 [`docs/stream-api.md`](docs/stream-api.md).
 
 ```bash
-zytunes-serve [--bind 0.0.0.0] [--port 9847] [--token SECRET] [--music-dir PATH] [--allow-insecure]
+zytunes-serve [--bind 0.0.0.0] [--port 9847] --token SECRET [--music-dir PATH]
 ```
 
 Configurable via CLI flags, `ZYTUNES_STREAM_*` environment variables, or a
 `[stream]` table in `~/.config/zytunes/config.toml` (in that precedence
-order). A **non-empty** token or `--allow-insecure` is required for any bind
-— including loopback, which is reachable by other users on a shared host.
-Empty `[stream] token` values count as unset. Serving is HTTP; put TLS in
-front on untrusted networks. The server refuses to start otherwise, since
-`POST /tracks/{id}/stems` alone would let any unauthenticated client
-trigger CPU-heavy separation jobs.
+order). A **non-empty** token is required for any bind — including
+loopback, which is reachable by other users on a shared host. Empty
+`[stream] token` values count as unset. There is no `--allow-insecure`
+escape hatch; leftover copies of that flag, `[stream] allow_insecure =
+true`, or `ZYTUNES_STREAM_ALLOW_INSECURE` fail the process. Serving is
+HTTP; put TLS in front on untrusted networks. The server refuses to start
+otherwise, since `POST /tracks/{id}/stems` alone would let any
+unauthenticated client trigger CPU-heavy separation jobs.
 
 ### Docker
 
@@ -306,13 +308,11 @@ Stem-split playback (`M` in the TUI) additionally needs a Python engine: `demucs
 
 ### MTPZ keys (Zune only)
 
-The Zune requires MTPZ authentication. Place the keys file in your home directory:
-
-```
-cp mtpz-data.example ~/.mtpz-data
-```
-
-These keys originate from the [libmtp-zune](https://github.com/kbhomes/libmtp-zune) project. The iPod backend does not use them.
+Zune sync needs MTPZ authentication. zytunes does **not** ship the keys
+file. Obtain `.mtpz-data` from [libmtp-zune](https://github.com/kbhomes/libmtp-zune)
+(`src/.mtpz-data` in that repo) and place it at `~/.mtpz-data`. Without
+it, Zune connect/sync fails at the handshake. The iPod backend does not
+use these keys.
 
 ### Music library
 
@@ -491,7 +491,7 @@ mobile/              — Flutter LAN client
 
 | Library | Role | Link |
 |---|---|---|
-| **libmtp-zune** | Protocol documentation. The `mtpz.md` file has the most detailed public description of the MTPZ handshake. Source of the `.mtpz-data` keys. | [kbhomes/libmtp-zune](https://github.com/kbhomes/libmtp-zune) |
+| **libmtp-zune** | Protocol documentation. The `mtpz.md` file has the most detailed public description of the MTPZ handshake. Obtain `.mtpz-data` from that project; zytunes does not vendor the keys. | [kbhomes/libmtp-zune](https://github.com/kbhomes/libmtp-zune) |
 
 ### Other references
 

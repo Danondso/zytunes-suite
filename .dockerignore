@@ -10,7 +10,6 @@ DEBUG.md
 TODO.md
 todos.md
 RECOMMENDER_DESIGN.md
-findings.md
 
 # Music/test fixtures and secrets — never belong in an image layer
 *.mp3

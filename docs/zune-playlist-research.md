@@ -104,7 +104,7 @@ Dead ends checked: ZenseMe ([dumbie](https://github.com/dumbie/ZenseMe), [mope-l
 - **No 45 s commit pause expected** on `SetObjectReferences` — it's a DB write, not a flash write. Default 30 s response timeout is fine.
 - **Stale handles in `DeviceLibrary` will silently corrupt the playlist.** Filter the queue against `DeviceState::track_set` before calling `SetObjectReferences`, or re-resolve handles immediately before push. Same pattern we already use for the sync queue.
 - **`MoveObject (0x1019)` is supported on v1.4** as a fallback if `parent=0` is rejected: create at music root, then `MoveObject`.
-- **Update-in-place > delete-and-recreate.** libmtp's `update_abstract_list` re-runs `SetObjectReferences` against the existing handle (L7987). For our `import_playlist`'s "replaced atomically" contract: locate the existing `0xBA05` whose `Name` matches, call `SetObjectReferences` with the new list, optionally `SetObjectPropValue (0x9804)` on `dc44 Name` to rename. No `DeleteObject` needed in the happy path. The folder-delete cascade gotcha from `findings.md` does not apply — a playlist is a leaf, not an `ASSOCIATION_FORMAT`.
+- **Update-in-place > delete-and-recreate.** libmtp's `update_abstract_list` re-runs `SetObjectReferences` against the existing handle (L7987). For our `import_playlist`'s "replaced atomically" contract: locate the existing `0xBA05` whose `Name` matches, call `SetObjectReferences` with the new list, optionally `SetObjectPropValue (0x9804)` on `dc44 Name` to rename. No `DeleteObject` needed in the happy path. The folder-delete cascade gotcha does not apply — a playlist is a leaf, not an `ASSOCIATION_FORMAT`.
 
 ## What to probe first on real hardware
 

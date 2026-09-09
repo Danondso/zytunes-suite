@@ -21,7 +21,7 @@ MTP-handle cache) and never persists the invalidation. `DeviceLibrary` is
 cached to disk (`~/.zytunes-library-cache-{serial}`), so the stale handles
 survive reconnects.
 
-This is the exact failure class documented in `findings.md`: stale cached
+This is the exact failure class: stale cached
 artist/album handles fed into `send_object_prop_list` halt the OUT pipe on
 firmware v1.4 and cascade every queued track. The `rm()` path was fixed for
 that incident (it calls `invalidate_library_for_path`); the TUI removal path
@@ -198,7 +198,7 @@ Commit: `chore: audit follow-ups — named constants, dead fields, doc comments`
 | "App has 160+ fields, 125 unwraps, 350 lines of dead test helpers" | Exaggerated/wrong | `App` has 78 fields; **0** `.unwrap()` in production app.rs (all in `mod tests`, line 6267+); the "dead helpers" at line 7998+ are `#[test]` functions. |
 | "app.rs is a 12,351-line monolith" | Half true | ~6.3k production lines, ~6k test lines. Still large — addressed by R3, not a rewrite. |
 | "`render_album_art` mutates state during rendering — design error" | Rejected | It's a memoized pre-render pass called from `tui/main.rs:129` *before* `draw()`; the render layer itself takes `&App`. Covered by tests. |
-| "Replace `art_disabled` session flag with per-track retry" | Rejected | Contradicts the documented incident (CLAUDE.md, findings.md): one bad JPEG wedges the MTP session and each retry costs a 45 s timeout cascade. The session-level kill switch is the deliberate fix. |
+| "Replace `art_disabled` session flag with per-track retry" | Rejected | Contradicts the documented incident (CLAUDE.md): one bad JPEG wedges the MTP session and each retry costs a 45 s timeout cascade. The session-level kill switch is the deliberate fix. |
 | "DeviceSession default `Err("not supported")` impls silently accept unsupported ops" | Rejected | Returning `Err` *is* failing fast; capability gating already exists via `DeviceCapabilities`. |
 | "Split the 54-field `Track` struct into Track + ExtendedMetadata" | Deferred | The wide-bag design is documented and deliberate: `skip_serializing_if` keeps the cache compact and forward-compatible; a split forces a `CACHE_SCHEMA_VERSION` bump and touches every consumer for readability-only payoff. Revisit only if the struct keeps growing. |
 | "dirlib clones Track millions of times / snapshot clone is wasteful" | Rejected | The snapshot clone is gated by `SAVE_DIRTY_THRESHOLD` (commented rationale in `dirlib.rs:262`); per-file progress samples clone three `String`s, not whole `Track`s. |
