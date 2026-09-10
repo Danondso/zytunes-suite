@@ -13,7 +13,7 @@ A Rust tool for syncing music (and photos/videos on Zune) to a Microsoft Zune or
 ## What works
 
 - **Multi-device detection** — scans for both Microsoft Zune (VID `0x045e`, all classic models + Zune HD) and classic iPod via `rusb` plus mounted-volume probing. CLI and TUI iterate registered backends and open a session against whichever device is connected
-- **MTPZ authentication (Zune)** — the Zune requires Microsoft's encrypted MTPZ handshake before exposing storage. Handled automatically via the native IOKit backend (`zune-mtp`)
+- **MTPZ authentication (Zune)** — the Zune requires Microsoft's encrypted MTPZ handshake before exposing storage. Handled automatically via the native IOKit backend (`zune-mtp`). Credentials are **not shipped**: copy a 5-line hex `.mtpz-data` file to `~/.mtpz-data`, or set `mtpz_data` / `ZYTUNES_MTPZ_DATA`. iPod sync does not use this file
 - **iPod Classic sync** — full music sync via a pure-Rust `ipod-db` crate. iTunesDB parser/writer with hash58 signing, ArtworkDB + ITHMB thumbnails, from-scratch libgpod-ported mhit writer for new tracks, and raw blob replay for lossless round-trip of existing tracks
 - **File listing** — `ls [path]` enumerates storage and prints the device's directory tree (device browser in the TUI shows human-readable `Artist/Album/Title.ext` paths on the iPod instead of the hashed F-dir filenames)
 - **Music push** — `push <files...>` uploads music files to the device with proper metadata
@@ -309,11 +309,26 @@ Stem-split playback (`M` in the TUI) additionally needs a Python engine: `demucs
 ### Zune authentication
 
 Zune sync needs an MTPZ handshake before the session can do useful work.
-zytunes does **not** ship the credentials that handshake needs. Put them
-at `~/.mtpz-data` in the format used by the existing MTPZ / libmtp
-ecosystem. Without that file, Zune connect/sync fails at the handshake.
-The iPod backend does not use it. See [libmtp-zune](https://github.com/kbhomes/libmtp-zune)
-for protocol notes.
+zytunes does **not** ship the credentials that handshake needs. Obtain a
+`.mtpz-data` file in the 5-line hex format used by the existing MTPZ /
+libmtp ecosystem, then point zytunes at it (first match wins):
+
+1. **`ZYTUNES_MTPZ_DATA`** — path to the file
+2. **`mtpz_data`** in `~/.config/zytunes/config.toml`
+3. **`~/.mtpz-data`** — default location
+
+```
+# copy into the default location
+cp /path/to/.mtpz-data ~/.mtpz-data
+
+# or keep it elsewhere and set the path
+# ~/.config/zytunes/config.toml
+mtpz_data = "/path/to/.mtpz-data"
+```
+
+Without a readable file at the resolved path, Zune connect/sync fails at
+the handshake. The iPod backend does not use it. See
+[libmtp-zune](https://github.com/kbhomes/libmtp-zune) for protocol notes.
 
 ### Music library
 

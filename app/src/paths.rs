@@ -53,6 +53,81 @@ pub fn device_cache_base() -> Option<PathBuf> {
     std::env::var("HOME").ok().map(PathBuf::from)
 }
 
+/// Default MTPZ handshake file: `$HOME/.mtpz-data`.
+pub fn default_mtpz_data_path() -> Option<PathBuf> {
+    std::env::var("HOME")
+        .ok()
+        .map(|home| Path::new(&home).join(".mtpz-data"))
+}
+
+/// Effective MTPZ handshake-file path.
+///
+/// Precedence: `ZYTUNES_MTPZ_DATA` (non-empty) → `mtpz_data` in
+/// `~/.config/zytunes/config.toml` (non-empty) → `~/.mtpz-data`.
+/// Does not require the file to exist — [`zune_mtp::MtpzKeys::load`]
+/// reports a missing file with the resolved path in the error.
+pub fn resolve_mtpz_data_path() -> Result<PathBuf, String> {
+    resolve_mtpz_data_path_from(
+        std::env::var("ZYTUNES_MTPZ_DATA").ok().as_deref(),
+        config_string_field("mtpz_data").as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+    )
+}
+
+fn resolve_mtpz_data_path_from(
+    env_override: Option<&str>,
+    config_value: Option<&str>,
+    home: Option<&str>,
+) -> Result<PathBuf, String> {
+    if let Some(trimmed) = env_override.map(str::trim).filter(|s| !s.is_empty()) {
+        return Ok(PathBuf::from(trimmed));
+    }
+    if let Some(trimmed) = config_value.map(str::trim).filter(|s| !s.is_empty()) {
+        return Ok(PathBuf::from(trimmed));
+    }
+    match home.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(home) => Ok(Path::new(home).join(".mtpz-data")),
+        None => Err(
+            "HOME is unset; set ZYTUNES_MTPZ_DATA or mtpz_data in ~/.config/zytunes/config.toml"
+                .into(),
+        ),
+    }
+}
+
+/// User-facing line when the handshake file is missing. `None` when a
+/// readable file is at the resolved path. Shared by the TUI log and the
+/// Zune session-open error so the wording stays one place.
+pub fn mtpz_file_missing_message() -> Option<String> {
+    match resolve_mtpz_data_path() {
+        Ok(path) if path.is_file() => None,
+        Ok(path) => Some(mtpz_file_missing_message_for(&path)),
+        Err(_) => Some("MTPZ file not found. Zune music management is disabled.".into()),
+    }
+}
+
+fn mtpz_file_missing_message_for(path: &Path) -> String {
+    format!(
+        "MTPZ file not found at {}. Zune music management is disabled.",
+        path.display()
+    )
+}
+
+fn config_string_field(field: &str) -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let path = Path::new(&home)
+        .join(".config")
+        .join("zytunes")
+        .join("config.toml");
+    let contents = std::fs::read_to_string(path).ok()?;
+    let table: toml::Table = contents.parse().ok()?;
+    table
+        .get(field)
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 /// Atomically write pre-serialized JSON to `path`.
 ///
 /// Creates parent directories, stages the bytes to `path` with a
@@ -175,5 +250,69 @@ mod tests {
         std::env::remove_var("ZYTUNES_CACHE_DIR");
         let home = std::env::var("HOME").ok().map(PathBuf::from);
         assert_eq!(device_cache_base(), home);
+    }
+
+    #[test]
+    fn mtpz_data_env_wins_over_config_and_home() {
+        assert_eq!(
+            resolve_mtpz_data_path_from(
+                Some("/tmp/from-env"),
+                Some("/tmp/from-config"),
+                Some("/home/user"),
+            )
+            .unwrap(),
+            PathBuf::from("/tmp/from-env")
+        );
+    }
+
+    #[test]
+    fn mtpz_data_config_wins_over_home() {
+        assert_eq!(
+            resolve_mtpz_data_path_from(None, Some("/opt/keys/.mtpz-data"), Some("/home/user"))
+                .unwrap(),
+            PathBuf::from("/opt/keys/.mtpz-data")
+        );
+    }
+
+    #[test]
+    fn mtpz_data_blank_env_and_config_fall_through_to_home() {
+        assert_eq!(
+            resolve_mtpz_data_path_from(Some("  "), Some(""), Some("/home/user")).unwrap(),
+            PathBuf::from("/home/user/.mtpz-data")
+        );
+    }
+
+    #[test]
+    fn mtpz_data_errors_when_nothing_resolves() {
+        let err = resolve_mtpz_data_path_from(None, None, None).unwrap_err();
+        assert!(err.contains("mtpz_data"), "{err}");
+    }
+
+    #[test]
+    fn mtpz_missing_message_names_the_path() {
+        let msg = mtpz_file_missing_message_for(Path::new("/tmp/nope.mtpz-data"));
+        assert!(msg.contains("/tmp/nope.mtpz-data"), "{msg}");
+        assert!(msg.contains("Zune music management is disabled"), "{msg}");
+    }
+
+    #[test]
+    fn mtpz_missing_message_is_none_when_file_exists() {
+        let _g = lock();
+        let tmp = std::env::temp_dir().join(format!(
+            "zytunes-mtpz-present-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&tmp, "placeholder").unwrap();
+        std::env::set_var("ZYTUNES_MTPZ_DATA", &tmp);
+        assert!(
+            mtpz_file_missing_message().is_none(),
+            "present file should not warn"
+        );
+        std::env::remove_var("ZYTUNES_MTPZ_DATA");
+        let _ = std::fs::remove_file(&tmp);
     }
 }

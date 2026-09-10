@@ -334,13 +334,24 @@ impl NativeSession {
     /// Performs device detection, MTP session open, and MTPZ authentication.
     /// The `log` callback receives diagnostic messages for each step.
     pub fn open(product_id: u16, log: &dyn Fn(&str)) -> Result<Self, DeviceError> {
+        if let Some(msg) = crate::paths::mtpz_file_missing_message() {
+            log(&msg);
+            return Err(msg.into());
+        }
+
         log("MTP: Opening USB device...");
         let mut session = MtpSession::open(MICROSOFT_VENDOR_ID, product_id)
             .map_err(|e| format!("USB open failed: {e}"))?;
         log("MTP: USB device opened, MTP session started");
 
-        log("MTP: Loading MTPZ keys from ~/.mtpz-data...");
-        let keys = MtpzKeys::load_default().map_err(|e| format!("MTPZ keys failed: {e}"))?;
+        let keys_path =
+            crate::paths::resolve_mtpz_data_path().map_err(|e| format!("MTPZ keys failed: {e}"))?;
+        log(&format!(
+            "MTP: Loading MTPZ keys from {}...",
+            keys_path.display()
+        ));
+        let keys = MtpzKeys::load(&keys_path.to_string_lossy())
+            .map_err(|e| format!("MTPZ keys failed: {e}"))?;
         log("MTP: Keys loaded, starting MTPZ handshake...");
 
         zune_mtp::mtpz::authenticate(&mut session, &keys, log)

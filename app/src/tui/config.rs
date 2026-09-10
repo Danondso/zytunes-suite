@@ -8,6 +8,10 @@ pub struct Config {
     pub music_dir: Option<String>,
     pub photo_dir: Option<String>,
     pub video_dir: Option<String>,
+    /// Path to the MTPZ handshake file (5 hex lines). Unset uses
+    /// `~/.mtpz-data`. `ZYTUNES_MTPZ_DATA` wins over this field. A blank
+    /// string reads as unset. iPod sync does not use this file.
+    pub mtpz_data: Option<String>,
     pub album_art_style: Option<String>,
     /// User preference for the now-playing panel. `None` means "auto" (show
     /// when there's a track and the terminal is tall enough). `Some(false)`
@@ -277,6 +281,7 @@ music_dir = "/home/user/Music"
         assert_eq!(config.music_dir.as_deref(), Some("/home/user/Music"));
         assert!(config.photo_dir.is_none());
         assert!(config.video_dir.is_none());
+        assert!(config.mtpz_data.is_none());
         assert!(config.album_art_style.is_none());
         assert!(config.show_player.is_none());
     }
@@ -322,6 +327,7 @@ music_dir = "/home/user/Music"
         assert!(config.music_dir.is_none());
         assert!(config.photo_dir.is_none());
         assert!(config.video_dir.is_none());
+        assert!(config.mtpz_data.is_none());
         assert!(config.album_art_style.is_none());
         assert!(config.show_player.is_none());
         assert!(config.fingerprinting.is_none());
@@ -417,6 +423,20 @@ music_dir = "/home/user/Music"
         let config: Config = toml::from_str(toml_str).unwrap();
         assert!(config.musicbrainz_base_url.is_none());
         assert!(config.musicbrainz_user_agent.is_none());
+    }
+
+    #[test]
+    fn config_round_trip_mtpz_data() {
+        let config = Config {
+            mtpz_data: Some("/opt/keys/.mtpz-data".into()),
+            ..Config::default()
+        };
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let deserialized: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(
+            deserialized.mtpz_data.as_deref(),
+            Some("/opt/keys/.mtpz-data")
+        );
     }
 
     #[test]

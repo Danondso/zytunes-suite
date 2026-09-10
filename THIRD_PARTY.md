@@ -2,11 +2,12 @@
 
 ## MTPZ handshake credentials
 
-The Zune requires an MTPZ handshake (`~/.mtpz-data`) before a session
-can do useful work. Those credentials are **not distributed** with
-zytunes — the file is not in this repository, and we will not add it.
-See `README.md` for where the process looks. The iPod backend does not
-use this file.
+The Zune requires an MTPZ handshake before a session can do useful
+work. Those credentials are **not distributed** with zytunes — the file
+is not in this repository, and we will not add it. Put a 5-line hex
+`.mtpz-data` file at `~/.mtpz-data`, or set `mtpz_data` in
+`~/.config/zytunes/config.toml` / `ZYTUNES_MTPZ_DATA`. See `README.md`.
+The iPod backend does not use this file.
 
 ## Reference sources
 

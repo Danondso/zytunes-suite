@@ -56,6 +56,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create app state.
     let mut app = App::new();
+    if let Some(msg) = zytunes::paths::mtpz_file_missing_message() {
+        app.sync.log.push(msg);
+    }
     app.load_local_plays_from_disk(&tui_logger);
     app.load_playlists_from_disk(&tui_logger);
     app.load_listen_log_from_disk(&tui_logger);

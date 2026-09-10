@@ -127,6 +127,9 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("\nPhotos are resized to fit the Zune screen (240x320).");
             println!("\nSet ZYTUNES_MUSIC_DIR or music_dir in ~/.config/zytunes/config.toml");
             println!("to point at your music folder.");
+            println!("\nZune sync needs an MTPZ handshake file (not shipped). Copy it to");
+            println!("~/.mtpz-data, or set mtpz_data / ZYTUNES_MTPZ_DATA. iPod sync does not");
+            println!("need it.");
             println!("\nExamples:");
             println!("  zytunes sync artist \"Radiohead\"");
             println!("  zytunes sync album \"OK Computer\"");
