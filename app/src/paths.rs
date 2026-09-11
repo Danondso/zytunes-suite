@@ -31,16 +31,27 @@ pub fn override_cache_dir() -> Option<PathBuf> {
     Some(path)
 }
 
-/// Root of the shared (non-device-scoped) cache tree:
-/// `$HOME/.cache/zytunes`. Deliberately does **not** consult
-/// `ZYTUNES_CACHE_DIR` — everything under this root (dirlib scans, album
-/// art, stems, model checkpoints, play history) is derived from source
-/// data that sibling worktrees share, so isolating it per-worktree would
-/// only multiply expensive regeneration. Device-scoped caches go through
-/// [`device_cache_base`] instead. Returns `None` when `HOME` is unset.
+/// Root of the shared (non-device-scoped) cache tree.
+///
+/// Precedence: `cache_dir` in `~/.config/zytunes/config.toml` (non-empty)
+/// → `$HOME/.cache/zytunes`. Deliberately does **not** consult
+/// `ZYTUNES_CACHE_DIR` — that env var is worktree isolation for
+/// device-scoped caches only. Everything under this root (dirlib scans,
+/// album art, stems, model checkpoints, play history) is derived from
+/// source data that sibling worktrees share. Returns `None` when neither
+/// an override nor `HOME` is available.
 pub fn zytunes_cache_root() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(Path::new(&home).join(".cache").join("zytunes"))
+    resolve_user_cache_root_from(
+        config_string_field("cache_dir").as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+    )
+}
+
+fn resolve_user_cache_root_from(config_value: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
+    if let Some(p) = config_value.map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(PathBuf::from(p));
+    }
+    Some(Path::new(home?).join(".cache").join("zytunes"))
 }
 
 /// Base directory for device-scoped cache dotfiles (track cache, library
@@ -242,6 +253,22 @@ mod tests {
 
         std::env::remove_var("ZYTUNES_CACHE_DIR");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn user_cache_root_honors_config_override() {
+        assert_eq!(
+            resolve_user_cache_root_from(Some("/mnt/big/zytunes-cache"), Some("/home/user")),
+            Some(PathBuf::from("/mnt/big/zytunes-cache"))
+        );
+        assert_eq!(
+            resolve_user_cache_root_from(Some("  "), Some("/home/user")),
+            Some(PathBuf::from("/home/user/.cache/zytunes"))
+        );
+        assert_eq!(
+            resolve_user_cache_root_from(None, Some("/home/user")),
+            Some(PathBuf::from("/home/user/.cache/zytunes"))
+        );
     }
 
     #[test]

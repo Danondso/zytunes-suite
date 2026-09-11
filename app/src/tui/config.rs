@@ -8,6 +8,11 @@ pub struct Config {
     pub music_dir: Option<String>,
     pub photo_dir: Option<String>,
     pub video_dir: Option<String>,
+    /// Shared cache root (dirlib scans, album art, default stem cache,
+    /// model checkpoints, play history). Unset uses `~/.cache/zytunes`.
+    /// A blank string reads as unset. Does not relocate device-scoped
+    /// caches (`ZYTUNES_CACHE_DIR` still does that).
+    pub cache_dir: Option<String>,
     /// Path to the MTPZ handshake file (5 hex lines). Unset uses
     /// `~/.mtpz-data`. `ZYTUNES_MTPZ_DATA` wins over this field. A blank
     /// string reads as unset. iPod sync does not use this file.
@@ -281,6 +286,7 @@ music_dir = "/home/user/Music"
         assert_eq!(config.music_dir.as_deref(), Some("/home/user/Music"));
         assert!(config.photo_dir.is_none());
         assert!(config.video_dir.is_none());
+        assert!(config.cache_dir.is_none());
         assert!(config.mtpz_data.is_none());
         assert!(config.album_art_style.is_none());
         assert!(config.show_player.is_none());
@@ -327,6 +333,7 @@ music_dir = "/home/user/Music"
         assert!(config.music_dir.is_none());
         assert!(config.photo_dir.is_none());
         assert!(config.video_dir.is_none());
+        assert!(config.cache_dir.is_none());
         assert!(config.mtpz_data.is_none());
         assert!(config.album_art_style.is_none());
         assert!(config.show_player.is_none());
@@ -423,6 +430,20 @@ music_dir = "/home/user/Music"
         let config: Config = toml::from_str(toml_str).unwrap();
         assert!(config.musicbrainz_base_url.is_none());
         assert!(config.musicbrainz_user_agent.is_none());
+    }
+
+    #[test]
+    fn config_round_trip_cache_dir() {
+        let config = Config {
+            cache_dir: Some("/mnt/big/zytunes-cache".into()),
+            ..Config::default()
+        };
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let deserialized: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(
+            deserialized.cache_dir.as_deref(),
+            Some("/mnt/big/zytunes-cache")
+        );
     }
 
     #[test]

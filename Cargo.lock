@@ -1311,7 +1311,7 @@ dependencies = [
 
 [[package]]
 name = "ipod-db"
-version = "0.1.0"
+version = "0.1.0-alpha"
 dependencies = [
  "byteorder",
  "encoding_rs",
@@ -4354,7 +4354,7 @@ dependencies = [
 
 [[package]]
 name = "zune-mtp"
-version = "0.1.0"
+version = "0.1.0-alpha"
 dependencies = [
  "aes",
  "cbc",
@@ -4401,7 +4401,7 @@ dependencies = [
 
 [[package]]
 name = "zytunes-stream"
-version = "0.1.0"
+version = "0.1.0-alpha"
 dependencies = [
  "axum",
  "http-body-util",

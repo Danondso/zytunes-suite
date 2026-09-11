@@ -14,7 +14,7 @@ From the workspace root:
 cargo run -p zytunes-stream -- --token SECRET --music-dir /path/to/Music
 ```
 
-Release install (`./install.sh`) puts `zytunes-serve` next to `zytunes` and `zytunes-tui` in `/usr/local/bin`:
+Release install with the stream server (`./install.sh --serve`) puts `zytunes-serve` next to `zytunes` and `zytunes-tui` in `/usr/local/bin`:
 
 ```bash
 zytunes-serve [--bind 0.0.0.0] [--port 9847] --token SECRET [--music-dir PATH]

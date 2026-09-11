@@ -346,10 +346,14 @@ The scanner reads tags via [lofty](https://crates.io/crates/lofty) for all commo
 ### Install
 
 ```
-./install.sh
+./install.sh                  # CLI + TUI
+./install.sh --setup          # write a new ~/.config/zytunes/config.toml, then install
+./install.sh --setup --serve  # new config + zytunes-serve
 ```
 
-This builds release binaries and installs `zytunes` (CLI), `zytunes-tui` (interactive TUI), and `zytunes-serve` (LAN streaming server) to `/usr/local/bin/`. To uninstall:
+This builds release binaries and installs `zytunes` (CLI) and `zytunes-tui` (interactive TUI) to `/usr/local/bin/`. The LAN streaming server (`zytunes-serve`) is optional — pass `--serve` (or `--all`) to build and install it too.
+
+`--setup` is the first-time wizard: it asks for your music library, shared cache, stem cache, and optional photo/video/MTPZ paths, then **writes a new** `~/.config/zytunes/config.toml` (any existing file is moved to `config.toml.bak`) before installing. To uninstall:
 
 ```
 ./uninstall.sh
