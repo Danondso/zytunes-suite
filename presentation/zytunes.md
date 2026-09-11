@@ -206,7 +206,10 @@ MVP
 ===
 
 <!-- alignment: center -->
-- Export the Library.xml from Apple music, claude go make it
+- Export the Library.xml from Apple music
+<!-- pause -->
+- rust parser!
+- implement the album / artist view
 
 
 From here we need to start digging into the phases of the work that was done so the git history aligns with it. 
@@ -243,51 +246,34 @@ Album Art
 ===
 
 <!-- alignment: center -->
-Terminals aren't known for pictures. Do it anyway.
+- TODO add screenshot of the album art
 <!-- pause -->
-It looks terrible, and it fits the cyberpunk aesthetic!
+It looks terribly vintage.
 <!-- pause -->
 Why not render them using [``](https://crates.io/crates/)
 <!-- pause -->
 I don't want to.
-- TODO add screenshot of the album art
-
 <!-- end_slide -->
 
 Zune Support
 ===
-
 <!-- alignment: center -->
-
 <!-- pause -->
-
 What does it take to make a Zune talk to other OSes?
-- TODO maybe add info about how the zune works
-
-<!-- end_slide -->
-
-A. Rewriting libmtp-zune in Rust
-===
-
-<!-- alignment: center -->
-
-The Zune doesn't speak plain MTP (Media Transfer Protocol). It speaks **MTPZ** — Microsoft's
-encrypted variant — [`libmtp-zune`](https://github.com/kbhomes/libmtp-zune), a
-reverse-engineering project in C.
-
-- C!? We can't be having that here. Sorry Dennis Richie :'(
-
 <!-- pause -->
-
+Doesn't use plain MTP (Media Transfer Protocol). It speaks **MTPZ** — Microsoft's
+encrypted variant
+<!-- pause -->
+A reverse engineered library written in C does this though [`libmtp-zune`](https://github.com/kbhomes/libmtp-zune)
+<!-- pause -->
+C!? We can't be having that here. Sorry Dennis Richie :'(
 <!-- pause -->
 Port it to Rust!
-
 <!-- pause -->
 `zune-mtp` ports that protocol knowledge — RSA-1024 signing, a
 PSS-like certificate exchange, AES-128-CBC, CMAC key extraction — into
 a native IOKit transport, bypassing libusb entirely because libusb
 can't do the data-out operations the handshake needs.
-
 <!-- end_slide -->
 
 Claude build me a hammer
@@ -304,12 +290,6 @@ It suggested probing the device to understand what it support and do research on
 read the result, delete or keep if it works.
 
 - Honestly surprised I didn't brick it
-
-<!-- pause -->
-
-- `tools/mtp-probe` is where everything that worked ended up
-- TODO if this isn't committed to the repo then we shouldn't reference the file
-
 <!-- end_slide -->
 
 Everything IS a nail when you have a Claude Hammer
@@ -325,138 +305,63 @@ Everything IS a nail when you have a Claude Hammer
 
 <!-- end_slide -->
 
-What the □□□□
+iPod
+===
+
+<!-- alignment: center -->
+<!-- pause -->
+Much easier than the Zune
+<!-- pause -->
+- No handshake, mounts as a USB storage device
+<!-- pause --> 
+- Real challenge: match the iTunesDB
+<!-- pause -->
+- similar to Zune, libgpod has already done this
+<!-- pause -->
+- time to port
+- gif of hitting something over and over and over
+
+<!-- speaker_note: I remember around this time I was brute force checking it over and over and over, very bad habit I probably wasted a lot of time here -->
+<!-- pause -->
+ipod-db does this
+<!-- end_slide -->
+
+The End cont.
 ===
 
 <!-- alignment: center -->
 
 <!-- pause -->
+We did it! We're done!
 
-Music was syncing. Then I looked at the album browser.
-
-- Why are my vaporwave tracks rendering as blocks?
-
-- Deep in the past the true wizards crafted a workaround for this
 <!-- pause -->
-- for Zune 1.4
+Talks to Zune, talks to iPods.
 
-- v1 firmware family was a Windows CE flavor
-- You can load font files onto the device and they'll pick up the right glyphs
-- All my zunes are v3.3, this can't work
+<!-- pause -->
+False.
 
 <!-- end_slide -->
 
-Hackerman
+Reject froot; return to Rust
 ===
 
 <!-- alignment: center -->
 
 <!-- pause -->
-
-Second instinct, once "gracefully" started meaning "worse": stop
-guessing and write small probes against the device.
-
-List the props the firmware actually serves. Dump a working sync.
-Diff that against ours. Repeat.
+Library.xml has outlived it's usefulness.
 
 <!-- pause -->
 
-The glyph coverage I needed showed up on **1.4**. That's the box I
-used for the rest of this work — the useful lesson for zytunes
-was the probe loop.
-
-1.4 doesn't rewrite the font table — but the glyph set it ships
-covers more of what I needed, and the MTP/MTPZ stack is the same one
-the rest of this talk is about.
-
-- TODO add firmware tradeoffs (the ones you care about)
-
-<!-- pause -->
+Replaced! We read the directory and build a cache. Updates as new files are added.
 
 <!-- end_slide -->
 
-Zune 3.0 looks clean though
-===
-
-<!-- alignment: center -->
-
-<!-- pause -->
-
-So zytunes doesn't force a firmware choice — it supports both, and adds
-**photo and video sync** (`photo-sync`, `video-sync`) for the newer
-firmware's Pictures/Video stores, transcoding video to WMV2/WMAv2 via
-ffmpeg along the way.
-
-<!-- end_slide -->
-
-V. The iPod
-===
-
-<!-- alignment: center -->
-
-<!-- pause -->
-
-After the Zune, this felt almost relaxing.
-
-<!-- pause -->
-
-No encrypted handshake — a classic iPod just mounts as a USB mass-storage
-volume. The hard part isn't talking to it, it's getting **iTunesDB**
-bit-exact: mhit/mhbd records, hash58 signing, ArtworkDB thumbnails,
-ported from `libgpod` from scratch in the `ipod-db` crate.
-
-<!-- pause -->
-
-"Apple still supports it" turns out to mean about the same thing as
-"Microsoft still supports the Zune." In practice, both are on me now.
-
-<!-- end_slide -->
-
-Shifting foundations
-===
-
-<!-- alignment: center -->
-
-<!-- pause -->
-
-Somewhere around month two, the "weekend project" architecture started
-showing its age.
-
-<!-- end_slide -->
-
-A. Removing Library.xml
-===
-
-<!-- alignment: center -->
-
-Remember that convenient MVP shortcut from section III?
-
-<!-- pause -->
-
-Apple's XML export doesn't carry the metadata a real device-sync tool
-actually needs, and it's one more moving part tied to one specific app
-on one specific OS.
-
-<!-- pause -->
-
-`feat!: remove iTunes Library.xml support` — directory scanning became
-the *only* library backend. Slower to set up. Correct forever after.
-
-<!-- end_slide -->
-
-B. I can get the stain out
+What if someone looks?
 ===
 
 <!-- alignment: center -->
 
 The unglamorous, load-bearing refactor work:
-
-<!-- end_slide -->
-
-1. God file!
-===
-
-<!-- alignment: center -->
 
 `app.rs` and `native.rs` had both grown into the kind of file where
 "just add one more match arm" stops being a joke.
@@ -486,7 +391,7 @@ regress quietly.
 
 <!-- end_slide -->
 
-3. Using TDD correctly :P
+Using TDD correctly
 ===
 
 <!-- alignment: center -->
@@ -503,7 +408,7 @@ makes it pass.
 
 <!-- end_slide -->
 
-C. There's a snake in my brut
+Snake Time
 ===
 
 <!-- alignment: center -->
@@ -625,7 +530,7 @@ would've made me give up before getting to them.
 
 <!-- pause -->
 
-And the refactor in section VI only worked because there were tests to
+And the refactor only worked because there were tests to
 catch what broke. Three months of vibe coding still needs a seatbelt.
 
 <!-- end_slide -->
