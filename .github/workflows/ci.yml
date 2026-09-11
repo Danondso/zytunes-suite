@@ -185,3 +185,32 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo install cargo-deny --locked
       - run: cargo deny check
+
+  # Single required check for the `main` ruleset. Matrix jobs report as
+  # `clippy (macos-latest)` when they run and as `clippy` when skipped, so
+  # requiring the matrix names deadlocks docs-only PRs. This job always
+  # reports as `CI` and treats `skipped` as success (the change-detection
+  # gate above) while failing on any `failure`/`cancelled`.
+  ci:
+    name: CI
+    needs: [changes, fmt, clippy, test, coverage, flutter, security]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every job to succeed or skip
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          needs = json.loads(os.environ["RESULTS"])
+          failed = []
+          for name, data in needs.items():
+              result = data.get("result")
+              print(f"{name}: {result}")
+              if result not in ("success", "skipped"):
+                  failed.append(f"{name}={result}")
+          if failed:
+              print("required jobs did not pass:", ", ".join(failed), file=sys.stderr)
+              sys.exit(1)
+          PY
