@@ -353,7 +353,7 @@ The scanner reads tags via [lofty](https://crates.io/crates/lofty) for all commo
 
 This builds release binaries and installs `zytunes` (CLI) and `zytunes-tui` (interactive TUI) to `/usr/local/bin/`. The LAN streaming server (`zytunes-serve`) is optional — pass `--serve` (or `--all`) to build and install it too.
 
-`--setup` is the first-time wizard: it asks for your music library, shared cache, stem cache, and optional photo/video/MTPZ paths, then **writes a new** `~/.config/zytunes/config.toml` (any existing file is moved to `config.toml.bak`) before installing. To uninstall:
+`--setup` is the first-time wizard: it asks for your music library, shared cache, stem cache, photo/video folders, and MTPZ path, then **writes a new** `~/.config/zytunes/config.toml` (any existing file is moved to `config.toml.bak`) before installing. Defaults follow the OS (`xdg-user-dir` when present, otherwise `~/Music`, `~/Pictures`, `~/Videos` or `~/Movies` on macOS, `~/.cache/zytunes`, `~/.mtpz-data`). Press Enter to keep a default; type `-` to skip an optional path. To uninstall:
 
 ```
 ./uninstall.sh

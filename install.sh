@@ -51,7 +51,10 @@ Always builds and installs:
 
 Optional pieces:
   --setup        First-time wizard: write a new ~/.config/zytunes/config.toml
-                 (backs up any existing file) before installing
+                 (backs up any existing file) before installing.
+                 Defaults: ~/Music, ~/Pictures, ~/Videos (or ~/Movies on
+                 macOS), ~/.cache/zytunes, ~/.mtpz-data — or xdg-user-dir
+                 when that tool is on PATH.
   --serve        Also build and install zytunes-serve (LAN streaming)
   --all          Install every optional piece (currently just --serve)
   -h, --help     Show this help
@@ -80,6 +83,34 @@ expand_path() {
     fi
 }
 
+# XDG user dir when the helper exists and returns a real folder (not $HOME).
+xdg_user_dir() {
+    local key="$1" d
+    command -v xdg-user-dir >/dev/null 2>&1 || return 1
+    d=$(xdg-user-dir "$key" 2>/dev/null) || return 1
+    [ -n "$d" ] && [ "$d" != "$HOME" ] || return 1
+    printf '%s\n' "$d"
+}
+
+# Prefer xdg-user-dir, then the first candidate that already exists, else the
+# first candidate. Extra candidates cover macOS Movies vs Linux Videos.
+default_user_dir() {
+    local xdg_key="$1"
+    shift
+    local d c
+    if d=$(xdg_user_dir "$xdg_key"); then
+        printf '%s\n' "$d"
+        return
+    fi
+    for c in "$@"; do
+        if [ -d "$c" ]; then
+            printf '%s\n' "$c"
+            return
+        fi
+    done
+    printf '%s\n' "$1"
+}
+
 prompt_path() {
     local label="$1"
     local default="$2"
@@ -93,7 +124,8 @@ prompt_path() {
     fi
     reply="${reply#"${reply%%[![:space:]]*}"}"
     reply="${reply%"${reply##*[![:space:]]}"}"
-    if [ -z "$reply" ]; then
+    # "-" skips an optional path even when a default is shown.
+    if [ -z "$reply" ] || [ "$reply" = "-" ]; then
         if [ "$required" = "1" ]; then
             echo "This path is required." >&2
             exit 1
@@ -140,15 +172,26 @@ run_setup() {
 
     local config_dir="${HOME}/.config/zytunes"
     local config_path="${config_dir}/config.toml"
-    local default_music="${HOME}/Music"
-    local default_cache="${HOME}/.cache/zytunes"
-    local default_stems="${default_cache}/stems"
-    local default_mtpz="${HOME}/.mtpz-data"
+    local default_music default_photo default_video default_cache default_stems default_mtpz
+    default_music=$(default_user_dir MUSIC "${HOME}/Music")
+    default_photo=$(default_user_dir PICTURES "${HOME}/Pictures")
+    if [ "$(uname -s)" = Darwin ]; then
+        default_video=$(default_user_dir VIDEOS "${HOME}/Movies" "${HOME}/Videos")
+    else
+        default_video=$(default_user_dir VIDEOS "${HOME}/Videos" "${HOME}/Movies")
+    fi
+    if [ -n "${XDG_CACHE_HOME:-}" ]; then
+        default_cache="${XDG_CACHE_HOME}/zytunes"
+    else
+        default_cache="${HOME}/.cache/zytunes"
+    fi
+    default_stems="${default_cache}/stems"
+    default_mtpz="${HOME}/.mtpz-data"
 
     echo
     echo "First-time setup — this writes a new ${config_path}"
     echo "Press Enter to accept the default in [brackets]."
-    echo "Leave optional fields blank to skip them."
+    echo "Type - and Enter to skip an optional path."
     echo
 
     local music_dir cache_dir stems_dir photo_dir video_dir mtpz_data
@@ -159,8 +202,8 @@ run_setup() {
         stems_default="${cache_dir}/stems"
     fi
     stems_dir=$(prompt_path "Stem cache" "$stems_default" 0)
-    photo_dir=$(prompt_path "Photo sync folder" "" 0)
-    video_dir=$(prompt_path "Video sync folder" "" 0)
+    photo_dir=$(prompt_path "Photo sync folder" "$default_photo" 0)
+    video_dir=$(prompt_path "Video sync folder" "$default_video" 0)
     mtpz_data=$(prompt_path "MTPZ handshake file (Zune)" "$default_mtpz" 0)
 
     # Only persist cache/stems/mtpz when they differ from built-in defaults
