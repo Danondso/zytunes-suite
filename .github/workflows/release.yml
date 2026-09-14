@@ -9,6 +9,11 @@ permissions:
 
 jobs:
   check-version:
+    # The release job pushes a chore version-bump commit back to main,
+    # which would re-enter this workflow. There are no tags yet, so the
+    # range is the whole history and every re-entry would try to cut
+    # another release. Skip the bot's own pushes.
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     outputs:
       bump: ${{ steps.bump.outputs.bump }}
@@ -105,12 +110,20 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install libusb and ALSA (Linux)
+      - name: Install system deps (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev libasound2-dev
+        run: sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev libasound2-dev libdiscid-dev
+
+      - name: Install system deps (macOS)
+        if: runner.os == 'macOS'
+        # Same Cellar-path trap as CI: rust-cache can replay a stale
+        # discid-sys/libusb1-sys link-search after brew bumps the formula.
+        run: |
+          brew install libdiscid
+          cargo clean -p discid-sys -p libusb1-sys
 
       - name: Build release binaries
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Package binaries
         run: |

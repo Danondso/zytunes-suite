@@ -13,6 +13,20 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+/// Serialise tests that register a child in the process-wide registry
+/// or sweep it. The registry is process-wide (TUI quit path), so
+/// `quit_teardown_kills_registered_children` SIGKILLs in-flight
+/// `run_engine_process` children from *other* tests — including the
+/// cascade stubs in `stems.rs`. Hold this for any test that registers
+/// a child or calls [`kill_active_stem_children`].
+#[cfg(test)]
+pub(crate) fn lock_driver_tests() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 /// Hooks a caller wires into [`run_engine_process`]. All are polled or
 /// invoked from the calling thread and the pipe-drain threads the driver
 /// owns; none outlive the call.
@@ -550,6 +564,7 @@ mod tests {
     /// Run `sh -c script` through the driver with permissive defaults.
     #[cfg(unix)]
     fn drive_sh(script: &str, cancelled: &dyn Fn() -> bool) -> Run {
+        let _lock = lock_driver_tests();
         let lines = std::sync::Mutex::new(Vec::new());
         let ticks = std::sync::Mutex::new(Vec::new());
         let on_line = |l: &str| lines.lock().unwrap().push(l.to_string());
@@ -620,8 +635,12 @@ mod tests {
         let run = drive_sh("echo out-detail; echo err-cause 1>&2; exit 2", &|| false);
         match run.outcome {
             Ok(EngineOutcome::Failed { tail, .. }) => {
-                let err_pos = tail.find("err-cause").expect(&tail);
-                let out_pos = tail.find("out-detail").expect(&tail);
+                let err_pos = tail
+                    .find("err-cause")
+                    .unwrap_or_else(|| panic!("missing err-cause in tail: {tail:?}"));
+                let out_pos = tail
+                    .find("out-detail")
+                    .unwrap_or_else(|| panic!("missing out-detail in tail: {tail:?}"));
                 assert!(err_pos < out_pos, "stderr should lead: {tail}");
             }
             other => panic!("expected Failed, got {other:?}"),
@@ -698,6 +717,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn driver_skips_percent_parsing_without_progress_hook() {
+        let _lock = lock_driver_tests();
         // on_progress: None must not panic on tqdm-shaped stderr and
         // still delivers info lines.
         let calls = AtomicUsize::new(0);
@@ -771,6 +791,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn quit_teardown_kills_registered_children_and_guard_deregisters() {
+        let _lock = lock_driver_tests();
         let mut cmd = std::process::Command::new("sh");
         cmd.arg("-c").arg("sleep 30");
         isolate_child_process(&mut cmd);

@@ -2,7 +2,7 @@
 name = "zytunes-stream"
 version = "0.1.0-alpha"
 edition = "2021"
-rust-version = "1.95"
+rust-version = "1.98"
 description = "HTTP streaming server for the zytunes music library"
 license = "MIT"
 

@@ -2,7 +2,7 @@
 name = "zune-mtp"
 version = "0.1.0-alpha"
 edition = "2021"
-rust-version = "1.95"
+rust-version = "1.98"
 description = "Native MTP/MTPZ library for USB device communication (macOS IOKit, Linux libusb)"
 license = "MIT"
 
@@ -14,7 +14,7 @@ cipher = "0.4"
 num-bigint = "0.4"
 sha1 = "0.10"
 hex = "0.4"
-rand = "0.8"
+rand = "0.8.6"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rusb = "0.9"
