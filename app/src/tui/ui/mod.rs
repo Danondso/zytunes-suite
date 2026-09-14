@@ -1466,9 +1466,13 @@ fn draw_device_info_connected(f: &mut Frame, app: &App, area: Rect) {
             40,
         )
     } else {
-        t.dim_text
+        t.header_text
     };
 
+    // Explicit fg/bg: unstyled spans otherwise inherit Color::Reset (the
+    // terminal default), which is light-on-light on iTunes/System 7/Win95
+    // and the light palettes when the emulator is in a dark theme.
+    let body = Style::default().fg(t.sidebar_text).bg(t.main_bg);
     let mut lines: Vec<Line> = Vec::new();
 
     // Zune ASCII art (centered).
@@ -1483,19 +1487,19 @@ fn draw_device_info_connected(f: &mut Frame, app: &App, area: Rect) {
     if let Some(ref fw) = app.device.firmware {
         lines.push(Line::from(vec![
             Span::styled(" FW: ", t.dim()),
-            Span::raw(fw.as_str()),
+            Span::styled(fw.as_str(), body),
         ]));
     }
     if let Some(ref mfr) = app.device.manufacturer {
         lines.push(Line::from(vec![
             Span::styled(" Mfr: ", t.dim()),
-            Span::raw(mfr.as_str()),
+            Span::styled(mfr.as_str(), body),
         ]));
     }
     if let Some(ref mode) = app.device.usb_mode {
         lines.push(Line::from(vec![
             Span::styled(" USB: ", t.dim()),
-            Span::raw(mode.as_str()),
+            Span::styled(mode.as_str(), body),
         ]));
     }
     if let Some(ref serial) = app.device.serial {
@@ -1506,13 +1510,13 @@ fn draw_device_info_connected(f: &mut Frame, app: &App, area: Rect) {
         };
         lines.push(Line::from(vec![
             Span::styled(" S/N: ", t.dim()),
-            Span::raw(display),
+            Span::styled(display, body),
         ]));
     }
     if let Some(ref sync_status) = app.device.sync_status {
         lines.push(Line::from(vec![
             Span::styled(" Sync: ", t.dim()),
-            Span::raw(sync_status.as_str()),
+            Span::styled(sync_status.as_str(), body),
         ]));
     }
 
@@ -1520,15 +1524,18 @@ fn draw_device_info_connected(f: &mut Frame, app: &App, area: Rect) {
     if app.device.acquired_items > 0 {
         lines.push(Line::from(vec![
             Span::styled(" Acquired: ", t.dim()),
-            Span::raw(format!(
-                "{} item{}",
-                app.device.acquired_items,
-                if app.device.acquired_items == 1 {
-                    ""
-                } else {
-                    "s"
-                }
-            )),
+            Span::styled(
+                format!(
+                    "{} item{}",
+                    app.device.acquired_items,
+                    if app.device.acquired_items == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                ),
+                body,
+            ),
         ]));
     }
 
@@ -1538,16 +1545,16 @@ fn draw_device_info_connected(f: &mut Frame, app: &App, area: Rect) {
         let free_gb = storage.free_bytes as f64 / 1_073_741_824.0;
         let used_gb = storage.used_bytes as f64 / 1_073_741_824.0;
         lines.push(Line::from(""));
-        lines.push(Line::from(format!(
-            " {:.1}/{:.1} GB ({:.1} free)",
-            used_gb, total_gb, free_gb
+        lines.push(Line::from(Span::styled(
+            format!(" {:.1}/{:.1} GB ({:.1} free)", used_gb, total_gb, free_gb),
+            body,
         )));
         let bar_width = (area.width as usize).saturating_sub(8).min(26);
         let filled = (bar_width as f64 * storage.used_percent as f64 / 100.0) as usize;
         let empty = bar_width.saturating_sub(filled);
         let bar_chars = anim::progress_bar_with_shine(filled, empty, app.anim_frame);
         let shine_color = anim::pulse_color(t.progress_bar, app.anim_frame, 20);
-        let mut bar_spans = vec![Span::raw(" [")];
+        let mut bar_spans = vec![Span::styled(" [", body)];
         for (ch, is_shine) in &bar_chars {
             let color = if *is_shine {
                 shine_color
@@ -1558,18 +1565,18 @@ fn draw_device_info_connected(f: &mut Frame, app: &App, area: Rect) {
             };
             bar_spans.push(Span::styled(ch.to_string(), Style::default().fg(color)));
         }
-        bar_spans.push(Span::raw(format!("] {}%", storage.used_percent)));
+        bar_spans.push(Span::styled(format!("] {}%", storage.used_percent), body));
         lines.push(Line::from(bar_spans));
     }
 
     if !app.device.loading_tracks {
-        lines.push(Line::from(format!(
-            " {} tracks on device",
-            app.device.tracks.len()
+        lines.push(Line::from(Span::styled(
+            format!(" {} tracks on device", app.device.tracks.len()),
+            body,
         )));
     }
 
-    let p = Paragraph::new(lines);
+    let p = Paragraph::new(lines).style(body);
     f.render_widget(p, area);
 }
 

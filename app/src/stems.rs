@@ -2061,6 +2061,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn cascade_runs_all_passes_and_windows_progress() {
+        let _lock = process::lock_driver_tests();
         let root = temp_root("cascade");
         let src = root.join("song.flac");
         std::fs::write(&src, b"flac").unwrap();
@@ -2110,6 +2111,7 @@ mod tests {
     #[cfg(unix)]
     fn cascade_missing_intermediate_is_missing_output_error() {
         use std::os::unix::fs::PermissionsExt;
+        let _lock = process::lock_driver_tests();
         let root = temp_root("cascade-missing");
         let src = root.join("song.flac");
         std::fs::write(&src, b"flac").unwrap();

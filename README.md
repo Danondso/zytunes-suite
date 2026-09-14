@@ -57,7 +57,7 @@ zytunes-tui
 # or: cargo run --bin zytunes-tui
 ```
 
-The TUI reads `music_dir` from `~/.config/zytunes/config.toml`, or falls back to the `ZYTUNES_MUSIC_DIR` env var.
+The TUI reads `music_dir` from `~/.config/zytunes/config.toml`, or falls back to the `ZYTUNES_MUSIC_DIR` env var. Every config key is listed with defaults in [`config.toml.example`](config.toml.example).
 
 ### Layout
 
@@ -330,6 +330,10 @@ Without a readable file at the resolved path, Zune connect/sync fails at
 the handshake. The iPod backend does not use it. See
 [libmtp-zune](https://github.com/kbhomes/libmtp-zune) for protocol notes.
 
+### Config file
+
+Copy [`config.toml.example`](config.toml.example) to `~/.config/zytunes/config.toml` and uncomment what you need. Paths, TUI, scan/fingerprinting, MusicBrainz/AcoustID, CD import, `[stems]`, `[stream]`, and custom `[themes."Name"]` tables are all there. `./install.sh --setup` copies that example (backing up any existing file) and uncomments only `music_dir`.
+
 ### Music library
 
 Point zytunes at a folder of audio files:
@@ -353,7 +357,7 @@ The scanner reads tags via [lofty](https://crates.io/crates/lofty) for all commo
 
 This builds release binaries and installs `zytunes` (CLI) and `zytunes-tui` (interactive TUI) to `/usr/local/bin/`. The LAN streaming server (`zytunes-serve`) is optional — pass `--serve` (or `--all`) to build and install it too.
 
-`--setup` is the first-time wizard: it asks for your music library, shared cache, stem cache, photo/video folders, and MTPZ path, then **writes a new** `~/.config/zytunes/config.toml` (any existing file is moved to `config.toml.bak`) before installing. Defaults follow the OS (`xdg-user-dir` when present, otherwise `~/Music`, `~/Pictures`, `~/Videos` or `~/Movies` on macOS, `~/.cache/zytunes`, `~/.mtpz-data`). Press Enter to keep a default; type `-` to skip an optional path. To uninstall:
+`--setup` is the first-time wizard: it asks for your music library (default `~/Music`, or `xdg-user-dir MUSIC` when that tool is on PATH), then copies [`config.toml.example`](config.toml.example) to `~/.config/zytunes/config.toml` with only `music_dir` uncommented (any existing file is moved to `config.toml.bak`). Photo/video, cache, stems, and MTPZ stay commented — uncomment them in the file when you need them. To uninstall:
 
 ```
 ./uninstall.sh
