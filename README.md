@@ -357,13 +357,6 @@ The scanner reads tags via [lofty](https://crates.io/crates/lofty) for all commo
 
 This builds release binaries and installs `zytunes` (CLI) and `zytunes-tui` (interactive TUI) to `/usr/local/bin/`. The LAN streaming server (`zytunes-serve`) is optional — pass `--serve` (or `--all`) to build and install it too.
 
-If `zytunes-tui` exits immediately with `zsh: killed`, the copy in `/usr/local/bin` is still root-owned from an older install. macOS SIGKILLs that combination on the AppKit-linked TUI. Fix in place without rebuilding:
-
-```
-sudo chown "$(whoami)" /usr/local/bin/zytunes-tui
-sudo codesign --force --sign - /usr/local/bin/zytunes-tui
-```
-
 `--setup` is the first-time wizard: it asks for your music library, shared cache, stem cache, photo/video folders, and MTPZ path, then **writes a new** `~/.config/zytunes/config.toml` (any existing file is moved to `config.toml.bak`) before installing. Defaults follow the OS (`xdg-user-dir` when present, otherwise `~/Music`, `~/Pictures`, `~/Videos` or `~/Movies` on macOS, `~/.cache/zytunes`, `~/.mtpz-data`). Press Enter to keep a default; type `-` to skip an optional path. To uninstall:
 
 ```
