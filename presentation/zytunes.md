@@ -48,10 +48,10 @@ Tinkering and modding stuff
 <!-- column_layout: [3, 2] -->
 <!-- column: 0 -->
 <!-- speaker_note: cobbled together a PSP that I could softmod from broken ones I bought off of friends, had to take them apart to see what version number the motherboards had and built one back together -->
-![image:width:100%](assets/psp.png)
+![image:width:50%](assets/psp.png)
 <!-- column: 1 -->
 <!-- pause -->
-![image:width:100%](assets/strat.png)
+![image:width:50%](assets/strat.png)
 
 <!-- reset_layout -->
 <!-- pause -->
@@ -65,26 +65,33 @@ The Gateway
 <!-- font_size: 2 -->
 <!-- pause -->
 <!-- speaker_note: Lovely little place down in Fayetteville called FreeGeek -->
-![](assets/fgar.png)
+![image:width:40%](assets/fgar.png)
 <!-- alignment: center -->
 <!-- pause -->
-- 521 W Ash St, Fayetteville, AR 72703 (down the road from Fossil Cove)
+521 W Ash St, Fayetteville, AR 72703 (down the road from Fossil Cove)
 <!-- pause -->
+Services:
+<!-- column_layout: [3, 2] -->
+<!-- column: 0 -->
 <!-- speaker_note: they take almost any electronic item, even car batteries, someone dropped off a telephone switchboard one time -->
-- e-waste recycling
+e-waste recycling
 <!-- pause -->
 <!-- speaker_note: reimage machines and put linux on them so they can be re-sold -->
 <!-- speaker_note: similar to geeksquad -->
-- IT support
+IT support
 <!-- pause -->
 <!-- speaker_note: testing and pricing electronic items for sale in the thrift store -->
 <!-- speaker_note: depending on skillset you can specialize in certain tech -->
 <!-- speaker_note: volunteer hours count towards class credits -->
-- volunteering
+<!-- column: 1 -->
+Volunteering
 <!-- pause -->
-- enabling my crippling addiction to hoarding outdated technology via their thrift store
+Education
 
+<!-- reset_layout -->
 ![image:width:50%](assets/old-comps.jpg)
+enabling my crippling addiction to hoarding outdated technology via their thrift store
+
 <!-- end_slide -->
 Reject modernity; return to ~~monke~~ froot
 ===
@@ -97,12 +104,12 @@ Reject modernity; return to ~~monke~~ froot
 <!-- column_layout: [3, 2] -->
 <!-- column: 0 -->
 2024
-![image:width:100%](assets/IMG_3924.jpeg)
+![image:width:60%](assets/IMG_3924.jpeg)
 <!-- column: 1 -->
 <!-- pause -->
 Walking out the store like:
-![image:width:100%](assets/thrifting.gif)
-![image:width:100%](assets/happy.gif)
+![image:width:60%](assets/thrifting.gif)
+![image:width:60%](assets/happy.gif)
 <!-- reset_layout -->
 <!-- pause -->
 Wait..
@@ -113,31 +120,35 @@ Time To Upgrade
 ===
 <!-- font_size: 2 -->
 <!-- column_layout: [3, 2] -->
-<!-- alignment: center -->
 <!-- pause -->
 
 <!-- column: 0 -->
-- 30GB stock, small boi
-<!-- pause -->
 <!-- speaker_note: using ALAC for a lot of my music, blows their estimation of 4min @128Kbps mp3 back in the elder days -->
 - 320GB library, many lossless formatted
 <!-- pause -->
+- 30GB stock, small boi
+<!-- pause -->
 ![image:width:100%](assets/iflash.png)
 <!-- pause -->
+<!-- alignment: center -->
 ZIF compatible storage powered by SD Cards
 <!-- speaker_note: show the iPod and demonstrate how you'd open it -->
 <!-- column: 1 -->
 <!-- speaker_note: the hardware is designed to interface with the iPods, so they have a ZIF connector, just pop out the old ZIF drive and put the new one in -->
+
+<!-- alignment: left -->
 <!-- pause -->
 - iFlash Solo
 <!-- pause -->
-- 512GB SD Card
+- 256GB SD Card
 <!-- pause -->
-![image:width:100%](assets/evil-ipod-dance.gif)
-- whole library fits!
+<!-- alignment: center -->
+![image:width:40%](assets/ipod-modded.png)
+- big space
 <!-- pause -->
 - we're done!
 <!-- reset_layout -->
+<!-- alignment: center -->
 <!-- pause -->
 ![image:width:100%](assets/so-much-space.gif)
 I am enjoying this.
@@ -154,10 +165,10 @@ The End
 The Spiral Continues
 ===
 <!-- font_size: 2 -->
-![image:width:60%](assets/a-few-months-later.png)
+![image:width:40%](assets/a-few-months-later.png)
 <!-- alignment: center -->
 <!-- pause -->
-![image:width:30%](assets/ohno.png)
+![image:width:50%](assets/ohno.png)
 
 <!-- speaker_note: Fast forward a few months, and things have dengenerated, I have this giant pile of devices, I've upgraded / repaired a lot of them, some are just hunks of junk because of activation lock. -->
 <!-- end_slide -->
@@ -176,7 +187,7 @@ iPods, Zunes, GoGears
 Upgrades, repairs, lack of parts
 <!-- speaker_note: as far as I can tell, you cannot purchase the screen to repair a Philips GoGear 30GB -->
 <!-- pause -->
-Managing these in one app is
+All this sprawl makes managing these devices on one app
 ![image:width:60%](assets/obnoxious.png)
 
 <!-- end_slide -->
@@ -245,7 +256,7 @@ MVP
 <!-- font_size: 2 -->
 <!-- speaker_note: An overview of the MVP plus what we'll dig into -->
 <!-- pause -->
-<!-- alignment: center -->
+<!-- alignment: left -->
 <!-- speaker_note: this comes from Apple Music, I think it's a leftover option from the iTunes era, I don't actually know too much about what it's used for outside of this -->
 - macos only to start
 - Export and parse Library.xml
@@ -260,11 +271,13 @@ MVP
 - Themes!
 
 <!-- pause -->
+<!-- alignment: center -->
 Kit:
 <!-- column_layout: [5, 5] -->
 <!-- column: 0 -->
 <!-- pause -->
 Patrician Crates 📦
+<!-- alignment: left -->
 * `ratatui` - TUI
 <!-- speaker_note: basically you don't have to press enter, keypresses turn into events -->
 * `crossterm` - interactive TUI
@@ -272,10 +285,12 @@ Patrician Crates 📦
 <!-- speaker_note: Why this split? I tried to do the whole USB stack in Rust with rusb. Finding the Zune worked. The MTPZ handshake did not — Mac libusb fails every time you send data TO the device (the certificate), error 0x2002. android-file-transfer already talked IOKit on Darwin and the handshake worked. So the tradeoff became rusb for detection, aft-mtp-cli So I shipped rusb to detect, shell out to aft-mtp-cli for everything real. IOKit FFI in-process is the later zune-mtp chapter. Linux wasn't in the MVP. -->
 * `rusb` — USB ops
 * `quick-xml` - XML parsing
-* `percent-encoding` - 
 <!-- column: 1 -->
+<!-- alignment: center -->
 Plebian Libs 📚:
-<!-- speaker_note: aft-mtp-cli is C++ and not rust, but I didn't think it made sense to try to build everything from scratch I wanted it to work first before trying to port libraries over -->
+<!-- alignment: left -->
+
+<!-- speaker_note: MTPZ is microsofts secure version of mtp, basically mtp with an auth handshake, aft-mtp-cli is C++ and not rust, but I didn't think it made sense to try to build everything from scratch I wanted it to work first before trying to port libraries over -->
 <!-- speaker_note: there's a whole sidequest hiding in here around modifying zune firmware versions I'm not going to get into for time -->
 <!-- speaker_note: aft-mtp-cli has its own handshake TrustedApp::Create(session, ~/.mtpz-data), so it works out of the box -->
 - `aft-mtp-cli` - C++ library rust shells out to -> MTP & MTPZ handshake
@@ -285,6 +300,7 @@ Plebian Libs 📚:
 <!-- reset_layout -->
 <!-- pause -->
 <!-- speaker_note: I wasn't doing anything special here outside of heavily leveraging plan mode. -->
+<!-- alignment: center -->
 Claude will do it all.
 
 ![image:width:40%](assets/do-it-all.gif)
@@ -296,10 +312,12 @@ The Spaghetti Factory Opens
 <!-- alignment: center -->
 <!-- font_size: 2 -->
 <!-- pause -->
-- Prompt for plan (sometimes do research before) -> review plan -> implement:
-- Prompt for plan and do research -> review research -> discuss -> implement:
-  - -> test -> feedback -> retest ->
+- CLAUDE.md
+- Prompt for plan/research -> review -> discuss -> choose and plan/implement:
+  - -> test -> feedback -> retest
+<!-- pause -->
 
+<!-- speaker_note: even doing the most basic>
 <!-- pause -->
 Warp Speed:
 
@@ -308,38 +326,38 @@ Warp Speed:
 <!-- column: 0 -->
 <!-- pause -->
 Mar 20–21:
-* 8 commits
-* 8,074 lines of Rust
-* 4,155 is the TUI
-* 11 themes, `/` search
+* 9 commits
+* 8,074 LOR
+* 4,155 is TUI
+* 11 themes & search
 * no `rodio`
 * ffmpeg + `aft-mtp-cli`
 <!-- column: 1 -->
 <!-- pause -->
 <!-- speaker_note: By this commit zune-mtp is already in Cargo.toml (~2.6k lines, Mar 26). The kit slide still lists aft-mtp-cli as the MTP path — that's the story of the MVP, not the tree at playback. -->
-+ Now Playing · Mar 27
-* 8 days from commit 1
-* 10,489 lines of Rust
-* 5,621 TUI
-* +2,477 for playback
+Now Playing · Mar 27:
+* 10,489 LOR
+* 2,477 for playback
 * `rodio`
-* `zune-mtp` - rust port of aft-mtp-cli
+* `zune-mtp` - 2,331 LOC port of aft-mtp-cli
 <!-- reset_layout -->
+<!-- speaker_note: we had to patch some things in order to get the TUX feeling right -->
 <!-- pause -->
-aft-mtp-cli adds: 
-- caching so we don't walk the zune library on every plugin (more songs -> more time)
-
-CLean up these adds;
-- Disk library cache — the big one. Cold zune-init walked the whole artist/album graph and took minutes. You added SaveCache / TryLoadFromCache (AFT-LIBRARY-CACHE-V1) at ~/.aft-library-cache, keyed by device serial. Second connect: load the file, skip the walk. After import, AutoSave kept it fresh.
-
-zune-refresh — delete that cache and rebuild from the device. Upstream zune-init is just new Library(session) every time, no cache, no refresh command.
-
-track-id: on stdout — after a successful import, print track-id:<mtp handle> so Rust can parse a stable object ID. Upstream ZuneImport returns silently.
-
-create-playlist <name> <comma-separated-ids> — build an AbstractAVPlaylist from the IDs zune-import just printed. Not in upstream CLI.
-
+<!-- alignment: left -->
+`aft-mtp-cli` command updates: 
+<!-- speaker_note: scales with library size, without this, every time i t's plugged in you'd have to walk the artist/album tree which had to complete before you could interact with it -->
+- `zune-init` - caching by device serial 
+<!-- spa>
+- `zune-import` - emit track ids 
+<!-- speaker_note: this was to force updating if synced from another device, if I bounced between machines I wanted to be able to resync the device --> 
+- `zune-refresh` — reset and re-walk the device for tracks
+<!-- speaker_note: a Zune playlist is not a list of paths — it's SetObjectReferences of MTP handles. -->
+- `zune-import` - (sync) emit track_id on stdout
+<!-- speaker_note: Wanting to add what I'd consider basic support, playlists -->
+- `create-playlist` - builds AbstractAVPlaylist playlists out of track_ids
 <!-- pause -->
-
+<!-- alignment: center -->
+Wait but what's `zune-mtp`?
 <!-- end_slide -->
 
 zune-mtp
@@ -347,20 +365,25 @@ zune-mtp
 <!-- font_size: 2 -->
 <!-- alignment: center -->
 <!-- pause -->
-<!-- speaker_note: libmtp-zune is a fork of libmtp -->
-Built referencing aft-mtp-cli and the libmtp-zune
+<!-- speaker_note: libmtp-zune is a fork of libmtp which adds zune support, it's where the mtpz data file came from -->
+Port `aft-mtp-cli` to rust using it and `libmtp-zune` as references
 <!-- pause -->
-BYOCredentials - mtpz data needed for zune sync
+`libmtp-zune` - written in C, based on `libmtp`
 <!-- pause -->
-A reverse engineered library written in C does this though [`libmtp-zune`](https://github.com/kbhomes/libmtp-zune)
+C != Rust, sorry Dennis Ritchie
 <!-- pause -->
-C!? We can't be having that here. Sorry Dennis Richie :'(
+<!-- speaker_note: into a native IOKit transport, bypassing libusb entirely because libusb
+can't do the data-out operations the handshake needs. -->
+<!-- alignment: left -->
+`zune-mtp` ports that protocol knowledge
+- handshake, hardware read, media read
+- push, rm, playlists, album art
+- ZMDB extraction (no more device walks)
 <!-- pause -->
-Port it to Rust!
-<!-- pause -->
-`zune-mtp` ports that protocol knowledge — RSA-1024 signing, a
-PSS-like certificate exchange, AES-128-CBC, CMAC key extraction — into a native IOKit transport, bypassing libusb entirely because libusb
-can't do the data-out operations the handshake needs.
+<!-- alignment: center -->
+Aww CRUD, it works
+![image:width:20%](assets/yes.gif)
+
 <!-- end_slide -->
 
 The End cont.
@@ -373,51 +396,73 @@ The End cont.
 We did it! We're done!
 
 <!-- pause -->
-Talks to a zune, apple music can handle iPods.
+Talks to a Zune. Apple Music can handle iPods.
 
 <!-- pause -->
-Not quite..
+(behind the scenes) Linux is working!
 
 <!-- pause -->
-C++, stdin/out reads, C libraries
+Well, almost..
+
+<!-- pause -->
+<!-- speaker_note: aft-mtp-cli is gone — no more stdin/stdout REPL. zune-mtp talks IOKit in-process. What's still C, ffmpeg for transcode (until Apr 3), libusb behind rusb for USB detect. iPods are still Apple Music — that's the next slide. -->
+ `ffmpeg` — C subprocess for transcoding
+<!-- speaker_note: can't really get away from this one -->
+`libusb` — `rusb` for device detection
+<!-- pause -->
+no iPod support
+
+locked into Library.xml exports
+<!-- speaker_note: You might be wondering where the slide on linux support is, I recall it took maybe an hour of testing to see what was broken, and for the sake of narrative and time I'm glossing over it, and lots of other stuff -->
 
 <!-- end_slide -->
 
-Claude build me a hammer
+Reject spaghett; return to Rust
+===
+<!-- font_size: 2 -->
+
+<!-- column_layout: [3, 2] -->
+<!-- column: 0 -->
+<!-- alignment: left -->
+<!-- pause -->
+Spaghett:
+<!-- speaker_note: I'm pretty locked into what Apple Music is doing in order for Zytunes to work -->
+- Library.xml -> not sustainable long term
+<!-- speaker_note: I'm pretty locked into what Apple Music is doing in order for Zytunes to work -->
+- Ripping CDs in Apple Music
+- `Automatically Add to Music` folder
+<!-- pause -->
+
+<!-- column: 1 -->
+Rusty Spaghett:
+<!-- pause -->
+- Add music directory traversal and cache building (in JSON), updates on app start
+<!-- pause -->
+(Most of) `ffmpeg` swapped for:
+<!-- speaker_note: great for a library of mixed files -->
+- `symphonia` - audio decoder
+<!-- speaker_note: Zune only supports WMA, AAC, and MP3, so we need to transcode the file if it's incompatible -->
+- `mp3lame-encoder` - JIT transcoding audio files
+<!-- pause -->
+- `lofty` - adds metadata parser and writer
+<!-- speaker_note: lofty works across files my files -->
+- `discid` — CD reads
+
+<!-- reset_layout -->
+<!-- alignment: center -->
+Feature Factory!
+<!-- pause -->
+- music brainz client for tagging
+- acoustid fingerprinting
+
+<!-- end_slide -->
+
+ipod-db
 ===
 <!-- font_size: 2 -->
 
 <!-- alignment: center -->
-
-I wanted to start from scratch and I'm clueless so I asked Claude to take a look.
-It suggested probing the device to understand what it support and do research on what's been done already.
-
-<!-- pause -->
-
-- Have Claude scaffold a throwaway probe binary, run it once against the real device,
-read the result, delete or keep if it works.
-
-- Honestly surprised I didn't brick it
-<!-- end_slide -->
-
-Everything IS a nail when you have a Claude Hammer
-===
-<!-- font_size: 2 -->
-
-<!-- alignment: center -->
-
-- We poke around and finally get the handshake woring.
-<!-- pause -->
-- `SendObjectInfo` → `SendObject` → a song is *on the device*.
-- Sync, push, remove, device browsing
-- aww CRUD, it works
-
-<!-- end_slide -->
-
-iPod
-===
-<!-- font_size: 2 -->
-<!-- alignment: center -->
+Apr 7th - 16th
 <!-- pause -->
 Much easier than the Zune
 <!-- pause -->
@@ -425,39 +470,16 @@ Much easier than the Zune
 <!-- pause --> 
 - Real challenge: parse and write back the iTunesDB
 <!-- pause -->
-<!-- speaker_note: fortunately gtkpod did this already and allows us to access -->
-- libgpod -> split from gtkpod, written in C
+<!-- speaker_note: fortunately gtkpod did this already and allows us to access an iPod -->
+- `libgpod` -> split from gtkpod, written in C
 <!-- pause -->
 
-<!-- speaker_note: I remember around this time I was brute force checking it over and over and over, very bad habit I probably wasted a lot of time here -->
+<!-- speaker_note: I remember around this time I was brute force checking it over and over and over, very bad habit I probably wasted a lot of time here, I'd have claude update the DB and I'd report back, it was a slog -->
 <!-- pause -->
 ipod-db does this
 <!-- end_slide -->
 
-Reject spaghett; return to Rust
-===
-<!-- font_size: 2 -->
 
-<!-- alignment: center -->
-
-<!-- pause -->
-Library.xml has outlived it's usefulness.
-
-<!-- pause -->
-Replaced! We read the directory and build a cache. Updates as new files are added.
-
-We swap (most of) ffmpeg for:
-<!-- speaker_note: great for a library of mixed files -->
-* `symphonia` - audio decoder
-<!-- speaker_note: Zune only supports WMA, AAC, and MP3, so we need to transcode the file if it's incompatible -->
-* `mp3lame-encoder` - JIT transcoding audio files
-<!-- pause -->
-* `lofty` - adds metadata parser and writer
-<!-- speaker_note: lofty works across files my files -->
-
-* `discid` — CD table-of-contents reads, LGPL, dynamically linked
-
-<!-- end_slide -->
 
 Time to refactor
 ===
@@ -587,3 +609,38 @@ Thank you
 <!-- pause -->
 `github.com/Danondso/zytunes-suite`
 <!-- pause -->
+
+
+
+
+
+Claude build me a hammer
+===
+<!-- font_size: 2 -->
+
+<!-- alignment: center -->
+
+I wanted to start from scratch and I'm clueless so I asked Claude to take a look.
+It suggested probing the device to understand what it support and do research on what's been done already.
+
+<!-- pause -->
+
+- Have Claude scaffold a throwaway probe binary, run it once against the real device,
+read the result, delete or keep if it works.
+
+- Honestly surprised I didn't brick it
+<!-- end_slide -->
+
+Everything IS a nail when you have a Claude Hammer
+===
+<!-- font_size: 2 -->
+
+<!-- alignment: center -->
+
+- We poke around and finally get the handshake woring.
+<!-- pause -->
+- `SendObjectInfo` → `SendObject` → a song is *on the device*.
+- Sync, push, remove, device browsing
+- aww CRUD, it works
+
+<!-- end_slide -->
