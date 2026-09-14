@@ -72,13 +72,43 @@ toml_quote() {
     printf '"%s"' "$s"
 }
 
+# Absolute path even if the target does not exist yet (the wizard mkdir -p's
+# afterwards). GNU realpath -m does this in one shot; BSD realpath (macOS)
+# has no -m and treats unknown flags as fatal.
 expand_path() {
     local p="$1"
     p="${p/#\~/$HOME}"
-    if command -v realpath >/dev/null 2>&1; then
+
+    if command -v realpath >/dev/null 2>&1 && realpath -m / >/dev/null 2>&1; then
         realpath -m "$p"
+        return
+    fi
+
+    case "$p" in
+        /*) ;;
+        *) p="${PWD}/${p}" ;;
+    esac
+
+    # Walk up to the longest prefix that exists, canonicalize that, then
+    # append the missing tail.
+    local prefix="$p" tail="" base
+    while [ -n "$prefix" ] && [ "$prefix" != "/" ] && [ ! -e "$prefix" ]; do
+        base=$(basename "$prefix")
+        prefix=$(dirname "$prefix")
+        if [ -n "$tail" ]; then
+            tail="${base}/${tail}"
+        else
+            tail="$base"
+        fi
+    done
+
+    if [ -e "$prefix" ] && command -v realpath >/dev/null 2>&1; then
+        prefix=$(realpath -q "$prefix")
+    fi
+    if [ -n "$tail" ]; then
+        printf '%s/%s\n' "$prefix" "$tail"
     else
-        printf '%s\n' "$p"
+        printf '%s\n' "$prefix"
     fi
 }
 
