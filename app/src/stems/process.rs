@@ -13,6 +13,20 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+/// Serialise tests that register a child in the process-wide registry
+/// or sweep it. The registry is process-wide (TUI quit path), so
+/// `quit_teardown_kills_registered_children` SIGKILLs in-flight
+/// `run_engine_process` children from *other* tests — including the
+/// cascade stubs in `stems.rs`. Hold this for any test that registers
+/// a child or calls [`kill_active_stem_children`].
+#[cfg(test)]
+pub(crate) fn lock_driver_tests() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 /// Hooks a caller wires into [`run_engine_process`]. All are polled or
 /// invoked from the calling thread and the pipe-drain threads the driver
 /// owns; none outlive the call.
@@ -530,19 +544,6 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         panic!("timed out waiting for {what}");
-    }
-
-    /// The child-pid registry is process-wide (that's the TUI quit path).
-    /// `quit_teardown_kills_registered_children` therefore SIGKILLs every
-    /// in-flight `run_engine_process` child — including ones belonging to
-    /// parallel tests — which emptied the failure tail and failed CI.
-    /// Hold this for any test that registers a child or sweeps the registry.
-    #[cfg(unix)]
-    fn lock_driver_tests() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// `kill(pid, 0)` existence probe: false once the process is gone.
