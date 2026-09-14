@@ -19,7 +19,7 @@ cargo test -p ipod-db         # Run ipod-db crate tests only
 cargo fmt                     # Format code
 cargo clippy                  # Lint
 ./install.sh                  # Build release CLI + TUI and install to /usr/local/bin
-./install.sh --setup          # Write a new ~/.config/zytunes/config.toml (OS path defaults), then install
+./install.sh --setup          # Copy config.toml.example (uncomment music_dir only), then install
 ./install.sh --serve          # Also build and install zytunes-serve
 ./uninstall.sh                # Remove zytunes, zytunes-tui, and zytunes-serve from /usr/local/bin
 

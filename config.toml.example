@@ -4,8 +4,9 @@
 # Every key is optional unless noted. A blank string on a path field
 # reads as unset. Unknown keys are ignored.
 #
-# `./install.sh --setup` writes a fresh config (backing up any existing
-# file to config.toml.bak) with OS-typical path defaults.
+# `./install.sh --setup` copies this file to ~/.config/zytunes/config.toml
+# (backing up any existing file to config.toml.bak) and uncomments
+# music_dir with the path you chose. Everything else stays commented.
 #
 # Device-scoped caches (track list, library handles, sync progress) are
 # *not* in this file — set ZYTUNES_CACHE_DIR for those.
