@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/Danondso/zytunes/actions/workflows/ci.yml/badge.svg)](https://github.com/Danondso/zytunes/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.94%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.98%2B-orange.svg)](https://www.rust-lang.org)
 
 A Rust tool for syncing music (and photos/videos on Zune) to a Microsoft Zune or classic iPod from macOS and Linux.
 

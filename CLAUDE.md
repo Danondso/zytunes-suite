@@ -35,7 +35,7 @@ CLI commands: `ls [path]`, `push <files...>`, `rm <paths...>`, `sync <type> <nam
 
 ## Architecture
 
-**Workspace layout:** Virtual Cargo workspace at the repo root. Sibling members: `app/` (package name `zytunes` — CLI + TUI), `zune-mtp/` (MTPZ library), `ipod-db/` (iTunesDB parser/writer), `zytunes-stream/` (`zytunes-serve` HTTP server). `mobile/` is the Flutter LAN client (not a Cargo member). All Rust crates specify `rust-version = "1.95"`. A `tools/mtp-probe` directory (gitignored) contains the MTP vendor operation probe tool used for reverse engineering.
+**Workspace layout:** Virtual Cargo workspace at the repo root. Sibling members: `app/` (package name `zytunes` — CLI + TUI), `zune-mtp/` (MTPZ library), `ipod-db/` (iTunesDB parser/writer), `zytunes-stream/` (`zytunes-serve` HTTP server). `mobile/` is the Flutter LAN client (not a Cargo member). All Rust crates specify `rust-version = "1.98"`. A `tools/mtp-probe` directory (gitignored) contains the MTP vendor operation probe tool used for reverse engineering.
 
 **Device abstraction:** `app/src/device/` defines `DeviceBackend` (detect + open session) and `DeviceCapabilities` (family, supported formats, transcode target, **`lossless_target`** for FLAC→ALAC-style lossless promotion on push, music root, max art dims). `ZuneBackend` (MTPZ-over-IOKit, `lossless_target = None`) and `IpodBackend` (USB mass storage + iTunesDB, `lossless_target = Some("alac")`) both implement it, so CLI and TUI iterate backends instead of hardcoding Zune. `DetectedDevice` carries a type-erased `backend_data: Box<dyn Any>` that the backend downcasts when opening a session.
 
