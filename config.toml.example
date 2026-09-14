@@ -1,0 +1,196 @@
+# zytunes config reference
+#
+# Copy to ~/.config/zytunes/config.toml and uncomment what you want.
+# Every key is optional unless noted. A blank string on a path field
+# reads as unset. Unknown keys are ignored.
+#
+# `./install.sh --setup` writes a fresh config (backing up any existing
+# file to config.toml.bak) with OS-typical path defaults.
+#
+# Environment variables that override a field are noted on that field.
+# Device-scoped caches (track list, library handles, sync progress) are
+# *not* in this file — set ZYTUNES_CACHE_DIR for those.
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+
+# Music library root. Recursively scanned for audio (lofty tags, then
+# Artist/Album/Track.ext for untagged files).
+# Override: ZYTUNES_MUSIC_DIR (wins over this key).
+# music_dir = "/Users/you/Music"
+
+# Shared cache root: dirlib scans, album art, default stem cache, model
+# checkpoints, play history. Does not move device-scoped caches.
+# Default: ~/.cache/zytunes
+# cache_dir = "/Users/you/.cache/zytunes"
+
+# Zune MTPZ handshake file (5 hex lines). Not shipped. iPod sync ignores this.
+# Override: ZYTUNES_MTPZ_DATA (wins over this key).
+# Default: ~/.mtpz-data
+# mtpz_data = "/Users/you/.mtpz-data"
+
+# Photo / video sync folders (Zune photo-sync / video-sync).
+# Overrides: ZYTUNES_PHOTOS_DIR, ZYTUNES_VIDEOS_DIR
+# photo_dir = "/Users/you/Pictures"
+# video_dir = "/Users/you/Movies"
+
+# ---------------------------------------------------------------------------
+# TUI
+# ---------------------------------------------------------------------------
+
+# Built-in names: "iTunes 2004", "Gruvbox Dark", "Gruvbox Light",
+# "Everforest Dark", "Everforest Light", "Tokyo Night", "IBM Mainframe",
+# "Amber CRT", "Windows 95", "System 7", "BIOS", "Red Sands",
+# "Newport Lights", "NeXTSTEP", "WinAmp Classic", "Zune Original"
+# — or a name from a [themes."…"] table below. Persisted when you pick
+# one with `t`.
+# theme = "iTunes 2004"
+
+# Album-art renderer. `T` toggles and writes this back.
+# "halfblock" (default) | "ascii"
+# album_art_style = "halfblock"
+
+# Now-playing panel. Omit the key for auto (show when a track is playing
+# and the terminal is tall enough). `P` cycles auto → hidden → shown.
+# true  = always show
+# false = always hide
+# show_player = true
+
+# ---------------------------------------------------------------------------
+# Library scan
+# ---------------------------------------------------------------------------
+
+# Chromaprint fingerprints during the directory scan. Default true.
+# false skips the expensive pass; playcount-merge that keys on acoustic_id
+# then has nothing to match.
+# fingerprinting = true
+
+# ---------------------------------------------------------------------------
+# MusicBrainz / AcoustID
+# ---------------------------------------------------------------------------
+
+# Public host requires a contact-bearing User-Agent per MB ToS.
+# Format: application/version (contact)
+# musicbrainz_user_agent = "zytunes/2.2.0 (you@example.com)"
+
+# Default: https://musicbrainz.org/ws/2
+# A local mirror skips the 1 req/sec cap and the UA requirement.
+# musicbrainz_base_url = "http://localhost:5000/ws/2"
+
+# AcoustID application API key for tag-manager fingerprint → MBID fallback.
+# Register at https://acoustid.org/new-application
+# Without a key, AcoustID dispatch is skipped silently.
+# acoustid_app_key = "your-application-key"
+
+# Embed ACOUSTID_FINGERPRINT on freshly ripped CD tracks. Default true.
+# Independent of `fingerprinting` (scan-time). Adds ~1–15 s per rip track.
+# acoustid_fingerprint = true
+
+# ---------------------------------------------------------------------------
+# CD import
+# ---------------------------------------------------------------------------
+
+# Overlay preselection: "mp3-cbr-320" (alias "mp3-320") | "mp3-v0" | "mp3-v2"
+# | "flac" | "wav". Unset / unparseable → flac.
+# default_fidelity = "flac"
+
+# Eject after a successful rip. Overlay `e` can override per import.
+# Default true.
+# cd_auto_eject = true
+
+# ---------------------------------------------------------------------------
+# Stem-split playback  (`M` in the TUI; [stems] also used by zytunes-serve)
+# ---------------------------------------------------------------------------
+
+[stems]
+# "auto" (default) — offer a uv-managed install when no engine is found.
+# "manual" — never install; report the missing engine.
+# "bundled" is reserved.
+# provision = "auto"
+
+# Explicit engine binary. Auto-provision writes the resolved path here.
+# Honored only when the file name matches the active engine
+# (demucs vs audio-separator).
+# command = "/Users/you/.local/share/zytunes/bin/demucs"
+
+# pip spec for auto-provision. Must name the same engine family as the
+# recipe or it is ignored. Default is engine-specific (and gpu-aware for
+# audio-separator).
+# package = "demucs"
+
+# Demucs model (demucs recipe only). Default "htdemucs_6s".
+# Changing it re-separates on next use.
+# model = "htdemucs_6s"
+
+# Install CUDA/MPS-capable torch instead of CPU-only. Default false.
+# The hq recipes want this true.
+# gpu = false
+
+# Stem-cache cap in GiB, LRU-pruned. Default 10.
+# cache_max_gb = 10
+
+# Stem-cache directory. Default ~/.cache/zytunes/stems (or {cache_dir}/stems).
+# cache_dir = "/Users/you/.cache/zytunes/stems"
+
+# "demucs" (default, six stems) | "hq" | "hq-harmony" (seven stems, lead/backing).
+# Unknown values log and fall back to demucs. Cache is per (track, recipe).
+# recipe = "demucs"
+
+# ---------------------------------------------------------------------------
+# LAN streaming server  (zytunes-serve)
+#
+# Flags > ZYTUNES_STREAM_* env > this table. A non-empty token is required
+# for any bind (loopback included). Serving is HTTP; put TLS in front on
+# untrusted networks.
+#
+# Env: ZYTUNES_STREAM_BIND, ZYTUNES_STREAM_PORT, ZYTUNES_STREAM_TOKEN
+#
+# allow_insecure is rejected if set (flag, table, or env) — there is no
+# unauthenticated mode.
+# ---------------------------------------------------------------------------
+
+[stream]
+# bind = "0.0.0.0"
+# port = 9847
+# token = "shared-secret"
+
+# ---------------------------------------------------------------------------
+# Custom themes
+#
+# Appear in the `t` picker. Inherit from `base` (default "iTunes 2004").
+# Unknown base, bad color, or a name that collides with a built-in: skipped
+# with a stderr warning, picker still works.
+#
+# Colors: #rrggbb or #rgb
+# border_type: plain | rounded | double | thick | quadrantoutside | quadrantinside
+# modifiers: bold, dim, italic, none — combine with + | ,
+# accent_anim: none | pulse | huecycle | colorshift
+# ---------------------------------------------------------------------------
+
+# theme = "My Custom"
+#
+# [themes."My Custom"]
+# base = "Gruvbox Dark"
+# sidebar_bg = "#282828"
+# sidebar_text = "#ebdbb2"
+# selection_bg = "#ff00aa"
+# selection_text = "#ffffff"
+# main_bg = "#1d2021"
+# alt_row_bg = "#282828"
+# border = "#504945"
+# footer_bg = "#1d2021"
+# footer_text = "#a89984"
+# header_text = "#fabd2f"
+# dim_text = "#928374"
+# error_text = "#fb4934"
+# success_text = "#b8bb26"
+# progress_bar = "#00ffaa"
+# progress_bg = "#3c3836"
+# accent_secondary = "#83a598"
+# border_type = "rounded"
+# header_modifier = "bold"
+# sidebar_modifier = "none"
+# dim_modifier = "dim"
+# footer_modifier = "none"
+# accent_anim = "pulse"

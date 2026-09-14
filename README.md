@@ -57,7 +57,7 @@ zytunes-tui
 # or: cargo run --bin zytunes-tui
 ```
 
-The TUI reads `music_dir` from `~/.config/zytunes/config.toml`, or falls back to the `ZYTUNES_MUSIC_DIR` env var.
+The TUI reads `music_dir` from `~/.config/zytunes/config.toml`, or falls back to the `ZYTUNES_MUSIC_DIR` env var. Every config key is listed with defaults in [`config.toml.example`](config.toml.example).
 
 ### Layout
 
@@ -330,6 +330,10 @@ Without a readable file at the resolved path, Zune connect/sync fails at
 the handshake. The iPod backend does not use it. See
 [libmtp-zune](https://github.com/kbhomes/libmtp-zune) for protocol notes.
 
+### Config file
+
+Copy [`config.toml.example`](config.toml.example) to `~/.config/zytunes/config.toml` and uncomment what you need. Paths, TUI, scan/fingerprinting, MusicBrainz/AcoustID, CD import, `[stems]`, `[stream]`, and custom `[themes."Name"]` tables are all there. `./install.sh --setup` can also write a new file with OS path defaults.
+
 ### Music library
 
 Point zytunes at a folder of audio files:
@@ -352,6 +356,13 @@ The scanner reads tags via [lofty](https://crates.io/crates/lofty) for all commo
 ```
 
 This builds release binaries and installs `zytunes` (CLI) and `zytunes-tui` (interactive TUI) to `/usr/local/bin/`. The LAN streaming server (`zytunes-serve`) is optional — pass `--serve` (or `--all`) to build and install it too.
+
+If `zytunes-tui` exits immediately with `zsh: killed`, the copy in `/usr/local/bin` is still root-owned from an older install. macOS SIGKILLs that combination on the AppKit-linked TUI. Fix in place without rebuilding:
+
+```
+sudo chown "$(whoami)" /usr/local/bin/zytunes-tui
+sudo codesign --force --sign - /usr/local/bin/zytunes-tui
+```
 
 `--setup` is the first-time wizard: it asks for your music library, shared cache, stem cache, photo/video folders, and MTPZ path, then **writes a new** `~/.config/zytunes/config.toml` (any existing file is moved to `config.toml.bak`) before installing. Defaults follow the OS (`xdg-user-dir` when present, otherwise `~/Music`, `~/Pictures`, `~/Videos` or `~/Movies` on macOS, `~/.cache/zytunes`, `~/.mtpz-data`). Press Enter to keep a default; type `-` to skip an optional path. To uninstall:
 

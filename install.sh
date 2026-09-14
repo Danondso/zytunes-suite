@@ -301,13 +301,25 @@ if [ "$INSTALL_SERVE" -eq 1 ] && [ ! -f "$SERVE_BINARY" ]; then
 fi
 
 echo "Installing to $INSTALL_DIR..."
-sudo cp "$CLI_BINARY" "$INSTALL_DIR/zytunes"
-sudo cp "$TUI_BINARY" "$INSTALL_DIR/zytunes-tui"
-sudo chmod 755 "$INSTALL_DIR/zytunes" "$INSTALL_DIR/zytunes-tui"
+# `sudo cp` leaves the Mach-O owned by root. macOS SIGKILLs a root-owned
+# ad-hoc-signed binary that links AppKit (rodio/cpal on the TUI) — zsh
+# reports that as "killed". Install as the invoking user and re-sign.
+install_bin() {
+    local src="$1" dest="$2"
+    sudo cp "$src" "$dest"
+    sudo chmod 755 "$dest"
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+        sudo chown "$SUDO_USER" "$dest"
+    fi
+    if command -v codesign >/dev/null 2>&1; then
+        sudo codesign --force --sign - "$dest"
+    fi
+}
+install_bin "$CLI_BINARY" "$INSTALL_DIR/zytunes"
+install_bin "$TUI_BINARY" "$INSTALL_DIR/zytunes-tui"
 
 if [ "$INSTALL_SERVE" -eq 1 ]; then
-    sudo cp "$SERVE_BINARY" "$INSTALL_DIR/zytunes-serve"
-    sudo chmod 755 "$INSTALL_DIR/zytunes-serve"
+    install_bin "$SERVE_BINARY" "$INSTALL_DIR/zytunes-serve"
 fi
 
 echo "Done."
