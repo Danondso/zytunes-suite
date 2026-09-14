@@ -7,7 +7,6 @@
 # `./install.sh --setup` writes a fresh config (backing up any existing
 # file to config.toml.bak) with OS-typical path defaults.
 #
-# Environment variables that override a field are noted on that field.
 # Device-scoped caches (track list, library handles, sync progress) are
 # *not* in this file — set ZYTUNES_CACHE_DIR for those.
 
@@ -17,7 +16,7 @@
 
 # Music library root. Recursively scanned for audio (lofty tags, then
 # Artist/Album/Track.ext for untagged files).
-# Override: ZYTUNES_MUSIC_DIR (wins over this key).
+# Override: ZYTUNES_MUSIC_DIR
 # music_dir = "/Users/you/Music"
 
 # Shared cache root: dirlib scans, album art, default stem cache, model
@@ -25,11 +24,12 @@
 # Default: ~/.cache/zytunes
 # cache_dir = "/Users/you/.cache/zytunes"
 
-# Zune MTPZ handshake file (5 hex lines). Not shipped. iPod sync ignores this.
-# Override: ZYTUNES_MTPZ_DATA (wins over this key).
+# Zune MTPZ handshake file. Not shipped. iPod sync ignores this.
+# Override: ZYTUNES_MTPZ_DATA
 # Default: ~/.mtpz-data
 # mtpz_data = "/Users/you/.mtpz-data"
 
+# This is CLI only
 # Photo / video sync folders (Zune photo-sync / video-sync).
 # Overrides: ZYTUNES_PHOTOS_DIR, ZYTUNES_VIDEOS_DIR
 # photo_dir = "/Users/you/Pictures"
@@ -43,8 +43,7 @@
 # "Everforest Dark", "Everforest Light", "Tokyo Night", "IBM Mainframe",
 # "Amber CRT", "Windows 95", "System 7", "BIOS", "Red Sands",
 # "Newport Lights", "NeXTSTEP", "WinAmp Classic", "Zune Original"
-# — or a name from a [themes."…"] table below. Persisted when you pick
-# one with `t`.
+# — or a name from a [themes."…"] table below.
 # theme = "iTunes 2004"
 
 # Album-art renderer. `T` toggles and writes this back.
@@ -84,7 +83,7 @@
 # acoustid_app_key = "your-application-key"
 
 # Embed ACOUSTID_FINGERPRINT on freshly ripped CD tracks. Default true.
-# Independent of `fingerprinting` (scan-time). Adds ~1–15 s per rip track.
+# Independent of `fingerprinting` at scan time. Adds ~1–15 s per rip track.
 # acoustid_fingerprint = true
 
 # ---------------------------------------------------------------------------
@@ -138,11 +137,9 @@
 # recipe = "demucs"
 
 # ---------------------------------------------------------------------------
-# LAN streaming server  (zytunes-serve)
+# http streaming server  (zytunes-serve)
 #
-# Flags > ZYTUNES_STREAM_* env > this table. A non-empty token is required
-# for any bind (loopback included). Serving is HTTP; put TLS in front on
-# untrusted networks.
+# A non-empty token is required for any bind (loopback included).
 #
 # Env: ZYTUNES_STREAM_BIND, ZYTUNES_STREAM_PORT, ZYTUNES_STREAM_TOKEN
 #
@@ -151,7 +148,7 @@
 # ---------------------------------------------------------------------------
 
 [stream]
-# bind = "0.0.0.0"
+# bind = "127.0.0.1" # use "0.0.0.0" if using with a mobile client
 # port = 9847
 # token = "shared-secret"
 
