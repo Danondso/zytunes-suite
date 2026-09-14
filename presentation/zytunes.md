@@ -1,50 +1,68 @@
 ---
 title: Rusty Spaghetti
 sub_title: Or - zytunes - building the music player I never thought I've always wanted while selling my soul to Anthropic while some bangin' tunes play oh and Rust is there too 🦀 (and maybe a snake 🐍)
-author: Dublin Anondson
+author: by Dublin Anondson
 date: 2026-08-29
 theme:
   name: terminal-dark
+  override:
+    intro_slide:
+      title:
+        font_size: 3
+    slide_title:
+      font_size: 3
 ---
 
 
-New Presentation Who Dis?
+New Slide Who Dis?
 ===
+<!-- font_size: 2 -->
 <!-- alignment: center -->
 Dublin
 <!-- pause -->
-- Senior Engineer on growth team at a SaaS startup in Nebraska
+<!-- speaker_note: SE on a PLG team at CompanyCam -->
+- Senior Engineer
+<!-- speaker_note: used to be a react dev but Claude writes everything now -->
 <!-- pause -->
 - BA in Computer Science @uark, December 2015
-<!-- speaker_note: when I started I was debugging JSF servers using ICEfaces and now AI is eating everything and claude writes it all for me, golly  -->
+<!-- column_layout: [3, 2] -->
+<!-- column: 0 -->
 <!-- pause -->
-- two cats
+![image:width:100%](assets/howl-and-aunty.png)
+Howl and Aunty Whispers
+<!-- column: 1 -->
 <!-- pause -->
-- 11 chickens
+![image:width:100%](assets/chickens.png)
+Big Eye, Jelly Boy, Hennsylvania, Bekahh, etc..
 <!-- pause -->
 <!-- end_slide -->
 How Did I Get Here?
 ===
+<!-- font_size: 2 -->
 <!-- alignment: center -->
 <!-- speaker_note: why am i giving a talk about ferrous pasta and old stuff -->
 <!-- pause -->
 <!-- speaker_note: Growing up in NJ I had access to lots of things to mess around with, stripping down old bikes and not putting them back together -->
-- Tinkering and modding stuff.
+Tinkering and modding stuff
 <!-- pause -->
-- Rebuilt and softmodded a PSP
-- pic of psp 200
+<!-- column_layout: [3, 2] -->
+<!-- column: 0 -->
+<!-- speaker_note: cobbled together a PSP that I could softmod from broken ones I bought off of friends, had to take them apart to see what version number the motherboards had and built one back together -->
+![image:width:100%](assets/psp.png)
+<!-- column: 1 -->
 <!-- pause -->
-- Modding guitars literally found on the side of the street
-- pic of my stratocaster
-<!-- pause -->
-- I enjoy using items that do more than they're supposed to. 
-- It's radical to see things used longer than our capitalist overlords intended.
+![image:width:100%](assets/strat.png)
 
-<!-- speaker_note: I'm really old -->
+<!-- reset_layout -->
+<!-- pause -->
+It brings me joy to see stuff work longer than intended.
+<!-- pause -->
+It's a supreme act of ownership to repair and maintain.
 <!-- end_slide -->
 
-Getting My Start
+The Gateway
 ===
+<!-- font_size: 2 -->
 <!-- pause -->
 <!-- speaker_note: Lovely little place down in Fayetteville called FreeGeek -->
 ![](assets/fgar.png)
@@ -64,11 +82,13 @@ Getting My Start
 <!-- speaker_note: volunteer hours count towards class credits -->
 - volunteering
 <!-- pause -->
-- enabling my crippling addiction to hoarding outdated technology
+- enabling my crippling addiction to hoarding outdated technology via their thrift store
 
+![image:width:50%](assets/old-comps.jpg)
 <!-- end_slide -->
 Reject modernity; return to ~~monke~~ froot
 ===
+<!-- font_size: 2 -->
 <!-- alignment: center -->
 <!-- pause -->
 <!-- speaker_note: this is the first one I picked up, a 5.5th Gen iPod (if it has search then it's 5.5th gen!) -->
@@ -85,13 +105,14 @@ Walking out the store like:
 ![image:width:100%](assets/happy.gif)
 <!-- reset_layout -->
 <!-- pause -->
-But wait..
+Wait..
 <!-- pause -->
-is it enough?
+is this good enough?
 <!-- end_slide -->
 Time To Upgrade
 ===
-<!-- column_layout: [3, 3] -->
+<!-- font_size: 2 -->
+<!-- column_layout: [3, 2] -->
 <!-- alignment: center -->
 <!-- pause -->
 
@@ -103,10 +124,10 @@ Time To Upgrade
 <!-- pause -->
 ![image:width:100%](assets/iflash.png)
 <!-- pause -->
-Don't tear the ribbon cables!
+ZIF compatible storage powered by SD Cards
+<!-- speaker_note: show the iPod and demonstrate how you'd open it -->
 <!-- column: 1 -->
 <!-- speaker_note: the hardware is designed to interface with the iPods, so they have a ZIF connector, just pop out the old ZIF drive and put the new one in -->
-
 <!-- pause -->
 - iFlash Solo
 <!-- pause -->
@@ -114,6 +135,7 @@ Don't tear the ribbon cables!
 <!-- pause -->
 ![image:width:100%](assets/evil-ipod-dance.gif)
 - whole library fits!
+<!-- pause -->
 - we're done!
 <!-- reset_layout -->
 <!-- pause -->
@@ -123,22 +145,27 @@ I am enjoying this.
 
 The End
 ===
+<!-- font_size: 2 -->
 <!-- pause -->
 <!-- alignment: center -->
 <!-- speaker_note: and... another -->
 <!-- end_slide -->
 
-A few months later
+The Spiral Continues
 ===
-![image:width:60%](assets/IMG_3926.jpeg)
+<!-- font_size: 2 -->
+![image:width:60%](assets/a-few-months-later.png)
 <!-- alignment: center -->
-RIP my wallet. Change the pic to the whole collection too
 <!-- pause -->
+![image:width:30%](assets/ohno.png)
+
 <!-- speaker_note: Fast forward a few months, and things have dengenerated, I have this giant pile of devices, I've upgraded / repaired a lot of them, some are just hunks of junk because of activation lock. -->
 <!-- end_slide -->
 
 The Ingredients
 ===
+<!-- font_size: 2 -->
+<!-- speaker_note: this is where the germ of rusty spaghetti starts to take shape -->
 <!-- alignment: center -->
 <!-- pause -->
 Accumulated a lot of devices
@@ -146,123 +173,184 @@ Accumulated a lot of devices
 <!-- speaker_note: nothing much to cover in the way of upgrading Zunes other than they can't read greater than 120GB if I remember right, and you can only use a few select SSD type ZIF Drives, iPod Classics and Zunes share similar batteries though! -->
 iPods, Zunes, GoGears
 <!-- pause -->
-Upgrades, Repairs, and Lost Causes
+Upgrades, repairs, lack of parts
 <!-- speaker_note: as far as I can tell, you cannot purchase the screen to repair a Philips GoGear 30GB -->
 <!-- pause -->
-Obnoxious compatibility, make this a word art PNG
+Managing these in one app is
+![image:width:60%](assets/obnoxious.png)
 
 <!-- end_slide -->
-I. The problem
+Constraints
 ===
+<!-- font_size: 2 -->
 
 <!-- speaker_note: I have a fun set of constraints, also I may have missed an app in the ecosystem that would have made this easier but I was already thinking about the recipe, in my dreams --> 
-
-Constraints: 
 <!-- alignment: left -->
 <!-- pause -->
-- Windows has the best compatibility
+Windows has the best compatibility
 <!-- pause -->
   - I don't use it  
-- macos has ipod support
-  - Apple Music is subpar for iPods lately
-  - no Zune support
 <!-- pause -->
-- Rockbox is a good alternative and works on Linux
-  - my exp was tricky
-- Other bizarre alternatives:
+macos is iPod support
 <!-- pause -->
-  - buy an old mac and upgrade the SSD and manually manage music on it
+  - Apple Music has no Zune support
 <!-- pause -->
-  - VM (it's just not as fun, Mom!)
-  - Learning the naming algorithm and manually adding songs yourself TODO check if this is actually something you can do
+  - funky behavior on newer OS versions
+<!-- pause -->
+Rockbox is pretty good
+<!-- pause -->
+  - USB session timeouts when moving tracks
+<!-- pause -->
+  - also no Zune support
+<!-- pause -->
+Alternatives:
+<!-- pause -->
+  - gtkpod, but no Zune support
+<!-- pause -->
+  - buy an older mac, bootcamp windows
+<!-- pause -->
+  - VM
+<!-- pause -->
+  - Build a cross OS compatible terminal based music player entirely in rust while selling my soul to anthropic while some bangin tunes play
 <!-- pause -->
 
-Goals: 
-- macos and Linux compatible application
-- TUI because I'm cracked out on LLM heroine and saw a coworker build a terminal app and I wanted the cyberpunk aesthetic
-- Rust native
-<!-- pause -->
-  - this will change later
-
+And no snakes. 
 <!-- pause -->
 ![image:width:20%](assets/evil-snake.gif)
-
+<!-- speaker_note: you can probably figure out where the rest of this is going now -->
 <!-- end_slide -->
 
 
-Disclaimer: 
+Preamble: 
 ===
+<!-- font_size: 2 -->
 <!-- alignment: center -->
 <!-- pause -->
-I cobbled this together from commit logs because I was an Enter pressing machine and just focused on QA. 
-
+- It's vibes all the way down
+<!-- speaker_note: latish 2025 I think is when I started using LLMs wholesale at work and around March when I started working on this, I had a  -->
+<!-- speaker_note: I cobbled the info together from memory/clauding about in the repo so I might get something wrong about a tech used or its function -->
 <!-- pause -->
-This was earlier(?) on when I started using LLMs for coding, and I was exercising how much I could let go and how much I could get done.
-- I'm still really lazy sob emoji
-
+<!-- speaker_note: I'm going to talk about how great using Claude for this is, but I'm a little fatigued at the pace and I sorta feel my identity as an engineer getting degraded sorta -->
+- Complicated feelings about LLMs now than back then
+<!-- pause -->
+<!-- speaker_note: I've never worked on a music app before, I leaned on claude to give me choices on how to proceed, at some point I stopped reading a lot of the prose it was writing -->
+- I made lots of goofy decisions
+<!-- pause -->
+- If done again, I'd pay more attention
+<!-- speaker_note: This talk is more about the bizarre speed at which I could iterate on something while getting inspired to try more as I went, because of Claude -->
 <!-- end_slide -->
 
 MVP
 ===
-
+<!-- font_size: 2 -->
+<!-- speaker_note: An overview of the MVP plus what we'll dig into -->
+<!-- pause -->
 <!-- alignment: center -->
-- Export the Library.xml from Apple music
+<!-- speaker_note: this comes from Apple Music, I think it's a leftover option from the iTunes era, I don't actually know too much about what it's used for outside of this -->
+- macos only to start
+- Export and parse Library.xml
 <!-- pause -->
-- rust parser!
-- implement the album / artist view
-
-
-From here we need to start digging into the phases of the work that was done so the git history aligns with it. 
-
-- Initial implementation
-- Transition away from aft-mtp-cli and IOKit
-- TODO fill this out with what was made first
+- display album/artist/tracks, handle playback, search
+<!-- pause -->
+- CLI for ease of iterating with Claude
+<!-- pause -->
+<!-- speaker_note: I wanted to throw claude at this problem and see if it could put together something, at the time I was picking up and upgrading zunes -->
+- manage media on Zunes
+<!-- pause -->
+- Themes!
 
 <!-- pause -->
+Kit:
+<!-- column_layout: [5, 5] -->
+<!-- column: 0 -->
+<!-- pause -->
+Patrician Crates 📦
+* `ratatui` - TUI
+<!-- speaker_note: basically you don't have to press enter, keypresses turn into events -->
+* `crossterm` - interactive TUI
+* `rodio` - playback 
+<!-- speaker_note: Why this split? I tried to do the whole USB stack in Rust with rusb. Finding the Zune worked. The MTPZ handshake did not — Mac libusb fails every time you send data TO the device (the certificate), error 0x2002. android-file-transfer already talked IOKit on Darwin and the handshake worked. So the tradeoff became rusb for detection, aft-mtp-cli So I shipped rusb to detect, shell out to aft-mtp-cli for everything real. IOKit FFI in-process is the later zune-mtp chapter. Linux wasn't in the MVP. -->
+* `rusb` — USB ops
+* `quick-xml` - XML parsing
+* `percent-encoding` - 
+<!-- column: 1 -->
+Plebian Libs 📚:
+<!-- speaker_note: aft-mtp-cli is C++ and not rust, but I didn't think it made sense to try to build everything from scratch I wanted it to work first before trying to port libraries over -->
+<!-- speaker_note: there's a whole sidequest hiding in here around modifying zune firmware versions I'm not going to get into for time -->
+<!-- speaker_note: aft-mtp-cli has its own handshake TrustedApp::Create(session, ~/.mtpz-data), so it works out of the box -->
+- `aft-mtp-cli` - C++ library rust shells out to -> MTP & MTPZ handshake
+- `ffmpeg` - transcode to MP3 + 200×200 art
+<!-- speaker_note: I guess rusb is cheating a little bit but that's okay it's an MVP -->
+- `libusb` - what rusb uses under the hood
+<!-- reset_layout -->
+<!-- pause -->
+<!-- speaker_note: I wasn't doing anything special here outside of heavily leveraging plan mode. -->
+Claude will do it all.
 
-* [`rodio`](https://crates.io/crates/rodio) — local playback
-* [`ratatui`](https://crates.io/crates/ratatui) — the entire TUI
-* [`rusb`](https://crates.io/crates/rusb) — USB device detection
-* [`lofty`](https://crates.io/crates/lofty) — tag reading across every format I care about
-* [`symphonia`](https://crates.io/crates/symphonia) + [`mp3lame-encoder`](https://crates.io/crates/mp3lame-encoder) — pure-Rust decode/transcode, no ffmpeg required for audio
-* [`discid`](https://crates.io/crates/discid) — CD table-of-contents reads, LGPL, dynamically linked
+![image:width:40%](assets/do-it-all.gif)
 
 <!-- end_slide -->
 
-Yay Themes
+The Spaghetti Factory Opens
 ===
-
 <!-- alignment: center -->
-- I wanted to emulate winamp with crazy themes
-- find winamp picture 
+<!-- font_size: 2 -->
 <!-- pause -->
-- it's a TUI though so only color and ASCII visuals 
+- Prompt for plan (sometimes do research before) -> review plan -> implement:
+- Prompt for plan and do research -> review research -> discuss -> implement:
+  - -> test -> feedback -> retest ->
+
 <!-- pause -->
-- add a video here of the TUI themes being toggled while a song is playing
+Warp Speed:
+
+<!-- speaker_note: Left column is v0.5.0 — the TUI binary, search, themes, Zune sync. Playback is not in that cut. Right column is when rodio / Now Playing land, which is what the kit slide claims. -->
+<!-- column_layout: [5, 5] -->
+<!-- column: 0 -->
+<!-- pause -->
+Mar 20–21:
+* 8 commits
+* 8,074 lines of Rust
+* 4,155 is the TUI
+* 11 themes, `/` search
+* no `rodio`
+* ffmpeg + `aft-mtp-cli`
+<!-- column: 1 -->
+<!-- pause -->
+<!-- speaker_note: By this commit zune-mtp is already in Cargo.toml (~2.6k lines, Mar 26). The kit slide still lists aft-mtp-cli as the MTP path — that's the story of the MVP, not the tree at playback. -->
++ Now Playing · Mar 27
+* 8 days from commit 1
+* 10,489 lines of Rust
+* 5,621 TUI
+* +2,477 for playback
+* `rodio`
+* `zune-mtp` - rust port of aft-mtp-cli
+<!-- reset_layout -->
+<!-- pause -->
+aft-mtp-cli adds: 
+- caching so we don't walk the zune library on every plugin (more songs -> more time)
+
+CLean up these adds;
+- Disk library cache — the big one. Cold zune-init walked the whole artist/album graph and took minutes. You added SaveCache / TryLoadFromCache (AFT-LIBRARY-CACHE-V1) at ~/.aft-library-cache, keyed by device serial. Second connect: load the file, skip the walk. After import, AutoSave kept it fresh.
+
+zune-refresh — delete that cache and rebuild from the device. Upstream zune-init is just new Library(session) every time, no cache, no refresh command.
+
+track-id: on stdout — after a successful import, print track-id:<mtp handle> so Rust can parse a stable object ID. Upstream ZuneImport returns silently.
+
+create-playlist <name> <comma-separated-ids> — build an AbstractAVPlaylist from the IDs zune-import just printed. Not in upstream CLI.
+
+<!-- pause -->
 
 <!-- end_slide -->
 
-Album Art
+zune-mtp
 ===
-
-<!-- alignment: center -->
-- TODO add screenshot of the album art
-<!-- pause -->
-It looks terribly vintage.
-<!-- pause -->
-Why not render them using [``](https://crates.io/crates/)
-<!-- pause -->
-I don't want to.
-<!-- end_slide -->
-
-Zune Support
-===
+<!-- font_size: 2 -->
 <!-- alignment: center -->
 <!-- pause -->
-What does it take to make a Zune talk to other OSes?
+<!-- speaker_note: libmtp-zune is a fork of libmtp -->
+Built referencing aft-mtp-cli and the libmtp-zune
 <!-- pause -->
-Doesn't use plain MTP (Media Transfer Protocol). It speaks **MTPZ** — Microsoft's
-encrypted variant
+BYOCredentials - mtpz data needed for zune sync
 <!-- pause -->
 A reverse engineered library written in C does this though [`libmtp-zune`](https://github.com/kbhomes/libmtp-zune)
 <!-- pause -->
@@ -271,13 +359,33 @@ C!? We can't be having that here. Sorry Dennis Richie :'(
 Port it to Rust!
 <!-- pause -->
 `zune-mtp` ports that protocol knowledge — RSA-1024 signing, a
-PSS-like certificate exchange, AES-128-CBC, CMAC key extraction — into
-a native IOKit transport, bypassing libusb entirely because libusb
+PSS-like certificate exchange, AES-128-CBC, CMAC key extraction — into a native IOKit transport, bypassing libusb entirely because libusb
 can't do the data-out operations the handshake needs.
+<!-- end_slide -->
+
+The End cont.
+===
+<!-- font_size: 2 -->
+
+<!-- alignment: center -->
+
+<!-- pause -->
+We did it! We're done!
+
+<!-- pause -->
+Talks to a zune, apple music can handle iPods.
+
+<!-- pause -->
+Not quite..
+
+<!-- pause -->
+C++, stdin/out reads, C libraries
+
 <!-- end_slide -->
 
 Claude build me a hammer
 ===
+<!-- font_size: 2 -->
 
 <!-- alignment: center -->
 
@@ -294,6 +402,7 @@ read the result, delete or keep if it works.
 
 Everything IS a nail when you have a Claude Hammer
 ===
+<!-- font_size: 2 -->
 
 <!-- alignment: center -->
 
@@ -307,43 +416,27 @@ Everything IS a nail when you have a Claude Hammer
 
 iPod
 ===
-
+<!-- font_size: 2 -->
 <!-- alignment: center -->
 <!-- pause -->
 Much easier than the Zune
 <!-- pause -->
 - No handshake, mounts as a USB storage device
 <!-- pause --> 
-- Real challenge: match the iTunesDB
+- Real challenge: parse and write back the iTunesDB
 <!-- pause -->
-- similar to Zune, libgpod has already done this
+<!-- speaker_note: fortunately gtkpod did this already and allows us to access -->
+- libgpod -> split from gtkpod, written in C
 <!-- pause -->
-- time to port
-- gif of hitting something over and over and over
 
 <!-- speaker_note: I remember around this time I was brute force checking it over and over and over, very bad habit I probably wasted a lot of time here -->
 <!-- pause -->
 ipod-db does this
 <!-- end_slide -->
 
-The End cont.
+Reject spaghett; return to Rust
 ===
-
-<!-- alignment: center -->
-
-<!-- pause -->
-We did it! We're done!
-
-<!-- pause -->
-Talks to Zune, talks to iPods.
-
-<!-- pause -->
-False.
-
-<!-- end_slide -->
-
-Reject froot; return to Rust
-===
+<!-- font_size: 2 -->
 
 <!-- alignment: center -->
 
@@ -351,16 +444,30 @@ Reject froot; return to Rust
 Library.xml has outlived it's usefulness.
 
 <!-- pause -->
-
 Replaced! We read the directory and build a cache. Updates as new files are added.
+
+We swap (most of) ffmpeg for:
+<!-- speaker_note: great for a library of mixed files -->
+* `symphonia` - audio decoder
+<!-- speaker_note: Zune only supports WMA, AAC, and MP3, so we need to transcode the file if it's incompatible -->
+* `mp3lame-encoder` - JIT transcoding audio files
+<!-- pause -->
+* `lofty` - adds metadata parser and writer
+<!-- speaker_note: lofty works across files my files -->
+
+* `discid` — CD table-of-contents reads, LGPL, dynamically linked
 
 <!-- end_slide -->
 
-What if someone looks?
+Time to refactor
 ===
+<!-- font_size: 2 -->
 
 <!-- alignment: center -->
 
+<!-- pause -->
+<!-- speaker_note: now that it works I better refactor this because I'd hate to have to answer for claude slop -->
+<!-- speaker_note: by the time we get to this point we've got a 10k line god file for the UI -->
 The unglamorous, load-bearing refactor work:
 
 `app.rs` and `native.rs` had both grown into the kind of file where
@@ -374,25 +481,9 @@ their head again.
 
 <!-- end_slide -->
 
-2. Security?
-===
-
-<!-- alignment: center -->
-
-Not a pentest — the boring kind of security: `unwrap()` calls that
-would panic the whole TUI on a malformed USB response, `String` errors
-that made every failure mode a guessing game.
-
-<!-- pause -->
-
-Typed `MtpError`/`DeviceError` enums, `unwrap()` swept out of the hot
-paths, CI wired up with dependency + security scanning so this doesn't
-regress quietly.
-
-<!-- end_slide -->
-
 Using TDD correctly
 ===
+<!-- font_size: 2 -->
 
 <!-- alignment: center -->
 
@@ -408,40 +499,23 @@ makes it pass.
 
 <!-- end_slide -->
 
-Snake Time
+Stems
 ===
-
-<!-- alignment: center -->
-
-Using Python. Because I have to.
-
-<!-- pause -->
-
-Section II said "entirely Rust." Section VII is about to spend its whole
-budget on stem separation, and the state of the art for that lives in
-PyTorch. Purity lost to pragmatism, and I'm at peace with it.
-
-<!-- end_slide -->
-
-A. Stems
-===
+<!-- font_size: 2 -->
 
 <!-- alignment: center -->
 
 Press `M` on a playing track, get it split into live-toggleable
-vocals/drums/bass/etc. Because why *wouldn't* a music sync tool also do
-real-time source separation.
+vocals/drums/bass/etc.
 
-<!-- end_slide -->
+Feature drift no feature dream!
 
-1. uv
-===
+<!-- font_size: 2 -->
 
 <!-- alignment: center -->
-
-Stem separation needs real Python dependencies — PyTorch, model
-checkpoints, gigabytes of it.
-
+<!-- pause -->
+<!-- speaker_note: I didn't want to bundle this with the install as it'd add gigs for the models and the AI part should be opt in -->
+- uv - bundles up pytorch & model, and checkpoints for separate install
 <!-- pause -->
 
 Nothing installs at startup or during a library scan. First press of
@@ -453,6 +527,7 @@ you say yes.
 
 2. A multi-pass architecture
 ===
+<!-- font_size: 2 -->
 
 <!-- alignment: center -->
 
@@ -465,83 +540,50 @@ The `hq-harmony` recipe cascades a Mel-Roformer karaoke model over the
 already-isolated vocal stem — seven stems out, lead and backing split
 cleanly, each pass's intermediate output feeding the next.
 
+<!-- pause -->
+
+We have Rock Band harmony vocals at home now.
+
 <!-- end_slide -->
 
-3. Nvidia drivers, thanks Linux
+It's Really a thing I promise
+=== 
+<!-- speaker_note: Ctrl+E hands the terminal to zytunes-tui. q in the TUI returns to the deck. -->
+<!-- pause -->
+```bash +exec +acquire_terminal
+/// if ! command -v zytunes-tui >/dev/null 2>&1; then
+///   exec "$(git rev-parse --show-toplevel)/target/release/zytunes-tui"
+/// fi
+zytunes-tui
+```
+<!-- snippet: >
+
+<!-- end_slide -->
+
+In The End
 ===
+<!-- font_size: 2 -->
 
 <!-- alignment: center -->
-
-Roformer inference on CPU is *markedly* slower than demucs. You really
-want a GPU for the high-quality recipes.
+<!-- pause -->
+<!-- speaker_note: I got to focus a lot on tradeoffs and choices instead of getting bogged down into learning a single library -->
+Since LLM's did all the heavy lifting I spent more time considering the system itself, and even with odd decisions made earlier, it was very easy to pivot. 
+<!-- speaker_note:  -->
+<!-- pause -->
+I learned so much more when I had to make this talk, I hope y'all did too.
 
 <!-- pause -->
 
-So naturally, the next few evenings went to Linux's favorite pastime:
-fighting Nvidia drivers until CUDA agreed to exist.
-
-<!-- pause -->
-
-It works now. `[stems] gpu = true` in the config, and I no longer think
-about it — which is the only metric that matters for a hobby project.
+TDD is clutch.
 
 <!-- end_slide -->
 
-B. What's still in the store
+Thank you
 ===
-
-<!-- alignment: center -->
-
-The candy store doesn't have a bottom. Next up:
-
-<!-- pause -->
-
-* **A streaming client** — point zytunes at the library over the network
-  instead of only local sync
-* **A mobile app** — on-device stem breakdown, so the split doesn't need
-  a laptop in the loop at all
-
-<!-- pause -->
-
-Neither exists yet. Both are why "done" was never really the word.
-
-<!-- end_slide -->
-
-VIII. What have we learned?
-===
+<!-- font_size: 2 -->
 
 <!-- alignment: center -->
 
 <!-- pause -->
-
-AI allows me to borrow the power of Demons and summon back from the dead these old devices. 
-
+`github.com/Danondso/zytunes-suite`
 <!-- pause -->
-
-Rust can absolutely live next to decades of reverse-engineered C
-knowledge — you just have to be willing to port the *understanding*,
-not the code.
-
-<!-- pause -->
-
-An LLM didn't replace the USB traces or the nights of "why does this
-one JPEG hang the pipe" — it replaced the eight other things that
-would've made me give up before getting to them.
-
-<!-- pause -->
-
-And the refactor only worked because there were tests to
-catch what broke. Three months of vibe coding still needs a seatbelt.
-
-<!-- end_slide -->
-
-zytunes
-===
-
-<!-- alignment: center -->
-
-`github.com/Danondso/zytunes`
-
-<!-- pause -->
-
-Thanks, all!

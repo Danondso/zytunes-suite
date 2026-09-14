@@ -73,14 +73,33 @@ toml_quote() {
     printf '"%s"' "$s"
 }
 
+# Absolute path even if the target does not exist yet (the wizard mkdir -p's
+# afterwards). GNU realpath -m does this in one shot; BSD realpath (macOS)
+# has no -m and treats unknown flags as fatal.
 expand_path() {
     local p="$1"
     p="${p/#\~/$HOME}"
-    if command -v realpath >/dev/null 2>&1; then
+
+    if command -v realpath >/dev/null 2>&1 && realpath -m / >/dev/null 2>&1; then
         realpath -m "$p"
-    else
-        printf '%s\n' "$p"
+        return
     fi
+
+    case "$p" in
+        /*) ;;
+        *) p="${PWD}/${p}" ;;
+    esac
+    while [ "$p" != "/" ] && [ "${p%/}" != "$p" ]; do
+        p="${p%/}"
+    done
+
+    local prefix="$p" suffix=""
+    while [ ! -d "$prefix" ] && [ "$prefix" != "/" ]; do
+        suffix="/$(basename "$prefix")${suffix}"
+        prefix=$(dirname "$prefix")
+    done
+    prefix=$(CDPATH= cd -P -- "$prefix" && pwd)
+    printf '%s%s\n' "$prefix" "$suffix"
 }
 
 # XDG user dir when the helper exists and returns a real folder (not $HOME).
