@@ -13,6 +13,16 @@ pub enum DeviceFamily {
     Ipod,
 }
 
+impl DeviceFamily {
+    /// Short label for UI copy ("Zune" / "iPod").
+    pub fn label(self) -> &'static str {
+        match self {
+            DeviceFamily::Zune => "Zune",
+            DeviceFamily::Ipod => "iPod",
+        }
+    }
+}
+
 /// Capabilities of a specific device family, used to drive format decisions,
 /// transcoding, and path layout without hardcoding Zune assumptions.
 #[derive(Clone)]
@@ -53,4 +63,15 @@ pub trait DeviceBackend: Send {
         detected: &DetectedDevice,
         log: Option<std::sync::mpsc::Sender<String>>,
     ) -> Result<Box<dyn DeviceSession + Send>, String>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DeviceFamily;
+
+    #[test]
+    fn family_label() {
+        assert_eq!(DeviceFamily::Zune.label(), "Zune");
+        assert_eq!(DeviceFamily::Ipod.label(), "iPod");
+    }
 }
