@@ -4370,7 +4370,7 @@ dependencies = [
 
 [[package]]
 name = "zytunes"
-version = "2.2.0-alpha"
+version = "3.0.0-alpha"
 dependencies = [
  "arboard",
  "base64",
