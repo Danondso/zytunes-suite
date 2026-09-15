@@ -129,8 +129,7 @@ impl ZuneDevice {
 
         if microsoft_devices.is_empty() {
             Err(ZuneDetectError::NotFound {
-                hint: "No Microsoft USB devices found. Is the Zune connected and powered on?"
-                    .to_string(),
+                hint: "No devices detected".to_string(),
             })
         } else {
             let details: Vec<String> = microsoft_devices

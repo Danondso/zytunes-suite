@@ -192,6 +192,15 @@ pub trait DeviceSession {
             "Playlist sync not supported on this device".into(),
         ))
     }
+    /// Release the session when the user disconnects.
+    ///
+    /// MTP backends can no-op: dropping the session already closes the USB
+    /// pipes. Mass-storage backends should not unmount here — `c` has to be
+    /// able to reconnect without a replug, which requires the volume to stay
+    /// mounted.
+    fn close(&mut self) -> Result<(), DeviceError> {
+        Ok(())
+    }
 }
 
 /// Result of a successful `import_playlist` call. The TUI surfaces the

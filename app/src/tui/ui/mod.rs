@@ -549,8 +549,11 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
     let browse_prefix = match app.browse_mode {
         BrowseMode::Library | BrowseMode::Playlists => "",
         BrowseMode::Device => match app.device.family {
-            Some(zytunes::device::DeviceFamily::Ipod) => "iPod: ",
-            _ => "Zune: ",
+            Some(family) => match family {
+                zytunes::device::DeviceFamily::Ipod => "iPod: ",
+                zytunes::device::DeviceFamily::Zune => "Zune: ",
+            },
+            None => "",
         },
     };
 
@@ -1373,7 +1376,12 @@ fn draw_device_info(f: &mut Frame, app: &App, area: Rect) {
         DeviceStatus::Disconnected => " Device [c] ".to_string(),
         DeviceStatus::Detecting | DeviceStatus::Connecting => " Device ".to_string(),
         DeviceStatus::Connected => {
-            let name = app.device.name.as_deref().unwrap_or("Zune");
+            let name = app
+                .device
+                .name
+                .as_deref()
+                .or_else(|| app.device.family.map(|f| f.label()))
+                .unwrap_or("Device");
             format!(" {} ", name)
         }
     };
@@ -1412,7 +1420,7 @@ fn draw_device_info(f: &mut Frame, app: &App, area: Rect) {
                 .connection_anim_start
                 .map(|start| app.anim_frame.wrapping_sub(start))
                 .unwrap_or(0);
-            let (screen1, screen2) = anim::connection_screen_lines(conn_frame);
+            let (screen1, screen2) = anim::connection_screen_lines(conn_frame, app.device.family);
             let zune_art = build_zune_art(screen1, screen2);
             let pulse = anim::animated_accent(
                 t.accent_color(),
@@ -1854,7 +1862,11 @@ fn draw_keys_panel(f: &mut Frame, app: &App, area: Rect) {
     let (section, keys): (&str, Vec<(&str, &str)>) = match app.active_panel {
         Panel::Library => (
             if is_device_mode {
-                " Zune Library"
+                match app.device.family {
+                    Some(zytunes::device::DeviceFamily::Ipod) => " iPod Library",
+                    Some(zytunes::device::DeviceFamily::Zune) => " Zune Library",
+                    None => " Device Library",
+                }
             } else {
                 " Library"
             },
@@ -2742,7 +2754,7 @@ fn draw_help_overlay(f: &mut Frame, app: &App) {
         "  G           Generate playlist seeded by selected artist/album",
         "",
         "  Device",
-        "  c           Connect to Zune",
+        "  c           Connect to device",
         "  r           Refresh device tracks",
         "  X           Clear playback cache",
         "  Esc         Close / cancel",
