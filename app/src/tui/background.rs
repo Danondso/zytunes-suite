@@ -699,28 +699,20 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                         Box<dyn DeviceBackend>,
                         zytunes::device::DetectedDevice,
                     )> = None;
-                    let mut last_err = String::from("No devices found");
 
                     for backend in backends {
-                        match backend.detect() {
-                            Ok(d) => {
-                                detected_result = Some((backend, d));
-                                break;
-                            }
-                            Err(e) => {
-                                last_err = e;
-                            }
+                        if let Ok(d) = backend.detect() {
+                            detected_result = Some((backend, d));
+                            break;
                         }
                     }
 
                     let (backend, detected) = match detected_result {
                         Some(pair) => pair,
                         None => {
-                            let _ = event_tx.send(BgEvent::SyncMessage(format!(
-                                "Device not found: {}",
-                                last_err
-                            )));
-                            let _ = event_tx.send(BgEvent::SessionFailed(last_err));
+                            let msg = "No devices detected";
+                            let _ = event_tx.send(BgEvent::SyncMessage(msg.into()));
+                            let _ = event_tx.send(BgEvent::SessionFailed(msg.into()));
                             continue;
                         }
                     };
@@ -940,8 +932,14 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                     }
                 }
                 BgCommand::Disconnect => {
+                    if let Some(mut s) = session.take() {
+                        if let Err(e) = s.close() {
+                            let _ =
+                                event_tx.send(BgEvent::SyncMessage(format!("Session close: {e}")));
+                        }
+                    }
                     let _ = event_tx.send(BgEvent::SyncMessage("Disconnected".into()));
-                    session = None;
+                    caps = None;
                 }
                 BgCommand::CancelSync => {
                     // Handled inline during sync execution via try_recv.

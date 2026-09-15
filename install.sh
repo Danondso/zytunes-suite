@@ -88,28 +88,17 @@ expand_path() {
         /*) ;;
         *) p="${PWD}/${p}" ;;
     esac
-
-    # Walk up to the longest prefix that exists, canonicalize that, then
-    # append the missing tail.
-    local prefix="$p" tail="" base
-    while [ -n "$prefix" ] && [ "$prefix" != "/" ] && [ ! -e "$prefix" ]; do
-        base=$(basename "$prefix")
-        prefix=$(dirname "$prefix")
-        if [ -n "$tail" ]; then
-            tail="${base}/${tail}"
-        else
-            tail="$base"
-        fi
+    while [ "$p" != "/" ] && [ "${p%/}" != "$p" ]; do
+        p="${p%/}"
     done
 
-    if [ -e "$prefix" ] && command -v realpath >/dev/null 2>&1; then
-        prefix=$(realpath -q "$prefix")
-    fi
-    if [ -n "$tail" ]; then
-        printf '%s/%s\n' "$prefix" "$tail"
-    else
-        printf '%s\n' "$prefix"
-    fi
+    local prefix="$p" suffix=""
+    while [ ! -d "$prefix" ] && [ "$prefix" != "/" ]; do
+        suffix="/$(basename "$prefix")${suffix}"
+        prefix=$(dirname "$prefix")
+    done
+    prefix=$(CDPATH= cd -P -- "$prefix" && pwd)
+    printf '%s%s\n' "$prefix" "$suffix"
 }
 
 # XDG user dir when the helper exists and returns a real folder (not $HOME).

@@ -580,6 +580,11 @@ pub struct DeviceState {
     pub acquired_items: u32,
     /// Sync progress status string from MTP vendor op 0x922f.
     pub sync_status: Option<String>,
+    /// Set by `d` so a still-running Connect (iPod iTunesDB walks can take
+    /// tens of seconds after `SessionReady`) cannot resurrect the UI with
+    /// a late `DeviceTracksLoaded` / `SessionReady`. Cleared when the user
+    /// presses `c`.
+    pub ignore_session_events: bool,
 }
 
 impl DeviceState {
@@ -606,6 +611,7 @@ impl DeviceState {
             artist_track_names: BTreeMap::new(),
             acquired_items: 0,
             sync_status: None,
+            ignore_session_events: false,
         }
     }
 
@@ -7636,6 +7642,7 @@ mod tests {
             artist_track_names: device.artist_track_names.clone(),
             acquired_items: 0,
             sync_status: None,
+            ignore_session_events: false,
         }
     }
 
@@ -7764,6 +7771,65 @@ mod tests {
             matches!(cmd_rx.try_recv(), Ok(BgCommand::Disconnect)),
             "worker must be told to drop the session"
         );
+        assert!(
+            app.device.ignore_session_events,
+            "late SessionReady/DeviceTracksLoaded must not resurrect the UI"
+        );
+    }
+
+    #[test]
+    fn d_on_ipod_ignores_late_session_events() {
+        use crate::audio::AudioCommand;
+        use crate::background::{BgCommand, BgEvent, DeviceInfo, StorageInfo};
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<BgCommand>();
+        let (audio_tx, _audio_rx) = std::sync::mpsc::channel::<AudioCommand>();
+        let mut app = App::new();
+        app.device.status = DeviceStatus::Connected;
+        app.device.family = Some(zytunes::device::DeviceFamily::Ipod);
+        app.device.name = Some("iPod".into());
+
+        app.handle_key(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('d'),
+                crossterm::event::KeyModifiers::empty(),
+            ),
+            &cmd_tx,
+            &audio_tx,
+        );
+
+        assert_eq!(app.device.status, DeviceStatus::Disconnected);
+        assert!(
+            matches!(cmd_rx.try_recv(), Ok(BgCommand::Disconnect)),
+            "worker must close the iPod session"
+        );
+        assert_eq!(
+            app.toast_message.as_ref().map(|(m, _, _)| m.as_str()),
+            Some("Disconnected")
+        );
+
+        // A still-running Connect (iTunesDB walk) must not flip us back.
+        app.handle_bg_event(BgEvent::DeviceDetected(DeviceInfo {
+            name: "iPod".into(),
+            firmware_version: None,
+            serial_number: None,
+            usb_mode: None,
+            manufacturer: None,
+            model: None,
+            family: zytunes::device::DeviceFamily::Ipod,
+        }));
+        app.handle_bg_event(BgEvent::SessionReady(Some(StorageInfo {
+            used_bytes: 1,
+            free_bytes: 1,
+            total_bytes: 2,
+            used_percent: 50,
+        })));
+        app.handle_bg_event(BgEvent::DeviceTracksLoaded(vec![make_device_entry(
+            "Artist/Album/song.mp3",
+            1,
+        )]));
+        assert_eq!(app.device.status, DeviceStatus::Disconnected);
+        assert!(app.device.name.is_none());
+        assert!(app.device.tracks.is_empty());
     }
 
     #[test]
