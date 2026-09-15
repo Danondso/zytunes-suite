@@ -366,7 +366,7 @@ zune-mtp
 <!-- alignment: center -->
 <!-- pause -->
 <!-- speaker_note: libmtp-zune is a fork of libmtp which adds zune support, it's where the mtpz data file came from -->
-Port `aft-mtp-cli` to rust using it and `libmtp-zune` as references
+Rust port using `aft-mtp-cli` and `libmtp-zune` as references
 <!-- pause -->
 `libmtp-zune` - written in C, based on `libmtp`
 <!-- pause -->
@@ -398,6 +398,7 @@ We did it! We're done!
 <!-- pause -->
 Talks to a Zune. Apple Music can handle iPods.
 
+<!-- speaker_note: You might be wondering where the slide on linux support is, I recall it took maybe an hour of testing to see what was broken, and for the sake of narrative and time I'm glossing over it, and lots of other stuff -->
 <!-- pause -->
 (behind the scenes) Linux is working!
 
@@ -406,14 +407,14 @@ Well, almost..
 
 <!-- pause -->
 <!-- speaker_note: aft-mtp-cli is gone — no more stdin/stdout REPL. zune-mtp talks IOKit in-process. What's still C, ffmpeg for transcode (until Apr 3), libusb behind rusb for USB detect. iPods are still Apple Music — that's the next slide. -->
- `ffmpeg` — C subprocess for transcoding
 <!-- speaker_note: can't really get away from this one -->
-`libusb` — `rusb` for device detection
+`ffmpeg` and `libusb` are still here
 <!-- pause -->
 no iPod support
 
-locked into Library.xml exports
-<!-- speaker_note: You might be wondering where the slide on linux support is, I recall it took maybe an hour of testing to see what was broken, and for the sake of narrative and time I'm glossing over it, and lots of other stuff -->
+locked into Library.xml
+<!-- pause -->
+Cruft!
 
 <!-- end_slide -->
 
@@ -431,12 +432,13 @@ Spaghett:
 <!-- speaker_note: I'm pretty locked into what Apple Music is doing in order for Zytunes to work -->
 - Ripping CDs in Apple Music
 - `Automatically Add to Music` folder
+- The barest of standards applied
 <!-- pause -->
 
 <!-- column: 1 -->
 Rusty Spaghett:
 <!-- pause -->
-- Add music directory traversal and cache building (in JSON), updates on app start
+- Add directory traversal and cache building (in JSON), updates on app start
 <!-- pause -->
 (Most of) `ffmpeg` swapped for:
 <!-- speaker_note: great for a library of mixed files -->
@@ -444,22 +446,38 @@ Rusty Spaghett:
 <!-- speaker_note: Zune only supports WMA, AAC, and MP3, so we need to transcode the file if it's incompatible -->
 - `mp3lame-encoder` - JIT transcoding audio files
 <!-- pause -->
+Also:
 - `lofty` - adds metadata parser and writer
 <!-- speaker_note: lofty works across files my files -->
-- `discid` — CD reads
-
+- `discid` — CD id reads via `libdiscid` (similar to `rusb`)
+<!-- pause -->
+And:
+- TDD
+- refactors
 <!-- reset_layout -->
 <!-- alignment: center -->
-Feature Factory!
 <!-- pause -->
-- music brainz client for tagging
-- acoustid fingerprinting
-
+Feature (Re)Factory!
+<!-- pause -->
+- use tdd during refactors to understand what breaks
+<!-- pause -->
+- parallelize directory reads
+<!-- pause -->
+- music brainz client for metadata
+<!-- pause -->
+- ASCII & half-block album art
+<!-- pause -->
+- more themes + visualizers
+- playcount aggregation from device
+<!-- pause -->
+- compact disc ripping via `ffmpeg`
+- `ipod-db` crate
 <!-- end_slide -->
 
 ipod-db
 ===
 <!-- font_size: 2 -->
+TODO from here on and then you're done!
 
 <!-- alignment: center -->
 Apr 7th - 16th
@@ -473,52 +491,26 @@ Much easier than the Zune
 <!-- speaker_note: fortunately gtkpod did this already and allows us to access an iPod -->
 - `libgpod` -> split from gtkpod, written in C
 <!-- pause -->
-
 <!-- speaker_note: I remember around this time I was brute force checking it over and over and over, very bad habit I probably wasted a lot of time here, I'd have claude update the DB and I'd report back, it was a slog -->
 <!-- pause -->
 ipod-db does this
-<!-- end_slide -->
-
-
-
-Time to refactor
-===
-<!-- font_size: 2 -->
-
-<!-- alignment: center -->
-
 <!-- pause -->
-<!-- speaker_note: now that it works I better refactor this because I'd hate to have to answer for claude slop -->
-<!-- speaker_note: by the time we get to this point we've got a 10k line god file for the UI -->
-The unglamorous, load-bearing refactor work:
-
-`app.rs` and `native.rs` had both grown into the kind of file where
-"just add one more match arm" stops being a joke.
-
+<!-- alignment: left -->
+How the DB is built:
+<!-- speaker_note: audio files are NOT the library. they live in hashed F00-F49 names. the iPod only plays what iTunesDB says exists. lowercase .mp3/.m4a — FAT doesn't care, firmware does. -->
+- copy audio into `iPod_Control/Music/F00..F49/`
 <!-- pause -->
-
-Split into `tui/app/keys.rs`, `tui/app/events.rs`, decomposed `native.rs`
-into focused pieces — same behavior, files a human can actually hold in
-their head again.
-
-<!-- end_slide -->
-
-Using TDD correctly
-===
-<!-- font_size: 2 -->
-
-<!-- alignment: center -->
-
-The `DeviceSession` trait exists specifically so sync/remove/collect
-logic can be tested against a fake — no hardware required, no flaky
-USB-in-CI nonsense.
-
+<!-- speaker_note: every record is 4-byte ASCII magic, then u32 header_size, u32 total_size, then payload. header_size lets you skip unknown fields so a Video, Mini, and Classic can share a parser. little-endian. strings are UTF-16LE. -->
+- the whole file is nested **chunks** — 4-byte magic + sizes + payload
 <!-- pause -->
-
-Behavior asserted, not mocks — did the right bytes land in the right
-file, not "was `write` called." Failing test first, then the code that
-makes it pass.
-
+<!-- speaker_note: mhbd = database header (db_id, version, hash58). mhsd = one dataset. order is load-bearing 4 albums, 1 tracks, 3 podcasts, 2 playlists, 5 smart playlists. -->
+- `mhbd` wraps `mhsd` datasets: albums, then tracks, then playlists
+<!-- pause -->
+<!-- speaker_note: mhit is one song's numeric row — track id, duration, bitrate, rating, file size, ~624 byte header. it does NOT hold the title. child mhods are typed blobs 1=title, 2=path in F-dirs, 3=album, 4=artist. existing tracks we replay the raw mhit+mhods blob so mystery fields survive new tracks we write from scratch and number from 52. -->
+- one track = one `mhit` (numbers) + child `mhod`s (title, path, artist)
+<!-- pause -->
+<!-- speaker_note: HMAC-SHA1 at mhbd+0x58 keyed by FirewireGuid. wrong hash = empty library, no error. id_0x24 must come from mhbd+0x24, not db_id. -->
+- sign `hash58` or the Classic shows "No Music"
 <!-- end_slide -->
 
 Stems
@@ -526,49 +518,39 @@ Stems
 <!-- font_size: 2 -->
 
 <!-- alignment: center -->
-
-Press `M` on a playing track, get it split into live-toggleable
-vocals/drums/bass/etc.
-
-Feature drift no feature dream!
-
-<!-- font_size: 2 -->
-
+<!-- speaker_note: Before I demo. Press M on a playing track. Nothing about this is in-process Rust inference — we shell out, same as ffmpeg for rip/video. -->
+Python!
+<!-- pause -->
+<!-- speaker_note: I didn't want to bundle this with the install as it'd add gigs for torch + checkpoints. The AI part is opt-in. uv is a Python package manager written in Rust. First M, we ask, then uv tool install into ~/.local/share/zytunes/bin. CPU pin so you don't pull CUDA. -->
+- `uv` installs an **engine** after you say yes — never at startup
+<!-- pause -->
+<!-- alignment: left -->
+<!-- speaker_note: Engine is the CLI. demucs for the default recipe. audio-separator (pinned 0.44.3) for hq — it can run Roformer checkpoints AND htdemucs_6s under one binary. That's why we didn't keep two Python stacks for the fancy recipes. -->
+- **engine** — `demucs` or `audio-separator`, a subprocess
+<!-- pause -->
+<!-- speaker_note: Checkpoints are the weight files, 200 MB to 1 GB each. audio-separator would drop them in /tmp and lose them on reboot, so we pin model_file_dir to ~/.cache/zytunes/models. Pinned names are BS-Roformer ep_317, Mel-Roformer karaoke, htdemucs_6s.yaml. Swap a checkpoint, bump the recipe cache id, old mixes re-separate. -->
+- **checkpoints** — the weight files, cached under `~/.cache/zytunes/models`
+<!-- pause -->
+<!-- speaker_note: A model is what a pass asks the engine to run. htdemucs_6s is six sources in one shot. Every strong Roformer is vocals/instrumental only. -->
+- **model** — which checkpoint a pass actually runs
+<!-- pause -->
+<!-- speaker_note: A recipe is engine plus ordered passes plus stem layout. Demucs is Meta's splitter, one shot, six stems, repo archived. Roformers are newer vocal models, better isolation, only two stems. No Roformer does drums/bass/guitar, so hq cascades. -->
+- **recipe** — which pipeline `[stems] recipe` selects
+<!-- pause -->
+- `demucs` — one pass, six stems
+<!-- pause -->
+<!-- speaker_note: First pass, BS-Roformer on the source gives vocals and instrumental. Second pass, htdemucs_6s on that instrumental gives drums/bass/guitar/piano/other. Same six-stem strip as demucs, better vocals. -->
+- `hq` — Roformer vocals, then demucs on the leftover
+<!-- pause -->
+<!-- speaker_note: Same two passes, then Mel-Roformer karaoke on the isolated vocal gives lead and backing. Seven stems. That's the Rock Band harmony trick. -->
+- `hq-harmony` — that, plus lead + backing (seven stems)
+<!-- pause -->
 <!-- alignment: center -->
-<!-- pause -->
-<!-- speaker_note: I didn't want to bundle this with the install as it'd add gigs for the models and the AI part should be opt in -->
-- uv - bundles up pytorch & model, and checkpoints for separate install
-<!-- pause -->
-
-Nothing installs at startup or during a library scan. First press of
-`M`, zytunes asks, then bootstraps [`uv`](https://github.com/astral-sh/uv)
-and pulls a pinned engine version into a managed location — only after
-you say yes.
-
-<!-- end_slide -->
-
-2. A multi-pass architecture
-===
-<!-- font_size: 2 -->
-
-<!-- alignment: center -->
-
-One pass gets you six stems. Getting **backing vocals** separated from
-the **lead** vocal needs a second, more specialized pass on top of that.
-
-<!-- pause -->
-
-The `hq-harmony` recipe cascades a Mel-Roformer karaoke model over the
-already-isolated vocal stem — seven stems out, lead and backing split
-cleanly, each pass's intermediate output feeding the next.
-
-<!-- pause -->
-
 We have Rock Band harmony vocals at home now.
 
 <!-- end_slide -->
 
-It's Really a thing I promise
+Demo
 === 
 <!-- speaker_note: Ctrl+E hands the terminal to zytunes-tui. q in the TUI returns to the deck. -->
 <!-- pause -->
@@ -582,18 +564,24 @@ zytunes-tui
 
 <!-- end_slide -->
 
+
+<!-- end_slide -->
+
 In The End
 ===
 <!-- font_size: 2 -->
 
 <!-- alignment: center -->
 <!-- pause -->
+It's still spaghetti
+<!-- pause -->
 <!-- speaker_note: I got to focus a lot on tradeoffs and choices instead of getting bogged down into learning a single library -->
 Since LLM's did all the heavy lifting I spent more time considering the system itself, and even with odd decisions made earlier, it was very easy to pivot. 
 <!-- speaker_note:  -->
 <!-- pause -->
-I learned so much more when I had to make this talk, I hope y'all did too.
 
+<!-- pause -->
+I learned so much more.
 <!-- pause -->
 
 TDD is clutch.
@@ -609,38 +597,3 @@ Thank you
 <!-- pause -->
 `github.com/Danondso/zytunes-suite`
 <!-- pause -->
-
-
-
-
-
-Claude build me a hammer
-===
-<!-- font_size: 2 -->
-
-<!-- alignment: center -->
-
-I wanted to start from scratch and I'm clueless so I asked Claude to take a look.
-It suggested probing the device to understand what it support and do research on what's been done already.
-
-<!-- pause -->
-
-- Have Claude scaffold a throwaway probe binary, run it once against the real device,
-read the result, delete or keep if it works.
-
-- Honestly surprised I didn't brick it
-<!-- end_slide -->
-
-Everything IS a nail when you have a Claude Hammer
-===
-<!-- font_size: 2 -->
-
-<!-- alignment: center -->
-
-- We poke around and finally get the handshake woring.
-<!-- pause -->
-- `SendObjectInfo` → `SendObject` → a song is *on the device*.
-- Sync, push, remove, device browsing
-- aww CRUD, it works
-
-<!-- end_slide -->

@@ -1,6 +1,6 @@
 # zytunes
 
-[![CI](https://github.com/Danondso/zytunes/actions/workflows/ci.yml/badge.svg)](https://github.com/Danondso/zytunes/actions/workflows/ci.yml)
+[![CI](https://github.com/Danondso/zytunes-suite/actions/workflows/ci.yml/badge.svg)](https://github.com/Danondso/zytunes-suite/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.98%2B-orange.svg)](https://www.rust-lang.org)
 
