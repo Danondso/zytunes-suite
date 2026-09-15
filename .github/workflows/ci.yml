@@ -33,7 +33,7 @@ jobs:
       mobile: ${{ steps.filter.outputs.mobile }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3
+      - uses: dorny/paths-filter@v4
         id: filter
         with:
           # `code` is true when any changed file is NOT a .md file. When
