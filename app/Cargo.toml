@@ -13,7 +13,7 @@ rusb = "0.9"
 # with the TUI or an orphan wedges the HuggingFace model-download lock.
 libc = "0.2"
 ratatui = "0.30"
-crossterm = "0.28"
+crossterm = "0.29"
 throbber-widgets-tui = "0.11.0"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
