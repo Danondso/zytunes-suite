@@ -1812,9 +1812,9 @@ fn draw_keys_panel(f: &mut Frame, app: &App, area: Rect) {
         ("?", "Full help"),
         ("Tab", "Next panel"),
         ("S-Tab", "Prev panel"),
-        ("1/2/3", "Art/Alb/Plist"),
+        ("1/2", "Artists/Albums"),
         ("4", "Sync queue"),
-        ("v", "Lib/Device view"),
+        ("v", "Lib/Dev/Plist"),
         ("t", "Theme picker"),
         ("T", "Art style"),
         ("P", "Player panel"),
@@ -1849,7 +1849,7 @@ fn draw_keys_panel(f: &mut Frame, app: &App, area: Rect) {
         "Add track"
     };
     let add_all_label = if is_device_mode {
-        "Remove all"
+        "Queue removal"
     } else {
         "Add all"
     };
@@ -1897,7 +1897,12 @@ fn draw_keys_panel(f: &mut Frame, app: &App, area: Rect) {
         Panel::Device => (
             " Device",
             if is_device_mode {
-                vec![("r", "Refresh"), ("d", "Disconnect"), ("U", "Dedupe")]
+                vec![
+                    ("r", "Refresh"),
+                    ("d", "Disconnect"),
+                    ("U", "Dedupe"),
+                    ("D", "Execute rm"),
+                ]
             } else {
                 vec![("r", "Refresh"), ("d", "Disconnect")]
             },
@@ -2693,9 +2698,9 @@ fn draw_help_overlay(f: &mut Frame, app: &App) {
         .or_else(|| app.stems_cfg.recipe_kind().ok().map(|r| r.layout().len()))
         .unwrap_or(6);
     let stem_toggle_line = if stem_count >= 7 {
-        "  1-7         Toggle stems while the mixer is active"
+        "  1-7         Toggle stems while the strip is on screen"
     } else {
-        "  1-6         Toggle stems while the mixer is active"
+        "  1-6         Toggle stems while the strip is on screen"
     };
     let help_text = vec![
         "",
@@ -2703,17 +2708,19 @@ fn draw_help_overlay(f: &mut Frame, app: &App) {
         "  Tab         Cycle panels",
         "  Up/Down     Navigate items",
         "  Enter       Select / expand",
-        "  1/2         Artists / Albums",
-        "  v           Toggle Library / Device view",
+        "  1/2         Artists / Albums (stem strip claims these digits when visible)",
+        "  v           Cycle Library / Device / Playlists",
         "  t           Theme picker",
         "  T           Toggle album art style (halfblock/ASCII)",
         "  P           Cycle player panel (auto / hidden / always)",
+        "  o           Stem settings",
+        "  i           CD import",
         "",
         "  Playback",
         "  Space       Play / pause selected track",
-        "  n / p       Next / previous track in playlist",
+        "  n / p       Next / previous track",
         "  < / >       Seek -/+ 5 seconds",
-        "  M           Stem mixer (split vocals/drums/bass/…)",
+        "  M           Stem mixer (album sidebar = batch pre-warm)",
         stem_toggle_line,
         "",
         "  Logs",
@@ -2724,6 +2731,7 @@ fn draw_help_overlay(f: &mut Frame, app: &App) {
         "  /           Search sidebar",
         "  s           Cycle sort column",
         "  I           Show track info (TrackList panel)",
+        "  m           MusicBrainz tag manager (Albums / TrackList)",
         "",
         "  Sync",
         "  a           Add track to queue",
@@ -2731,12 +2739,14 @@ fn draw_help_overlay(f: &mut Frame, app: &App) {
         "  4           Jump to sync queue",
         "  S / Enter   Execute sync",
         "  d           Remove from queue",
-        "  C           Clear queue",
+        "  C           Clear queue (SyncQueue panel)",
         "",
         "  Device view",
-        "  a           Remove track from device",
-        "  A           Remove all visible tracks",
-        "  U           Dedupe (remove duplicate copies, keep newest)",
+        "  a           Queue selection for removal",
+        "  D           Confirm / execute removal queue",
+        "  C           Clear removal queue",
+        "  U           Dedupe (keep newest copy)",
+        "  d           Disconnect (when queue/playlists do not claim it)",
         "",
         "  Playlists view",
         "  N           New manual playlist",
