@@ -109,8 +109,9 @@ pub struct StemsConfig {
     /// stems by hand. A blank string behaves like unset.
     pub cache_dir: Option<String>,
     /// Separation recipe: `"demucs"` (default), `"hq"` (the Roformer
-    /// vocals / demucs band cascade), or `"hq-harmony"` (adds
-    /// lead/backing vocal stems). Its `cache_id` is recorded in each
+    /// vocals / demucs band cascade), `"sw"` (single-pass 6-stem
+    /// BS-RoFormer-SW), or `"hq-harmony"` (adds lead/backing vocal
+    /// stems). Its `cache_id` is recorded in each
     /// stem-cache entry's metadata, so switching recipes re-separates on
     /// next use (the entry directory itself is keyed by source path
     /// alone — see todos.md for per-recipe coexistence).
@@ -560,6 +561,7 @@ cache_max_gb = 25
         for (raw, kind) in [
             ("demucs", zytunes::stems::RecipeKind::Demucs),
             ("hq", zytunes::stems::RecipeKind::Hq),
+            ("sw", zytunes::stems::RecipeKind::Sw),
             ("hq-harmony", zytunes::stems::RecipeKind::HqHarmony),
         ] {
             let cfg: Config = toml::from_str(&format!("[stems]\nrecipe = \"{raw}\"\n")).unwrap();
