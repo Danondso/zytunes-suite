@@ -415,6 +415,9 @@ impl DeviceSession for IpodSession {
                     } else {
                         None
                     },
+                    // mhit +40; parser already lifts 0 → None, but filter
+                    // again so a raw 0 never reaches the Duration column.
+                    duration_ms: t.total_time_ms.filter(|&ms| ms > 0),
                 }
             })
             .collect();
@@ -551,6 +554,7 @@ mod tests {
         assert_eq!(entries[0].last_played, None);
         assert_eq!(entries[0].skip_count, None);
         assert_eq!(entries[0].rating, None);
+        assert_eq!(entries[0].duration_ms, None);
     }
 
     #[test]
@@ -566,6 +570,28 @@ mod tests {
         // same scale, so DeviceEntry.rating is unit-consistent across both
         // backends).
         assert_eq!(entries[0].rating, Some(80));
+    }
+
+    #[test]
+    fn collect_all_tracks_surfaces_duration() {
+        let mut db = ipod_db::IpodDatabase::new(PathBuf::from("/mnt/IPOD"));
+        let mut t = track(0, 0, 0, 0);
+        t.total_time_ms = Some(240_000);
+        db.add_track(t);
+        let mut session = IpodSession::new(db, None);
+        let entries = session.collect_all_tracks("").unwrap();
+        assert_eq!(entries[0].duration_ms, Some(240_000));
+    }
+
+    #[test]
+    fn collect_all_tracks_lifts_zero_duration() {
+        let mut db = ipod_db::IpodDatabase::new(PathBuf::from("/mnt/IPOD"));
+        let mut t = track(0, 0, 0, 0);
+        t.total_time_ms = Some(0);
+        db.add_track(t);
+        let mut session = IpodSession::new(db, None);
+        let entries = session.collect_all_tracks("").unwrap();
+        assert_eq!(entries[0].duration_ms, None);
     }
 
     fn track_named(artist: &str, album: &str, title: &str) -> ipod_db::IpodTrack {

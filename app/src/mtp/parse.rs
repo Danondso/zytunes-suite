@@ -28,6 +28,10 @@ pub struct DeviceEntry {
     /// shown as 0–5 stars by dividing by 20). `None` when the device doesn't
     /// surface ratings or hasn't been queried for them yet.
     pub rating: Option<u16>,
+    /// Duration in milliseconds. MTP `0xDC89 Duration` (UINT32) on Zune;
+    /// mhit `+40` on iPod Classic. `None` when the source didn't surface a
+    /// positive duration (0 is meaningless and is lifted to `None`).
+    pub duration_ms: Option<u32>,
 }
 
 impl DeviceEntry {

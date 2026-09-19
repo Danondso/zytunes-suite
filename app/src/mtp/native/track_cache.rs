@@ -4,7 +4,7 @@
 //!
 //! The cache lets a reconnect skip a full MTP rescan: the only thing we
 //! re-validate is the device's free-bytes header. Schema has grown over
-//! time (`play_count`, `rating`, `skip_count` columns added in later
+//! time (`play_count`, `rating`, `skip_count`, `duration_ms` columns added in later
 //! phases) and `load` accepts every historical shape so users don't lose
 //! their cache when they upgrade.
 
@@ -50,16 +50,18 @@ impl TrackCache {
             // Format evolution: original cache had 5 fields; play_count
             // (column 5) and rating (column 6) were added in Phase 4b;
             // skip_count (column 7) was added in Phase 3 alongside the
-            // local-plays sidecar. Old caches still parse — missing fields
-            // stay `None`. `lines()` already strips `\n` and `\r\n`, so
-            // per-field newline trimming would be redundant.
-            let parts: Vec<&str> = line.splitn(8, '\t').collect();
+            // local-plays sidecar; duration_ms (column 8) followed.
+            // Old caches still parse — missing fields stay `None`.
+            // `lines()` already strips `\n` and `\r\n`, so per-field
+            // newline trimming would be redundant.
+            let parts: Vec<&str> = line.splitn(9, '\t').collect();
             if parts.len() < 5 {
                 continue;
             }
             let play_count = parts.get(5).and_then(|s| s.parse::<u32>().ok());
             let rating = parts.get(6).and_then(|s| s.parse::<u16>().ok());
             let skip_count = parts.get(7).and_then(|s| s.parse::<u32>().ok());
+            let duration_ms = parts.get(8).and_then(|s| s.parse::<u32>().ok());
             entries.push(DeviceEntry {
                 object_id: parts[0].parse().unwrap_or(0),
                 storage_id: parts[1].parse().unwrap_or(0),
@@ -69,6 +71,7 @@ impl TrackCache {
                 play_count,
                 rating,
                 skip_count,
+                duration_ms,
                 ..Default::default()
             });
         }
@@ -188,17 +191,18 @@ impl TrackCache {
 }
 
 /// Serialize one `DeviceEntry` to its on-disk track-cache line. Tabs in
-/// the name are flattened to spaces so the `splitn(8, '\t')` loader stays
-/// in sync. `play_count`, `rating`, and `skip_count` are emitted as digits
-/// or empty for `None`.
+/// the name are flattened to spaces so the `splitn(9, '\t')` loader stays
+/// in sync. `play_count`, `rating`, `skip_count`, and `duration_ms` are
+/// emitted as digits or empty for `None`.
 fn serialize_entry(entry: &DeviceEntry) -> String {
     let safe_name = entry.name.replace('\t', " ");
     let pc = entry.play_count.map(|v| v.to_string()).unwrap_or_default();
     let rt = entry.rating.map(|v| v.to_string()).unwrap_or_default();
     let sk = entry.skip_count.map(|v| v.to_string()).unwrap_or_default();
+    let dur = entry.duration_ms.map(|v| v.to_string()).unwrap_or_default();
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-        entry.object_id, entry.storage_id, entry.format, entry.size, safe_name, pc, rt, sk
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        entry.object_id, entry.storage_id, entry.format, entry.size, safe_name, pc, rt, sk, dur
     )
 }
 
@@ -652,6 +656,48 @@ mod tests {
         assert_eq!(loaded[1].rating, None);
 
         if let Some(p) = cache.cache_path() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn track_cache_round_trips_duration() {
+        let cache = make_cache(Some("duration-rt"));
+        let entries = vec![
+            DeviceEntry {
+                duration_ms: Some(240_000),
+                ..sample_entry("Artist/Album/timed.mp3", 100)
+            },
+            sample_entry("Artist/Album/untimed.mp3", 101),
+        ];
+        cache.save(&entries, 1_000).expect("save");
+
+        let (_, loaded) = cache.load().unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].duration_ms, Some(240_000));
+        assert_eq!(loaded[1].duration_ms, None);
+
+        if let Some(p) = cache.cache_path() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn track_cache_loads_eight_field_format_without_duration() {
+        // Pre-duration cache (8 fields: id, sid, fmt, size, name, pc, rt, sk)
+        // must still parse — `duration_ms` defaults to None.
+        let cache = make_cache(Some("eight-field-legacy"));
+        if let Some(p) = cache.cache_path() {
+            let _ = std::fs::write(
+                &p,
+                "#free_bytes:0\n1\t1\tmp3\t100\tA/B/legacy.mp3\t12\t80\t3\n",
+            );
+            let (_, loaded) = cache.load().unwrap();
+            assert_eq!(loaded.len(), 1);
+            assert_eq!(loaded[0].play_count, Some(12));
+            assert_eq!(loaded[0].rating, Some(80));
+            assert_eq!(loaded[0].skip_count, Some(3));
+            assert_eq!(loaded[0].duration_ms, None);
             let _ = std::fs::remove_file(p);
         }
     }

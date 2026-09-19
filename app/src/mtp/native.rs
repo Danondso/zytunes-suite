@@ -7,7 +7,7 @@ mod playcount;
 mod track_cache;
 
 use album_art::extract_album_art;
-use playcount::{apply_playcounts, apply_ratings, apply_skip_counts};
+use playcount::{apply_durations, apply_playcounts, apply_ratings, apply_skip_counts};
 use track_cache::TrackCache;
 
 use crate::mtp::parse::DeviceEntry;
@@ -538,20 +538,22 @@ impl NativeSession {
     }
 
     /// Enrich `tracks` with `play_count` (from `0xDC91 UseCount`),
-    /// `rating` (from `0xDC8A Rating`), and `skip_count` (from `0xDC92
-    /// SkipCount`) using bulk `GetObjectPropList` queries — one round-trip
-    /// per property for the whole library, not one per track. Tracks whose
-    /// `object_id` is `0` (ZMDB entries before any cache merge has restored
-    /// the handle) are skipped silently.
+    /// `rating` (from `0xDC8A Rating`), `skip_count` (from `0xDC92
+    /// SkipCount`), and `duration_ms` (from `0xDC89 Duration`) using bulk
+    /// `GetObjectPropList` queries — one round-trip per property for the
+    /// whole library, not one per track. Tracks whose `object_id` is `0`
+    /// (ZMDB entries before any cache merge has restored the handle) are
+    /// skipped silently.
     ///
-    /// All three queries are best-effort and independent: if the device
+    /// All four queries are best-effort and independent: if the device
     /// rejects one, we log it and proceed with the others. UseCount and
     /// Rating are confirmed to work on Zune v1.4 firmware
     /// `01.04.00485.00-00425` even though they're not listed in
-    /// `GetObjectPropsSupported(0x3009)`; SkipCount is in the same
-    /// neighbourhood and may behave the same way, but if v1.4 rejects it
-    /// the merge logic at the App layer just sees `delta = 0` for the skip
-    /// dimension — no harm done.
+    /// `GetObjectPropsSupported(0x3009)`; SkipCount and Duration are in the
+    /// same neighbourhood and may behave the same way. A rejected SkipCount
+    /// just means the merge logic at the App layer sees `delta = 0` for
+    /// that dimension; a rejected Duration leaves the library-tag fallback
+    /// to fill the TUI column.
     ///
     /// Called from each track-collect path (ZMDB fast path, cache-hit
     /// refresh, slow fallback); callers may invoke it multiple times per
@@ -566,6 +568,7 @@ impl NativeSession {
         self.enrich_one_prop(tracks, PROP_USE_COUNT, "playcounts", apply_playcounts);
         self.enrich_one_prop(tracks, PROP_RATING, "ratings", apply_ratings);
         self.enrich_one_prop(tracks, PROP_SKIP_COUNT, "skip counts", apply_skip_counts);
+        self.enrich_one_prop(tracks, PROP_DURATION, "durations", apply_durations);
     }
 
     /// Issue a single bulk `GetObjectPropList` for `prop` across all MP3
@@ -602,6 +605,7 @@ impl NativeSession {
                     PROP_USE_COUNT => t.play_count.is_some(),
                     PROP_RATING => t.rating.is_some(),
                     PROP_SKIP_COUNT => t.skip_count.is_some(),
+                    PROP_DURATION => t.duration_ms.is_some(),
                     _ => false,
                 })
                 .count()

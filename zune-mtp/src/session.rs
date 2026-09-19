@@ -1050,6 +1050,7 @@ mod tests {
         assert_eq!(crate::proplist::PROP_SKIP_COUNT, 0xDC92);
         assert_eq!(crate::proplist::PROP_LAST_ACCESSED, 0xDC93);
         assert_eq!(crate::proplist::PROP_RATING, 0xDC8A);
+        assert_eq!(crate::proplist::PROP_DURATION, 0xDC89);
         assert_eq!(crate::proplist::PROP_DATE_ADDED, 0xDC4E);
     }
 

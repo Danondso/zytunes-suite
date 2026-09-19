@@ -1445,6 +1445,17 @@ fn draw_device_info(f: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+/// Show the model line only when it adds information the panel title
+/// doesn't already carry (Zune title is already "Zune 80"; a named iPod
+/// still wants "iPod Classic 160GB" underneath).
+fn distinct_model_line<'a>(name: Option<&'a str>, model: Option<&'a str>) -> Option<&'a str> {
+    match (name, model) {
+        (_, None) => None,
+        (Some(n), Some(m)) if n == m => None,
+        (_, Some(m)) => Some(m),
+    }
+}
+
 fn draw_device_info_connected(f: &mut Frame, app: &App, area: Rect) {
     let t = app.theme();
     let is_syncing = matches!(app.sync.status, SyncStatus::Running { .. });
@@ -1496,6 +1507,14 @@ fn draw_device_info_connected(f: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from(vec![
             Span::styled(" FW: ", t.dim()),
             Span::styled(fw.as_str(), body),
+        ]));
+    }
+    if let Some(model) =
+        distinct_model_line(app.device.name.as_deref(), app.device.model.as_deref())
+    {
+        lines.push(Line::from(vec![
+            Span::styled(" Model: ", t.dim()),
+            Span::styled(model, body),
         ]));
     }
     if let Some(ref mfr) = app.device.manufacturer {
@@ -4318,6 +4337,20 @@ mod tests {
             proposed: Some(prop.into()),
             enabled: true,
         }
+    }
+
+    #[test]
+    fn distinct_model_line_hides_when_title_already_is_the_model() {
+        assert_eq!(distinct_model_line(Some("Zune 80"), Some("Zune 80")), None);
+        assert_eq!(
+            distinct_model_line(Some("Dublin's iPod"), Some("iPod Classic 160GB")),
+            Some("iPod Classic 160GB")
+        );
+        assert_eq!(
+            distinct_model_line(None, Some("iPod Video 30GB")),
+            Some("iPod Video 30GB")
+        );
+        assert_eq!(distinct_model_line(Some("iPod"), None), None);
     }
 
     #[test]

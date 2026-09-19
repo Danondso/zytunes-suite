@@ -116,6 +116,7 @@ fn device_entry(object_id: u64, name: &str) -> zytunes::mtp::parse::DeviceEntry 
         last_played: None,
         skip_count: None,
         rating: None,
+        duration_ms: None,
     }
 }
 

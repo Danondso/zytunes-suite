@@ -1,7 +1,9 @@
 pub mod ipod;
+mod ipod_models;
 pub mod zune;
 
-pub use ipod::IpodBackend;
+pub use ipod::{IpodBackend, IpodDeviceData};
+pub use ipod_models::{ipod_model_from_storage, ipod_model_label};
 pub use zune::{zune_model_from_storage, ZuneBackend, ZuneDetectError, ZuneDevice, ZuneDeviceData};
 
 use crate::mtp::DeviceSession;

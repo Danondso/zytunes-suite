@@ -77,7 +77,8 @@ use zytunes::cd::drive::{enumerate_drives, read_disc_toc, CdDrive, DriveError};
 use zytunes::cd::metadata::{ripped_track_destination, tag_ripped_file, tag_ripped_fingerprint};
 use zytunes::cd::rip::{eject_drive, rip_track_cancellable, RipError, RipFidelity};
 use zytunes::device::{
-    DeviceBackend, DeviceCapabilities, DeviceFamily, IpodBackend, ZuneBackend, ZuneDeviceData,
+    ipod_model_label, DeviceBackend, DeviceCapabilities, DeviceFamily, IpodBackend, IpodDeviceData,
+    ZuneBackend, ZuneDeviceData,
 };
 use zytunes::mtp::native::NativeSession;
 use zytunes::mtp::parse::DeviceEntry;
@@ -724,13 +725,27 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
 
                     // Build initial DeviceInfo from detection data.
                     let zune_data = detected.backend_data.downcast_ref::<ZuneDeviceData>();
+                    let ipod_data = detected.backend_data.downcast_ref::<IpodDeviceData>();
+                    let initial_model = match detected.family {
+                        DeviceFamily::Ipod => {
+                            let label = ipod_model_label(
+                                detected.model.as_deref(),
+                                ipod_data.and_then(|d| d.family_id),
+                                None,
+                            );
+                            (label != "iPod")
+                                .then_some(label)
+                                .or(detected.model.clone())
+                        }
+                        DeviceFamily::Zune => detected.model.clone(),
+                    };
                     let device_info = DeviceInfo {
                         name: detected.name.clone(),
                         firmware_version: detected.firmware.clone(),
                         serial_number: detected.serial.clone(),
                         usb_mode: zune_data.and_then(|d| d.usb_mode.clone()),
                         manufacturer: None,
-                        model: None,
+                        model: initial_model,
                         family: detected.family,
                     };
                     let _ = event_tx.send(BgEvent::DeviceDetected(device_info));
@@ -831,13 +846,29 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                 if let Ok((total, free)) = s.get_storage_info() {
                                     let used = total.saturating_sub(free);
                                     let pct = (used * 100).checked_div(total).unwrap_or(0) as u8;
+                                    let model = ipod_model_label(
+                                        detected.model.as_deref(),
+                                        detected
+                                            .backend_data
+                                            .downcast_ref::<IpodDeviceData>()
+                                            .and_then(|d| d.family_id),
+                                        Some(total),
+                                    );
+                                    // Keep an iTunes-assigned / volume name as
+                                    // the panel title; otherwise use the model
+                                    // string (same pattern as Zune 80 etc.).
+                                    let name = if detected.name != "iPod" {
+                                        detected.name.clone()
+                                    } else {
+                                        model.clone()
+                                    };
                                     let _ = event_tx.send(BgEvent::DeviceDetected(DeviceInfo {
-                                        name: detected.name.clone(),
+                                        name,
                                         firmware_version: detected.firmware.clone(),
                                         serial_number: detected.serial.clone(),
-                                        usb_mode: None,
+                                        usb_mode: Some("Mass Storage".into()),
                                         manufacturer: Some("Apple".to_string()),
-                                        model: detected.model.clone(),
+                                        model: Some(model),
                                         family: detected.family,
                                     }));
                                     let _ =

@@ -1,4 +1,4 @@
-use super::{DetectedDevice, DeviceBackend, DeviceCapabilities, DeviceFamily};
+use super::{ipod_model_label, DetectedDevice, DeviceBackend, DeviceCapabilities, DeviceFamily};
 use crate::mtp::DeviceSession;
 
 /// Backend-specific data for a detected iPod, stored in `DetectedDevice::backend_data`.
@@ -7,6 +7,8 @@ pub struct IpodDeviceData {
     /// FirewireGuid (USB serial number) used for hash58 database signing.
     /// Required for iPod Classic; `None` for older models that don't check.
     pub firewire_id: Option<String>,
+    /// SysInfoExtended `FamilyID`, when the plist is present and parseable.
+    pub family_id: Option<u32>,
 }
 
 /// iPod device backend implementing the `DeviceBackend` trait.
@@ -25,7 +27,12 @@ impl DeviceBackend for IpodBackend {
         // On macOS, ioreg reports it; on Linux, it's in /sys or via lsusb.
         let firewire_id = read_firewire_id();
 
-        let name = "iPod".to_string();
+        let label = ipod_model_label(detected.model.as_deref(), detected.family_id, None);
+        let name = detected.name.clone().unwrap_or(label);
+        // Keep SysInfo `ModelNumStr` on `DetectedDevice.model` so the
+        // connect path can combine it with storage capacity. The TUI
+        // DeviceInfo emission maps it to a friendly label.
+
         Ok(DetectedDevice {
             family: DeviceFamily::Ipod,
             name,
@@ -35,6 +42,7 @@ impl DeviceBackend for IpodBackend {
             backend_data: Box::new(IpodDeviceData {
                 mount_point: detected.mount_point,
                 firewire_id,
+                family_id: detected.family_id,
             }),
         })
     }

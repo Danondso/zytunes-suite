@@ -1,7 +1,7 @@
 //! Pure projection of `GetObjectPropList` results onto `DeviceEntry` rows.
 //!
 //! Each function pulls a single MTP object property (UseCount, Rating,
-//! SkipCount) out of the parsed prop-list response and stamps it onto the
+//! SkipCount, Duration) out of the parsed prop-list response and stamps it onto the
 //! matching track by `object_id`. They share the same shape on purpose:
 //! `enrich_one_prop` in `native.rs` is generic over them and counts how
 //! many tracks each pass populated for the log line.
@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 
-use zune_mtp::proplist::{PROP_RATING, PROP_SKIP_COUNT, PROP_USE_COUNT};
+use zune_mtp::proplist::{PROP_DURATION, PROP_RATING, PROP_SKIP_COUNT, PROP_USE_COUNT};
 use zune_mtp::session::PropListElement;
 
 use crate::mtp::parse::DeviceEntry;
@@ -92,6 +92,34 @@ pub(super) fn apply_skip_counts(tracks: &mut [DeviceEntry], elements: &[PropList
         }
         if let Some(&n) = counts.get(&(t.object_id as u32)) {
             t.skip_count = Some(n);
+        }
+    }
+}
+
+/// Project parsed `GetObjectPropList` elements onto tracks, populating
+/// `duration_ms` for entries whose `object_id` matches a returned handle.
+/// MTP `0xDC89 Duration` is UINT32 milliseconds. A reported `0` is skipped
+/// — duration 0 is meaningless and would hide the library-tag fallback.
+pub(super) fn apply_durations(tracks: &mut [DeviceEntry], elements: &[PropListElement]) {
+    let mut durations: HashMap<u32, u32> = HashMap::new();
+    for e in elements {
+        if e.prop_code == PROP_DURATION {
+            if let Some(v) = e.as_u32() {
+                if v > 0 {
+                    durations.insert(e.object_handle, v);
+                }
+            }
+        }
+    }
+    if durations.is_empty() {
+        return;
+    }
+    for t in tracks.iter_mut() {
+        if t.object_id == 0 {
+            continue;
+        }
+        if let Some(&ms) = durations.get(&(t.object_id as u32)) {
+            t.duration_ms = Some(ms);
         }
     }
 }
@@ -262,5 +290,62 @@ mod tests {
         };
         apply_skip_counts(&mut tracks, &[use_count]);
         assert_eq!(tracks[0].skip_count, None);
+    }
+
+    fn duration_element(handle: u32, ms: u32) -> PropListElement {
+        PropListElement {
+            object_handle: handle,
+            prop_code: PROP_DURATION,
+            datatype: 0x0006,
+            value: ms.to_le_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn apply_durations_populates_matched_handles() {
+        let mut tracks = vec![sample_entry("a.mp3", 700), sample_entry("b.mp3", 701)];
+        let elements = vec![duration_element(700, 240_000), duration_element(701, 1_000)];
+        apply_durations(&mut tracks, &elements);
+        assert_eq!(tracks[0].duration_ms, Some(240_000));
+        assert_eq!(tracks[1].duration_ms, Some(1_000));
+    }
+
+    #[test]
+    fn apply_durations_skips_zero() {
+        // Duration 0 is meaningless; leave the field alone so a library
+        // fallback can still fill the TUI column.
+        let mut tracks = vec![
+            DeviceEntry {
+                duration_ms: Some(180_000),
+                ..sample_entry("a.mp3", 800)
+            },
+            sample_entry("b.mp3", 801),
+        ];
+        apply_durations(
+            &mut tracks,
+            &[duration_element(800, 0), duration_element(801, 0)],
+        );
+        assert_eq!(tracks[0].duration_ms, Some(180_000));
+        assert_eq!(tracks[1].duration_ms, None);
+    }
+
+    #[test]
+    fn apply_durations_skips_zero_object_ids() {
+        let mut tracks = vec![sample_entry("zmdb-only.mp3", 0)];
+        apply_durations(&mut tracks, &[duration_element(0, 240_000)]);
+        assert_eq!(tracks[0].duration_ms, None);
+    }
+
+    #[test]
+    fn apply_durations_ignores_non_duration_props() {
+        let mut tracks = vec![sample_entry("a.mp3", 900)];
+        let use_count = PropListElement {
+            object_handle: 900,
+            prop_code: PROP_USE_COUNT,
+            datatype: 0x0006,
+            value: 5u32.to_le_bytes().to_vec(),
+        };
+        apply_durations(&mut tracks, &[use_count]);
+        assert_eq!(tracks[0].duration_ms, None);
     }
 }
