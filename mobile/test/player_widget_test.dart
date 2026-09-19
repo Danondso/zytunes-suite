@@ -315,13 +315,12 @@ void main() {
     await tester.pumpWidget(ZytunesApp(session: session));
     await playFirstTrack(tester);
 
-    expect(find.byKey(const Key('playCount')), findsOneWidget);
-    expect(find.text('5'), findsWidgets);
-
+    // The meter lives on the full player, not the mini now-playing bar.
     await tester.tap(find.byKey(const Key('nowPlayingTrack')));
     await tester.pumpAndSettle();
     expect(find.byKey(const Key('playerScreen')), findsOneWidget);
     expect(find.byKey(const Key('playCount')), findsOneWidget);
+    expect(find.text('5'), findsWidgets);
 
     playback.emulatePosition(const Duration(milliseconds: 150000));
     await tester.pump();
