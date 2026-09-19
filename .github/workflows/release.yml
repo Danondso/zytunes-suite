@@ -167,7 +167,7 @@ jobs:
           git push origin "v${{ needs.check-version.outputs.new_version }}"
 
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
