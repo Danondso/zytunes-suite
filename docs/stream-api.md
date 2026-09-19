@@ -220,7 +220,7 @@ Content-Type is derived from the file extension (`audio/flac`, `audio/mpeg`,
 
 The server reuses the TUI stem cache (`[stems] cache_dir`, default
 `~/.cache/zytunes/stems`) and the `[stems]` recipe (`demucs` / `hq` /
-`hq-harmony`). A track already split
+`sw` / `hq-harmony`). A track already split
 in the TUI is ready immediately. The server does **not** auto-provision
 Python engines — press `M` once in `zytunes-tui` to install.
 

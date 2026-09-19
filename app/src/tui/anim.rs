@@ -164,12 +164,18 @@ pub fn typing_reveal(text: &str, elapsed_frames: usize) -> &str {
     &text[..boundary]
 }
 
-/// Returns two screen lines for the Zune ASCII art during connection.
+/// Returns two screen lines for the device ASCII art during connection.
 /// Each line must be <=12 chars. Frame counter starts at 0 when connection begins.
-pub fn connection_screen_lines(frame: usize) -> (&'static str, &'static str) {
+/// `family` is whatever we last detected (or `None` while still scanning) so
+/// an iPod connect never paints "Zune" / "MTPZ Handshake".
+pub fn connection_screen_lines(
+    frame: usize,
+    family: Option<zytunes::device::DeviceFamily>,
+) -> (&'static str, &'static str) {
     // Each stage lasts ~1 second (20 frames at 20fps)
     let stage = frame / 20;
     let sub = frame % 20;
+    let found_label = family.map(|f| f.label()).unwrap_or("Device");
 
     match stage {
         0 => {
@@ -189,17 +195,37 @@ pub fn connection_screen_lines(frame: usize) -> (&'static str, &'static str) {
                 2 => "Found..",
                 _ => "Found...",
             };
-            (dots, "Zune")
+            (dots, found_label)
         }
-        2 => {
-            let dots = match (sub / 5) % 4 {
-                0 => "MTPZ",
-                1 => "MTPZ.",
-                2 => "MTPZ..",
-                _ => "MTPZ...",
-            };
-            (dots, "Handshake")
-        }
+        2 => match family {
+            Some(zytunes::device::DeviceFamily::Ipod) => {
+                let dots = match (sub / 5) % 4 {
+                    0 => "Opening",
+                    1 => "Opening.",
+                    2 => "Opening..",
+                    _ => "Opening...",
+                };
+                (dots, "Volume")
+            }
+            Some(zytunes::device::DeviceFamily::Zune) => {
+                let dots = match (sub / 5) % 4 {
+                    0 => "MTPZ",
+                    1 => "MTPZ.",
+                    2 => "MTPZ..",
+                    _ => "MTPZ...",
+                };
+                (dots, "Handshake")
+            }
+            None => {
+                let dots = match (sub / 5) % 4 {
+                    0 => "USB",
+                    1 => "USB.",
+                    2 => "USB..",
+                    _ => "USB...",
+                };
+                (dots, "Connect")
+            }
+        },
         _ => {
             let dots = match (sub / 5) % 4 {
                 0 => "Ready",
@@ -810,32 +836,39 @@ mod tests {
 
     #[test]
     fn connection_screen_lines_fit_width() {
-        for frame in 0..100 {
-            let (line1, line2) = connection_screen_lines(frame);
-            assert!(
-                line1.len() <= 12,
-                "line1 '{}' exceeds 12 chars at frame {}",
-                line1,
-                frame
-            );
-            assert!(
-                line2.len() <= 12,
-                "line2 '{}' exceeds 12 chars at frame {}",
-                line2,
-                frame
-            );
+        use zytunes::device::DeviceFamily;
+        for family in [None, Some(DeviceFamily::Zune), Some(DeviceFamily::Ipod)] {
+            for frame in 0..100 {
+                let (line1, line2) = connection_screen_lines(frame, family);
+                assert!(
+                    line1.len() <= 12,
+                    "line1 '{}' exceeds 12 chars at frame {} family {:?}",
+                    line1,
+                    frame,
+                    family
+                );
+                assert!(
+                    line2.len() <= 12,
+                    "line2 '{}' exceeds 12 chars at frame {} family {:?}",
+                    line2,
+                    frame,
+                    family
+                );
+            }
         }
     }
 
     #[test]
     fn connection_screen_stages_progress() {
-        let (l1_0, _) = connection_screen_lines(0);
-        let (l1_20, _) = connection_screen_lines(20);
-        let (l1_40, _) = connection_screen_lines(40);
-        // Each stage should have different content
+        use zytunes::device::DeviceFamily;
+        let (l1_0, _) = connection_screen_lines(0, None);
+        let (_, l2_20) = connection_screen_lines(20, Some(DeviceFamily::Ipod));
+        let (l1_40_zune, _) = connection_screen_lines(40, Some(DeviceFamily::Zune));
+        let (l1_40_ipod, _) = connection_screen_lines(40, Some(DeviceFamily::Ipod));
         assert!(l1_0.starts_with("Scanning"));
-        assert!(l1_20.starts_with("Found"));
-        assert!(l1_40.starts_with("MTPZ"));
+        assert_eq!(l2_20, "iPod");
+        assert!(l1_40_zune.starts_with("MTPZ"));
+        assert!(l1_40_ipod.starts_with("Opening"));
     }
 
     #[test]

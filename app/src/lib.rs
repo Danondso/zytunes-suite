@@ -172,33 +172,29 @@ pub fn connect() -> Result<
 > {
     let backends: Vec<Box<dyn DeviceBackend>> = vec![Box::new(ZuneBackend), Box::new(IpodBackend)];
 
-    let mut last_err = String::from("No device backends available");
+    let mut last_err = String::from("No devices detected");
     for backend in &backends {
-        match backend.detect() {
-            Ok(detected) => {
-                println!(
-                    "{} detected: {}",
-                    detected.name,
-                    match detected.family {
-                        DeviceFamily::Zune => "Zune",
-                        DeviceFamily::Ipod => "iPod",
-                    }
-                );
+        let Ok(detected) = backend.detect() else {
+            continue;
+        };
+        println!(
+            "{} detected: {}",
+            detected.name,
+            match detected.family {
+                DeviceFamily::Zune => "Zune",
+                DeviceFamily::Ipod => "iPod",
+            }
+        );
 
-                print!("Connecting... ");
-                match backend.open_session(&detected, None) {
-                    Ok(session) => {
-                        println!("OK");
-                        let caps = backend.capabilities();
-                        return Ok((session, caps, detected));
-                    }
-                    Err(e) => {
-                        println!("FAILED");
-                        last_err = e;
-                    }
-                }
+        print!("Connecting... ");
+        match backend.open_session(&detected, None) {
+            Ok(session) => {
+                println!("OK");
+                let caps = backend.capabilities();
+                return Ok((session, caps, detected));
             }
             Err(e) => {
+                println!("FAILED");
                 last_err = e;
             }
         }

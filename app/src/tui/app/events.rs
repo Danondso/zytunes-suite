@@ -22,6 +22,9 @@ impl App {
             BgEvent::SessionReady(storage) => self.on_session_ready(storage),
             BgEvent::SessionFailed(e) => self.on_session_failed(e),
             BgEvent::DeviceSyncStatus(status) => {
+                if self.device.ignore_session_events {
+                    return;
+                }
                 self.device.sync_status = status;
             }
             BgEvent::AlbumArtLoaded { key, image } => {
@@ -33,11 +36,17 @@ impl App {
                 }
             }
             BgEvent::LoadingDeviceTracks => {
+                if self.device.ignore_session_events {
+                    return;
+                }
                 self.device.loading_tracks = true;
                 self.set_toast("Loading device tracks...".into(), false);
             }
             BgEvent::DeviceTracksLoaded(tracks) => self.on_device_tracks_loaded(tracks),
             BgEvent::DeviceTrackAdded(entry) => {
+                if self.device.ignore_session_events {
+                    return;
+                }
                 self.device.add_indexed_track(&entry);
                 self.device.tracks.push(entry);
                 self.device_index_dirty = true;
@@ -91,6 +100,9 @@ impl App {
                 );
             }
             BgEvent::StorageUpdated(storage) => {
+                if self.device.ignore_session_events {
+                    return;
+                }
                 self.device.storage = Some(storage);
             }
             BgEvent::PhotoSyncComplete { success, failed } => {
@@ -110,6 +122,9 @@ impl App {
                 }
             }
             BgEvent::AcquiredItemsCount(count) => {
+                if self.device.ignore_session_events {
+                    return;
+                }
                 self.device.acquired_items = count;
             }
             BgEvent::PlaylistImported { name, summary } => self.on_playlist_imported(name, summary),
@@ -528,6 +543,9 @@ impl App {
     }
 
     fn on_device_detected(&mut self, info: DeviceInfo) {
+        if self.device.ignore_session_events {
+            return;
+        }
         self.device.name = Some(info.name);
         self.device.firmware = info.firmware_version;
         self.device.serial = info.serial_number;
@@ -539,6 +557,9 @@ impl App {
     }
 
     fn on_session_ready(&mut self, storage: Option<StorageInfo>) {
+        if self.device.ignore_session_events {
+            return;
+        }
         self.device.status = DeviceStatus::Connected;
         self.connection_anim_start = None;
         self.device.storage = storage;
@@ -567,6 +588,9 @@ impl App {
     }
 
     fn on_device_tracks_loaded(&mut self, tracks: Vec<DeviceEntry>) {
+        if self.device.ignore_session_events {
+            return;
+        }
         self.device.loading_tracks = false;
         self.device.tracks = tracks;
         self.build_device_index();

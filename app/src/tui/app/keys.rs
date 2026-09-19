@@ -558,6 +558,7 @@ impl App {
                 self.cancel_rip();
             }
             KeyCode::Char('c') if self.device.status == DeviceStatus::Disconnected => {
+                self.device.ignore_session_events = false;
                 self.device.status = DeviceStatus::Detecting;
                 self.connection_anim_start = Some(self.anim_frame);
                 let _ = cmd_tx.send(BgCommand::Connect);
@@ -719,8 +720,10 @@ impl App {
     }
 
     /// Disconnect the device: drop the worker session and clear all
-    /// device-side UI state.
+    /// device-side UI state. The iPod volume stays mounted so `c` can
+    /// reconnect without a replug.
     fn disconnect_device(&mut self, cmd_tx: &mpsc::Sender<BgCommand>) {
+        self.device.ignore_session_events = true;
         let _ = cmd_tx.send(BgCommand::Disconnect);
         self.device.status = DeviceStatus::Disconnected;
         self.device.name = None;
