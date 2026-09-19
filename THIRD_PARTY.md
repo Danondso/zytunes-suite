@@ -54,17 +54,18 @@ managed install) and invoked by path.
   stem-separation engine, including the `htdemucs_6s` model weights it
   downloads on first use.
 - **[python-audio-separator](https://github.com/nomadkaraoke/python-audio-separator)**
-  (MIT) — the engine behind the `hq`/`hq-harmony` recipes; runs Roformer
+  (MIT) — the engine behind the `hq`/`sw`/`hq-harmony` recipes; runs Roformer
   checkpoints and demucs models behind one CLI.
 - **[uv](https://github.com/astral-sh/uv)** (MIT OR Apache-2.0) — the
   managed-install vehicle. Bootstrapped from Astral's official install
   script only after explicit user consent in the TUI.
 
-The Roformer model checkpoints the `hq` recipes reference (BS-Roformer
-`ep_317` by viperx; the Mel-Roformer karaoke model by aufr33/viperx) are
-community-trained weights fetched by audio-separator from its model
-registry on first separation — zytunes never distributes them, and every
-download happens behind the same explicit consent as the engine install.
+The Roformer model checkpoints the `hq`/`sw` recipes reference (BS-Roformer
+`ep_317` by viperx; jarredou BS-RoFormer-SW; the Mel-Roformer karaoke model
+by aufr33/viperx) are community-trained weights fetched by audio-separator
+from its model registry on first separation — zytunes never distributes
+them, and every download happens behind the same explicit consent as the
+engine install.
 If a checkpoint's license terms matter for your use, review them at the
 model registry before enabling those recipes.
 
