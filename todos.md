@@ -1,6 +1,7 @@
 # TODO: Performance & architectural cleanup
 
-Follow-ups from the `/review`-style audit. Ordered roughly by impact.
+Follow-ups from the `/review`-style audit. Remaining open items live in
+[`TODO.md`](TODO.md). Everything below is done (or wontfix).
 
 ## Structural
 
@@ -183,132 +184,6 @@ sidebar_bg, alt_row on main_bg) reviewed and left as-is — alt rows are
 intentionally subtle, and sidebar text is already high-contrast on every
 built-in.
 
-## UX bugs
-
-### Device track list: duration column is empty (Zune)
-`DeviceEntry` (`src/mtp/parse.rs`) has no duration field, so device-mode
-rows always render an empty Duration column. Two-pronged fix, scoped
-during investigation (2026-07-11):
-
-1. **MTP enrichment (device truth).** Add `PROP_DURATION: u16 = 0xDC89`
-   to `zune-mtp/src/proplist.rs`, an `apply_durations` projection in
-   `src/mtp/native/playcount.rs` (skip `0` values — duration 0 is
-   meaningless, unlike play_count 0), and a fourth
-   `enrich_one_prop(tracks, PROP_DURATION, ...)` call in
-   `NativeSession::enrich_with_playcounts`. The bulk
-   `GetObjectPropList(0xFFFFFFFF, MP3, prop, 0, 0)` pattern is already
-   proven on v1.4 firmware for UseCount/Rating — one extra round trip
-   per connect. ZMDB has **no** duration in the audio record (all 28
-   fixed bytes are mapped: album/artist/genre/folder refs, size,
-   track#, format), so ZMDB rows only pick duration up after the cache
-   merge restores their object handles — same limitation playcounts
-   already have.
-2. **Library fallback (instant coverage).** In `device_tracks_to_info`
-   (`src/tui/app.rs`), refactor `resolve_library_id_for_device_track`
-   to return the matched `&Track` and use
-   `dt.duration_ms.or(lib_track.total_time_ms)` — covers every
-   device row that has a library counterpart with zero USB traffic.
-
-Wiring: `DeviceEntry.duration_ms: Option<u32>`, 9th tab-separated
-column in `TrackCache` (`splitn(9, ..)`, old caches parse fine),
-`DeviceTrackInfo.duration_ms: Option<u64>` threaded through
-`add_indexed_track`, and iPod fills it for free from mhit `+40`
-(`t.total_time_ms`, lift 0 → `None`) in
-`IpodSession::collect_all_tracks`. The UI already renders
-`TrackInfo.duration_ms` when present — no render changes needed.
-
-## Future features
-
-### Tag manager: composer / lyricist / performer fields
-`build_track_fields` in `src/tag_ops.rs` currently emits all Picard-standard
-release-level fields (Title/Artist/Album/Year/Genre/MUSICBRAINZ_ALBUMTYPE/
-Media/Country/Status/Packaging/Script/Language/ISRC/Barcode/Catalog#/Label
-plus all six MBIDs and Filename), but **track-level credit fields** like
-composer, lyricist, conductor, and performers are still absent. MB models
-these as recording–artist relationships, not as fields on the recording
-itself. Scope:
-
-1. Extend the `lookup_release_full` / `lookup_disc` `inc` set with
-   `work-rels+recording-rels+artist-rels` (already requesting
-   `+recordings+artist-credits+release-groups+isrcs+labels+genres`).
-2. Add a `relations: Vec<Relation>` field to `Recording` in `musicbrainz.rs`,
-   where each `Relation` carries the relation type (`composer`/`lyricist`/
-   `conductor`/`performer`/`vocal`/`instrument`) and the linked artist's
-   name + MBID.
-3. Walk each track's `recording.relations` in `build_track_fields` and
-   join multi-artist credits with `; ` (Picard's convention) before
-   pushing the diff field.
-4. Map to `ItemKey::Composer`, `ItemKey::Lyricist`, `ItemKey::Conductor`,
-   `ItemKey::Performer` in `apply_field`. Picard also writes per-instrument
-   TXXX frames (`Performer:Lead Guitar` etc.) — start with the bare
-   `Performer` aggregate, defer per-instrument splits.
-5. Add a `Credits` `FieldKind` variant (or reuse `Identity`) so the diff
-   UI sections them together. The track-header summary in `ui/mod.rs`
-   should not regress for credit-only diffs.
-
-The MB inc-set change is harmless to other call sites (CD import / overlay
-rendering both ignore unknown fields), so the work is contained to
-`musicbrainz.rs` + `tag_ops.rs` + tests.
-
-### AcoustID lookup as tag-manager fallback (next up)
-The tag-manager overlay's resolution chain is currently:
-`mb_release_id` → direct lookup, else MB search (Solr-only). For files
-with no MBIDs at all, neither path works on a Solr-less mirror — and
-search-by-text is unreliable even with Solr. Library tracks already
-carry a Chromaprint `acoustic_id` and `total_time_ms` (see
-`src/fingerprint.rs`), so we have everything the AcoustID web service
-needs to identify a bare audio file from scratch.
-
-Integration point is `App::resolve_known_release_mbid` in
-`src/tui/app.rs` — extend it with an async-but-blocking-on-worker call
-that, when no library MBID exists, dispatches AcoustID lookup and
-treats the returned recording MBID as the starting point for an MB
-`/recording/{mbid}?inc=releases` round-trip to pick a release.
-
-Scope:
-
-1. **`src/acoustid.rs` client.** GET `https://api.acoustid.org/v2/lookup`
-   (NOT POST — the API takes `client`, `fingerprint`, `duration`,
-   `meta` as query params or form-encoded body. GET is simpler and
-   their docs are explicit it's supported). `meta=recordings+releases`
-   returns enough to skip the follow-up MB call for the common case.
-   Rate-limit to 3 req/sec per their ToS. Return
-   `Result<Vec<AcoustIdHit>, AcoustIdError>` where each hit carries
-   recording MBID + score + optional release IDs.
-2. **Config field.** Add `acoustid_app_key: Option<String>` to
-   `~/.config/zytunes/config.toml` (parallel to
-   `musicbrainz_user_agent`). Without it, the lookup-first chain
-   skips AcoustID silently — the feature stays dark until configured.
-   Plumb through `App.acoustid_app_key` like `mb_user_agent`.
-3. **Disk cache.** Fingerprints are stable input, so cache responses
-   keyed on `(acoustic_id, duration_secs_rounded)` at
-   `$ZYTUNES_CACHE_DIR/.zytunes-acoustid-cache`. Re-launches reuse
-   without re-hitting the API. Match the dirlib cache's logger
-   forwarding so warnings land in the TUI sync log rather than stderr.
-4. **Worker integration.** New `BgCommand::AcoustIdLookup {
-   token, fingerprint, duration_ms, app_key }` and matching
-   `BgEvent::AcoustIdResolved { token, result: Result<Vec<AcoustIdHit>,
-   String> }`. Token-fenced same as the existing MB requests.
-5. **Tag-manager dispatch.** When `resolve_known_release_mbid` returns
-   None AND the library track carries `acoustic_id`, dispatch
-   `AcoustIdLookup` instead of `MbSearchReleases`. On a single
-   high-confidence hit (score > 0.9), auto-advance to
-   `MbReleaseDetails` for the first release on the matched recording;
-   on ambiguous hits, present them as a `SearchResults`-like list so
-   the user picks. The overlay needs a small enum extension to track
-   "we resolved via AcoustID" so error recovery (Esc from Error phase
-   currently goes to SearchInput) routes back somewhere useful.
-6. **Tests.** Live-fixture JSON test for the AcoustID response parser
-   (catches struct-shape drift). Mock worker test asserting that an
-   empty library MBID + present `acoustic_id` triggers `AcoustIdLookup`
-   not `MbSearchReleases`. Cache-hit test (second call with same
-   fingerprint doesn't hit the network).
-
-Out of scope: AcoustID submission of new fingerprints (we read, we
-don't contribute). Per-track batch lookup for an entire untagged
-album — let the user invoke per-track for now; a "scan untagged"
-batch mode is its own follow-up.
-
 ## Stem-split follow-ups
 
 ### ~~Stem cache holds one entry per track, so recipe A/B re-separates every flip~~ (done)
@@ -423,53 +298,10 @@ resolution folded into `paths::zytunes_cache_root()`, now shared by
 stem config panel remains with that panel's todo. Tests:
 `pinned_model_files_names_every_recipe_checkpoint`,
 `prune_model_cache_removes_retired_ckpts_and_their_sidecars`,
-`p
-천​국​의 뒷​마​당
-by GODSPEED 音
-Why do you love this album?
-
-appears in 602 other collections
-download
-overlove
-by Oblique Occasions
-Why do you love this album?
-
-appears in 445 other collections
-download
-BLYAT
-by DARK DESIRE
-Why do you love this album?
-
-appears in 569 other collections
-download
-起​​​源​​​不​​​明 (Remastered)
-by 𝐺𝑂𝑅𝐸
-Why do you love this album?
-
-appears in 676 other collections
-download
-香り
-by slowerpace 音楽
-Why do you love this album?
-
-appears in 707 other collections
-download
-rune_model_cache_tolerates_missing_dir`.
-
+`prune_model_cache_tolerates_missing_dir`.
 
 ## Quality of life updates
 - ~~stem cache dir override (ie make it easier to locate if you want to get the stems~~ (done — `[stems] cache_dir` config, resolved via `StemsConfig::stem_cache_dir()`; the `o` panel now shows the resolved stem-cache path)
-- stems export
-- dedupe menu
 - ~~stem cache delete~~ (done — `c` in the stem settings panel clears the separated-stems cache without touching the engine; routed through `StemJobs` so it can't race a staging separation)
-- CD TUI panel with graphic
-- delete functionality (always put in trash, NEVER just delete it
-- audit command keys and make controls more intuitive
-- import from directory / auto sorting
-
-
-
-
-
 
 
