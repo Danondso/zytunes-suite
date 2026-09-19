@@ -2316,6 +2316,7 @@ fn recipe_cost_hint(recipe: zytunes::stems::RecipeKind) -> &'static str {
     match recipe {
         RecipeKind::Demucs => "1 pass — fastest on CPU",
         RecipeKind::Hq => "2 passes, Roformer vocals — slow on CPU",
+        RecipeKind::Sw => "1 pass, 6-stem Roformer — slow on CPU",
         RecipeKind::HqHarmony => "3 passes + 2 checkpoints on first use",
     }
 }
