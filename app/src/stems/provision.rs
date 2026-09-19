@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 /// (`--custom_output_names` JSON, `--model_file_dir`, stem-name keys)
 /// is verified against this exact version — bump deliberately, never
 /// let it float.
-pub const AUDIO_SEPARATOR_VERSION: &str = "0.44.3";
+pub const AUDIO_SEPARATOR_VERSION: &str = "0.47.0";
 
 /// A stem-engine executable zytunes knows how to drive. Which engine a
 /// recipe needs comes from [`crate::stems::RecipeKind::engine`]; this

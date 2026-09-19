@@ -24,6 +24,7 @@
   - Commands have been made organically
   - Audit mappings
   - Suggest improvements / redundant / confusing
+  - Make controls more intuitive
 - **One Offs**
   - perf: batch transcoding — transcoding is sequential; `rayon` is already a dependency but unused in the sync loop.
 - **Unify cache implementations** — four device-scoped caches plus the album-art cache are hand-rolled with no shared abstraction. The dirlib library scan cache stays out of this work: it lives at `$HOME/.cache/zytunes` precisely so sibling worktrees pointed at the same `~/Music` reuse one scan, which is the entire reason `ZYTUNES_CACHE_DIR` exists (it isolates device caches per-worktree without dragging the library scan along). Goal: one cache layer for everything else, with on-disk formats designed for **export** (a user can bundle their cache, ship it to another machine or back it up, and reimport it).
@@ -78,6 +79,17 @@
   - Some later models use MTP (non-encrypted); `zune-mtp` transport is reusable, auth path is not
   - Check if any model needs a proprietary DB (SA52xx songdb.dat) vs pure tag-based playback
   - Slot into `DeviceSession` trait once scoped
+- **Zune device-list duration column is empty** — `DeviceEntry` has no duration field, so device-mode rows always render an empty Duration column. Two-pronged fix (scoped 2026-07-11):
+  1. **MTP enrichment (device truth).** Add `PROP_DURATION: u16 = 0xDC89` to `zune-mtp/src/proplist.rs`, an `apply_durations` projection in `src/mtp/native/playcount.rs` (skip `0` — duration 0 is meaningless), and a fourth `enrich_one_prop(tracks, PROP_DURATION, ...)` call in `NativeSession::enrich_with_playcounts`. The bulk `GetObjectPropList` pattern is already proven on v1.4 for UseCount/Rating. ZMDB has no duration in the audio record, so ZMDB rows only pick it up after the cache merge restores object handles.
+  2. **Library fallback (instant coverage).** In `device_tracks_to_info`, return the matched `&Track` from `resolve_library_id_for_device_track` and use `dt.duration_ms.or(lib_track.total_time_ms)`.
+  Wiring: `DeviceEntry.duration_ms: Option<u32>`, 9th tab-separated column in `TrackCache` (old caches still parse), `DeviceTrackInfo.duration_ms: Option<u64>` through `add_indexed_track`. iPod fills this for free from mhit `+40` (`t.total_time_ms`, lift 0 → `None`) in `IpodSession::collect_all_tracks`. UI already renders `TrackInfo.duration_ms` when present.
+- **Tag manager: composer / lyricist / performer fields** — `build_track_fields` emits Picard-standard release-level fields but not track-level credits. MB models these as recording–artist relationships. Scope: extend `lookup_release_full` / `lookup_disc` `inc` with `work-rels+recording-rels+artist-rels`; add `relations: Vec<Relation>` on `Recording`; walk relations in `build_track_fields` (join with `; `); map to `ItemKey::{Composer,Lyricist,Conductor,Performer}` in `apply_field` (bare `Performer` first, defer per-instrument TXXX); section them in the diff UI without regressing credit-only track-header summaries. Contained to `musicbrainz.rs` + `tag_ops.rs` + tests.
+- **AcoustID lookup as tag-manager fallback** — resolution is currently `mb_release_id` → direct lookup, else MB search (Solr-only). Untagged files with a Chromaprint `acoustic_id` should hit AcoustID, then `/recording/{mbid}?inc=releases`. Scope: `src/acoustid.rs` GET client (`meta=recordings+releases`, 3 req/sec); `acoustid_app_key` in config (feature stays dark until set); disk cache keyed on `(acoustic_id, duration_secs_rounded)`; worker `AcoustIdLookup` / `AcoustIdResolved` token-fenced like MB; high-confidence hit (score > 0.9) auto-advances, ambiguous hits present as a pick list. Out of scope: submitting fingerprints, album-wide untagged batch scan.
+- **Stems export** — make it easy to grab separated stem FLACs out of the cache (beyond `[stems] cache_dir` pointing at a convenient disk).
+- **Dedupe menu** — richer UI than the Device-mode `U` keep-newest hotkey.
+- **CD TUI panel with graphic** — dedicated CD panel art, not just the import overlay.
+- **Trash on delete** — library-side deletes always go to the system trash, never unlink in place.
+- **Import from directory / auto sorting** — drop a folder of files and sort them into the library layout.
 
 ## Done
 
