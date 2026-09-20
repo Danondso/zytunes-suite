@@ -51,6 +51,11 @@
 # "halfblock" (default) | "ascii"
 # album_art_style = "halfblock"
 
+# Now-playing soundbar. Omit the key to follow the active theme.
+# `W` overrides until you pick a theme again.
+# "meters" | "eq" | "mirror" | "pulse" | "dots"
+# soundbar_style = "meters"
+
 # Now-playing panel. Omit the key for auto (show when a track is playing
 # and the terminal is tall enough). `P` cycles auto → hidden → shown.
 # true  = always show

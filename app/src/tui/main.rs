@@ -83,7 +83,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Set up audio thread.
     let (audio_event_tx, audio_event_rx) = mpsc::channel();
-    let audio_cmd_tx = audio::spawn(audio_event_tx);
+    let audio_cmd_tx = audio::spawn(audio_event_tx, std::sync::Arc::clone(&app.waveform));
 
     // Kick off async library load. `fingerprinting` defaults to true when
     // unset; setting `fingerprinting = false` in config.toml skips the

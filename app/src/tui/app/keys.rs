@@ -505,6 +505,10 @@ impl App {
             KeyCode::Char('T') => {
                 self.toggle_album_art_style();
             }
+            KeyCode::Char('W') => {
+                let label = self.cycle_soundbar_style();
+                self.set_toast(label.to_string(), false);
+            }
             KeyCode::Char('I') if self.active_panel == Panel::TrackList => {
                 self.open_track_info();
             }

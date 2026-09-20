@@ -11,6 +11,9 @@ use super::anim::{
     SKIN_GRUVBOX_LIGHT, SKIN_IBM, SKIN_ITUNES, SKIN_NEWPORT, SKIN_RED_SANDS, SKIN_SYSTEM7,
     SKIN_TOKYO_NIGHT, SKIN_WIN95,
 };
+use super::audio::{
+    SoundbarStyle, RAMP_ASCII, RAMP_BLOCKS, RAMP_BRAILLE, RAMP_CHUNKY, RAMP_DOTS, RAMP_SHADE,
+};
 
 // Modifier bit constants for const-compatible theme presets.
 const BOLD: u16 = Modifier::BOLD.bits();
@@ -29,6 +32,17 @@ pub enum AccentAnim {
     HueCycle,
     /// Shift between accent and a secondary color.
     ColorShift,
+}
+
+/// How soundbar cells pick a colour from this theme's palette.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SoundbarColor {
+    /// One colour (progress_bar), quiet cells dim.
+    Flat,
+    /// Quiet → progress_bar → accent, by amplitude.
+    Height,
+    /// Bass uses progress_bar, treble uses accent, faded by amplitude.
+    Split,
 }
 
 pub struct Theme {
@@ -61,6 +75,12 @@ pub struct Theme {
     // Now-playing animation skin and sidebar spinner set.
     pub player_skin: &'static PlayerSkin,
     pub spinner_set: &'static Set,
+    /// Default now-playing soundbar for this theme. `W` can override
+    /// until the next theme change.
+    pub soundbar_style: SoundbarStyle,
+    /// Glyph alphabet for the soundbar (blocks, braille, ASCII, …).
+    pub soundbar_ramp: &'static [char],
+    pub soundbar_color: SoundbarColor,
 }
 
 impl Theme {
@@ -125,6 +145,31 @@ impl Theme {
         Style::default().fg(self.success_text)
     }
 
+    /// Foreground for one soundbar cell. Quiet cells fall toward `dim_text`.
+    pub fn soundbar_fg(&self, peak: u8, pos: f32) -> Color {
+        let t = (peak as f32 / 255.0).sqrt();
+        match self.soundbar_color {
+            SoundbarColor::Flat => {
+                if peak == 0 {
+                    self.dim_text
+                } else {
+                    self.progress_bar
+                }
+            }
+            SoundbarColor::Height => {
+                if t < 0.55 {
+                    lerp_color(self.dim_text, self.progress_bar, t / 0.55)
+                } else {
+                    lerp_color(self.progress_bar, self.accent_secondary, (t - 0.55) / 0.45)
+                }
+            }
+            SoundbarColor::Split => {
+                let band = lerp_color(self.progress_bar, self.accent_secondary, pos);
+                lerp_color(self.dim_text, band, t)
+            }
+        }
+    }
+
     /// Returns a pre-configured Block with the theme's border style and type.
     pub fn block(&self) -> Block<'static> {
         Block::default()
@@ -158,6 +203,24 @@ impl Theme {
     /// The most "active" accent color for the theme, used for pulse animations.
     pub fn accent_color(&self) -> Color {
         self.progress_bar
+    }
+}
+
+fn lerp_color(a: Color, b: Color, t: f32) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    match (a, b) {
+        (Color::Rgb(ar, ag, ab), Color::Rgb(br, bg, bb)) => Color::Rgb(
+            (ar as f32 + (br as f32 - ar as f32) * t) as u8,
+            (ag as f32 + (bg as f32 - ag as f32) * t) as u8,
+            (ab as f32 + (bb as f32 - ab as f32) * t) as u8,
+        ),
+        _ => {
+            if t < 0.5 {
+                a
+            } else {
+                b
+            }
+        }
     }
 }
 
@@ -208,6 +271,9 @@ pub const ITUNES_2004: Theme = Theme {
     accent_secondary: Color::Rgb(56, 117, 215),
     player_skin: &SKIN_ITUNES,
     spinner_set: &BRAILLE_EIGHT,
+    soundbar_style: SoundbarStyle::Meters,
+    soundbar_ramp: RAMP_BLOCKS,
+    soundbar_color: SoundbarColor::Height,
 };
 
 pub const GRUVBOX_DARK: Theme = Theme {
@@ -236,6 +302,9 @@ pub const GRUVBOX_DARK: Theme = Theme {
     accent_secondary: Color::Rgb(214, 93, 14),
     player_skin: &SKIN_GRUVBOX_DARK,
     spinner_set: &BRAILLE_SIX_DOUBLE,
+    soundbar_style: SoundbarStyle::Eq,
+    soundbar_ramp: RAMP_BLOCKS,
+    soundbar_color: SoundbarColor::Split,
 };
 
 pub const GRUVBOX_LIGHT: Theme = Theme {
@@ -264,6 +333,9 @@ pub const GRUVBOX_LIGHT: Theme = Theme {
     accent_secondary: Color::Rgb(175, 58, 3),
     player_skin: &SKIN_GRUVBOX_LIGHT,
     spinner_set: &BRAILLE_SIX,
+    soundbar_style: SoundbarStyle::Eq,
+    soundbar_ramp: RAMP_BLOCKS,
+    soundbar_color: SoundbarColor::Split,
 };
 
 pub const EVERFOREST_DARK: Theme = Theme {
@@ -292,6 +364,9 @@ pub const EVERFOREST_DARK: Theme = Theme {
     accent_secondary: Color::Rgb(167, 192, 128),
     player_skin: &SKIN_EVERFOREST_DARK,
     spinner_set: &OGHAM_A,
+    soundbar_style: SoundbarStyle::Pulse,
+    soundbar_ramp: RAMP_BLOCKS,
+    soundbar_color: SoundbarColor::Height,
 };
 
 pub const EVERFOREST_LIGHT: Theme = Theme {
@@ -320,6 +395,9 @@ pub const EVERFOREST_LIGHT: Theme = Theme {
     accent_secondary: Color::Rgb(141, 161, 1),
     player_skin: &SKIN_EVERFOREST_LIGHT,
     spinner_set: &OGHAM_B,
+    soundbar_style: SoundbarStyle::Pulse,
+    soundbar_ramp: RAMP_BLOCKS,
+    soundbar_color: SoundbarColor::Height,
 };
 
 pub const TOKYO_NIGHT: Theme = Theme {
@@ -348,6 +426,9 @@ pub const TOKYO_NIGHT: Theme = Theme {
     accent_secondary: Color::Rgb(125, 207, 255),
     player_skin: &SKIN_TOKYO_NIGHT,
     spinner_set: &BLACK_CIRCLE,
+    soundbar_style: SoundbarStyle::Meters,
+    soundbar_ramp: RAMP_BRAILLE,
+    soundbar_color: SoundbarColor::Split,
 };
 
 pub const IBM_MAINFRAME: Theme = Theme {
@@ -376,6 +457,9 @@ pub const IBM_MAINFRAME: Theme = Theme {
     accent_secondary: Color::Rgb(40, 200, 80),
     player_skin: &SKIN_IBM,
     spinner_set: &VERTICAL_BLOCK,
+    soundbar_style: SoundbarStyle::Eq,
+    soundbar_ramp: RAMP_CHUNKY,
+    soundbar_color: SoundbarColor::Flat,
 };
 
 pub const AMBER_CRT: Theme = Theme {
@@ -404,6 +488,9 @@ pub const AMBER_CRT: Theme = Theme {
     accent_secondary: Color::Rgb(255, 200, 60),
     player_skin: &SKIN_IBM,
     spinner_set: &VERTICAL_BLOCK,
+    soundbar_style: SoundbarStyle::Pulse,
+    soundbar_ramp: RAMP_DOTS,
+    soundbar_color: SoundbarColor::Height,
 };
 
 pub const WINDOWS_95: Theme = Theme {
@@ -432,6 +519,9 @@ pub const WINDOWS_95: Theme = Theme {
     accent_secondary: Color::Rgb(0, 0, 128),
     player_skin: &SKIN_WIN95,
     spinner_set: &WHITE_SQUARE,
+    soundbar_style: SoundbarStyle::Meters,
+    soundbar_ramp: RAMP_SHADE,
+    soundbar_color: SoundbarColor::Flat,
 };
 
 pub const SYSTEM_7: Theme = Theme {
@@ -460,6 +550,9 @@ pub const SYSTEM_7: Theme = Theme {
     accent_secondary: Color::Rgb(0, 0, 0),
     player_skin: &SKIN_SYSTEM7,
     spinner_set: &QUADRANT_BLOCK,
+    soundbar_style: SoundbarStyle::Meters,
+    soundbar_ramp: RAMP_SHADE,
+    soundbar_color: SoundbarColor::Height,
 };
 
 pub const BIOS: Theme = Theme {
@@ -488,6 +581,9 @@ pub const BIOS: Theme = Theme {
     accent_secondary: Color::Rgb(85, 255, 85),
     player_skin: &SKIN_BIOS,
     spinner_set: &ASCII,
+    soundbar_style: SoundbarStyle::Eq,
+    soundbar_ramp: RAMP_ASCII,
+    soundbar_color: SoundbarColor::Flat,
 };
 
 pub const RED_SANDS: Theme = Theme {
@@ -516,6 +612,9 @@ pub const RED_SANDS: Theme = Theme {
     accent_secondary: Color::Rgb(200, 80, 40),
     player_skin: &SKIN_RED_SANDS,
     spinner_set: &BRAILLE_ONE,
+    soundbar_style: SoundbarStyle::Pulse,
+    soundbar_ramp: RAMP_BLOCKS,
+    soundbar_color: SoundbarColor::Height,
 };
 
 pub const NEWPORT_LIGHTS: Theme = Theme {
@@ -547,6 +646,9 @@ pub const NEWPORT_LIGHTS: Theme = Theme {
     // the old WHITE_CIRCLE set (◷◶◵◴) had only 4 frames and its glyphs
     // rendered inconsistently in some fonts, showing up as a skipped frame.
     spinner_set: &BRAILLE_EIGHT,
+    soundbar_style: SoundbarStyle::Mirror,
+    soundbar_ramp: RAMP_DOTS,
+    soundbar_color: SoundbarColor::Split,
 };
 
 pub const NEXTSTEP: Theme = Theme {
@@ -575,6 +677,9 @@ pub const NEXTSTEP: Theme = Theme {
     accent_secondary: Color::Rgb(96, 112, 140),
     player_skin: &SKIN_SYSTEM7,
     spinner_set: &BRAILLE_SIX,
+    soundbar_style: SoundbarStyle::Eq,
+    soundbar_ramp: RAMP_CHUNKY,
+    soundbar_color: SoundbarColor::Flat,
 };
 
 pub const WINAMP_CLASSIC: Theme = Theme {
@@ -603,6 +708,9 @@ pub const WINAMP_CLASSIC: Theme = Theme {
     accent_secondary: Color::Rgb(255, 220, 0),
     player_skin: &SKIN_IBM,
     spinner_set: &VERTICAL_BLOCK,
+    soundbar_style: SoundbarStyle::Mirror,
+    soundbar_ramp: RAMP_BLOCKS,
+    soundbar_color: SoundbarColor::Split,
 };
 
 pub const ZUNE_ORIGINAL: Theme = Theme {
@@ -635,6 +743,9 @@ pub const ZUNE_ORIGINAL: Theme = Theme {
     accent_secondary: Color::Rgb(235, 141, 0),
     player_skin: &SKIN_TOKYO_NIGHT,
     spinner_set: &BLACK_CIRCLE,
+    soundbar_style: SoundbarStyle::Pulse,
+    soundbar_ramp: RAMP_BLOCKS,
+    soundbar_color: SoundbarColor::Split,
 };
 
 /// Look up a theme by name (case-insensitive). Falls back to the default theme
@@ -852,6 +963,9 @@ pub fn build_user_theme(name: &str, ut: &crate::config::UserTheme) -> Result<The
         )?,
         player_skin: base.player_skin,
         spinner_set: base.spinner_set,
+        soundbar_style: base.soundbar_style,
+        soundbar_ramp: base.soundbar_ramp,
+        soundbar_color: base.soundbar_color,
     })
 }
 
@@ -940,6 +1054,44 @@ mod tests {
                 t.name
             );
         }
+    }
+
+    #[test]
+    fn theme_soundbar_styles() {
+        use crate::audio::SoundbarStyle::*;
+        let cases = [
+            ("iTunes 2004", Meters),
+            ("Gruvbox Dark", Eq),
+            ("WinAmp Classic", Mirror),
+            ("BIOS", Eq),
+            ("Zune Original", Pulse),
+            ("Newport Lights", Mirror),
+            ("Tokyo Night", Meters),
+        ];
+        for (name, style) in cases {
+            assert_eq!(theme_by_name(name).soundbar_style, style, "{name}");
+        }
+        assert_eq!(theme_by_name("Tokyo Night").soundbar_ramp, RAMP_BRAILLE);
+        assert_eq!(theme_by_name("BIOS").soundbar_ramp, RAMP_ASCII);
+        assert_eq!(theme_by_name("Windows 95").soundbar_ramp, RAMP_SHADE);
+        assert_eq!(theme_by_name("IBM Mainframe").soundbar_ramp, RAMP_CHUNKY);
+        assert_eq!(
+            theme_by_name("WinAmp Classic").soundbar_color,
+            SoundbarColor::Split
+        );
+        assert_eq!(
+            theme_by_name("IBM Mainframe").soundbar_color,
+            SoundbarColor::Flat
+        );
+        let ibm = theme_by_name("IBM Mainframe");
+        assert_eq!(ibm.soundbar_fg(0, 0.0), ibm.dim_text);
+        assert_eq!(ibm.soundbar_fg(255, 0.0), ibm.progress_bar);
+        let winamp = theme_by_name("WinAmp Classic");
+        assert_ne!(
+            winamp.soundbar_fg(255, 0.0),
+            winamp.soundbar_fg(255, 1.0),
+            "Split colours bass and treble differently"
+        );
     }
 
     #[test]

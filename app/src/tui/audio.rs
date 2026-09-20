@@ -3,6 +3,7 @@ use std::io::BufReader;
 use std::path::Path;
 use std::process::Command;
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -12,6 +13,14 @@ use zytunes::stems::{StemGains, StemSet};
 #[path = "audio/stem_mix.rs"]
 pub mod stem_mix;
 use stem_mix::StemMixerSource;
+
+#[path = "audio/waveform.rs"]
+pub mod waveform;
+use waveform::WaveformTap;
+pub use waveform::{
+    soundbar_atoms, SoundbarStyle, Waveform, RAMP_ASCII, RAMP_BLOCKS, RAMP_BRAILLE, RAMP_CHUNKY,
+    RAMP_DOTS, RAMP_SHADE,
+};
 
 /// Formats that rodio + symphonia can decode directly (with expanded codec features).
 /// WMA is the only common format not supported by symphonia.
@@ -236,7 +245,17 @@ fn build_stem_mixer(
     StemMixerSource::new(decoders, gains.clone())
 }
 
-pub fn spawn(event_tx: mpsc::Sender<AudioEvent>) -> mpsc::Sender<AudioCommand> {
+/// Wrap `src` so the now-playing soundbar sees the samples that actually
+/// reach the mixer. Applied at append, after seek/fade, so skip-ahead
+/// does not paint the bars with discarded audio.
+fn append_live<S: rodio::Source + Send + 'static>(player: &Player, src: S, wave: &Arc<Waveform>) {
+    player.append(WaveformTap::new(src, Arc::clone(wave)));
+}
+
+pub fn spawn(
+    event_tx: mpsc::Sender<AudioEvent>,
+    wave: Arc<Waveform>,
+) -> mpsc::Sender<AudioCommand> {
     let (cmd_tx, cmd_rx) = mpsc::channel::<AudioCommand>();
 
     thread::spawn(move || {
@@ -282,7 +301,8 @@ pub fn spawn(event_tx: mpsc::Sender<AudioEvent>) -> mpsc::Sender<AudioCommand> {
                     };
 
                     let new_player = Player::connect_new(device_sink.mixer());
-                    new_player.append(source);
+                    wave.clear();
+                    append_live(&new_player, source, &wave);
                     play_start = Instant::now();
                     paused_elapsed = Duration::ZERO;
                     playing = true;
@@ -352,7 +372,7 @@ pub fn spawn(event_tx: mpsc::Sender<AudioEvent>) -> mpsc::Sender<AudioCommand> {
                                 // sound.
                                 new_player.pause();
                             }
-                            new_player.append(positioned.fade_in(fade));
+                            append_live(&new_player, positioned.fade_in(fade), &wave);
                             // Cut over: the new source starts on the next
                             // output callback; stopping the old
                             // immediately after leaves a near-zero seam
@@ -382,6 +402,7 @@ pub fn spawn(event_tx: mpsc::Sender<AudioEvent>) -> mpsc::Sender<AudioCommand> {
                     }
                     playing = false;
                     paused_elapsed = Duration::ZERO;
+                    wave.clear();
                 }
                 Ok(AudioCommand::Pause) => {
                     if let Some(ref p) = player {
@@ -436,10 +457,10 @@ pub fn spawn(event_tx: mpsc::Sender<AudioEvent>) -> mpsc::Sender<AudioCommand> {
                         }
                         let appended = match src {
                             NowSource::File(path) => build_decoder(path)
-                                .map(|s| new_player.append(seek_source(s, new_pos))),
+                                .map(|s| append_live(&new_player, seek_source(s, new_pos), &wave)),
                             NowSource::Stems(stems, gains) => {
                                 build_stem_mixer(stems, gains, new_pos)
-                                    .map(|m| new_player.append(m))
+                                    .map(|m| append_live(&new_player, m, &wave))
                             }
                         };
                         match appended {
