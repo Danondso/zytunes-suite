@@ -1,7 +1,7 @@
 use zytunes::{
     check_ffmpeg_available, collect_music_files, collect_photo_files, collect_video_files, connect,
-    find_matching_tracks, make_transcode_temp_dir, needs_transcoding, needs_video_transcoding,
-    resize_photo_for_zune, sync_to_device, transcode_and_import, transcode_and_import_video,
+    find_matching_tracks, make_transcode_temp_dir, needs_video_transcoding, resize_photo_for_zune,
+    sync_to_device, transcode_and_import_video, transcode_paths_parallel, will_transcode,
 };
 
 use std::collections::HashMap;
@@ -290,7 +290,7 @@ fn cmd_sync(args: &[String]) -> Result<(), String> {
         .filter(|t| {
             t.location
                 .as_ref()
-                .is_some_and(|loc| needs_transcoding(loc, caps.supported_formats))
+                .is_some_and(|loc| will_transcode(loc, &caps))
         })
         .count();
     println!(
@@ -427,15 +427,12 @@ fn cmd_push(paths: &[String]) -> Result<(), String> {
     println!();
 
     // Check which files need transcoding.
-    let needs_transcode = files
-        .iter()
-        .filter(|f| needs_transcoding(f, caps.supported_formats))
-        .count();
+    let needs_transcode = files.iter().filter(|f| will_transcode(f, &caps)).count();
 
     println!("Found {} music file(s) to push", files.len());
     if needs_transcode > 0 {
         println!(
-            "  {} file(s) will be transcoded to MP3 (device doesn't support FLAC/OGG/etc.)",
+            "  {} file(s) will be transcoded for the device",
             needs_transcode
         );
     }
@@ -446,7 +443,9 @@ fn cmd_push(paths: &[String]) -> Result<(), String> {
     if needs_transcode > 0 {
         std::fs::create_dir_all(&temp_dir)
             .map_err(|e| format!("Failed to create temp directory: {e}"))?;
+        println!("Transcoding {needs_transcode} file(s) in parallel...");
     }
+    let prepared = transcode_paths_parallel(&files, &temp_dir, &caps);
 
     let mut success = 0;
     let mut failed = 0;
@@ -459,7 +458,17 @@ fn cmd_push(paths: &[String]) -> Result<(), String> {
             .to_string_lossy();
         println!("[{}/{}] {}", i + 1, total, filename);
 
-        match transcode_and_import(session.as_mut(), file, &temp_dir, &caps, None) {
+        let upload_path = match prepared.get(file) {
+            Some(Ok(p)) => p.as_str(),
+            Some(Err(e)) => {
+                println!("  FAILED: {e}");
+                failed += 1;
+                continue;
+            }
+            None => file.as_str(),
+        };
+
+        match session.import_track(upload_path, None) {
             Ok(_id) => {
                 println!("  OK");
                 success += 1;

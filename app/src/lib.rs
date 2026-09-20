@@ -72,8 +72,9 @@ use std::str::FromStr;
 // transcode pipeline from the crate root.
 pub use transcode::{
     check_ffmpeg_available, make_transcode_temp_dir, needs_transcoding, needs_video_transcoding,
-    transcode_and_import, transcode_and_import_video, transcode_flac_to_alac, transcode_for_device,
-    transcode_to_mp3, transcode_to_wmv,
+    next_transcode_batch, transcode_and_import, transcode_and_import_video, transcode_flac_to_alac,
+    transcode_for_device, transcode_parallelism, transcode_paths_parallel, transcode_to_mp3,
+    transcode_to_wmv, will_transcode,
 };
 
 /// The type of sync operation to perform.
@@ -322,6 +323,13 @@ pub fn sync_to_device(
         println!("\nAll tracks already on device — nothing to sync");
     }
 
+    let locations: Vec<String> = to_push.iter().filter_map(|t| t.location.clone()).collect();
+    let n_transcode = locations.iter().filter(|l| will_transcode(l, caps)).count();
+    if n_transcode > 0 {
+        println!("Transcoding {n_transcode} track(s) in parallel...");
+    }
+    let prepared = transcode_paths_parallel(&locations, temp_dir, caps);
+
     for (i, track) in to_push.iter().enumerate() {
         let loc = match track.location.as_deref() {
             Some(l) => l,
@@ -334,8 +342,17 @@ pub fn sync_to_device(
         let display = format!("{} - {} - {}", track.artist, track.album, track.name);
         println!("[{}/{}] {}", i + 1, total, display);
 
+        let upload_path = match prepared.get(loc) {
+            Some(Ok(p)) => p.as_str(),
+            Some(Err(e)) => {
+                println!("  FAILED: {e}");
+                failed += 1;
+                continue;
+            }
+            None => loc,
+        };
         let meta = mtp::TrackMeta::from_track(track);
-        match transcode_and_import(session, loc, temp_dir, caps, Some(&meta)) {
+        match session.import_track(upload_path, Some(&meta)) {
             Ok(object_id) => {
                 println!("  OK (id: {})", object_id);
                 success += 1;
@@ -968,6 +985,26 @@ mod tests {
         assert_eq!(result.success, 5);
         assert_eq!(result.skipped, 0);
         assert_eq!(mock.import_calls.len(), 5);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sync_transcode_failure_does_not_block_later_imports() {
+        let (dir, files) = setup_test_files("sync-tx-fail", 1);
+        let temp_dir = dir.join("transcode");
+        let missing = dir.join("missing.flac");
+        let t_fail = make_test_track(1, "Gone", "Artist", "Album", missing.to_str().unwrap());
+        let t_ok = make_test_track(2, "Song", "Artist", "Album", &files[0]);
+        let tracks: Vec<&library::Track> = vec![&t_fail, &t_ok];
+
+        let mut mock = MockSession::new();
+        let caps = test_caps();
+        let result = sync_to_device(&mut mock, &tracks, &temp_dir, &caps).unwrap();
+
+        assert_eq!(result.success, 1);
+        assert_eq!(result.failed, 1);
+        assert_eq!(mock.import_calls, vec![files[0].clone()]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
