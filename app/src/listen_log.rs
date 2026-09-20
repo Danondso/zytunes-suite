@@ -115,13 +115,14 @@ impl ListenLog {
     /// Append one event and persist if a save path is bound.
     ///
     /// Best-effort persistence: the event is added to in-memory state
-    /// unconditionally, then a write is attempted. Disk errors go to
-    /// stderr and the in-memory state stays consistent so the caller's
-    /// logic is unaffected. **Trade-off:** events appended in this
-    /// session that fail to persist survive until process exit and are
-    /// gone after a crash. Treat the log as an info signal, not a source
-    /// of truth — the recommender layers this against the live library
-    /// scan, so missing rows are tolerated.
+    /// unconditionally, then a write is attempted. Disk errors go through
+    /// the [`Logger`] (stderr in the CLI, the TUI sync log in the TUI)
+    /// and the in-memory state stays consistent so the caller's logic is
+    /// unaffected. **Trade-off:** events appended in this session that
+    /// fail to persist survive until process exit and are gone after a
+    /// crash. Treat the log as an info signal, not a source of truth —
+    /// the recommender layers this against the live library scan, so
+    /// missing rows are tolerated.
     pub fn append(&mut self, event: ListenEvent) {
         self.events.push(event);
         // Borrow rather than clone — `append_to_disk` only needs `&Path`,

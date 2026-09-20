@@ -60,6 +60,11 @@ const FORMAT_ABSTRACT_AUDIO_VIDEO_PLAYLIST: u16 = 0xBA05;
 const FORMAT_EXIF_JPEG: u16 = 0x3801;
 const FORMAT_WMV: u16 = 0xB981;
 
+fn playlist_object_matches(object_filename: &str, object_format: u16, want: &str) -> bool {
+    object_format == FORMAT_ABSTRACT_AUDIO_VIDEO_PLAYLIST
+        && object_filename.eq_ignore_ascii_case(want)
+}
+
 /// Cached artist info.
 struct ArtistInfo {
     id: u32,
@@ -1499,7 +1504,7 @@ impl DeviceSession for NativeSession {
             format!("{trimmed}.zpl")
         };
 
-        let (playlist_handle, replaced) = match self.find_existing_playlist(&filename) {
+        let (playlist_handle, replaced) = match self.find_existing_playlist(&filename)? {
             Some(h) => {
                 self.log_msg(&format!(
                     "Updating existing playlist \"{trimmed}\" at handle 0x{h:08x}"
@@ -1633,22 +1638,34 @@ impl NativeSession {
     /// Zune tends to keep playlists there per libmtp conventions. Match
     /// is case-insensitive: the filesystem layer treats `Roadtrip.zpl`
     /// and `roadtrip.zpl` as the same file on the device.
-    fn find_existing_playlist(&mut self, filename: &str) -> Option<u32> {
-        self.session
+    ///
+    /// `get_object_handles` failures propagate so a USB stall cannot
+    /// fall through to create-a-duplicate. A dead pipe during
+    /// `get_object_info` also propagates; a per-object non-fatal error
+    /// skips that handle (logged) so one unreadable object does not
+    /// block playlist sync.
+    fn find_existing_playlist(&mut self, filename: &str) -> Result<Option<u32>, DeviceError> {
+        let handles = self
+            .session
             .get_object_handles(self.storage_id, MTP_ROOT)
-            .ok()
-            .and_then(|handles| {
-                handles.into_iter().find(|h| {
-                    self.session
-                        .get_object_info(*h)
-                        .ok()
-                        .map(|info| {
-                            info.object_format == FORMAT_ABSTRACT_AUDIO_VIDEO_PLAYLIST
-                                && info.filename.eq_ignore_ascii_case(filename)
-                        })
-                        .unwrap_or(false)
-                })
-            })
+            .mtp_err()?;
+        for h in handles {
+            match self.session.get_object_info(h).mtp_err() {
+                Ok(info)
+                    if playlist_object_matches(&info.filename, info.object_format, filename) =>
+                {
+                    return Ok(Some(h));
+                }
+                Ok(_) => {}
+                Err(e) if matches!(e, DeviceError::DeviceGone(_)) => return Err(e),
+                Err(e) => {
+                    self.log_msg(&format!(
+                        "Skipping object 0x{h:08x} during playlist lookup: {e}"
+                    ));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Create a zero-byte playlist object and return its handle. libmtp
@@ -2774,5 +2791,24 @@ mod tests {
         let r = resolve_playlist_handles(&track_keys, &recent, &device_tracks);
         assert_eq!(r.member_handles, vec![100]);
         assert_eq!(r.from_recent, 1);
+    }
+
+    #[test]
+    fn playlist_object_matches_is_case_insensitive_and_format_gated() {
+        assert!(playlist_object_matches(
+            "Roadtrip.zpl",
+            FORMAT_ABSTRACT_AUDIO_VIDEO_PLAYLIST,
+            "roadtrip.zpl"
+        ));
+        assert!(!playlist_object_matches(
+            "Roadtrip.zpl",
+            FORMAT_MP3,
+            "roadtrip.zpl"
+        ));
+        assert!(!playlist_object_matches(
+            "Other.zpl",
+            FORMAT_ABSTRACT_AUDIO_VIDEO_PLAYLIST,
+            "roadtrip.zpl"
+        ));
     }
 }

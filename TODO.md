@@ -6,8 +6,6 @@
 
 ## Future
 
-- **Diagnostics: route playlist/listen-log writes through the project Logger** — `src/playlist_store.rs` and `src/listen_log.rs` use `eprintln!` for failure paths instead of the project's `Logger = Arc<dyn Fn(&str) + Send + Sync>` pattern (the same pattern `src/cache.rs` already uses to avoid stderr corrupting the rendered TUI). Both files run from the TUI hot path on every play/skip and every playlist save, so a stray write at the wrong moment can scribble through the ratatui frame. Goal: thread an optional `Logger` into `PlaylistStore::{load_from, save_to}` and `ListenLog::{append, append_to_disk, save_to}`, defaulting to `default_logger` (stderr) for the CLI and a closure-routed-into-`SyncMessage` for the TUI. Drop the module-level `eprintln!` calls. Out of scope for the playlists/recommender PR — touches every diagnostic call site and deserves its own pass.
-- **Diagnostics: tighten the existing-playlist lookup error path** — `NativeSession::import_playlist` swallows transient `get_object_handles` / `get_object_info` errors via `.ok()` when scanning for an existing `<name>.zpl` to update in place. Now that the filename match is correct (commit 8a517a2), a transient stall during this scan still falls through to the create branch — which now correctly hits the case-insensitive existence check on the *next* sync. The blast radius is small (one extra `<name>.zpl` survives until the next successful scan), but propagating the handle-list error rather than silencing it would surface USB issues sooner. Out of scope for this PR; small enough to bundle into a future MTP-error-handling sweep.
 - **Configurable transcode quality** — currently hardcoded to symphonia → LAME `NearBest` VBR (~190kbps) in `src/lib.rs:326`. Add CLI flag and config key for bitrate/quality.
 - **Theming (remaining)**
   - Theme preview screenshots in docs
@@ -87,6 +85,9 @@
 - **Import from directory / auto sorting** — drop a folder of files and sort them into the library layout.
 
 ## Done
+
+- **Diagnostics: playlist/listen-log Logger** — `PlaylistStore` and `ListenLog` take a `Logger`; CLI uses stderr, TUI routes into `SyncMessage`. No `eprintln!` on those hot paths.
+- **Diagnostics: playlist lookup USB errors** — `find_existing_playlist` propagates `get_object_handles` failures and `DeviceGone` from `get_object_info` instead of falling through to create a duplicate `.zpl`. Non-fatal per-object errors skip that handle (logged). The TUI worker drops the session on `DeviceGone`.
 
 - **Device-list duration column** — `DeviceEntry.duration_ms` from MTP `0xDC89 Duration` (Zune bulk enrich, skip 0) and iTunesDB mhit `+40` (iPod). Track cache 9th column; old files still parse. Device-mode rows fall back to the matched library tag's `total_time_ms` when the device didn't surface a duration (ZMDB rows before handle merge).
 - **iPod device-panel identity** — generation + capacity composed from SysInfo `ModelNumStr` (libgpod suffix table: 1G–4G, Photo, mini, shuffle, nano 1–6, Video, Classic), SysInfoExtended `FamilyID`, USB product ID (including shuffle `0x1300`–`0x1303`), and storage. Measured size is snapped to a marketing SKU only when it is within ~15%; flash-mods keep the real GB. Unknown SKUs never guess Classic. Panel title uses the iTunes name from `iPod_Control/iTunes/DeviceInfo` (UTF-16LE) when present; otherwise the model string. A Model line is shown only when it differs from the title. USB line includes the product ID (matched to the mounted block device on Linux). FS shows FAT vs HFS+ (and read-only) from the mount table. Firmware falls back to sysfs block `rev` on Linux when SysInfo is empty.
