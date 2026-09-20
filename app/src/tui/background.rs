@@ -134,7 +134,8 @@ use zytunes::stems::{
 use zytunes::{
     collect_photo_files_with_logger, collect_video_files_with_logger, make_transcode_temp_dir,
     needs_video_transcoding, next_transcode_batch, resize_photo_for_zune,
-    transcode_and_import_video, transcode_parallelism, transcode_paths_parallel, will_transcode,
+    transcode_and_import_video, transcode_for_device, transcode_parallelism,
+    transcode_paths_parallel, will_transcode,
 };
 
 /// Commands sent from the main TUI thread to the background worker.
@@ -1397,16 +1398,18 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                 // user's added tracks sync instead of vanishing.
                 BgCommand::ExecuteSyncQueue(items) | BgCommand::AppendSyncQueue(items) => {
                     if let Some(ref mut s) = session {
-                        let cur_caps = caps.clone();
-                        let fallback_caps = DeviceCapabilities {
-                            family: DeviceFamily::Zune,
-                            supported_formats: &["mp3", "wma", "aac"],
-                            transcode_target: "mp3",
-                            lossless_target: None,
-                            music_root: "/Music",
-                            max_art_dimensions: Some((200, 200)),
+                        let Some(tx_caps) = caps.clone() else {
+                            let n = items.len();
+                            let _ = event_tx.send(BgEvent::Error(
+                                "Sync started without device capabilities".into(),
+                            ));
+                            let _ = event_tx.send(BgEvent::SyncComplete {
+                                success: 0,
+                                failed: n,
+                                skipped: 0,
+                            });
+                            continue;
                         };
-                        let tx_caps = cur_caps.as_ref().unwrap_or(&fallback_caps);
 
                         // Mutable queue so `AppendSyncQueue` commands received
                         // mid-sync can extend the work in flight.
@@ -1424,7 +1427,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
 
                         let to_transcode = sync_queue
                             .iter()
-                            .filter(|it| will_transcode(&it.location, tx_caps))
+                            .filter(|it| will_transcode(&it.location, &tx_caps))
                             .count();
                         let _ = event_tx.send(BgEvent::SyncMessage(format!(
                             "Starting sync: {} tracks ({} need transcoding)",
@@ -1454,9 +1457,21 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                 &mut prepared,
                                 &sync_queue,
                                 &temp_dir,
-                                tx_caps,
+                                &tx_caps,
                                 &event_tx,
                             );
+
+                            cancelled |= drain_sync_commands(
+                                &cmd_rx,
+                                &event_tx,
+                                &mut sync_queue,
+                                &mut total,
+                            );
+                            if cancelled {
+                                let _ =
+                                    event_tx.send(BgEvent::SyncMessage("Sync cancelled".into()));
+                                break;
+                            }
 
                             let Some(item) = sync_queue.pop_front() else {
                                 break;
@@ -1490,6 +1505,34 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                         error: Some(e.clone()),
                                     });
                                     continue;
+                                }
+                                None if will_transcode(&item.location, &tx_caps) => {
+                                    match transcode_for_device(&item.location, &temp_dir, &tx_caps)
+                                    {
+                                        Ok(p) => {
+                                            let size =
+                                                std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+                                            let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                                                "  Transcoded \"{}\" ({:.1} MB)",
+                                                item.name,
+                                                size as f64 / 1_048_576.0
+                                            )));
+                                            p
+                                        }
+                                        Err(e) => {
+                                            failed += 1;
+                                            let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                                                "  Transcode FAILED: {}",
+                                                e
+                                            )));
+                                            let _ = event_tx.send(BgEvent::SyncTrackDone {
+                                                track_name: item.name.clone(),
+                                                success: false,
+                                                error: Some(e),
+                                            });
+                                            continue;
+                                        }
+                                    }
                                 }
                                 None => item.location.clone(),
                             };

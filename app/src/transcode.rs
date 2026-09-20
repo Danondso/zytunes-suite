@@ -22,9 +22,10 @@ pub fn make_transcode_temp_dir() -> std::path::PathBuf {
 
 /// Unique path in `temp_dir` for a transcoded copy of `input`.
 ///
-/// Hashes the full source path so two files that share a stem (the usual
-/// `01 - Intro.flac` on two albums) do not clobber each other when
-/// transcoding in parallel.
+/// Hashes the full source path into a subdirectory so two files that share
+/// a stem (the usual `01 - Intro.flac` on two albums) do not clobber each
+/// other when transcoding in parallel. The basename stays `{stem}.{ext}` so
+/// `import_track` still publishes the original filename to the device.
 fn transcoded_output_path(temp_dir: &Path, input: &str, ext: &str) -> PathBuf {
     use std::hash::{Hash, Hasher};
     let stem = Path::new(input)
@@ -34,7 +35,17 @@ fn transcoded_output_path(temp_dir: &Path, input: &str, ext: &str) -> PathBuf {
         .unwrap_or_else(|| "track".into());
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     input.hash(&mut hasher);
-    temp_dir.join(format!("{stem}-{:016x}.{ext}", hasher.finish()))
+    temp_dir
+        .join(format!("{:016x}", hasher.finish()))
+        .join(format!("{stem}.{ext}"))
+}
+
+fn prepare_transcode_output(temp_dir: &Path, input: &str, ext: &str) -> Result<PathBuf, String> {
+    let output = transcoded_output_path(temp_dir, input, ext);
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("Cannot create temp dir: {e}"))?;
+    }
+    Ok(output)
 }
 
 /// Check if a file needs transcoding for the target device.
@@ -73,9 +84,7 @@ pub fn check_ffmpeg_available() -> bool {
 /// Uses wmv2 video codec at 320x240 and wmav2 audio — the Zune's native
 /// playback format. Returns the path to the output WMV file.
 pub fn transcode_to_wmv(input: &str, temp_dir: &Path) -> Result<String, String> {
-    std::fs::create_dir_all(temp_dir).map_err(|e| format!("Cannot create temp dir: {e}"))?;
-
-    let output = transcoded_output_path(temp_dir, input, "wmv");
+    let output = prepare_transcode_output(temp_dir, input, "wmv")?;
 
     let result = std::process::Command::new("ffmpeg")
         .args([
@@ -249,7 +258,12 @@ pub fn transcode_paths_parallel<S: AsRef<str> + Sync>(
     unique
         .into_par_iter()
         .map(|p| {
-            let result = transcode_for_device(&p, temp_dir, caps);
+            // Symphonia (and LAME on odd inputs) can panic; without isolation
+            // one bad file aborts the whole rayon collect and drops siblings.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                transcode_for_device(&p, temp_dir, caps)
+            }))
+            .unwrap_or_else(|_| Err(format!("transcoder panicked on {p}")));
             (p, result)
         })
         .collect()
@@ -279,8 +293,7 @@ pub fn transcode_flac_to_alac(input: &str, temp_dir: &Path) -> Result<String, St
     if !check_ffmpeg_available() {
         return Err("ffmpeg is required for FLAC→ALAC transcoding".into());
     }
-    std::fs::create_dir_all(temp_dir).map_err(|e| format!("Cannot create temp dir: {e}"))?;
-    let output = transcoded_output_path(temp_dir, input, "m4a");
+    let output = prepare_transcode_output(temp_dir, input, "m4a")?;
 
     let status = std::process::Command::new("ffmpeg")
         .args([
@@ -493,9 +506,8 @@ pub fn transcode_to_mp3(
     use symphonia::core::meta::MetadataOptions;
     use symphonia::core::probe::Hint;
 
-    std::fs::create_dir_all(temp_dir).map_err(|e| format!("Cannot create temp dir: {e}"))?;
     let input_path = Path::new(input);
-    let output = transcoded_output_path(temp_dir, input, "mp3");
+    let output = prepare_transcode_output(temp_dir, input, "mp3")?;
 
     // 1. Read metadata and album art with lofty
     let meta = read_lofty_metadata(input)?;
@@ -879,8 +891,13 @@ mod tests {
         let a = transcoded_output_path(dir, "/album-a/01 - Intro.flac", "mp3");
         let b = transcoded_output_path(dir, "/album-b/01 - Intro.flac", "mp3");
         assert_ne!(a, b);
-        assert!(a.to_string_lossy().ends_with(".mp3"));
-        assert!(b.to_string_lossy().ends_with(".mp3"));
+        assert_eq!(
+            a.file_name(),
+            b.file_name(),
+            "basename must stay the original stem so the device filename is unchanged"
+        );
+        assert_eq!(a.file_name().unwrap().to_string_lossy(), "01 - Intro.mp3");
+        assert_ne!(a.parent(), b.parent());
     }
 
     #[test]
@@ -1429,6 +1446,11 @@ mod tests {
         let a = map.get(&paths[0]).unwrap().as_ref().unwrap();
         let b = map.get(&paths[1]).unwrap().as_ref().unwrap();
         assert_ne!(a, b);
+        assert_eq!(Path::new(a).file_name(), Path::new(b).file_name());
+        assert_eq!(
+            Path::new(a).file_name().unwrap().to_string_lossy(),
+            "01 - Intro.mp3"
+        );
         assert!(Path::new(a).exists());
         assert!(Path::new(b).exists());
 
