@@ -18,6 +18,11 @@ pub struct DetectedIpod {
     /// SysInfoExtended `FamilyID` (generation integer). `None` when the
     /// plist is missing, binary, or has no FamilyID key.
     pub family_id: Option<u32>,
+    /// `boardHwSwInterfaceRev` gestalt from SysInfo (e.g. `0x000B0005`).
+    pub gestalt: Option<u32>,
+    /// Post-2006 firmware creates `SysInfo` at 0 bytes. Combined with USB
+    /// PID this distinguishes Video 5.5G from 5G.
+    pub sysinfo_empty: bool,
 }
 
 /// Check if a path looks like an iPod mount point.
@@ -25,37 +30,77 @@ fn is_ipod_mount(path: &Path) -> bool {
     path.join("iPod_Control").is_dir()
 }
 
+/// Parsed `iPod_Control/Device/SysInfo` fields we care about for identity.
+struct SysInfoFields {
+    model: Option<String>,
+    serial: Option<String>,
+    firmware: Option<String>,
+    gestalt: Option<u32>,
+    empty: bool,
+}
+
 /// Try to parse SysInfo from iPod_Control/Device/SysInfo.
-fn read_sysinfo(mount: &Path) -> (Option<String>, Option<String>, Option<String>) {
+fn read_sysinfo(mount: &Path) -> SysInfoFields {
     let sysinfo_path = mount.join("iPod_Control").join("Device").join("SysInfo");
-    let contents = match std::fs::read_to_string(sysinfo_path) {
+    let contents = match std::fs::read_to_string(&sysinfo_path) {
         Ok(c) => c,
-        Err(_) => return (None, None, None),
+        Err(_) => {
+            return SysInfoFields {
+                model: None,
+                serial: None,
+                firmware: None,
+                gestalt: None,
+                empty: !sysinfo_path.exists(),
+            };
+        }
     };
 
-    let mut model = None;
-    let mut serial = None;
-    let mut firmware = None;
+    let mut fields = SysInfoFields {
+        model: None,
+        serial: None,
+        firmware: None,
+        gestalt: None,
+        empty: contents.trim().is_empty(),
+    };
 
     for line in contents.lines() {
         let line = line.trim();
         if let Some((key, value)) = line.split_once(':') {
             let key = key.trim();
-            let value = value.trim().to_string();
+            let value = value.trim();
+            if value.is_empty() {
+                continue;
+            }
             match key {
-                "ModelNumStr" => model = Some(value),
-                "pszSerialNumber" | "FirewireGuid" if serial.is_none() => {
-                    serial = Some(value);
+                "ModelNumStr" => fields.model = Some(value.to_string()),
+                "pszSerialNumber" | "FirewireGuid" if fields.serial.is_none() => {
+                    fields.serial = Some(value.to_string());
                 }
-                "visibleBuildID" | "buildID" if firmware.is_none() => {
-                    firmware = Some(value);
+                "visibleBuildID" | "buildID" if fields.firmware.is_none() => {
+                    fields.firmware = Some(value.to_string());
+                }
+                "boardHwSwInterfaceRev" if fields.gestalt.is_none() => {
+                    fields.gestalt = parse_sysinfo_hex(value);
                 }
                 _ => {}
             }
         }
     }
+    if fields.model.is_none()
+        && fields.serial.is_none()
+        && fields.firmware.is_none()
+        && fields.gestalt.is_none()
+    {
+        fields.empty = true;
+    }
+    fields
+}
 
-    (model, serial, firmware)
+/// `0x000B0005 (0.0.11 5)` → `0x000B0005`.
+fn parse_sysinfo_hex(value: &str) -> Option<u32> {
+    let token = value.split_whitespace().next()?;
+    let token = token.trim_start_matches("0x").trim_start_matches("0X");
+    u32::from_str_radix(token, 16).ok()
 }
 
 /// Read the iTunes-assigned iPod name from `iPod_Control/iTunes/DeviceInfo`.
@@ -110,27 +155,53 @@ fn utf16le_to_string(bytes: &[u8]) -> String {
         .to_string()
 }
 
-/// FAT volume label from the mount directory name. Generic `IPOD` labels
-/// are treated as unnamed so a model string can take over in the UI.
+/// True for names that are not a user-assigned iPod name: empty, generic
+/// FAT labels (`IPOD`, `NO NAME`, `UNTITLED`), or Linux automount IDs
+/// (`1234-5678`, GPT/UUID folder names under `/run/media/$USER/`).
+pub fn is_generic_ipod_name(name: &str) -> bool {
+    let n = name.trim();
+    n.is_empty()
+        || n.eq_ignore_ascii_case("ipod")
+        || n.eq_ignore_ascii_case("no name")
+        || n.eq_ignore_ascii_case("untitled")
+        || n.eq_ignore_ascii_case("usb disk")
+        || n.eq_ignore_ascii_case("usb drive")
+        || n.eq_ignore_ascii_case("removable disk")
+        || is_volume_uuid(n)
+}
+
+/// FAT volume serial (`1234-5678`) or a hex-and-hyphen UUID, as used for
+/// unlabeled udisks mount directories.
+fn is_volume_uuid(name: &str) -> bool {
+    name.len() >= 9 && name.contains('-') && name.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+}
+
+/// iTunes DeviceInfo name, else a non-generic volume label. Generic FAT
+/// labels and automount UUIDs yield `None` so the UI can show a model string.
+fn user_assigned_name(mount: &Path) -> Option<String> {
+    read_device_name(mount)
+        .filter(|n| !is_generic_ipod_name(n))
+        .or_else(|| volume_name(mount))
+}
+
 fn volume_name(mount: &Path) -> Option<String> {
     let name = mount.file_name()?.to_str()?.trim();
-    if name.is_empty() || name.eq_ignore_ascii_case("ipod") {
+    if is_generic_ipod_name(name) {
         None
     } else {
         Some(name.to_string())
     }
 }
 
-/// SysInfoExtended `FamilyID` from the XML plist. Binary plists (`bplist`)
+/// SysInfoExtended XML from the on-disk plist. Binary plists (`bplist`)
 /// are skipped — we don't pull in a plist crate for one integer.
-fn read_family_id(mount: &Path) -> Option<u32> {
+fn read_sysinfo_extended_xml(mount: &Path) -> Option<String> {
     let path = mount
         .join("iPod_Control")
         .join("Device")
         .join("SysInfoExtended");
     let bytes = std::fs::read(path).ok()?;
-    let xml = std::str::from_utf8(&bytes).ok()?;
-    plist_integer(xml, "FamilyID")
+    std::str::from_utf8(&bytes).ok().map(str::to_string)
 }
 
 /// Pull the integer immediately following `<key>NAME</key>` in a plist.
@@ -140,6 +211,35 @@ pub(crate) fn plist_integer(xml: &str, key: &str) -> Option<u32> {
     let start = rest.find("<integer>")? + "<integer>".len();
     let end = rest[start..].find("</integer>")?;
     rest[start..start + end].trim().parse().ok()
+}
+
+fn plist_string(xml: &str, key: &str) -> Option<String> {
+    let needle = format!("<key>{key}</key>");
+    let rest = xml.split(&needle).nth(1)?;
+    let start = rest.find("<string>")? + "<string>".len();
+    let end = rest[start..].find("</string>")?;
+    let s = rest[start..start + end].trim();
+    (!s.is_empty()).then(|| s.to_string())
+}
+
+fn apply_sysinfo_extended_xml(
+    xml: &str,
+    family_id: &mut Option<u32>,
+    serial: &mut Option<String>,
+    firmware: &mut Option<String>,
+) {
+    if family_id.is_none() {
+        *family_id = plist_integer(xml, "FamilyID");
+    }
+    if serial.is_none() {
+        *serial = plist_string(xml, "FireWireGUID")
+            .or_else(|| plist_string(xml, "FirewireGuid"))
+            .or_else(|| plist_string(xml, "SerialNumber"));
+    }
+    if firmware.is_none() {
+        *firmware =
+            plist_string(xml, "VisibleBuildID").or_else(|| plist_string(xml, "visibleBuildID"));
+    }
 }
 
 /// Scan common mount points for connected iPods.
@@ -216,16 +316,23 @@ pub fn detect_ipods() -> Vec<DetectedIpod> {
             continue;
         }
         if is_ipod_mount(&candidate) {
-            let (model, serial, firmware) = read_sysinfo(&candidate);
-            let name = read_device_name(&candidate).or_else(|| volume_name(&candidate));
-            let family_id = read_family_id(&candidate);
+            let sys = read_sysinfo(&candidate);
+            let name = user_assigned_name(&candidate);
+            let mut family_id = None;
+            let mut serial = sys.serial;
+            let mut firmware = sys.firmware;
+            if let Some(xml) = read_sysinfo_extended_xml(&candidate) {
+                apply_sysinfo_extended_xml(&xml, &mut family_id, &mut serial, &mut firmware);
+            }
             results.push(DetectedIpod {
                 mount_point: candidate,
-                model,
+                model: sys.model,
                 serial,
                 firmware_version: firmware,
                 name,
                 family_id,
+                gestalt: sys.gestalt,
+                sysinfo_empty: sys.empty,
             });
         }
     }
@@ -266,10 +373,42 @@ mod tests {
         )
         .unwrap();
 
-        let (model, serial, fw) = read_sysinfo(tmp.path());
-        assert_eq!(model.as_deref(), Some("MA002"));
-        assert_eq!(serial.as_deref(), Some("ABC123"));
-        assert_eq!(fw.as_deref(), Some("1.3.0"));
+        let s = read_sysinfo(tmp.path());
+        assert_eq!(s.model.as_deref(), Some("MA002"));
+        assert_eq!(s.serial.as_deref(), Some("ABC123"));
+        assert_eq!(s.firmware.as_deref(), Some("1.3.0"));
+        assert!(!s.empty);
+    }
+
+    #[test]
+    fn test_read_sysinfo_empty_file() {
+        let tmp = TempDir::new().unwrap();
+        let device_dir = tmp.path().join("iPod_Control").join("Device");
+        std::fs::create_dir_all(&device_dir).unwrap();
+        std::fs::write(device_dir.join("SysInfo"), "").unwrap();
+        let s = read_sysinfo(tmp.path());
+        assert!(s.empty);
+        assert!(s.model.is_none());
+    }
+
+    #[test]
+    fn test_read_sysinfo_gestalt() {
+        let tmp = TempDir::new().unwrap();
+        let device_dir = tmp.path().join("iPod_Control").join("Device");
+        std::fs::create_dir_all(&device_dir).unwrap();
+        std::fs::write(
+            device_dir.join("SysInfo"),
+            "boardHwSwInterfaceRev: 0x000B0010 (0.0.11 16)\n",
+        )
+        .unwrap();
+        let s = read_sysinfo(tmp.path());
+        assert_eq!(s.gestalt, Some(0x000B0010));
+        assert!(!s.empty);
+    }
+
+    #[test]
+    fn test_parse_sysinfo_hex() {
+        assert_eq!(parse_sysinfo_hex("0x000B0005 (0.0.11 5)"), Some(0x000B0005));
     }
 
     fn utf16le(s: &str) -> Vec<u8> {
@@ -287,6 +426,16 @@ mod tests {
             read_device_name(tmp.path()).as_deref(),
             Some("Dublin's iPod")
         );
+    }
+
+    #[test]
+    fn test_user_assigned_name_drops_generic_deviceinfo() {
+        let tmp = TempDir::new().unwrap();
+        let mount = tmp.path().join("173e8dfc-f647-34c2-a205-dda46088c578");
+        let itunes = mount.join("iPod_Control").join("iTunes");
+        std::fs::create_dir_all(&itunes).unwrap();
+        std::fs::write(itunes.join("DeviceInfo"), utf16le("iPod")).unwrap();
+        assert_eq!(user_assigned_name(&mount), None);
     }
 
     #[test]
@@ -315,6 +464,18 @@ mod tests {
     }
 
     #[test]
+    fn test_volume_name_skips_automount_uuid() {
+        assert_eq!(
+            volume_name(Path::new("/run/media/user/dfc-f647-34c2-a205-dda46088c578")),
+            None
+        );
+        assert_eq!(volume_name(Path::new("/media/user/1234-5678")), None);
+        assert_eq!(volume_name(Path::new("/media/user/NO NAME")), None);
+        assert!(is_generic_ipod_name("dfc-f647-34c2-a205-dda46088c578"));
+        assert!(!is_generic_ipod_name("Dublin's iPod"));
+    }
+
+    #[test]
     fn test_plist_integer_family_id() {
         let xml = r#"<?xml version="1.0"?>
 <plist><dict>
@@ -325,6 +486,7 @@ mod tests {
 </dict></plist>"#;
         assert_eq!(plist_integer(xml, "FamilyID"), Some(31));
         assert_eq!(plist_integer(xml, "Missing"), None);
+        assert_eq!(plist_string(xml, "FireWireGUID"), Some("000A2700".into()));
     }
 
     #[test]
@@ -337,7 +499,10 @@ mod tests {
             "<plist><dict><key>FamilyID</key>\n<integer>26</integer></dict></plist>",
         )
         .unwrap();
-        assert_eq!(read_family_id(tmp.path()), Some(26));
+        assert_eq!(
+            read_sysinfo_extended_xml(tmp.path()).and_then(|xml| plist_integer(&xml, "FamilyID")),
+            Some(26)
+        );
     }
 
     #[test]
@@ -346,7 +511,29 @@ mod tests {
         let device_dir = tmp.path().join("iPod_Control").join("Device");
         std::fs::create_dir_all(&device_dir).unwrap();
         std::fs::write(device_dir.join("SysInfoExtended"), b"bplist00\x00\x01").unwrap();
-        assert_eq!(read_family_id(tmp.path()), None);
+        assert_eq!(
+            read_sysinfo_extended_xml(tmp.path()).and_then(|xml| plist_integer(&xml, "FamilyID")),
+            None
+        );
+    }
+
+    #[test]
+    fn test_apply_sysinfo_extended_xml_fills_gaps() {
+        let xml = r#"<plist><dict>
+<key>FireWireGUID</key><string>000A270015CE2062</string>
+<key>FamilyID</key><integer>25</integer>
+<key>VisibleBuildID</key><string>1.2.3</string>
+</dict></plist>"#;
+        let mut family_id = None;
+        let mut serial = None;
+        let mut firmware = None;
+        apply_sysinfo_extended_xml(xml, &mut family_id, &mut serial, &mut firmware);
+        assert_eq!(family_id, Some(25));
+        assert_eq!(serial.as_deref(), Some("000A270015CE2062"));
+        assert_eq!(firmware.as_deref(), Some("1.2.3"));
+        let mut serial = Some("keep".into());
+        apply_sysinfo_extended_xml(xml, &mut family_id, &mut serial, &mut firmware);
+        assert_eq!(serial.as_deref(), Some("keep"));
     }
 
     #[test]

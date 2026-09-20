@@ -2,14 +2,16 @@
 //!
 //! Identification is composed, not a SKU→pretty-name map:
 //!
-//! 1. SysInfo `ModelNumStr` suffix (libgpod's `ipod_info_table` — strip the
-//!    leading `M` so `MA446LL/A` and `A446` both hit) → generation + factory GB
-//! 2. SysInfoExtended `FamilyID` → generation only (covers post-2006 devices
-//!    whose SysInfo is empty)
-//! 3. Measured storage, snapped to Apple marketing sizes → capacity
+//! 1. SysInfo `ModelNumStr` suffix (libgpod table; leading `M`/`P` stripped)
+//! 2. SysInfoExtended `FamilyID`
+//! 3. SysInfo `boardHwSwInterfaceRev` gestalt (1G/2G have no ModelNumStr;
+//!    `0x000B0005` = Video 5G, `0x000B0010` = Video 5.5G)
+//! 4. USB product ID when SysInfo was never written
+//! 5. Empty SysInfo + Video PID `0x1209` → 5.5G (post-2006 firmware leaves
+//!    SysInfo at 0 bytes; 5G writes a populated file)
+//! 6. Measured storage, snapped to Apple marketing sizes
 //!
-//! Unknown part numbers still get a generation from FamilyID, or at worst
-//! `"iPod 80GB"` from capacity — never a guessed "Classic".
+//! USB vendor inquiry and SCSI SysInfoExtended dumps are not used.
 
 /// Click-wheel / nano / shuffle generation. Touch/iPhone/iPad are omitted:
 /// they don't mount `iPod_Control/` as mass storage.
@@ -32,6 +34,7 @@ enum Gen {
     Nano4,
     Nano5,
     Nano6,
+    Nano7,
     Video,
     Video55,
     Classic,
@@ -57,6 +60,7 @@ impl Gen {
             Gen::Nano4 => "iPod nano 4G",
             Gen::Nano5 => "iPod nano 5G",
             Gen::Nano6 => "iPod nano 6G",
+            Gen::Nano7 => "iPod nano 7G",
             Gen::Video => "iPod Video",
             Gen::Video55 => "iPod Video 5.5G",
             Gen::Classic => "iPod Classic",
@@ -263,10 +267,30 @@ const FAMILY_IDS: &[(u32, Gen)] = &[
     (6, Gen::Photo),
     (7, Gen::Mini2),
     (19, Gen::Video),
+    (25, Gen::Video55),
     (26, Gen::Video55),
     (31, Gen::Classic),
     (34, Gen::Classic),
     (37, Gen::Classic),
+];
+
+/// Apple VID `0x05AC` mass-storage product IDs (not DFU/WTF). 5G and 5.5G
+/// Video share `0x1209`.
+const USB_PIDS: &[(u16, Gen)] = &[
+    (0x1201, Gen::Ipod3G),
+    (0x1202, Gen::Ipod2G),
+    (0x1203, Gen::Ipod4G),
+    (0x1204, Gen::Photo),
+    (0x1205, Gen::Mini1),
+    (0x1209, Gen::Video),
+    (0x120A, Gen::Nano1),
+    (0x1260, Gen::Nano2),
+    (0x1261, Gen::Classic),
+    (0x1262, Gen::Nano3),
+    (0x1263, Gen::Nano4),
+    (0x1265, Gen::Nano5),
+    (0x1266, Gen::Nano6),
+    (0x1267, Gen::Nano7),
 ];
 
 /// Marketing capacities Apple actually shipped. Used when we only have a
@@ -275,21 +299,31 @@ const MARKETING_GB: &[u16] = &[
     1, 2, 4, 5, 8, 10, 15, 16, 20, 30, 32, 40, 60, 64, 80, 120, 160,
 ];
 
-/// Identify an iPod from SysInfo `ModelNumStr`, optional SysInfoExtended
-/// `FamilyID`, and optional total storage. Mirrors the Zune storage→name
-/// helper, but generation and capacity are composed independently.
-pub fn ipod_model_label(
-    model_num: Option<&str>,
-    family_id: Option<u32>,
-    total_bytes: Option<u64>,
-) -> String {
-    let from_suffix = model_num.and_then(lookup_model_num);
-    let gen = from_suffix
-        .map(|(g, _)| g)
-        .or_else(|| family_id.and_then(lookup_family));
+/// Hints gathered from SysInfo, SysInfoExtended, USB, and storage.
+/// Generation and capacity are composed independently — see [`ipod_model_label`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IpodModelHints<'a> {
+    pub model_num: Option<&'a str>,
+    pub family_id: Option<u32>,
+    pub usb_pid: Option<u16>,
+    pub gestalt: Option<u32>,
+    /// Firmware created a 0-byte SysInfo (post-2006 Video 5.5G / nano 2G+).
+    pub sysinfo_empty: bool,
+    pub total_bytes: Option<u64>,
+}
+
+/// Identify an iPod from [`IpodModelHints`].
+pub fn ipod_model_label(hints: IpodModelHints<'_>) -> String {
+    let from_suffix = hints.model_num.and_then(lookup_model_num);
     let gb = from_suffix
         .map(|(_, gb)| gb)
-        .or_else(|| total_bytes.map(snap_gb));
+        .or_else(|| hints.total_bytes.map(snap_gb));
+    let gen = from_suffix
+        .map(|(g, _)| g)
+        .or_else(|| hints.family_id.and_then(lookup_family))
+        .or_else(|| hints.gestalt.and_then(lookup_gestalt))
+        .or_else(|| hints.usb_pid.and_then(lookup_usb_pid));
+    let gen = refine_video_generation(gen, gb, hints);
     match (gen, gb) {
         (Some(g), Some(n)) => format!("{} {}", g.label(), format_gb(n)),
         (Some(g), None) => g.label().to_string(),
@@ -298,9 +332,9 @@ pub fn ipod_model_label(
     }
 }
 
-/// Capacity-only label when generation is unknown. Does **not** assume Classic.
-pub fn ipod_model_from_storage(total_bytes: u64) -> String {
-    format!("iPod {}", format_gb(snap_gb(total_bytes)))
+/// True for Apple mass-storage iPod product IDs we can map to a generation.
+pub(crate) fn ipod_usb_pid_known(pid: u16) -> bool {
+    lookup_usb_pid(pid).is_some()
 }
 
 fn lookup_model_num(raw: &str) -> Option<(Gen, u16)> {
@@ -318,6 +352,41 @@ fn lookup_family(id: u32) -> Option<Gen> {
         .map(|(_, g)| *g)
 }
 
+fn lookup_usb_pid(pid: u16) -> Option<Gen> {
+    USB_PIDS.iter().find(|(p, _)| *p == pid).map(|(_, g)| *g)
+}
+
+/// `boardHwSwInterfaceRev` gestalt. Exact values for Video 5G/5.5G; high
+/// 16 bits for 1G/2G (those SKUs have no ModelNumStr).
+fn lookup_gestalt(g: u32) -> Option<Gen> {
+    match g {
+        0x000B0005 => Some(Gen::Video),
+        0x000B0010 => Some(Gen::Video55),
+        _ => match g >> 16 {
+            1 => Some(Gen::Ipod1G),
+            2 => Some(Gen::Ipod2G),
+            _ => None,
+        },
+    }
+}
+
+/// 5G Video shipped 30/60GB; 5.5G shipped 30/80GB. PID `0x1209` is shared.
+/// 80GB promotes to 5.5G. An empty SysInfo on a Video PID is the post-2006
+/// firmware behaviour (5.5G), not 5G (which writes a populated SysInfo).
+fn refine_video_generation(
+    gen: Option<Gen>,
+    gb: Option<u16>,
+    hints: IpodModelHints<'_>,
+) -> Option<Gen> {
+    match (gen, gb) {
+        (Some(Gen::Video), Some(80)) => Some(Gen::Video55),
+        (Some(Gen::Video), _) if hints.sysinfo_empty && hints.usb_pid == Some(0x1209) => {
+            Some(Gen::Video55)
+        }
+        (g, _) => g,
+    }
+}
+
 /// libgpod: if the first character is a letter, skip it (`MA446` → `A446`).
 /// Also drop regional `LL/A` suffixes.
 fn model_suffix(raw: &str) -> String {
@@ -327,7 +396,7 @@ fn model_suffix(raw: &str) -> String {
         .trim_end_matches("LL")
         .trim_end_matches("ll")
         .to_ascii_uppercase();
-    if s.starts_with('M') && s.len() > 1 {
+    if s.len() > 1 && matches!(s.as_bytes()[0], b'M' | b'P') {
         s[1..].to_string()
     } else {
         s
@@ -370,43 +439,81 @@ mod tests {
         assert_eq!(model_suffix("MC297LL"), "C297");
         assert_eq!(model_suffix("A446"), "A446");
         assert_eq!(model_suffix("8513"), "8513");
+        assert_eq!(model_suffix("PA003"), "A003", "HP SKUs use a P prefix");
+    }
+
+    fn label(hints: IpodModelHints<'_>) -> String {
+        ipod_model_label(hints)
     }
 
     #[test]
     fn known_suffix_composes_generation_and_factory_gb() {
         assert_eq!(
-            ipod_model_label(Some("MA446LL/A"), None, None),
+            label(IpodModelHints {
+                model_num: Some("MA446LL/A"),
+                ..Default::default()
+            }),
             "iPod Video 5.5G 30GB"
         );
         assert_eq!(
-            ipod_model_label(Some("MB147"), None, None),
+            label(IpodModelHints {
+                model_num: Some("MB147"),
+                ..Default::default()
+            }),
             "iPod Classic 80GB"
         );
         assert_eq!(
-            ipod_model_label(Some("MC297LL"), None, None),
+            label(IpodModelHints {
+                model_num: Some("MC297LL"),
+                ..Default::default()
+            }),
             "iPod Classic 160GB"
         );
-        // Previously missing from the hand-written SKU list.
         assert_eq!(
-            ipod_model_label(Some("MA444"), None, None),
+            label(IpodModelHints {
+                model_num: Some("MA444"),
+                ..Default::default()
+            }),
             "iPod Video 5.5G 30GB"
         );
-        assert_eq!(ipod_model_label(Some("MA004"), None, None), "iPod nano 2GB");
         assert_eq!(
-            ipod_model_label(Some("M9724"), None, None),
+            label(IpodModelHints {
+                model_num: Some("MA004"),
+                ..Default::default()
+            }),
+            "iPod nano 2GB"
+        );
+        assert_eq!(
+            label(IpodModelHints {
+                model_num: Some("M9724"),
+                ..Default::default()
+            }),
             "iPod shuffle 512MB"
         );
         assert_eq!(
-            ipod_model_label(Some("MC525"), None, None),
+            label(IpodModelHints {
+                model_num: Some("MC525"),
+                ..Default::default()
+            }),
             "iPod nano 6G 8GB"
         );
     }
 
     #[test]
     fn unknown_suffix_does_not_guess_classic() {
-        assert_eq!(ipod_model_label(Some("XX999"), None, None), "iPod");
         assert_eq!(
-            ipod_model_label(Some("ZZ000"), None, Some(74_000_000_000)),
+            label(IpodModelHints {
+                model_num: Some("XX999"),
+                ..Default::default()
+            }),
+            "iPod"
+        );
+        assert_eq!(
+            label(IpodModelHints {
+                model_num: Some("ZZ000"),
+                total_bytes: Some(74_000_000_000),
+                ..Default::default()
+            }),
             "iPod 80GB"
         );
     }
@@ -414,35 +521,159 @@ mod tests {
     #[test]
     fn family_id_fills_generation_when_suffix_unknown() {
         assert_eq!(
-            ipod_model_label(None, Some(31), Some(74_000_000_000)),
+            label(IpodModelHints {
+                family_id: Some(31),
+                total_bytes: Some(74_000_000_000),
+                ..Default::default()
+            }),
             "iPod Classic 80GB"
         );
         assert_eq!(
-            ipod_model_label(None, Some(19), Some(28_000_000_000)),
+            label(IpodModelHints {
+                family_id: Some(19),
+                total_bytes: Some(28_000_000_000),
+                ..Default::default()
+            }),
             "iPod Video 30GB"
         );
-        // Suffix still wins over FamilyID.
         assert_eq!(
-            ipod_model_label(Some("MA446"), Some(31), None),
+            label(IpodModelHints {
+                family_id: Some(25),
+                total_bytes: Some(28_000_000_000),
+                ..Default::default()
+            }),
+            "iPod Video 5.5G 30GB"
+        );
+        assert_eq!(
+            label(IpodModelHints {
+                model_num: Some("MA446"),
+                family_id: Some(31),
+                ..Default::default()
+            }),
             "iPod Video 5.5G 30GB"
         );
     }
 
     #[test]
+    fn usb_pid_fills_generation_when_sysinfo_empty() {
+        assert_eq!(
+            label(IpodModelHints {
+                usb_pid: Some(0x1209),
+                total_bytes: Some(28_000_000_000),
+                ..Default::default()
+            }),
+            "iPod Video 30GB"
+        );
+        assert_eq!(
+            label(IpodModelHints {
+                usb_pid: Some(0x1209),
+                sysinfo_empty: true,
+                total_bytes: Some(28_000_000_000),
+                ..Default::default()
+            }),
+            "iPod Video 5.5G 30GB"
+        );
+        assert_eq!(
+            label(IpodModelHints {
+                usb_pid: Some(0x1209),
+                total_bytes: Some(74_000_000_000),
+                ..Default::default()
+            }),
+            "iPod Video 5.5G 80GB"
+        );
+        assert_eq!(
+            label(IpodModelHints {
+                usb_pid: Some(0x1261),
+                total_bytes: Some(74_000_000_000),
+                ..Default::default()
+            }),
+            "iPod Classic 80GB"
+        );
+        assert_eq!(
+            label(IpodModelHints {
+                model_num: Some("MA446"),
+                usb_pid: Some(0x1261),
+                ..Default::default()
+            }),
+            "iPod Video 5.5G 30GB"
+        );
+    }
+
+    #[test]
+    fn gestalt_fills_generation() {
+        assert_eq!(
+            label(IpodModelHints {
+                gestalt: Some(0x000B0005),
+                total_bytes: Some(28_000_000_000),
+                ..Default::default()
+            }),
+            "iPod Video 30GB"
+        );
+        assert_eq!(
+            label(IpodModelHints {
+                gestalt: Some(0x000B0010),
+                total_bytes: Some(28_000_000_000),
+                ..Default::default()
+            }),
+            "iPod Video 5.5G 30GB"
+        );
+        assert_eq!(
+            label(IpodModelHints {
+                gestalt: Some(0x00010000),
+                total_bytes: Some(5_000_000_000),
+                ..Default::default()
+            }),
+            "iPod 1G 5GB"
+        );
+    }
+
+    #[test]
     fn storage_only_snaps_to_marketing_size() {
-        assert_eq!(ipod_model_from_storage(28_000_000_000), "iPod 30GB");
-        assert_eq!(ipod_model_from_storage(55_000_000_000), "iPod 60GB");
-        assert_eq!(ipod_model_from_storage(74_000_000_000), "iPod 80GB");
-        assert_eq!(ipod_model_from_storage(111_000_000_000), "iPod 120GB");
-        assert_eq!(ipod_model_from_storage(149_000_000_000), "iPod 160GB");
+        assert_eq!(
+            label(IpodModelHints {
+                total_bytes: Some(28_000_000_000),
+                ..Default::default()
+            }),
+            "iPod 30GB"
+        );
+        assert_eq!(
+            label(IpodModelHints {
+                total_bytes: Some(55_000_000_000),
+                ..Default::default()
+            }),
+            "iPod 60GB"
+        );
+        assert_eq!(
+            label(IpodModelHints {
+                total_bytes: Some(74_000_000_000),
+                ..Default::default()
+            }),
+            "iPod 80GB"
+        );
+        assert_eq!(
+            label(IpodModelHints {
+                total_bytes: Some(111_000_000_000),
+                ..Default::default()
+            }),
+            "iPod 120GB"
+        );
+        assert_eq!(
+            label(IpodModelHints {
+                total_bytes: Some(149_000_000_000),
+                ..Default::default()
+            }),
+            "iPod 160GB"
+        );
     }
 
     #[test]
     fn known_suffix_keeps_factory_gb_even_if_storage_differs() {
-        // Flash-modded 30GB Video still identifies as the factory SKU;
-        // the storage bar shows the real df figure separately.
         assert_eq!(
-            ipod_model_label(Some("MA446"), None, Some(74_000_000_000)),
+            label(IpodModelHints {
+                model_num: Some("MA446"),
+                total_bytes: Some(74_000_000_000),
+                ..Default::default()
+            }),
             "iPod Video 5.5G 30GB"
         );
     }
