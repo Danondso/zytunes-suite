@@ -20,6 +20,7 @@ use ratatui::Terminal;
 
 use app::{App, KeyOutcome};
 use background::BgCommand;
+use zytunes::resolve_mp3_quality;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Suppress panics from background threads (rodio/symphonia can panic on
@@ -45,6 +46,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = config::load();
     theme::init_themes(&cfg.themes);
 
+    let mut quality_warning = None;
+    let mp3_quality = resolve_mp3_quality(
+        None,
+        std::env::var("ZYTUNES_TRANSCODE_QUALITY").ok().as_deref(),
+        cfg.transcode_quality.as_deref(),
+        |m| quality_warning = Some(m.to_string()),
+    )
+    .unwrap_or_default();
+
     // Set up background worker first so we can clone event_tx for the
     // TUI logger before the background thread takes ownership.
     let (event_tx, event_rx) = mpsc::channel();
@@ -52,7 +62,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tui_logger: zytunes::cache::Logger = std::sync::Arc::new(move |msg: &str| {
         let _ = tui_log_tx.send(background::BgEvent::SyncMessage(msg.to_string()));
     });
-    let cmd_tx = background::spawn(event_tx);
+    let cmd_tx = background::spawn(event_tx, mp3_quality);
 
     // Create app state.
     let mut app = App::new();
@@ -62,6 +72,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     app.load_local_plays_from_disk(&tui_logger);
     app.load_playlists_from_disk(&tui_logger);
     app.load_listen_log_from_disk(&tui_logger);
+    if let Some(w) = quality_warning {
+        app.sync.log.push(w);
+    }
     app.loading_library = true;
 
     if let Some(ref theme_name) = cfg.theme {
