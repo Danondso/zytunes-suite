@@ -46,7 +46,7 @@ impl DeviceBackend for IpodBackend {
     fn detect(&self) -> Result<DetectedDevice, String> {
         let detected = ipod_db::detect::detect_ipod().map_err(|e| format!("{}", e))?;
 
-        let usb = read_usb_ipod();
+        let usb = read_usb_ipod(&detected.mount_point, detected.serial.as_deref());
         let usb_pid = usb.as_ref().map(|(pid, _)| *pid);
         let usb_serial = usb.and_then(|(_, serial)| serial);
         #[cfg(target_os = "macos")]
@@ -184,33 +184,47 @@ impl DeviceBackend for IpodBackend {
 
 /// Read the connected Apple iPod's USB product ID and serial.
 ///
-/// Linux prefers sysfs so we don't have to open a device that mass-storage
-/// already claimed. rusb descriptor listing is the fallback (macOS, or
-/// sysfs missing).
-fn read_usb_ipod() -> Option<(u16, Option<String>)> {
+/// Linux prefers the USB device that owns the mounted block disk, so two
+/// iPods don't get each other's PID. Sysfs listing (optionally filtered by
+/// SysInfo serial) is next. rusb is last; opening for a serial string often
+/// fails while usb-storage owns the device, so a missed serial here is
+/// expected rather than a complete identity.
+fn read_usb_ipod(
+    mount: &std::path::Path,
+    prefer_serial: Option<&str>,
+) -> Option<(u16, Option<String>)> {
     #[cfg(target_os = "linux")]
     {
-        if let Some(found) = read_sysfs_usb_ipod() {
+        if let Some(found) = usb_from_mount(mount) {
+            return Some(found);
+        }
+        if let Some(found) = read_sysfs_usb_ipod(prefer_serial) {
             return Some(found);
         }
     }
-    read_rusb_usb_ipod()
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = mount;
+    }
+    read_rusb_usb_ipod(prefer_serial)
 }
 
 #[cfg(target_os = "linux")]
-fn read_sysfs_usb_ipod() -> Option<(u16, Option<String>)> {
-    let root = std::path::Path::new("/sys/bus/usb/devices");
-    for ent in std::fs::read_dir(root).ok()? {
-        let path = ent.ok()?.path();
-        let vid = read_sysfs_hex_u16(&path.join("idVendor"))?;
+fn usb_from_mount(mount: &std::path::Path) -> Option<(u16, Option<String>)> {
+    let disk = ipod_db::detect::block_device_for_mount(mount)?;
+    let name = disk.file_name()?.to_str()?;
+    let start = std::path::PathBuf::from(format!("/sys/block/{name}/device"))
+        .canonicalize()
+        .ok()?;
+    for ancestor in start.ancestors() {
+        let Some(vid) = read_sysfs_hex_u16(&ancestor.join("idVendor")) else {
+            continue;
+        };
         if vid != 0x05AC {
             continue;
         }
-        let pid = read_sysfs_hex_u16(&path.join("idProduct"))?;
-        if !super::ipod_models::ipod_usb_pid_known(pid) {
-            continue;
-        }
-        let serial = std::fs::read_to_string(path.join("serial"))
+        let pid = read_sysfs_hex_u16(&ancestor.join("idProduct"))?;
+        let serial = std::fs::read_to_string(ancestor.join("serial"))
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
@@ -220,24 +234,78 @@ fn read_sysfs_usb_ipod() -> Option<(u16, Option<String>)> {
 }
 
 #[cfg(target_os = "linux")]
+fn read_sysfs_usb_ipod(prefer_serial: Option<&str>) -> Option<(u16, Option<String>)> {
+    let root = std::path::Path::new("/sys/bus/usb/devices");
+    let mut first = None;
+    for ent in std::fs::read_dir(root).ok()? {
+        let path = ent.ok()?.path();
+        let Some(vid) = read_sysfs_hex_u16(&path.join("idVendor")) else {
+            continue;
+        };
+        if vid != 0x05AC {
+            continue;
+        }
+        let Some(pid) = read_sysfs_hex_u16(&path.join("idProduct")) else {
+            continue;
+        };
+        if !super::ipod_models::ipod_usb_pid_known(pid) {
+            continue;
+        }
+        let serial = std::fs::read_to_string(path.join("serial"))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        if prefer_serial
+            .is_some_and(|want| serial.as_deref().is_some_and(|s| usb_serial_eq(s, want)))
+        {
+            return Some((pid, serial));
+        }
+        if first.is_none() && prefer_serial.is_none() {
+            first = Some((pid, serial));
+        }
+    }
+    first
+}
+
+#[cfg(target_os = "linux")]
 fn read_sysfs_hex_u16(path: &std::path::Path) -> Option<u16> {
     let s = std::fs::read_to_string(path).ok()?;
     u16::from_str_radix(s.trim(), 16).ok()
 }
 
-fn read_rusb_usb_ipod() -> Option<(u16, Option<String>)> {
+fn read_rusb_usb_ipod(prefer_serial: Option<&str>) -> Option<(u16, Option<String>)> {
     let ctx = rusb::Context::new().ok()?;
+    let mut first = None;
     for dev in ctx.devices().ok()?.iter() {
         let desc = dev.device_descriptor().ok()?;
         if desc.vendor_id() != 0x05AC {
             continue;
         }
         let pid = desc.product_id();
-        if super::ipod_models::ipod_usb_pid_known(pid) {
-            return Some((pid, None));
+        if !super::ipod_models::ipod_usb_pid_known(pid) {
+            continue;
+        }
+        // usb-storage has usually claimed the device; open() is best-effort.
+        let serial = dev.open().ok().and_then(|h| {
+            h.read_serial_number_string_ascii(&desc)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        });
+        if prefer_serial
+            .is_some_and(|want| serial.as_deref().is_some_and(|s| usb_serial_eq(s, want)))
+        {
+            return Some((pid, serial));
+        }
+        if first.is_none() && prefer_serial.is_none() {
+            first = Some((pid, serial));
         }
     }
-    None
+    first
+}
+
+fn usb_serial_eq(a: &str, b: &str) -> bool {
+    a.trim().eq_ignore_ascii_case(b.trim())
 }
 
 /// macOS: FirewireGuid from ioreg. Linux uses the USB serial from sysfs
@@ -283,5 +351,12 @@ mod tests {
         assert!(caps.supported_formats.contains(&"m4a"));
         assert_eq!(caps.transcode_target, "mp3");
         assert!(caps.max_art_dimensions.is_none());
+    }
+
+    #[test]
+    fn usb_serial_eq_ignores_case_and_padding() {
+        assert!(usb_serial_eq("000A270015CE2062", "000a270015ce2062"));
+        assert!(usb_serial_eq("  abc  ", "ABC"));
+        assert!(!usb_serial_eq("000A270015CE2062", "000A270015CE2063"));
     }
 }

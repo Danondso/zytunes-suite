@@ -621,6 +621,18 @@ impl DeviceState {
         }
     }
 
+    fn clear_panel_identity(&mut self) {
+        self.name = None;
+        self.firmware = None;
+        self.serial = None;
+        self.manufacturer = None;
+        self.model = None;
+        self.usb_mode = None;
+        self.family = None;
+        self.volume_format = None;
+        self.storage = None;
+    }
+
     /// Incrementally add a single device track to all index structures.
     /// Used during sync deltas to avoid O(N²) full rebuilds.
     pub fn add_indexed_track(&mut self, entry: &DeviceEntry) {
@@ -7857,6 +7869,9 @@ mod tests {
         let mut app = App::new();
         app.device.status = DeviceStatus::Connected;
         app.device.name = Some("Zune".into());
+        app.device.volume_format = Some("FAT".into());
+        app.device.usb_mode = Some("MTP".into());
+        app.device.firmware = Some("1.0".into());
         app.active_panel = Panel::Library;
 
         app.handle_key(
@@ -7870,6 +7885,9 @@ mod tests {
 
         assert_eq!(app.device.status, DeviceStatus::Disconnected);
         assert!(app.device.name.is_none());
+        assert!(app.device.volume_format.is_none());
+        assert!(app.device.usb_mode.is_none());
+        assert!(app.device.firmware.is_none());
         assert!(
             matches!(cmd_rx.try_recv(), Ok(BgCommand::Disconnect)),
             "worker must be told to drop the session"
@@ -8323,8 +8341,14 @@ mod tests {
         let mut app = App::new();
         app.device.status = DeviceStatus::Connecting;
         app.connection_anim_start = Some(42);
+        app.device.volume_format = Some("HFS+ (read-only)".into());
+        app.device.firmware = Some("1.62".into());
+        app.device.usb_mode = Some("Mass Storage 1209".into());
         app.handle_bg_event(BgEvent::SessionFailed("timeout".into()));
         assert_eq!(app.device.status, DeviceStatus::Disconnected);
+        assert!(app.device.volume_format.is_none());
+        assert!(app.device.firmware.is_none());
+        assert!(app.device.usb_mode.is_none());
         assert!(app.connection_anim_start.is_none());
         let (msg, _, is_error) = app.toast_message.as_ref().unwrap();
         assert!(is_error);
