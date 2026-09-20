@@ -1751,13 +1751,27 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                 }
                 BgCommand::ImportPlaylist { name, track_keys } => {
                     if let Some(ref mut s) = session {
-                        let result = s
-                            .import_playlist(&name, &track_keys)
-                            .map_err(|e| e.to_string());
-                        let _ = event_tx.send(BgEvent::PlaylistImported {
-                            name,
-                            summary: result,
-                        });
+                        match s.import_playlist(&name, &track_keys) {
+                            Ok(summary) => {
+                                let _ = event_tx.send(BgEvent::PlaylistImported {
+                                    name,
+                                    summary: Ok(summary),
+                                });
+                            }
+                            Err(e) => {
+                                let gone = is_device_gone(&e);
+                                let _ = event_tx.send(BgEvent::PlaylistImported {
+                                    name,
+                                    summary: Err(e.to_string()),
+                                });
+                                if gone {
+                                    session = None;
+                                    let _ = event_tx.send(BgEvent::SessionFailed(
+                                        "Device disconnected from USB".into(),
+                                    ));
+                                }
+                            }
+                        }
                     } else {
                         let _ = event_tx.send(BgEvent::PlaylistImported {
                             name,

@@ -6,8 +6,6 @@
 
 ## Future
 
-- **Diagnostics: route playlist/listen-log writes through the project Logger** — `src/playlist_store.rs` and `src/listen_log.rs` use `eprintln!` for failure paths instead of the project's `Logger = Arc<dyn Fn(&str) + Send + Sync>` pattern (the same pattern `src/cache.rs` already uses to avoid stderr corrupting the rendered TUI). Both files run from the TUI hot path on every play/skip and every playlist save, so a stray write at the wrong moment can scribble through the ratatui frame. Goal: thread an optional `Logger` into `PlaylistStore::{load_from, save_to}` and `ListenLog::{append, append_to_disk, save_to}`, defaulting to `default_logger` (stderr) for the CLI and a closure-routed-into-`SyncMessage` for the TUI. Drop the module-level `eprintln!` calls. Out of scope for the playlists/recommender PR — touches every diagnostic call site and deserves its own pass.
-- **Diagnostics: tighten the existing-playlist lookup error path** — `NativeSession::import_playlist` swallows transient `get_object_handles` / `get_object_info` errors via `.ok()` when scanning for an existing `<name>.zpl` to update in place. Now that the filename match is correct (commit 8a517a2), a transient stall during this scan still falls through to the create branch — which now correctly hits the case-insensitive existence check on the *next* sync. The blast radius is small (one extra `<name>.zpl` survives until the next successful scan), but propagating the handle-list error rather than silencing it would surface USB issues sooner. Out of scope for this PR; small enough to bundle into a future MTP-error-handling sweep.
 - **Theming (remaining)**
   - Theme preview screenshots in docs
 - **Player Support (remaining)**
@@ -85,6 +83,8 @@
 
 ## Done
 
+- **Diagnostics: playlist/listen-log Logger** — `PlaylistStore` and `ListenLog` take a `Logger`; CLI uses stderr, TUI routes into `SyncMessage`. No `eprintln!` on those hot paths.
+- **Diagnostics: playlist lookup USB errors** — `find_existing_playlist` propagates `get_object_handles` failures and `DeviceGone` from `get_object_info` instead of falling through to create a duplicate `.zpl`. Non-fatal per-object errors skip that handle (logged). The TUI worker drops the session on `DeviceGone`.
 - **Batch transcoding** — CLI `sync`/`push` and the TUI sync queue encode non-native tracks in parallel via rayon (`transcode_paths_parallel`) then upload sequentially over USB. The TUI only prefetches a CPU-width window of upcoming encodes so `AppendSyncQueue` can still extend a run. Temp outputs include a source-path hash so same-stem files (two albums' `01 - Intro.flac`) do not clobber each other. The TUI now uses `transcode_for_device` (FLAC→ALAC on iPod) rather than always dropping to MP3.
 - **Configurable transcode quality** — MP3 encoder target is `Mp3Quality` (`v0` / `v2` default / `v4` / CBR 128–320). CLI `--quality`/`-q` wins over `ZYTUNES_TRANSCODE_QUALITY` then `transcode_quality` in config.toml. Invalid CLI values error; invalid env/config warn and fall back to v2. iPod FLAC→ALAC is unchanged. The TUI worker receives the resolved quality at spawn so it stays config-file-free.
 - **Device-list duration column** — `DeviceEntry.duration_ms` from MTP `0xDC89 Duration` (Zune bulk enrich, skip 0) and iTunesDB mhit `+40` (iPod). Track cache 9th column; old files still parse. Device-mode rows fall back to the matched library tag's `total_time_ms` when the device didn't surface a duration (ZMDB rows before handle merge).
