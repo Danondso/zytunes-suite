@@ -148,7 +148,7 @@ fn run_loop(
             // a minimum of 4 rows for the track list, borders, footer, player.
             let show_player = app.should_show_player(size.height);
             // borders + footer + player; the player height comes from the
-            // same accessor draw() uses (10 while stems are engaged) so
+            // same accessor draw() uses (11 while stems are engaged) so
             // the art is sized for the panel that will actually be drawn.
             let overhead: u16 = 2
                 + 3

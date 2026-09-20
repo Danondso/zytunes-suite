@@ -125,8 +125,10 @@ impl<S: Source> WaveformTap<S> {
         }
         fft_radix2(&mut re, &mut im);
 
-        // Hann coherent gain 0.5 → *2, then 2/N for a real-FFT one-sided bin.
-        let scale = 4.0 / n;
+        // 4/N is coherent-gain corrected; extra GAIN lifts typical mix levels
+        // off the floor so the meters read as a contour instead of a few spikes.
+        const GAIN: f32 = 3.0;
+        let scale = 4.0 / n * GAIN;
         let mut frame = [0u8; BINS];
         for (c, slot) in frame.iter_mut().enumerate() {
             let (lo, hi) = self.bands[c];
@@ -151,8 +153,8 @@ fn band_ranges(sr: u32) -> [(usize, usize); BINS] {
     let sr = sr.max(1) as f32;
     let nyquist = sr / 2.0;
     let bin_hz = sr / FFT_N as f32;
-    let f_min = 40.0_f32.min(nyquist / 4.0).max(bin_hz);
-    let f_max = nyquist.min(16_000.0).max(f_min * 2.0);
+    let f_min = F_MIN_HZ.min(nyquist / 4.0).max(bin_hz);
+    let f_max = nyquist.min(F_MAX_HZ).max(f_min * 2.0);
     let ratio = f_max / f_min;
     let mut out = [(1usize, 2usize); BINS];
     for (c, slot) in out.iter_mut().enumerate() {
@@ -250,15 +252,16 @@ impl<S: Source> Source for WaveformTap<S> {
 
 /// Map a 0–255 amplitude onto `levels` (sparse → dense).
 ///
-/// `sqrt` lifts typical mix levels out of the floor glyphs so the bar
-/// reads as a contour instead of a thin spike train.
+/// Index 0 is the resting floor — every column keeps a mark so silent
+/// bands do not vanish. `pow(0.4)` lifts mid levels so the contour reads.
 pub fn glyph_from_levels(peak: u8, levels: &[char]) -> char {
     if levels.is_empty() {
-        return ' ';
+        return '▁';
     }
-    let boosted = ((peak as f32 / 255.0).sqrt() * 255.0) as usize;
-    let i = (boosted * (levels.len() - 1) + 127) / 255;
-    levels[i.min(levels.len() - 1)]
+    let t = (peak as f32 / 255.0).powf(0.4);
+    let last = levels.len() - 1;
+    let i = (t * last as f32).round() as usize;
+    levels[i.min(last)]
 }
 
 #[cfg(test)]
@@ -266,18 +269,18 @@ pub fn bar_glyph(peak: u8) -> char {
     glyph_from_levels(peak, RAMP_BLOCKS)
 }
 
-/// Block heights — iTunes / Gruvbox / Zune.
-pub const RAMP_BLOCKS: &[char] = &[' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+/// Block heights — iTunes / Gruvbox / Zune. Floor is `▁`, never blank.
+pub const RAMP_BLOCKS: &[char] = &['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 /// Bubble dots — Amber CRT / Newport.
-pub const RAMP_DOTS: &[char] = &[' ', '·', '•', '●'];
+pub const RAMP_DOTS: &[char] = &['·', '•', '●'];
 /// Shade ramp — Windows 95 / System 7.
-pub const RAMP_SHADE: &[char] = &[' ', '░', '▒', '▓', '█'];
+pub const RAMP_SHADE: &[char] = &['░', '▒', '▓', '█'];
 /// ASCII density — BIOS.
-pub const RAMP_ASCII: &[char] = &[' ', '.', ':', '-', '=', '+', '*', '#', '@'];
+pub const RAMP_ASCII: &[char] = &['.', ':', '-', '=', '+', '*', '#', '@'];
 /// Braille fill — Tokyo Night.
-pub const RAMP_BRAILLE: &[char] = &[' ', '⡀', '⣀', '⣠', '⣤', '⣦', '⣶', '⣷', '⣿'];
+pub const RAMP_BRAILLE: &[char] = &['⡀', '⣀', '⣠', '⣤', '⣦', '⣶', '⣷', '⣿'];
 /// Three-level chunky — IBM / NeXTSTEP.
-pub const RAMP_CHUNKY: &[char] = &[' ', '▄', '█'];
+pub const RAMP_CHUNKY: &[char] = &['▁', '▄', '█'];
 
 /// In-place soundbar draw styles. `W` cycles these; all of them only
 /// change column height, never slide sideways.
@@ -364,6 +367,84 @@ pub fn render_soundbar(
     soundbar_plain(&soundbar_atoms(wave, style, width, ramp))
 }
 
+/// Log-spectrum range used by both the FFT tap and the Hz labels.
+const F_MIN_HZ: f32 = 40.0;
+const F_MAX_HZ: f32 = 16_000.0;
+
+/// Geometric centre of band `i` of `n` log-spaced columns (40 Hz–16 kHz).
+fn band_center_hz(i: usize, n: usize) -> f32 {
+    if n == 0 {
+        return F_MIN_HZ;
+    }
+    let t = (i as f32 + 0.5) / n as f32;
+    F_MIN_HZ * (F_MAX_HZ / F_MIN_HZ).powf(t)
+}
+
+/// Compact Hz label that fits in `max` cells: `40`, `250`, `1k`, `16k`.
+fn compact_hz(hz: f32, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let full = if hz < 1000.0 {
+        format!("{}", hz.round() as u32)
+    } else {
+        let k = hz / 1000.0;
+        if k < 10.0 && (k - k.round()).abs() >= 0.15 {
+            format!("{k:.1}k")
+        } else {
+            format!("{}k", k.round() as u32)
+        }
+    };
+    full.chars().take(max).collect()
+}
+
+fn hz_labels(n: usize) -> Vec<String> {
+    (0..n)
+        .map(|i| compact_hz(band_center_hz(i, n), 3))
+        .collect()
+}
+
+/// Double-wide gapped meters that fit in `width`: `██ ██ ██` is `3n - 1` cells.
+/// Every `W` layout uses this so they share one centered island instead of
+/// Eq/Mirror stretching to the panel edges.
+fn meter_bands(width: usize) -> usize {
+    ((width + 1) / 3).clamp(1, 12)
+}
+
+fn style_bands(style: SoundbarStyle, width: usize) -> (usize, bool) {
+    let n = meter_bands(width);
+    match style {
+        SoundbarStyle::Eq => (((3 * n) / 2).max(1), false),
+        _ => (n, true),
+    }
+}
+
+/// Hz shorthand under each meter, same cell width as [`soundbar_atoms`] so
+/// `Alignment::Center` keeps the two rows on the same island.
+pub fn soundbar_labels(style: SoundbarStyle, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let (n, double) = style_bands(style, width);
+    let labels = match style {
+        SoundbarStyle::Mirror => {
+            let half_n = n.div_ceil(2).max(1);
+            let half = hz_labels(half_n);
+            let mut labs: Vec<String> = half
+                .iter()
+                .cloned()
+                .chain(half.iter().rev().cloned())
+                .collect();
+            if labs.len() > n {
+                labs.remove(labs.len() / 2);
+            }
+            labs
+        }
+        _ => hz_labels(n),
+    };
+    paint_labels(&labels, double)
+}
+
 pub fn soundbar_atoms(
     wave: &Waveform,
     style: SoundbarStyle,
@@ -378,28 +459,24 @@ pub fn soundbar_atoms(
     } else {
         ramp
     };
+    let (n, double) = style_bands(style, width);
     match style {
-        SoundbarStyle::Meters | SoundbarStyle::Dots => {
-            let n = ((width + 1) / 3).clamp(1, 12);
-            paint(&wave.columns(n), ramp, true)
-        }
-        SoundbarStyle::Eq => {
-            let n = width.div_ceil(2).clamp(1, 24);
-            paint(&wave.columns(n), ramp, false)
+        SoundbarStyle::Meters | SoundbarStyle::Dots | SoundbarStyle::Eq => {
+            paint(&wave.columns(n), ramp, double)
         }
         SoundbarStyle::Mirror => {
-            let n = (((width + 1) / 3).clamp(2, 16) / 2) * 2;
-            let n = n.max(2);
-            let half = wave.columns(n / 2);
-            let peaks: Vec<u8> = half
+            let half = wave.columns(n.div_ceil(2).max(1));
+            let mut peaks: Vec<u8> = half
                 .iter()
                 .copied()
                 .chain(half.iter().rev().copied())
                 .collect();
-            paint(&peaks, ramp, true)
+            if peaks.len() > n {
+                peaks.remove(peaks.len() / 2);
+            }
+            paint(&peaks, ramp, double)
         }
         SoundbarStyle::Pulse => {
-            let n = ((width + 1) / 3).clamp(1, 12);
             let level = f32::from(wave.columns(1).first().copied().unwrap_or(0));
             let peaks: Vec<u8> = (0..n)
                 .map(|i| {
@@ -411,7 +488,7 @@ pub fn soundbar_atoms(
                     (level * (1.0 - x * x).max(0.0)) as u8
                 })
                 .collect();
-            paint(&peaks, ramp, true)
+            paint(&peaks, ramp, double)
         }
     }
 }
@@ -455,6 +532,42 @@ fn paint(peaks: &[u8], ramp: &[char], double: bool) -> Vec<SoundbarAtom> {
         }
     }
     out
+}
+
+/// Place each band's Hz shorthand in the same cells as that meter.
+/// Double-wide: two chars in the bar, space in the gap (`40  1k`).
+/// Eq: two chars straddle the bar and the following gap (`40 80 1k`).
+fn paint_labels(labels: &[String], double: bool) -> String {
+    let n = labels.len();
+    if n == 0 {
+        return String::new();
+    }
+    let len = if double { 3 * n - 1 } else { 2 * n - 1 };
+    let mut out = vec![' '; len];
+    let mut at = 0usize;
+    for (i, lab) in labels.iter().enumerate() {
+        let mut cs = lab.chars();
+        if at < len {
+            out[at] = cs.next().unwrap_or(' ');
+        }
+        if double {
+            if at + 1 < len {
+                out[at + 1] = cs.next().unwrap_or(' ');
+            }
+            at += 2;
+            if i + 1 < n {
+                at += 1;
+            }
+        } else if i + 1 < n {
+            if at + 1 < len {
+                out[at + 1] = cs.next().unwrap_or(' ');
+            }
+            at += 2;
+        } else {
+            at += 1;
+        }
+    }
+    out.into_iter().collect()
 }
 
 #[cfg(test)]
@@ -547,7 +660,7 @@ mod tests {
 
     #[test]
     fn bar_glyph_ends() {
-        assert_eq!(bar_glyph(0), ' ');
+        assert_eq!(bar_glyph(0), '▁');
         assert_eq!(bar_glyph(255), '█');
     }
 
@@ -556,7 +669,62 @@ mod tests {
         assert_eq!(glyph_from_levels(255, RAMP_ASCII), '@');
         assert_eq!(glyph_from_levels(255, RAMP_BRAILLE), '⣿');
         assert_eq!(glyph_from_levels(255, RAMP_SHADE), '█');
-        assert_eq!(glyph_from_levels(0, RAMP_CHUNKY), ' ');
+        assert_eq!(glyph_from_levels(0, RAMP_CHUNKY), '▁');
+        assert_eq!(glyph_from_levels(0, RAMP_DOTS), '·');
+        assert_eq!(glyph_from_levels(0, RAMP_ASCII), '.');
+    }
+
+    #[test]
+    fn silent_columns_keep_a_floor_mark() {
+        let wave = Waveform::new();
+        let line = render_soundbar(&wave, SoundbarStyle::Meters, 40, RAMP_BLOCKS);
+        let marks: Vec<char> = line.chars().filter(|c| *c != ' ').collect();
+        assert!(!marks.is_empty(), "quiet bands must still draw a floor");
+        assert!(marks.iter().all(|&c| c == '▁'), "got {line:?}");
+    }
+
+    #[test]
+    fn compact_hz_shorthand() {
+        assert_eq!(compact_hz(40.0, 2), "40");
+        assert_eq!(compact_hz(250.0, 3), "250");
+        assert_eq!(compact_hz(1000.0, 2), "1k");
+        assert_eq!(compact_hz(16000.0, 3), "16k");
+        assert_eq!(compact_hz(16000.0, 2), "16");
+    }
+
+    #[test]
+    fn soundbar_labels_match_atom_width() {
+        let wave = Waveform::new();
+        for style in [
+            SoundbarStyle::Meters,
+            SoundbarStyle::Eq,
+            SoundbarStyle::Mirror,
+            SoundbarStyle::Pulse,
+            SoundbarStyle::Dots,
+        ] {
+            for width in [12usize, 24, 40, 80] {
+                let atoms = soundbar_atoms(&wave, style, width, RAMP_BLOCKS);
+                let labels = soundbar_labels(style, width);
+                assert_eq!(
+                    labels.chars().count(),
+                    atoms.len(),
+                    "{style:?} at {width}: labels {labels:?}"
+                );
+            }
+        }
+        let meters = soundbar_labels(SoundbarStyle::Meters, 40);
+        assert!(
+            meters.contains('4') || meters.contains('5'),
+            "bass end should show ~40–50 Hz, got {meters:?}"
+        );
+        let mirror = soundbar_labels(SoundbarStyle::Mirror, 40);
+        let chars: Vec<char> = mirror.chars().collect();
+        assert!(chars.len() >= 4);
+        assert_eq!(
+            &chars[..2],
+            &chars[chars.len() - 2..],
+            "mirror bass labels must match at both edges, got {mirror:?}"
+        );
     }
 
     #[test]
@@ -584,11 +752,16 @@ mod tests {
         let mut frame = [0u8; BINS];
         frame[0] = 255;
         wave.publish(&frame);
-        let line = render_soundbar(&wave, SoundbarStyle::Mirror, 40, RAMP_BLOCKS);
-        let chars: Vec<char> = line.chars().filter(|c| *c != ' ').collect();
-        let mut rev = chars.clone();
-        rev.reverse();
-        assert_eq!(chars, rev, "mirror must read the same backwards");
+        for width in [32usize, 40] {
+            let line = render_soundbar(&wave, SoundbarStyle::Mirror, width, RAMP_BLOCKS);
+            let chars: Vec<char> = line.chars().filter(|c| *c != ' ').collect();
+            let mut rev = chars.clone();
+            rev.reverse();
+            assert_eq!(
+                chars, rev,
+                "mirror must read the same backwards at width {width}"
+            );
+        }
     }
 
     #[test]
@@ -601,6 +774,36 @@ mod tests {
             "Dots must keep its own alphabet, got {line:?}"
         );
         assert!(!line.contains('@'), "Dots must not use the ASCII ramp");
+    }
+
+    #[test]
+    fn all_styles_share_a_centered_width() {
+        let wave = Waveform::new();
+        wave.publish(&[255; BINS]);
+        let styles = [
+            SoundbarStyle::Meters,
+            SoundbarStyle::Eq,
+            SoundbarStyle::Mirror,
+            SoundbarStyle::Pulse,
+            SoundbarStyle::Dots,
+        ];
+        for width in [12usize, 24, 40, 80] {
+            let meters = render_soundbar(&wave, SoundbarStyle::Meters, width, RAMP_BLOCKS)
+                .chars()
+                .count();
+            assert!(meters <= width, "meters overflowed {width}");
+            for style in styles {
+                let n = render_soundbar(&wave, style, width, RAMP_BLOCKS)
+                    .chars()
+                    .count();
+                assert!(n <= width, "{style:?} overflowed {n} > {width}");
+                let delta = (n as i32 - meters as i32).unsigned_abs();
+                assert!(
+                    delta <= 1,
+                    "{style:?} painted {n} vs meters {meters} at width {width}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -2154,13 +2154,13 @@ impl App {
     /// Rows the now-playing panel occupies when shown: one extra while a
     /// stem strip is rendering inside it. The single source of truth for
     /// `ui::draw`'s layout AND the run loop's album-art pre-render — the
-    /// pre-render sizing art against a hardcoded 9 clipped the art's
+    /// pre-render sizing art against a hardcoded height clipped the art's
     /// bottom row whenever stems were engaged.
     pub fn player_panel_height(&self) -> u16 {
         if self.stems.status != StemStatus::Off {
-            10
+            11
         } else {
-            9
+            10
         }
     }
 
@@ -12742,13 +12742,13 @@ mod tests {
     #[test]
     fn player_panel_height_grows_while_stems_engaged() {
         let mut app = stem_playing_app("/lib/song.mp3");
-        assert_eq!(app.player_panel_height(), 9);
+        assert_eq!(app.player_panel_height(), 10);
         app.stems.status = StemStatus::Separating { pct: None };
-        assert_eq!(app.player_panel_height(), 10);
+        assert_eq!(app.player_panel_height(), 11);
         app.stems.status = StemStatus::Active;
-        assert_eq!(app.player_panel_height(), 10);
+        assert_eq!(app.player_panel_height(), 11);
         app.stems.status = StemStatus::Off;
-        assert_eq!(app.player_panel_height(), 9);
+        assert_eq!(app.player_panel_height(), 10);
     }
 
     #[test]

@@ -18,8 +18,8 @@ use stem_mix::StemMixerSource;
 pub mod waveform;
 use waveform::WaveformTap;
 pub use waveform::{
-    soundbar_atoms, SoundbarStyle, Waveform, RAMP_ASCII, RAMP_BLOCKS, RAMP_BRAILLE, RAMP_CHUNKY,
-    RAMP_DOTS, RAMP_SHADE,
+    soundbar_atoms, soundbar_labels, SoundbarStyle, Waveform, RAMP_ASCII, RAMP_BLOCKS,
+    RAMP_BRAILLE, RAMP_CHUNKY, RAMP_DOTS, RAMP_SHADE,
 };
 
 /// Formats that rodio + symphonia can decode directly (with expanded codec features).
