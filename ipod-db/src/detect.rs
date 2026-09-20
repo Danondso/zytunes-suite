@@ -244,6 +244,7 @@ fn apply_sysinfo_extended_xml(
     }
 }
 
+#[cfg(any(test, target_os = "linux"))]
 fn pretty_fstype(fs: &str) -> String {
     match fs {
         "vfat" | "msdos" | "fat" | "exfat" => "FAT".into(),
@@ -254,6 +255,7 @@ fn pretty_fstype(fs: &str) -> String {
 }
 
 /// `/dev/sdb1` → `/dev/sdb`; `nvme0n1p1` → `nvme0n1`.
+#[cfg(any(test, target_os = "linux"))]
 fn whole_disk(dev: &Path) -> PathBuf {
     let Some(name) = dev.file_name().and_then(|n| n.to_str()) else {
         return dev.to_path_buf();
