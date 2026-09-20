@@ -93,6 +93,7 @@ fn prefetch_sync_transcodes(
     queue: &std::collections::VecDeque<SyncItem>,
     temp_dir: &std::path::Path,
     caps: &DeviceCapabilities,
+    quality: Mp3Quality,
     event_tx: &mpsc::Sender<BgEvent>,
 ) {
     let batch = next_transcode_batch(
@@ -105,10 +106,10 @@ fn prefetch_sync_transcodes(
         return;
     }
     let _ = event_tx.send(BgEvent::SyncMessage(format!(
-        "Transcoding {} track(s)...",
+        "Transcoding {} track(s) (MP3 {quality})...",
         batch.len()
     )));
-    prepared.extend(transcode_paths_parallel(&batch, temp_dir, caps));
+    prepared.extend(transcode_paths_parallel(&batch, temp_dir, caps, quality));
 }
 
 use std::collections::HashMap;
@@ -135,7 +136,7 @@ use zytunes::{
     collect_photo_files_with_logger, collect_video_files_with_logger, make_transcode_temp_dir,
     needs_video_transcoding, next_transcode_batch, resize_photo_for_zune,
     transcode_and_import_video, transcode_for_device, transcode_parallelism,
-    transcode_paths_parallel, will_transcode,
+    transcode_paths_parallel, will_transcode, Mp3Quality,
 };
 
 /// Commands sent from the main TUI thread to the background worker.
@@ -683,7 +684,7 @@ pub enum CdStatusEvent {
 }
 
 /// Spawn the background worker thread. Returns a sender for commands.
-pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
+pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::Sender<BgCommand> {
     let (cmd_tx, cmd_rx) = mpsc::channel::<BgCommand>();
 
     thread::spawn(move || {
@@ -1430,8 +1431,8 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                             .filter(|it| will_transcode(&it.location, &tx_caps))
                             .count();
                         let _ = event_tx.send(BgEvent::SyncMessage(format!(
-                            "Starting sync: {} tracks ({} need transcoding)",
-                            total, to_transcode
+                            "Starting sync: {} tracks ({} need transcoding, MP3 {})",
+                            total, to_transcode, mp3_quality
                         )));
 
                         loop {
@@ -1458,6 +1459,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                 &sync_queue,
                                 &temp_dir,
                                 &tx_caps,
+                                mp3_quality,
                                 &event_tx,
                             );
 
@@ -1507,8 +1509,12 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                     continue;
                                 }
                                 None if will_transcode(&item.location, &tx_caps) => {
-                                    match transcode_for_device(&item.location, &temp_dir, &tx_caps)
-                                    {
+                                    match transcode_for_device(
+                                        &item.location,
+                                        &temp_dir,
+                                        &tx_caps,
+                                        mp3_quality,
+                                    ) {
                                         Ok(p) => {
                                             let size =
                                                 std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);

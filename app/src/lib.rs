@@ -72,9 +72,9 @@ use std::str::FromStr;
 // transcode pipeline from the crate root.
 pub use transcode::{
     check_ffmpeg_available, make_transcode_temp_dir, needs_transcoding, needs_video_transcoding,
-    next_transcode_batch, transcode_and_import, transcode_and_import_video, transcode_flac_to_alac,
-    transcode_for_device, transcode_parallelism, transcode_paths_parallel, transcode_to_mp3,
-    transcode_to_wmv, will_transcode,
+    next_transcode_batch, resolve_mp3_quality, transcode_and_import, transcode_and_import_video,
+    transcode_flac_to_alac, transcode_for_device, transcode_parallelism, transcode_paths_parallel,
+    transcode_to_mp3, transcode_to_mp3_with_quality, transcode_to_wmv, will_transcode, Mp3Quality,
 };
 
 /// The type of sync operation to perform.
@@ -275,6 +275,7 @@ pub fn sync_to_device(
     pushable: &[&library::Track],
     temp_dir: &Path,
     caps: &DeviceCapabilities,
+    quality: Mp3Quality,
 ) -> Result<SyncResult, String> {
     // Scan device for existing tracks to avoid duplicates.
     print!("Scanning device for existing tracks... ");
@@ -326,9 +327,9 @@ pub fn sync_to_device(
     let locations: Vec<String> = to_push.iter().filter_map(|t| t.location.clone()).collect();
     let n_transcode = locations.iter().filter(|l| will_transcode(l, caps)).count();
     if n_transcode > 0 {
-        println!("Transcoding {n_transcode} track(s) in parallel...");
+        println!("Transcoding {n_transcode} track(s) in parallel (MP3 {quality})...");
     }
-    let prepared = transcode_paths_parallel(&locations, temp_dir, caps);
+    let prepared = transcode_paths_parallel(&locations, temp_dir, caps, quality);
 
     for (i, track) in to_push.iter().enumerate() {
         let loc = match track.location.as_deref() {
@@ -980,7 +981,8 @@ mod tests {
 
         let mut mock = MockSession::new();
         let caps = test_caps();
-        let result = sync_to_device(&mut mock, &tracks, &temp_dir, &caps).unwrap();
+        let result =
+            sync_to_device(&mut mock, &tracks, &temp_dir, &caps, Mp3Quality::default()).unwrap();
 
         assert_eq!(result.success, 5);
         assert_eq!(result.skipped, 0);
@@ -1000,7 +1002,8 @@ mod tests {
 
         let mut mock = MockSession::new();
         let caps = test_caps();
-        let result = sync_to_device(&mut mock, &tracks, &temp_dir, &caps).unwrap();
+        let result =
+            sync_to_device(&mut mock, &tracks, &temp_dir, &caps, Mp3Quality::default()).unwrap();
 
         assert_eq!(result.success, 1);
         assert_eq!(result.failed, 1);
@@ -1024,7 +1027,8 @@ mod tests {
             .push(make_device_entry(50, "Artist/Album/Song 2.mp3"));
 
         let caps = test_caps();
-        let result = sync_to_device(&mut mock, &tracks, &temp_dir, &caps).unwrap();
+        let result =
+            sync_to_device(&mut mock, &tracks, &temp_dir, &caps, Mp3Quality::default()).unwrap();
 
         assert_eq!(result.success, 2);
         assert_eq!(result.skipped, 1);
@@ -1049,7 +1053,8 @@ mod tests {
             .push(make_device_entry(50, "Artist A/Album/Song.mp3"));
 
         let caps = test_caps();
-        let result = sync_to_device(&mut mock, &tracks, &temp_dir, &caps).unwrap();
+        let result =
+            sync_to_device(&mut mock, &tracks, &temp_dir, &caps, Mp3Quality::default()).unwrap();
 
         assert_eq!(result.success, 1); // Only Artist B's track imported
         assert_eq!(result.skipped, 1); // Artist A's track skipped

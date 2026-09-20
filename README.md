@@ -21,7 +21,7 @@ A Rust tool for syncing music (and photos/videos on Zune) to a Microsoft Zune or
 - **Music library sync** — `sync <type> <name>` syncs tracks by artist, album, or track name by scanning a local music folder. Detects duplicates already on device and skips them. The TUI's queued sync also filters out tracks already on the device before dispatching the sync
 - **Library scan** — `scan` pre-warms the directory-library cache without opening the TUI (useful for large libraries)
 - **Photo & video sync (Zune)** — `photo-sync [dir]` and `video-sync [dir]` push images and videos to the Zune's Pictures/Video stores. Videos are transcoded to WMV2/WMAv2 via ffmpeg; photos are JPEG-normalised and resized to fit 240×320. iPod photo/video sync is not implemented
-- **Auto-transcoding (audio)** — formats the connected device does not play natively are transcoded via pure-Rust symphonia + LAME (MP3) or ffmpeg (FLAC→ALAC on iPod). Sync and push encode those tracks in parallel (rayon) before sequential USB upload. Zune album art is resized to 200×200 JPEG. The M4A/ALAC→MP3 path trims trailing silence leaked by symphonia's unapplied `elst` edit-list atoms
+- **Auto-transcoding (audio)** — formats the connected device does not play natively are transcoded via pure-Rust symphonia + LAME (MP3) or ffmpeg (FLAC→ALAC on iPod). Default MP3 quality is LAME `-V 2` (~190 kbps VBR); override with `--quality` / `-q`, `ZYTUNES_TRANSCODE_QUALITY`, or `transcode_quality` in config (`v0` / `v2` / `v4` / `cbr-128` / `cbr-192` / `cbr-256` / `cbr-320`). Sync and push encode those tracks in parallel (rayon) before sequential USB upload. Zune album art is resized to 200×200 JPEG. The M4A/ALAC→MP3 path trims trailing silence leaked by symphonia's unapplied `elst` edit-list atoms
 - **Native-format passthrough** — Zune natives (MP3, WMA, AAC) skip transcoding. iPod natives are broader (MP3, M4A, AAC, ALAC, WAV, AIFF); only OGG/OPUS drop to MP3 on iPod
 - **Per-device lossless promotion** — FLAC library tracks pushed to iPod transcode to ALAC (lossless) instead of dropping to MP3. Zune still falls through to MP3 since its firmware has no lossless container. Controlled by `DeviceCapabilities::lossless_target`
 - **CD import** — insert an audio CD and zytunes shows a status bar with the disc's artist/album (identified via MusicBrainz; libdiscid reads the disc TOC and our pure-Rust `compute_disc_id` derives the MB disc ID from it). Press `i` to open an import overlay: toggle individual tracks, cycle through alternate release matches, pick a fidelity (FLAC, WAV, or MP3 V2 / V0 / 320 CBR), and optionally auto-eject when done. Files land under `{music_dir}/{Artist}/{Album}/01 - Title.{ext}` with Picard-equivalent tags (identity, numbering, ISRC / barcode / catalog / label, and 6 MusicBrainz IDs — track, recording, release, release-group, release-artist, and track-artist — that the tag manager keys on)
@@ -259,7 +259,7 @@ The TUI works in any EAW-compliant terminal (Alacritty, kitty, wezterm, Zed's em
 1. Browse your music library and press `a` to add artists, albums, or individual tracks to the sync queue
 2. Press `c` to connect to the device (auto-detects via USB, performs MTPZ handshake on Zune / mounts the iPod volume)
 3. Press `S` or switch to the queue and press `Enter` to start syncing
-4. Formats the device does not play natively are transcoded (Zune → LAME VBR `NearBest` ~V0 MP3 with 200×200 art; iPod keeps WAV/AIFF/M4A/ALAC and promotes FLAC → ALAC)
+4. Formats the device does not play natively are transcoded (Zune → MP3 at the configured quality, default LAME `-V 2` ~190 kbps, with 200×200 art; iPod keeps WAV/AIFF/M4A/ALAC and promotes FLAC → ALAC). `--quality` / `ZYTUNES_TRANSCODE_QUALITY` / `transcode_quality` select `v0`, `v2`, `v4`, or CBR 128–320; FLAC→ALAC ignores the MP3 setting
 5. Progress and results appear in the log panel; device track list auto-refreshes on completion. Tracks already on the device are skipped automatically and noted in the log
 6. If the device disconnects mid-sync (unplug, unrecoverable stall), the TUI aborts remaining items, drops the session, and tells you to replug
 
@@ -280,6 +280,7 @@ Other CD-import config knobs (all optional):
 default_fidelity     = "flac"  # overlay default: "mp3-cbr-320" | "mp3-v0" | "mp3-v2" | "flac" | "wav"
 cd_auto_eject        = true    # eject after a successful rip (defaults to true)
 acoustid_fingerprint = true    # embed an AcoustID fingerprint at rip time (~1–15 s/track)
+transcode_quality    = "v2"    # device-side MP3: "v0" | "v2" | "v4" | "cbr-128" | "cbr-192" | "cbr-256" | "cbr-320"
 ```
 
 ## Streaming server (zytunes-serve)
@@ -380,7 +381,7 @@ the handshake. The iPod backend does not use it. See
 
 ### Config file
 
-Copy [`config.toml.example`](config.toml.example) to `~/.config/zytunes/config.toml` and uncomment what you need. Paths, TUI, scan/fingerprinting, MusicBrainz/AcoustID, CD import, `[stems]`, `[stream]`, and custom `[themes."Name"]` tables are all there. `./install.sh --setup` copies that example (backing up any existing file) and uncomments only `music_dir`.
+Copy [`config.toml.example`](config.toml.example) to `~/.config/zytunes/config.toml` and uncomment what you need. Paths, TUI, scan/fingerprinting, MusicBrainz/AcoustID, CD import, device transcode quality, `[stems]`, `[stream]`, and custom `[themes."Name"]` tables are all there. `./install.sh --setup` copies that example (backing up any existing file) and uncomments only `music_dir`.
 
 ### Music library
 

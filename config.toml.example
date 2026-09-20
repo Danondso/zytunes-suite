@@ -88,6 +88,17 @@
 # acoustid_fingerprint = true
 
 # ---------------------------------------------------------------------------
+# Device transcode (CLI sync/push and TUI queue)
+# ---------------------------------------------------------------------------
+
+# MP3 encoder target when the device cannot play the source natively.
+# Does not affect iPod FLAC→ALAC. Default v2 (LAME -V 2, ~190 kbps VBR).
+# Override: --quality / -q, or ZYTUNES_TRANSCODE_QUALITY
+# Values: "v0" | "v2" | "v4" | "cbr-128" | "cbr-192" | "cbr-256" | "cbr-320"
+# Aliases: "mp3-v0", "320", "mp3-cbr-320". Unknown values warn and use v2.
+# transcode_quality = "v2"
+
+# ---------------------------------------------------------------------------
 # CD import
 # ---------------------------------------------------------------------------
 

@@ -9,7 +9,9 @@
 use crate::device::DeviceCapabilities;
 use crate::mtp::{self, DeviceSession};
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use rayon::prelude::*;
 
@@ -66,6 +68,142 @@ pub fn needs_video_transcoding(path: &str) -> bool {
         .unwrap_or("")
         .to_lowercase();
     ext != "wmv"
+}
+
+/// MP3 encoder target for device-side transcode (Zune always; iPod when the
+/// source is not FLAC→ALAC). Does not affect lossless promotion.
+///
+/// Default is [`Mp3Quality::V2`] — LAME `-V 2` / `Quality::NearBest`, the
+/// historical hardcoded setting (~190 kbps VBR).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Mp3Quality {
+    /// LAME `-V 0` (`Quality::Best`), ~245 kbps VBR.
+    V0,
+    /// LAME `-V 2` (`Quality::NearBest`), ~190 kbps VBR.
+    #[default]
+    V2,
+    /// LAME `-V 4` (`Quality::Nice`), ~165 kbps VBR.
+    V4,
+    /// Constant bitrate. Only LAME's standard CBR table is accepted.
+    Cbr(u16),
+}
+
+impl Mp3Quality {
+    /// Values accepted by [`FromStr`]: VBR names and CBR kbps.
+    pub const HELP: &'static str = "v0 | v2 | v4 | cbr-128 | cbr-192 | cbr-256 | cbr-320";
+
+    fn lame_vbr_quality(self) -> Option<mp3lame_encoder::Quality> {
+        match self {
+            Self::V0 => Some(mp3lame_encoder::Quality::Best),
+            Self::V2 => Some(mp3lame_encoder::Quality::NearBest),
+            Self::V4 => Some(mp3lame_encoder::Quality::Nice),
+            Self::Cbr(_) => None,
+        }
+    }
+
+    fn lame_bitrate(self) -> Option<mp3lame_encoder::Bitrate> {
+        match self {
+            Self::Cbr(128) => Some(mp3lame_encoder::Bitrate::Kbps128),
+            Self::Cbr(160) => Some(mp3lame_encoder::Bitrate::Kbps160),
+            Self::Cbr(192) => Some(mp3lame_encoder::Bitrate::Kbps192),
+            Self::Cbr(256) => Some(mp3lame_encoder::Bitrate::Kbps256),
+            Self::Cbr(320) => Some(mp3lame_encoder::Bitrate::Kbps320),
+            _ => None,
+        }
+    }
+
+    fn apply(self, builder: &mut mp3lame_encoder::Builder) -> Result<(), String> {
+        match self.lame_vbr_quality() {
+            Some(q) => {
+                builder
+                    .set_vbr_mode(mp3lame_encoder::VbrMode::Mtrh)
+                    .map_err(|e| format!("LAME set VBR mode: {e:?}"))?;
+                builder
+                    .set_vbr_quality(q)
+                    .map_err(|e| format!("LAME set VBR quality: {e:?}"))?;
+            }
+            None => {
+                let br = self.lame_bitrate().ok_or_else(|| {
+                    "unsupported MP3 CBR kbps (allowed: 128, 160, 192, 256, 320)".to_string()
+                })?;
+                builder
+                    .set_vbr_mode(mp3lame_encoder::VbrMode::Off)
+                    .map_err(|e| format!("LAME set VBR mode: {e:?}"))?;
+                builder
+                    .set_brate(br)
+                    .map_err(|e| format!("LAME set bitrate: {e:?}"))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for Mp3Quality {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::V0 => f.write_str("v0"),
+            Self::V2 => f.write_str("v2"),
+            Self::V4 => f.write_str("v4"),
+            Self::Cbr(kbps) => write!(f, "cbr-{kbps}"),
+        }
+    }
+}
+
+impl FromStr for Mp3Quality {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let t = s.trim().to_ascii_lowercase();
+        let t = t.strip_prefix("mp3-").unwrap_or(&t);
+        match t {
+            "v0" | "best" => Ok(Self::V0),
+            "v2" | "nearbest" => Ok(Self::V2),
+            "v4" => Ok(Self::V4),
+            "cbr-128" | "128" => Ok(Self::Cbr(128)),
+            "cbr-160" | "160" => Ok(Self::Cbr(160)),
+            "cbr-192" | "192" => Ok(Self::Cbr(192)),
+            "cbr-256" | "256" => Ok(Self::Cbr(256)),
+            "cbr-320" | "320" => Ok(Self::Cbr(320)),
+            other => Err(format!(
+                "unknown transcode quality \"{other}\" (expected {})",
+                Self::HELP
+            )),
+        }
+    }
+}
+
+fn nonempty(s: Option<&str>) -> Option<&str> {
+    s.map(str::trim).filter(|t| !t.is_empty())
+}
+
+/// Pick an MP3 encoder target: explicit override, then env, then config, then
+/// [`Mp3Quality::V2`]. Invalid explicit values are errors; invalid env/config
+/// values warn and fall back to the default so a typo in `config.toml` does
+/// not refuse a sync.
+pub fn resolve_mp3_quality(
+    explicit: Option<&str>,
+    env: Option<&str>,
+    config: Option<&str>,
+    mut warn: impl FnMut(&str),
+) -> Result<Mp3Quality, String> {
+    if let Some(s) = nonempty(explicit) {
+        return s.parse();
+    }
+    for (label, value) in [
+        ("ZYTUNES_TRANSCODE_QUALITY", env),
+        ("transcode_quality", config),
+    ] {
+        if let Some(s) = nonempty(value) {
+            return match s.parse() {
+                Ok(q) => Ok(q),
+                Err(e) => {
+                    warn(&format!("{label}: {e}; using v2"));
+                    Ok(Mp3Quality::default())
+                }
+            };
+        }
+    }
+    Ok(Mp3Quality::default())
 }
 
 /// Check whether ffmpeg is available on the system.
@@ -144,9 +282,10 @@ pub fn transcode_and_import(
     local_path: &str,
     temp_dir: &Path,
     caps: &DeviceCapabilities,
+    quality: Mp3Quality,
     meta: Option<&mtp::TrackMeta>,
 ) -> Result<u64, mtp::DeviceError> {
-    let upload_path = transcode_for_device(local_path, temp_dir, caps)?;
+    let upload_path = transcode_for_device(local_path, temp_dir, caps, quality)?;
     session.import_track(&upload_path, meta)
 }
 
@@ -167,6 +306,7 @@ pub fn transcode_for_device(
     local_path: &str,
     temp_dir: &Path,
     caps: &DeviceCapabilities,
+    quality: Mp3Quality,
 ) -> Result<String, String> {
     if let Some(lossless_target) = caps.lossless_target {
         if is_flac(local_path) && lossless_target == "alac" {
@@ -174,7 +314,12 @@ pub fn transcode_for_device(
         }
     }
     if needs_transcoding(local_path, caps.supported_formats) {
-        return transcode_to_mp3(local_path, temp_dir, caps.max_art_dimensions);
+        return transcode_to_mp3_with_quality(
+            local_path,
+            temp_dir,
+            caps.max_art_dimensions,
+            quality,
+        );
     }
     Ok(local_path.to_string())
 }
@@ -242,6 +387,7 @@ pub fn transcode_paths_parallel<S: AsRef<str> + Sync>(
     paths: &[S],
     temp_dir: &Path,
     caps: &DeviceCapabilities,
+    quality: Mp3Quality,
 ) -> HashMap<String, Result<String, String>> {
     let mut unique = Vec::new();
     let mut seen = HashSet::new();
@@ -261,7 +407,7 @@ pub fn transcode_paths_parallel<S: AsRef<str> + Sync>(
             // Symphonia (and LAME on odd inputs) can panic; without isolation
             // one bad file aborts the whole rayon collect and drops siblings.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                transcode_for_device(&p, temp_dir, caps)
+                transcode_for_device(&p, temp_dir, caps, quality)
             }))
             .unwrap_or_else(|_| Err(format!("transcoder panicked on {p}")));
             (p, result)
@@ -498,6 +644,16 @@ pub fn transcode_to_mp3(
     temp_dir: &Path,
     max_art_dimensions: Option<(u32, u32)>,
 ) -> Result<String, String> {
+    transcode_to_mp3_with_quality(input, temp_dir, max_art_dimensions, Mp3Quality::default())
+}
+
+/// Same as [`transcode_to_mp3`] with an explicit encoder target.
+pub fn transcode_to_mp3_with_quality(
+    input: &str,
+    temp_dir: &Path,
+    max_art_dimensions: Option<(u32, u32)>,
+    quality: Mp3Quality,
+) -> Result<String, String> {
     use id3::TagLike;
     use symphonia::core::audio::SampleBuffer;
     use symphonia::core::codecs::DecoderOptions;
@@ -553,12 +709,7 @@ pub fn transcode_to_mp3(
     mp3_builder
         .set_sample_rate(sample_rate)
         .map_err(|e| format!("LAME set sample rate: {e:?}"))?;
-    mp3_builder
-        .set_vbr_mode(mp3lame_encoder::VbrMode::Mtrh)
-        .map_err(|e| format!("LAME set VBR mode: {e:?}"))?;
-    mp3_builder
-        .set_vbr_quality(mp3lame_encoder::Quality::NearBest)
-        .map_err(|e| format!("LAME set VBR quality: {e:?}"))?;
+    quality.apply(&mut mp3_builder)?;
     let mut mp3_encoder = mp3_builder
         .build()
         .map_err(|e| format!("LAME build: {e:?}"))?;
@@ -813,6 +964,72 @@ mod tests {
         assert!(needs_video_transcoding("movie.mkv"));
     }
 
+    #[test]
+    fn mp3_quality_parses_aliases_and_rejects_unknown() {
+        assert_eq!("v0".parse::<Mp3Quality>().unwrap(), Mp3Quality::V0);
+        assert_eq!("V0".parse::<Mp3Quality>().unwrap(), Mp3Quality::V0);
+        assert_eq!("mp3-v0".parse::<Mp3Quality>().unwrap(), Mp3Quality::V0);
+        assert_eq!("best".parse::<Mp3Quality>().unwrap(), Mp3Quality::V0);
+        assert_eq!("v2".parse::<Mp3Quality>().unwrap(), Mp3Quality::V2);
+        assert_eq!("nearbest".parse::<Mp3Quality>().unwrap(), Mp3Quality::V2);
+        assert_eq!("v4".parse::<Mp3Quality>().unwrap(), Mp3Quality::V4);
+        assert_eq!(
+            "cbr-320".parse::<Mp3Quality>().unwrap(),
+            Mp3Quality::Cbr(320)
+        );
+        assert_eq!("320".parse::<Mp3Quality>().unwrap(), Mp3Quality::Cbr(320));
+        assert_eq!(
+            "mp3-cbr-320".parse::<Mp3Quality>().unwrap(),
+            Mp3Quality::Cbr(320)
+        );
+        assert_eq!(
+            "mp3-320".parse::<Mp3Quality>().unwrap(),
+            Mp3Quality::Cbr(320)
+        );
+        assert_eq!(
+            "cbr-128".parse::<Mp3Quality>().unwrap(),
+            Mp3Quality::Cbr(128)
+        );
+        assert!("v1".parse::<Mp3Quality>().is_err());
+        assert!("cbr-64".parse::<Mp3Quality>().is_err());
+        assert!("".parse::<Mp3Quality>().is_err());
+        assert_eq!(Mp3Quality::V2.to_string(), "v2");
+        assert_eq!(Mp3Quality::Cbr(192).to_string(), "cbr-192");
+        assert_eq!(Mp3Quality::default(), Mp3Quality::V2);
+    }
+
+    #[test]
+    fn resolve_mp3_quality_precedence() {
+        let q = resolve_mp3_quality(Some("v0"), Some("v4"), Some("cbr-320"), |_| {}).unwrap();
+        assert_eq!(q, Mp3Quality::V0);
+
+        let q = resolve_mp3_quality(None, Some("v4"), Some("cbr-320"), |_| {}).unwrap();
+        assert_eq!(q, Mp3Quality::V4);
+
+        let q = resolve_mp3_quality(None, None, Some("cbr-192"), |_| {}).unwrap();
+        assert_eq!(q, Mp3Quality::Cbr(192));
+
+        let q = resolve_mp3_quality(None, None, None, |_| {}).unwrap();
+        assert_eq!(q, Mp3Quality::V2);
+
+        let q = resolve_mp3_quality(Some("  "), Some("v0"), None, |_| {}).unwrap();
+        assert_eq!(q, Mp3Quality::V0);
+
+        assert!(resolve_mp3_quality(Some("nope"), None, None, |_| {}).is_err());
+
+        let mut warned = String::new();
+        let q = resolve_mp3_quality(None, Some("nope"), Some("v0"), |m| warned = m.to_string())
+            .unwrap();
+        assert_eq!(q, Mp3Quality::V2);
+        assert!(warned.contains("ZYTUNES_TRANSCODE_QUALITY"));
+        assert!(warned.contains("using v2"));
+
+        warned.clear();
+        let q = resolve_mp3_quality(None, None, Some("nope"), |m| warned = m.to_string()).unwrap();
+        assert_eq!(q, Mp3Quality::V2);
+        assert!(warned.contains("transcode_quality"));
+    }
+
     // -- Transcoding decision tests --
 
     #[test]
@@ -830,7 +1047,10 @@ mod tests {
         let caps = test_caps();
         let temp = std::env::temp_dir();
         let path = "/somewhere/song.mp3";
-        assert_eq!(transcode_for_device(path, &temp, &caps).unwrap(), path);
+        assert_eq!(
+            transcode_for_device(path, &temp, &caps, Mp3Quality::default()).unwrap(),
+            path
+        );
     }
 
     #[test]
@@ -842,7 +1062,8 @@ mod tests {
         // the ALAC branch.
         let caps = test_caps();
         let temp = std::env::temp_dir();
-        let err = transcode_for_device("/nope/missing.flac", &temp, &caps).unwrap_err();
+        let err = transcode_for_device("/nope/missing.flac", &temp, &caps, Mp3Quality::default())
+            .unwrap_err();
         // Hits the MP3 path → error mentions decode/open of the file
         assert!(
             !err.contains("ALAC") && !err.contains("alac"),
@@ -857,7 +1078,8 @@ mod tests {
         // error so we know we dispatched correctly.
         let caps = ipod_caps_with_lossless();
         let temp = std::env::temp_dir();
-        let result = transcode_for_device("/nope/missing.flac", &temp, &caps);
+        let result =
+            transcode_for_device("/nope/missing.flac", &temp, &caps, Mp3Quality::default());
         match result {
             Err(e) if e.contains("ffmpeg") => {} // expected — either spawn-fail or process-fail
             Err(other) => panic!("expected ffmpeg-related error, got {other:?}"),
@@ -870,7 +1092,10 @@ mod tests {
         let caps = ipod_caps_with_lossless();
         let temp = std::env::temp_dir();
         let path = "/somewhere/song.mp3";
-        assert_eq!(transcode_for_device(path, &temp, &caps).unwrap(), path);
+        assert_eq!(
+            transcode_for_device(path, &temp, &caps, Mp3Quality::default()).unwrap(),
+            path
+        );
     }
 
     #[test]
@@ -927,7 +1152,7 @@ mod tests {
         let caps = test_caps();
         let temp = std::env::temp_dir();
         let paths = ["song.mp3", "song.mp3", "/nope/missing.flac"];
-        let map = transcode_paths_parallel(&paths, &temp, &caps);
+        let map = transcode_paths_parallel(&paths, &temp, &caps, Mp3Quality::default());
         assert!(!map.contains_key("song.mp3"));
         assert_eq!(map.len(), 1);
         assert!(map.get("/nope/missing.flac").unwrap().is_err());
@@ -1441,7 +1666,7 @@ mod tests {
             wav_a.to_str().unwrap().to_string(),
             wav_b.to_str().unwrap().to_string(),
         ];
-        let map = transcode_paths_parallel(&paths, &out_dir, &caps);
+        let map = transcode_paths_parallel(&paths, &out_dir, &caps, Mp3Quality::default());
         assert_eq!(map.len(), 2);
         let a = map.get(&paths[0]).unwrap().as_ref().unwrap();
         let b = map.get(&paths[1]).unwrap().as_ref().unwrap();
@@ -1589,5 +1814,40 @@ mod tests {
         assert!(result.is_err());
 
         let _ = std::fs::remove_dir_all(&out_dir);
+    }
+
+    #[test]
+    fn transcode_cbr320_is_larger_than_v4() {
+        let dir = std::env::temp_dir().join("zytunes-test-transcode-quality");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let wav = dir.join("tone.wav");
+        make_wav_tail(&wav, 44_100, 0);
+
+        let v4_dir = dir.join("v4");
+        let cbr_dir = dir.join("cbr");
+        std::fs::create_dir_all(&v4_dir).unwrap();
+        std::fs::create_dir_all(&cbr_dir).unwrap();
+
+        let v4 =
+            transcode_to_mp3_with_quality(wav.to_str().unwrap(), &v4_dir, None, Mp3Quality::V4)
+                .unwrap();
+        let cbr = transcode_to_mp3_with_quality(
+            wav.to_str().unwrap(),
+            &cbr_dir,
+            None,
+            Mp3Quality::Cbr(320),
+        )
+        .unwrap();
+
+        let v4_len = std::fs::metadata(&v4).unwrap().len();
+        let cbr_len = std::fs::metadata(&cbr).unwrap().len();
+        assert!(
+            cbr_len > v4_len,
+            "CBR 320 ({cbr_len}) should outsize V4 VBR ({v4_len})"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
