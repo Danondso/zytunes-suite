@@ -6,7 +6,6 @@
 
 ## Future
 
-- **Configurable transcode quality** — currently hardcoded to symphonia → LAME `NearBest` VBR (~190kbps) in `src/lib.rs:326`. Add CLI flag and config key for bitrate/quality.
 - **Theming (remaining)**
   - Theme preview screenshots in docs
 - **Player Support (remaining)**
@@ -23,8 +22,6 @@
   - Audit mappings
   - Suggest improvements / redundant / confusing
   - Make controls more intuitive
-- **One Offs**
-  - perf: batch transcoding — transcoding is sequential; `rayon` is already a dependency but unused in the sync loop.
 - **Unify cache implementations** — four device-scoped caches plus the album-art cache are hand-rolled with no shared abstraction. The dirlib library scan cache stays out of this work: it lives at `$HOME/.cache/zytunes` precisely so sibling worktrees pointed at the same `~/Music` reuse one scan, which is the entire reason `ZYTUNES_CACHE_DIR` exists (it isolates device caches per-worktree without dragging the library scan along). Goal: one cache layer for everything else, with on-disk formats designed for **export** (a user can bundle their cache, ship it to another machine or back it up, and reimport it).
   - **In scope:**
     - `src/art_cache.rs` — album art, raw JPEG + `.meta.json` sidecar, `$HOME/.cache/zytunes/art/{hash(artist,album)}.jpg`, source-file `(mtime,size)` fingerprint. Worth exporting (regenerating across a large library is expensive).
@@ -88,7 +85,8 @@
 
 - **Diagnostics: playlist/listen-log Logger** — `PlaylistStore` and `ListenLog` take a `Logger`; CLI uses stderr, TUI routes into `SyncMessage`. No `eprintln!` on those hot paths.
 - **Diagnostics: playlist lookup USB errors** — `find_existing_playlist` propagates `get_object_handles` failures and `DeviceGone` from `get_object_info` instead of falling through to create a duplicate `.zpl`. Non-fatal per-object errors skip that handle (logged). The TUI worker drops the session on `DeviceGone`.
-
+- **Batch transcoding** — CLI `sync`/`push` and the TUI sync queue encode non-native tracks in parallel via rayon (`transcode_paths_parallel`) then upload sequentially over USB. The TUI only prefetches a CPU-width window of upcoming encodes so `AppendSyncQueue` can still extend a run. Temp outputs include a source-path hash so same-stem files (two albums' `01 - Intro.flac`) do not clobber each other. The TUI now uses `transcode_for_device` (FLAC→ALAC on iPod) rather than always dropping to MP3.
+- **Configurable transcode quality** — MP3 encoder target is `Mp3Quality` (`v0` / `v2` default / `v4` / CBR 128–320). CLI `--quality`/`-q` wins over `ZYTUNES_TRANSCODE_QUALITY` then `transcode_quality` in config.toml. Invalid CLI values error; invalid env/config warn and fall back to v2. iPod FLAC→ALAC is unchanged. The TUI worker receives the resolved quality at spawn so it stays config-file-free.
 - **Device-list duration column** — `DeviceEntry.duration_ms` from MTP `0xDC89 Duration` (Zune bulk enrich, skip 0) and iTunesDB mhit `+40` (iPod). Track cache 9th column; old files still parse. Device-mode rows fall back to the matched library tag's `total_time_ms` when the device didn't surface a duration (ZMDB rows before handle merge).
 - **iPod device-panel identity** — generation + capacity composed from SysInfo `ModelNumStr` (libgpod suffix table: 1G–4G, Photo, mini, shuffle, nano 1–6, Video, Classic), SysInfoExtended `FamilyID`, USB product ID (including shuffle `0x1300`–`0x1303`), and storage. Measured size is snapped to a marketing SKU only when it is within ~15%; flash-mods keep the real GB. Unknown SKUs never guess Classic. Panel title uses the iTunes name from `iPod_Control/iTunes/DeviceInfo` (UTF-16LE) when present; otherwise the model string. A Model line is shown only when it differs from the title. USB line includes the product ID (matched to the mounted block device on Linux). FS shows FAT vs HFS+ (and read-only) from the mount table. Firmware falls back to sysfs block `rev` on Linux when SysInfo is empty.
 - **Mobile: play counts** — Flutter LAN client. `POST /tracks/{id}/play` after the iTunes threshold (50% of duration or 4 minutes), matching the TUI. Completing a track is a fallback for short clips; skip before the threshold does not count. Same sidecar as the TUI (`local-plays.json`).

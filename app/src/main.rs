@@ -1,7 +1,8 @@
 use zytunes::{
     check_ffmpeg_available, collect_music_files, collect_photo_files, collect_video_files, connect,
-    find_matching_tracks, make_transcode_temp_dir, needs_transcoding, needs_video_transcoding,
-    resize_photo_for_zune, sync_to_device, transcode_and_import, transcode_and_import_video,
+    find_matching_tracks, make_transcode_temp_dir, needs_video_transcoding, resize_photo_for_zune,
+    resolve_mp3_quality, sync_to_device, transcode_and_import_video, transcode_paths_parallel,
+    will_transcode, Mp3Quality,
 };
 
 use std::collections::HashMap;
@@ -42,6 +43,43 @@ fn load_config_bool(field: &str) -> Option<bool> {
     load_config_value(field).and_then(|v| v.as_bool())
 }
 
+/// Pull `--quality` / `-q` out of a command's remaining argv. The flag may
+/// appear anywhere among the positional args. Value may be `--quality=v0`.
+fn take_transcode_quality_flag(args: &[String]) -> Result<(Option<String>, Vec<String>), String> {
+    let mut quality = None;
+    let mut rest = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if let Some(v) = a.strip_prefix("--quality=") {
+            quality = Some(v.to_string());
+            i += 1;
+            continue;
+        }
+        if a == "--quality" || a == "-q" {
+            i += 1;
+            let v = args
+                .get(i)
+                .ok_or_else(|| format!("--quality requires a value ({})", Mp3Quality::HELP))?;
+            quality = Some(v.clone());
+            i += 1;
+            continue;
+        }
+        rest.push(a.clone());
+        i += 1;
+    }
+    Ok((quality, rest))
+}
+
+fn resolve_cli_mp3_quality(explicit: Option<&str>) -> Result<Mp3Quality, String> {
+    resolve_mp3_quality(
+        explicit,
+        std::env::var("ZYTUNES_TRANSCODE_QUALITY").ok().as_deref(),
+        load_config_field("transcode_quality").as_deref(),
+        |m| eprintln!("warning: {m}"),
+    )
+}
+
 fn load_config_value(field: &str) -> Option<toml::Value> {
     let home = std::env::var("HOME").ok()?;
     let path = Path::new(&home)
@@ -59,10 +97,14 @@ fn run(args: &[String]) -> Result<(), String> {
     match command {
         "ls" => cmd_ls(args.get(2).map(|s| s.as_str()).unwrap_or("/")),
         "push" => {
-            if args.len() < 3 {
-                return Err("Usage: zytunes push <file-or-directory> [file2 ...]".into());
+            let (q_flag, rest) = take_transcode_quality_flag(&args[2..])?;
+            if rest.is_empty() {
+                return Err(
+                    "Usage: zytunes push [--quality <preset>] <file-or-directory> [file2 ...]"
+                        .into(),
+                );
             }
-            cmd_push(&args[2..])
+            cmd_push(&rest, resolve_cli_mp3_quality(q_flag.as_deref())?)
         }
         "rm" => {
             if args.len() < 3 {
@@ -72,13 +114,14 @@ fn run(args: &[String]) -> Result<(), String> {
         }
         "library" => cmd_library(args.get(2).map(|s| s.as_str())),
         "sync" => {
-            if args.len() < 3 {
-                return Err("Usage: zytunes sync <type> <name>\n  \
+            let (q_flag, rest) = take_transcode_quality_flag(&args[2..])?;
+            if rest.len() < 2 {
+                return Err("Usage: zytunes sync [--quality <preset>] <type> <name>\n  \
                      type: artist, album, track\n  \
                      e.g.: zytunes sync artist \"Radiohead\""
                     .into());
             }
-            cmd_sync(&args[2..])
+            cmd_sync(&rest, resolve_cli_mp3_quality(q_flag.as_deref())?)
         }
         "photo-sync" => {
             let dir = args
@@ -109,9 +152,9 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("Usage: zytunes <command> [args...]\n");
             println!("Commands:");
             println!("  ls [path]              List device contents (default: /)");
-            println!("  push <files...>        Push music files to the Zune");
-            println!("  rm <device-paths...>   Remove files/folders from the Zune");
-            println!("  sync <type> <name>     Sync music to the Zune");
+            println!("  push [--quality <q>] <files...>   Push music files to the device");
+            println!("  rm <device-paths...>   Remove files/folders from the device");
+            println!("  sync [--quality <q>] <type> <name>  Sync music to the device");
             println!("  photo-sync [dir]       Sync photos to the Zune");
             println!("  video-sync [dir]       Sync videos to the Zune");
             println!("  library [query]        Browse the music library");
@@ -124,6 +167,12 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("  sync track <name>      Sync a single track by name");
             println!("\nUnsupported formats (FLAC, OGG, WAV, M4A, OPUS, etc.)");
             println!("are auto-transcoded to MP3 with album art.");
+            println!(
+                "MP3 quality (default v2, ~190 kbps VBR): {}",
+                Mp3Quality::HELP
+            );
+            println!("  --quality / -q, ZYTUNES_TRANSCODE_QUALITY, or transcode_quality");
+            println!("  in ~/.config/zytunes/config.toml. FLAC→ALAC on iPod ignores this.");
             println!("\nPhotos are resized to fit the Zune screen (240x320).");
             println!("\nSet ZYTUNES_MUSIC_DIR or music_dir in ~/.config/zytunes/config.toml");
             println!("to point at your music folder.");
@@ -132,8 +181,8 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("need it.");
             println!("\nExamples:");
             println!("  zytunes sync artist \"Radiohead\"");
-            println!("  zytunes sync album \"OK Computer\"");
-            println!("  zytunes push song.mp3");
+            println!("  zytunes sync --quality v0 album \"OK Computer\"");
+            println!("  zytunes push --quality cbr-320 song.flac");
             println!("  zytunes photo-sync ~/Pictures/zune-wallpapers");
             println!("  zytunes video-sync ~/Videos/zune");
             println!("  zytunes ls /Music");
@@ -241,7 +290,7 @@ fn cmd_library(query: Option<&str>) -> Result<(), String> {
 }
 
 /// Sync tracks from the music library to the Zune.
-fn cmd_sync(args: &[String]) -> Result<(), String> {
+fn cmd_sync(args: &[String], quality: Mp3Quality) -> Result<(), String> {
     if args.len() < 2 {
         return Err("Usage: zytunes sync <type> <name>".into());
     }
@@ -290,13 +339,14 @@ fn cmd_sync(args: &[String]) -> Result<(), String> {
         .filter(|t| {
             t.location
                 .as_ref()
-                .is_some_and(|loc| needs_transcoding(loc, caps.supported_formats))
+                .is_some_and(|loc| will_transcode(loc, &caps))
         })
         .count();
     println!(
-        "\n{} tracks to push ({} need transcoding)",
+        "\n{} tracks to push ({} need transcoding, MP3 {})",
         pushable.len(),
-        to_transcode
+        to_transcode,
+        quality
     );
 
     // Create temp dir for transcoded files.
@@ -306,7 +356,7 @@ fn cmd_sync(args: &[String]) -> Result<(), String> {
             .map_err(|e| format!("Failed to create temp directory: {e}"))?;
     }
 
-    let result = sync_to_device(session.as_mut(), &pushable, &temp_dir, &caps)?;
+    let result = sync_to_device(session.as_mut(), &pushable, &temp_dir, &caps, quality)?;
 
     // Clean up temp files.
     let _ = std::fs::remove_dir_all(&temp_dir);
@@ -416,7 +466,7 @@ fn cmd_ls(path: &str) -> Result<(), String> {
 
 /// Push music files to the Zune.
 /// Automatically transcodes unsupported formats (FLAC, OGG, etc.) to MP3.
-fn cmd_push(paths: &[String]) -> Result<(), String> {
+fn cmd_push(paths: &[String], quality: Mp3Quality) -> Result<(), String> {
     let files = collect_music_files(&paths.iter().map(|s| s.as_str()).collect::<Vec<_>>());
     if files.is_empty() {
         return Err("No music files found.".into());
@@ -427,15 +477,12 @@ fn cmd_push(paths: &[String]) -> Result<(), String> {
     println!();
 
     // Check which files need transcoding.
-    let needs_transcode = files
-        .iter()
-        .filter(|f| needs_transcoding(f, caps.supported_formats))
-        .count();
+    let needs_transcode = files.iter().filter(|f| will_transcode(f, &caps)).count();
 
     println!("Found {} music file(s) to push", files.len());
     if needs_transcode > 0 {
         println!(
-            "  {} file(s) will be transcoded to MP3 (device doesn't support FLAC/OGG/etc.)",
+            "  {} file(s) will be transcoded for the device",
             needs_transcode
         );
     }
@@ -446,7 +493,9 @@ fn cmd_push(paths: &[String]) -> Result<(), String> {
     if needs_transcode > 0 {
         std::fs::create_dir_all(&temp_dir)
             .map_err(|e| format!("Failed to create temp directory: {e}"))?;
+        println!("Transcoding {needs_transcode} file(s) in parallel (MP3 {quality})...");
     }
+    let prepared = transcode_paths_parallel(&files, &temp_dir, &caps, quality);
 
     let mut success = 0;
     let mut failed = 0;
@@ -459,7 +508,17 @@ fn cmd_push(paths: &[String]) -> Result<(), String> {
             .to_string_lossy();
         println!("[{}/{}] {}", i + 1, total, filename);
 
-        match transcode_and_import(session.as_mut(), file, &temp_dir, &caps, None) {
+        let upload_path = match prepared.get(file) {
+            Some(Ok(p)) => p.as_str(),
+            Some(Err(e)) => {
+                println!("  FAILED: {e}");
+                failed += 1;
+                continue;
+            }
+            None => file.as_str(),
+        };
+
+        match session.import_track(upload_path, None) {
             Ok(_id) => {
                 println!("  OK");
                 success += 1;
@@ -1134,5 +1193,35 @@ mod tests {
         assert_eq!(prop_label(0xDC92), "SkipCount");
         assert_eq!(prop_label(0xDC93), "LastAccessed");
         assert!(prop_label(0xFFFF).starts_with("(unknown"));
+    }
+
+    #[test]
+    fn take_quality_flag_strips_long_and_short_forms() {
+        let (q, rest) =
+            take_transcode_quality_flag(&args(&["--quality", "v0", "artist", "A"])).unwrap();
+        assert_eq!(q.as_deref(), Some("v0"));
+        assert_eq!(rest, vec!["artist".to_string(), "A".to_string()]);
+
+        let (q, rest) =
+            take_transcode_quality_flag(&args(&["album", "--quality=cbr-320", "OK"])).unwrap();
+        assert_eq!(q.as_deref(), Some("cbr-320"));
+        assert_eq!(rest, vec!["album".to_string(), "OK".to_string()]);
+
+        let (q, rest) = take_transcode_quality_flag(&args(&["-q", "v4", "file.flac"])).unwrap();
+        assert_eq!(q.as_deref(), Some("v4"));
+        assert_eq!(rest, vec!["file.flac".to_string()]);
+    }
+
+    #[test]
+    fn take_quality_flag_missing_value_errors() {
+        assert!(take_transcode_quality_flag(&args(&["--quality"])).is_err());
+        assert!(take_transcode_quality_flag(&args(&["-q"])).is_err());
+    }
+
+    #[test]
+    fn take_quality_flag_absent_leaves_args() {
+        let (q, rest) = take_transcode_quality_flag(&args(&["artist", "Radiohead"])).unwrap();
+        assert!(q.is_none());
+        assert_eq!(rest, vec!["artist".to_string(), "Radiohead".to_string()]);
     }
 }

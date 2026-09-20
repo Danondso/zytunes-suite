@@ -56,6 +56,12 @@ pub struct Config {
     /// `flac`, `wav`. Unset / unparseable defaults to FLAC (lossless
     /// archival).
     pub default_fidelity: Option<String>,
+    /// MP3 encoder target for device-side transcode (Zune always; iPod
+    /// when the source is not FLAC→ALAC). Accepts `v0`, `v2` (default),
+    /// `v4`, `cbr-128`, `cbr-192`, `cbr-256`, `cbr-320` (and aliases
+    /// `mp3-v0` / `320`). Unset / unparseable falls back to v2 with a
+    /// warning. Override: `--quality` / `ZYTUNES_TRANSCODE_QUALITY`.
+    pub transcode_quality: Option<String>,
     /// Default auto-eject preference for the CD import overlay. The
     /// overlay's own checkbox can override per-import. Unset defaults
     /// to `true` so a successful rip ejects the disc.
@@ -343,6 +349,7 @@ music_dir = "/home/user/Music"
         assert!(config.musicbrainz_base_url.is_none());
         assert!(config.musicbrainz_user_agent.is_none());
         assert!(config.default_fidelity.is_none());
+        assert!(config.transcode_quality.is_none());
         assert!(config.cd_auto_eject.is_none());
         assert!(config.themes.is_empty());
     }
@@ -431,6 +438,27 @@ music_dir = "/home/user/Music"
         let config: Config = toml::from_str(toml_str).unwrap();
         assert!(config.musicbrainz_base_url.is_none());
         assert!(config.musicbrainz_user_agent.is_none());
+    }
+
+    #[test]
+    fn config_round_trip_transcode_quality() {
+        let config = Config {
+            transcode_quality: Some("v0".into()),
+            ..Config::default()
+        };
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let deserialized: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(deserialized.transcode_quality.as_deref(), Some("v0"));
+    }
+
+    #[test]
+    fn config_backwards_compatible_without_transcode_quality() {
+        let toml_str = r#"
+theme = "Gruvbox Dark"
+music_dir = "/home/user/Music"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.transcode_quality.is_none());
     }
 
     #[test]
