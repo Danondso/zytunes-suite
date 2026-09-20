@@ -78,8 +78,12 @@ fn read_sysinfo(mount: &Path) -> SysInfoFields {
                 "pszSerialNumber" | "FirewireGuid" if fields.serial.is_none() => {
                     fields.serial = Some(value.to_string());
                 }
-                "visibleBuildID" | "buildID" if fields.firmware.is_none() => {
-                    fields.firmware = Some(value.to_string());
+                _ if key.eq_ignore_ascii_case("visibleBuildID")
+                    || key.eq_ignore_ascii_case("buildID") =>
+                {
+                    if fields.firmware.is_none() {
+                        fields.firmware = Some(value.to_string());
+                    }
                 }
                 "boardHwSwInterfaceRev" if fields.gestalt.is_none() => {
                     fields.gestalt = parse_sysinfo_hex(value);
@@ -244,7 +248,7 @@ fn apply_sysinfo_extended_xml(
     }
 }
 
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(any(test, target_os = "linux", target_os = "macos"))]
 fn pretty_fstype(fs: &str) -> String {
     match fs {
         "vfat" | "msdos" | "fat" | "exfat" => "FAT".into(),
@@ -315,21 +319,85 @@ fn linux_mount_for(mount: &Path) -> Option<LinuxMount> {
     None
 }
 
-fn volume_format(mount: &Path) -> Option<String> {
+/// Whole-disk path for `mount` (`/dev/sdb1` → `/dev/sdb`). Linux only.
+pub fn block_device_for_mount(mount: &Path) -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
     {
         let info = linux_mount_for(mount)?;
-        let label = pretty_fstype(&info.fstype);
-        Some(if info.readonly {
-            format!("{label} (read-only)")
+        if !info.source.starts_with("/dev/") {
+            None
         } else {
-            label
-        })
+            Some(whole_disk(&info.source))
+        }
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = mount;
         None
+    }
+}
+
+/// `/dev/disk2s1 on /Volumes/IPOD (msdos, local, read-only)`
+#[cfg(any(test, target_os = "macos"))]
+fn parse_macos_mount_line(line: &str) -> Option<(PathBuf, String, bool)> {
+    let on = line.find(" on ")?;
+    let rest = &line[on + 4..];
+    let paren = rest.rfind(" (")?;
+    let target = rest[..paren].trim();
+    if target.is_empty() {
+        return None;
+    }
+    let opts = rest[paren + 2..].trim().trim_end_matches(')');
+    let fstype = opts.split(',').next()?.trim();
+    if fstype.is_empty() {
+        return None;
+    }
+    let readonly = opts.split(',').any(|o| {
+        let o = o.trim();
+        o == "read-only" || o == "ro"
+    });
+    Some((PathBuf::from(target), fstype.to_string(), readonly))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_mount_for(mount: &Path) -> Option<(String, bool)> {
+    let want = mount.canonicalize().unwrap_or_else(|_| mount.to_path_buf());
+    let output = std::process::Command::new("mount").output().ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let Some((target, fstype, readonly)) = parse_macos_mount_line(line) else {
+            continue;
+        };
+        let target_canon = target.canonicalize().unwrap_or(target);
+        if target_canon == want {
+            return Some((fstype, readonly));
+        }
+    }
+    None
+}
+
+fn volume_format(mount: &Path) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    let info = {
+        let m = linux_mount_for(mount)?;
+        (m.fstype, m.readonly)
+    };
+    #[cfg(target_os = "macos")]
+    let info = macos_mount_for(mount)?;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = mount;
+        return None;
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let (fstype, readonly) = info;
+        let label = pretty_fstype(&fstype);
+        Some(if readonly {
+            format!("{label} (read-only)")
+        } else {
+            label
+        })
     }
 }
 
@@ -496,6 +564,16 @@ mod tests {
     }
 
     #[test]
+    fn test_read_sysinfo_firmware_key_is_case_insensitive() {
+        let tmp = TempDir::new().unwrap();
+        let device_dir = tmp.path().join("iPod_Control").join("Device");
+        std::fs::create_dir_all(&device_dir).unwrap();
+        std::fs::write(device_dir.join("SysInfo"), "VisibleBuildID: 1.62\n").unwrap();
+        let s = read_sysinfo(tmp.path());
+        assert_eq!(s.firmware.as_deref(), Some("1.62"));
+    }
+
+    #[test]
     fn test_read_sysinfo_empty_file() {
         let tmp = TempDir::new().unwrap();
         let device_dir = tmp.path().join("iPod_Control").join("Device");
@@ -656,6 +734,24 @@ mod tests {
         assert_eq!(pretty_fstype("vfat"), "FAT");
         assert_eq!(pretty_fstype("hfsplus"), "HFS+");
         assert_eq!(pretty_fstype("ext4"), "ext4");
+    }
+
+    #[test]
+    fn test_parse_macos_mount_line() {
+        let (target, fstype, ro) = parse_macos_mount_line(
+            "/dev/disk2s1 on /Volumes/IPOD (msdos, local, nodev, nosuid, noowners)",
+        )
+        .unwrap();
+        assert_eq!(target, PathBuf::from("/Volumes/IPOD"));
+        assert_eq!(fstype, "msdos");
+        assert!(!ro);
+
+        let (_, fstype, ro) = parse_macos_mount_line(
+            "/dev/disk3s1 on /Volumes/iPod (hfs, local, nodev, nosuid, read-only, journaled)",
+        )
+        .unwrap();
+        assert_eq!(fstype, "hfs");
+        assert!(ro);
     }
 
     #[test]

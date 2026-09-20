@@ -726,7 +726,7 @@ impl App {
         self.device.ignore_session_events = true;
         let _ = cmd_tx.send(BgCommand::Disconnect);
         self.device.status = DeviceStatus::Disconnected;
-        self.device.name = None;
+        self.device.clear_panel_identity();
         self.device.tracks.clear();
         self.clear_device_index();
         self.set_toast("Disconnected".into(), false);

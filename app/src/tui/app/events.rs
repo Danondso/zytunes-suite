@@ -580,6 +580,7 @@ impl App {
 
     fn on_session_failed(&mut self, e: String) {
         self.device.status = DeviceStatus::Disconnected;
+        self.device.clear_panel_identity();
         self.device.sync_status = None;
         self.connection_anim_start = None;
         self.set_toast(format!("Connection failed: {}", e), true);

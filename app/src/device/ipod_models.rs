@@ -291,6 +291,10 @@ const USB_PIDS: &[(u16, Gen)] = &[
     (0x1265, Gen::Nano5),
     (0x1266, Gen::Nano6),
     (0x1267, Gen::Nano7),
+    (0x1300, Gen::Shuffle1),
+    (0x1301, Gen::Shuffle2),
+    (0x1302, Gen::Shuffle3),
+    (0x1303, Gen::Shuffle4),
 ];
 
 /// Marketing capacities Apple actually shipped. Used when we only have a
@@ -408,16 +412,17 @@ fn snap_gb(total_bytes: u64) -> u16 {
         return 0;
     }
     let gb = total_bytes as f64 / 1_000_000_000.0;
-    MARKETING_GB
-        .iter()
-        .copied()
-        .min_by(|&a, &b| {
-            (a as f64 - gb)
-                .abs()
-                .partial_cmp(&(b as f64 - gb).abs())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .unwrap_or(gb.round() as u16)
+    let measured = gb.round().clamp(1.0, u16::MAX as f64) as u16;
+    let snapped = MARKETING_GB.iter().copied().min_by(|&a, &b| {
+        (a as f64 - gb)
+            .abs()
+            .partial_cmp(&(b as f64 - gb).abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    match snapped {
+        Some(n) if (n as f64 - gb).abs() / gb <= 0.15 => n,
+        _ => measured,
+    }
 }
 
 fn format_gb(gb: u16) -> String {
@@ -663,6 +668,50 @@ mod tests {
                 ..Default::default()
             }),
             "iPod 160GB"
+        );
+        assert_eq!(
+            label(IpodModelHints {
+                usb_pid: Some(0x1209),
+                sysinfo_empty: true,
+                total_bytes: Some(256_000_000_000),
+                ..Default::default()
+            }),
+            "iPod Video 5.5G 256GB"
+        );
+        assert_eq!(
+            label(IpodModelHints {
+                total_bytes: Some(240_000_000_000),
+                ..Default::default()
+            }),
+            "iPod 240GB"
+        );
+    }
+
+    #[test]
+    fn shuffle_usb_pid_fills_generation() {
+        assert_eq!(
+            label(IpodModelHints {
+                usb_pid: Some(0x1300),
+                total_bytes: Some(512_000_000),
+                ..Default::default()
+            }),
+            "iPod shuffle 512MB"
+        );
+        assert_eq!(
+            label(IpodModelHints {
+                usb_pid: Some(0x1301),
+                total_bytes: Some(1_000_000_000),
+                ..Default::default()
+            }),
+            "iPod shuffle 2G 1GB"
+        );
+        assert_eq!(
+            label(IpodModelHints {
+                usb_pid: Some(0x1303),
+                total_bytes: Some(2_000_000_000),
+                ..Default::default()
+            }),
+            "iPod shuffle 4G 2GB"
         );
     }
 
