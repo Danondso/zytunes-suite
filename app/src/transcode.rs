@@ -8,13 +8,33 @@
 
 use crate::device::DeviceCapabilities;
 use crate::mtp::{self, DeviceSession};
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+
+use rayon::prelude::*;
 
 /// Path of a unique temp directory for transcoded files (includes PID to
 /// avoid collisions). Only builds the path — the transcode helpers create
 /// the directory on first use.
 pub fn make_transcode_temp_dir() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("zytunes-transcode-{}", std::process::id()))
+}
+
+/// Unique path in `temp_dir` for a transcoded copy of `input`.
+///
+/// Hashes the full source path so two files that share a stem (the usual
+/// `01 - Intro.flac` on two albums) do not clobber each other when
+/// transcoding in parallel.
+fn transcoded_output_path(temp_dir: &Path, input: &str, ext: &str) -> PathBuf {
+    use std::hash::{Hash, Hasher};
+    let stem = Path::new(input)
+        .file_stem()
+        .map(|s| s.to_string_lossy())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "track".into());
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    input.hash(&mut hasher);
+    temp_dir.join(format!("{stem}-{:016x}.{ext}", hasher.finish()))
 }
 
 /// Check if a file needs transcoding for the target device.
@@ -55,11 +75,7 @@ pub fn check_ffmpeg_available() -> bool {
 pub fn transcode_to_wmv(input: &str, temp_dir: &Path) -> Result<String, String> {
     std::fs::create_dir_all(temp_dir).map_err(|e| format!("Cannot create temp dir: {e}"))?;
 
-    let stem = Path::new(input)
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy();
-    let output = temp_dir.join(format!("{stem}.wmv"));
+    let output = transcoded_output_path(temp_dir, input, "wmv");
 
     let result = std::process::Command::new("ffmpeg")
         .args([
@@ -154,6 +170,97 @@ pub fn transcode_for_device(
     Ok(local_path.to_string())
 }
 
+/// Whether [`transcode_for_device`] will write a temp file rather than
+/// returning the source path unchanged.
+pub fn will_transcode(path: &str, caps: &DeviceCapabilities) -> bool {
+    if caps.lossless_target == Some("alac") && is_flac(path) {
+        return true;
+    }
+    needs_transcoding(path, caps.supported_formats)
+}
+
+/// Next source paths, in queue order, that should be transcoded to fill a
+/// window of `window` in-flight transcode slots.
+///
+/// Native (passthrough) paths do not consume a slot. A path already in
+/// `prepared`, or already selected for this batch, is not transcoded again.
+/// Used by the TUI sync loop so `AppendSyncQueue` can grow the work without
+/// pre-transcoding the entire queue, while still running up to one CPU's
+/// worth of encodes ahead of the sequential USB upload.
+pub fn next_transcode_batch<'a, I>(
+    locations: I,
+    prepared: &HashMap<String, Result<String, String>>,
+    caps: &DeviceCapabilities,
+    window: usize,
+) -> Vec<String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    if window == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut slots = 0usize;
+    for loc in locations {
+        if !will_transcode(loc, caps) {
+            continue;
+        }
+        if prepared.contains_key(loc) {
+            slots += 1;
+            if slots >= window {
+                break;
+            }
+            continue;
+        }
+        if out.iter().any(|p| p == loc) {
+            continue;
+        }
+        out.push(loc.to_string());
+        slots += 1;
+        if slots >= window {
+            break;
+        }
+    }
+    out
+}
+
+/// Run [`transcode_for_device`] over `paths` in parallel.
+///
+/// Returns a map from source path to result. Paths that do not need
+/// transcoding are omitted so a miss means passthrough. Duplicate paths
+/// are transcoded once. Rayon's global pool caps concurrency at CPU count.
+pub fn transcode_paths_parallel<S: AsRef<str> + Sync>(
+    paths: &[S],
+    temp_dir: &Path,
+    caps: &DeviceCapabilities,
+) -> HashMap<String, Result<String, String>> {
+    let mut unique = Vec::new();
+    let mut seen = HashSet::new();
+    for p in paths {
+        let p = p.as_ref();
+        if !will_transcode(p, caps) {
+            continue;
+        }
+        let s = p.to_string();
+        if seen.insert(s.clone()) {
+            unique.push(s);
+        }
+    }
+    unique
+        .into_par_iter()
+        .map(|p| {
+            let result = transcode_for_device(&p, temp_dir, caps);
+            (p, result)
+        })
+        .collect()
+}
+
+/// Rayon pool width — TUI prefetch window so we do not encode the whole
+/// remaining queue before the next USB upload.
+pub fn transcode_parallelism() -> usize {
+    rayon::current_num_threads().max(1)
+}
+
 fn is_flac(path: &str) -> bool {
     std::path::Path::new(path)
         .extension()
@@ -173,12 +280,7 @@ pub fn transcode_flac_to_alac(input: &str, temp_dir: &Path) -> Result<String, St
         return Err("ffmpeg is required for FLAC→ALAC transcoding".into());
     }
     std::fs::create_dir_all(temp_dir).map_err(|e| format!("Cannot create temp dir: {e}"))?;
-    let input_path = std::path::Path::new(input);
-    let stem = input_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("track");
-    let output = temp_dir.join(format!("{stem}.m4a"));
+    let output = transcoded_output_path(temp_dir, input, "m4a");
 
     let status = std::process::Command::new("ffmpeg")
         .args([
@@ -393,8 +495,7 @@ pub fn transcode_to_mp3(
 
     std::fs::create_dir_all(temp_dir).map_err(|e| format!("Cannot create temp dir: {e}"))?;
     let input_path = Path::new(input);
-    let stem = input_path.file_stem().unwrap_or_default().to_string_lossy();
-    let output = temp_dir.join(format!("{stem}.mp3"));
+    let output = transcoded_output_path(temp_dir, input, "mp3");
 
     // 1. Read metadata and album art with lofty
     let meta = read_lofty_metadata(input)?;
@@ -758,6 +859,61 @@ mod tests {
         let temp = std::env::temp_dir();
         let path = "/somewhere/song.mp3";
         assert_eq!(transcode_for_device(path, &temp, &caps).unwrap(), path);
+    }
+
+    #[test]
+    fn will_transcode_matches_dispatch() {
+        let zune = test_caps();
+        let ipod = ipod_caps_with_lossless();
+        assert!(will_transcode("song.flac", &zune));
+        assert!(will_transcode("song.flac", &ipod));
+        assert!(will_transcode("song.wav", &zune));
+        assert!(!will_transcode("song.wav", &ipod));
+        assert!(!will_transcode("song.mp3", &zune));
+        assert!(!will_transcode("song.mp3", &ipod));
+    }
+
+    #[test]
+    fn transcoded_output_path_unique_for_same_stem() {
+        let dir = Path::new("/tmp");
+        let a = transcoded_output_path(dir, "/album-a/01 - Intro.flac", "mp3");
+        let b = transcoded_output_path(dir, "/album-b/01 - Intro.flac", "mp3");
+        assert_ne!(a, b);
+        assert!(a.to_string_lossy().ends_with(".mp3"));
+        assert!(b.to_string_lossy().ends_with(".mp3"));
+    }
+
+    #[test]
+    fn next_transcode_batch_fills_window_skipping_native_and_prepared() {
+        let caps = test_caps();
+        let locs = ["a.flac", "b.mp3", "c.flac", "d.flac", "a.flac"];
+        let empty = HashMap::new();
+        assert_eq!(
+            next_transcode_batch(locs.iter().copied(), &empty, &caps, 2),
+            vec!["a.flac".to_string(), "c.flac".to_string()]
+        );
+
+        let mut prepared = HashMap::new();
+        prepared.insert("a.flac".into(), Ok("a.mp3".into()));
+        assert_eq!(
+            next_transcode_batch(locs.iter().copied(), &prepared, &caps, 2),
+            vec!["c.flac".to_string()]
+        );
+
+        prepared.insert("c.flac".into(), Ok("c.mp3".into()));
+        assert!(next_transcode_batch(locs.iter().copied(), &prepared, &caps, 2).is_empty());
+        assert!(next_transcode_batch(locs.iter().copied(), &empty, &caps, 0).is_empty());
+    }
+
+    #[test]
+    fn transcode_paths_parallel_skips_native_and_dedups() {
+        let caps = test_caps();
+        let temp = std::env::temp_dir();
+        let paths = ["song.mp3", "song.mp3", "/nope/missing.flac"];
+        let map = transcode_paths_parallel(&paths, &temp, &caps);
+        assert!(!map.contains_key("song.mp3"));
+        assert_eq!(map.len(), 1);
+        assert!(map.get("/nope/missing.flac").unwrap().is_err());
     }
 
     #[test]
@@ -1242,6 +1398,39 @@ mod tests {
         let has_id3 = data.starts_with(b"ID3");
         let has_sync = data.len() >= 2 && data[0] == 0xff && (data[1] & 0xe0) == 0xe0;
         assert!(has_id3 || has_sync, "output is not a valid MP3 file");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transcode_paths_parallel_same_stem_does_not_clobber() {
+        let dir = std::env::temp_dir().join("zytunes-test-transcode-parallel-stem");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let album_a = dir.join("album-a");
+        let album_b = dir.join("album-b");
+        std::fs::create_dir_all(&album_a).unwrap();
+        std::fs::create_dir_all(&album_b).unwrap();
+        let wav_a = album_a.join("01 - Intro.wav");
+        let wav_b = album_b.join("01 - Intro.wav");
+        make_wav(&wav_a, 44100);
+        make_wav(&wav_b, 44100);
+
+        let out_dir = dir.join("out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let caps = test_caps();
+        let paths = [
+            wav_a.to_str().unwrap().to_string(),
+            wav_b.to_str().unwrap().to_string(),
+        ];
+        let map = transcode_paths_parallel(&paths, &out_dir, &caps);
+        assert_eq!(map.len(), 2);
+        let a = map.get(&paths[0]).unwrap().as_ref().unwrap();
+        let b = map.get(&paths[1]).unwrap().as_ref().unwrap();
+        assert_ne!(a, b);
+        assert!(Path::new(a).exists());
+        assert!(Path::new(b).exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

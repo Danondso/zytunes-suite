@@ -85,6 +85,33 @@ fn drain_sync_commands(
     cancelled
 }
 
+/// Transcode enough upcoming queue items to keep `transcode_parallelism()`
+/// slots filled. Native files are skipped; already-prepared paths are not
+/// encoded again. Uploads stay sequential on the caller.
+fn prefetch_sync_transcodes(
+    prepared: &mut HashMap<String, Result<String, String>>,
+    queue: &std::collections::VecDeque<SyncItem>,
+    temp_dir: &std::path::Path,
+    caps: &DeviceCapabilities,
+    event_tx: &mpsc::Sender<BgEvent>,
+) {
+    let batch = next_transcode_batch(
+        queue.iter().map(|it| it.location.as_str()),
+        prepared,
+        caps,
+        transcode_parallelism(),
+    );
+    if batch.is_empty() {
+        return;
+    }
+    let _ = event_tx.send(BgEvent::SyncMessage(format!(
+        "Transcoding {} track(s)...",
+        batch.len()
+    )));
+    prepared.extend(transcode_paths_parallel(&batch, temp_dir, caps));
+}
+
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -106,8 +133,8 @@ use zytunes::stems::{
 };
 use zytunes::{
     collect_photo_files_with_logger, collect_video_files_with_logger, make_transcode_temp_dir,
-    needs_transcoding, needs_video_transcoding, resize_photo_for_zune, transcode_and_import_video,
-    transcode_to_mp3,
+    needs_video_transcoding, next_transcode_batch, resize_photo_for_zune,
+    transcode_and_import_video, transcode_parallelism, transcode_paths_parallel, will_transcode,
 };
 
 /// Commands sent from the main TUI thread to the background worker.
@@ -1371,11 +1398,15 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                 BgCommand::ExecuteSyncQueue(items) | BgCommand::AppendSyncQueue(items) => {
                     if let Some(ref mut s) = session {
                         let cur_caps = caps.clone();
-                        let supported_formats = cur_caps
-                            .as_ref()
-                            .map(|c| c.supported_formats)
-                            .unwrap_or(&["mp3", "wma", "aac"]);
-                        let max_art_dims = cur_caps.as_ref().and_then(|c| c.max_art_dimensions);
+                        let fallback_caps = DeviceCapabilities {
+                            family: DeviceFamily::Zune,
+                            supported_formats: &["mp3", "wma", "aac"],
+                            transcode_target: "mp3",
+                            lossless_target: None,
+                            music_root: "/Music",
+                            max_art_dimensions: Some((200, 200)),
+                        };
+                        let tx_caps = cur_caps.as_ref().unwrap_or(&fallback_caps);
 
                         // Mutable queue so `AppendSyncQueue` commands received
                         // mid-sync can extend the work in flight.
@@ -1389,10 +1420,11 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
 
                         let temp_dir = make_transcode_temp_dir();
                         let _ = std::fs::create_dir_all(&temp_dir);
+                        let mut prepared: HashMap<String, Result<String, String>> = HashMap::new();
 
                         let to_transcode = sync_queue
                             .iter()
-                            .filter(|it| needs_transcoding(&it.location, supported_formats))
+                            .filter(|it| will_transcode(&it.location, tx_caps))
                             .count();
                         let _ = event_tx.send(BgEvent::SyncMessage(format!(
                             "Starting sync: {} tracks ({} need transcoding)",
@@ -1417,6 +1449,15 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                     event_tx.send(BgEvent::SyncMessage("Sync cancelled".into()));
                                 break;
                             }
+
+                            prefetch_sync_transcodes(
+                                &mut prepared,
+                                &sync_queue,
+                                &temp_dir,
+                                tx_caps,
+                                &event_tx,
+                            );
+
                             let Some(item) = sync_queue.pop_front() else {
                                 break;
                             };
@@ -1427,40 +1468,31 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                 track_name: item.name.clone(),
                             });
 
-                            let upload_path =
-                                if needs_transcoding(&item.location, supported_formats) {
+                            let upload_path = match prepared.get(&item.location) {
+                                Some(Ok(p)) => {
+                                    let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
                                     let _ = event_tx.send(BgEvent::SyncMessage(format!(
-                                        "[{}/{}] Transcoding \"{}\" to MP3...",
-                                        processed, total, item.name
+                                        "  Transcoded \"{}\" ({:.1} MB)",
+                                        item.name,
+                                        size as f64 / 1_048_576.0
                                     )));
-                                    match transcode_to_mp3(&item.location, &temp_dir, max_art_dims)
-                                    {
-                                        Ok(p) => {
-                                            let size =
-                                                std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
-                                            let _ = event_tx.send(BgEvent::SyncMessage(format!(
-                                                "  Transcoded ({:.1} MB)",
-                                                size as f64 / 1_048_576.0
-                                            )));
-                                            p
-                                        }
-                                        Err(e) => {
-                                            failed += 1;
-                                            let _ = event_tx.send(BgEvent::SyncMessage(format!(
-                                                "  Transcode FAILED: {}",
-                                                e
-                                            )));
-                                            let _ = event_tx.send(BgEvent::SyncTrackDone {
-                                                track_name: item.name.clone(),
-                                                success: false,
-                                                error: Some(e),
-                                            });
-                                            continue;
-                                        }
-                                    }
-                                } else {
-                                    item.location.clone()
-                                };
+                                    p.clone()
+                                }
+                                Some(Err(e)) => {
+                                    failed += 1;
+                                    let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                                        "  Transcode FAILED: {}",
+                                        e
+                                    )));
+                                    let _ = event_tx.send(BgEvent::SyncTrackDone {
+                                        track_name: item.name.clone(),
+                                        success: false,
+                                        error: Some(e.clone()),
+                                    });
+                                    continue;
+                                }
+                                None => item.location.clone(),
+                            };
 
                             // Overwrite: remove any on-device copies the app
                             // matched for this track before the new file
@@ -1551,7 +1583,11 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                     let entry = DeviceEntry {
                                         object_id: id,
                                         storage_id: 0,
-                                        format: "MP3".to_string(),
+                                        format: std::path::Path::new(&upload_path)
+                                            .extension()
+                                            .and_then(|e| e.to_str())
+                                            .unwrap_or("mp3")
+                                            .to_ascii_uppercase(),
                                         size: file_size,
                                         name: format!(
                                             "{}/{}/{}",
