@@ -167,6 +167,10 @@ pub struct DeviceTrackInfo {
     /// here so device-mode rows that lack a library counterpart can still
     /// surface the device-side skip count (parity with `play_count`).
     pub skip_count: Option<u32>,
+    /// Duration in milliseconds from the device (MTP Duration / iTunesDB
+    /// mhit). `None` until enrichment or iPod collect fills it; the TUI
+    /// falls back to the matched library track's tag.
+    pub duration_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -560,6 +564,7 @@ pub struct DeviceState {
     pub model: Option<String>,
     pub usb_mode: Option<String>,
     pub family: Option<zytunes::device::DeviceFamily>,
+    pub volume_format: Option<String>,
     pub storage: Option<StorageInfo>,
     pub tracks: Vec<DeviceEntry>,
     pub loading_tracks: bool,
@@ -599,6 +604,7 @@ impl DeviceState {
             model: None,
             usb_mode: None,
             family: None,
+            volume_format: None,
             storage: None,
             tracks: Vec::new(),
             loading_tracks: false,
@@ -653,6 +659,7 @@ impl DeviceState {
                 play_count: entry.play_count,
                 rating: entry.rating,
                 skip_count: entry.skip_count,
+                duration_ms: entry.duration_ms.map(u64::from),
             });
 
         let artist_key = normalize_for_match(&artist);
@@ -788,18 +795,17 @@ impl DeviceState {
 /// to library titles like `"Smells Like Teen Spirit"`. Mirrors the matching
 /// strategy used by `merge_device_plays_into_local` so the displayed
 /// aggregate stays consistent with the merged sidecar.
-fn resolve_library_id_for_device_track(
-    lib: &dyn zytunes::library::MusicLibrary,
+fn resolve_library_track_for_device_track<'a>(
+    lib: &'a dyn zytunes::library::MusicLibrary,
     artist: &str,
     display_name: &str,
-) -> Option<u64> {
-    let lookup = |name: &str| -> Option<u64> {
+) -> Option<&'a zytunes::library::Track> {
+    let lookup = |name: &str| -> Option<&'a zytunes::library::Track> {
         lib.tracks_by_name(name)
             .find(|t| t.artist.eq_ignore_ascii_case(artist))
-            .map(|t| t.id)
     };
-    if let Some(id) = lookup(display_name) {
-        return Some(id);
+    if let Some(track) = lookup(display_name) {
+        return Some(track);
     }
     let stripped = zytunes::strip_track_number(display_name.trim());
     if stripped != display_name {
@@ -6086,7 +6092,7 @@ fn device_tracks_to_info(
                 dt.name.clone(),
                 dt.artist.clone(),
                 dt.album.clone(),
-                None,
+                dt.duration_ms,
                 None,
                 None,
                 dt.track_number,
@@ -6103,8 +6109,15 @@ fn device_tracks_to_info(
             // form so the displayed aggregate matches what
             // `merge_device_plays_into_local` already folded into the sidecar
             // for filenames like `"01 Song"`.
-            let lib_id = library
-                .and_then(|lib| resolve_library_id_for_device_track(lib, &dt.artist, &dt.name));
+            let lib_track = library
+                .and_then(|lib| resolve_library_track_for_device_track(lib, &dt.artist, &dt.name));
+            let lib_id = lib_track.map(|t| t.id);
+            // Device duration wins when present (MTP / iTunesDB truth);
+            // otherwise use the library tag so the Duration column isn't
+            // blank for ZMDB rows that haven't been handle-merged yet.
+            if info.duration_ms.is_none() {
+                info.duration_ms = lib_track.and_then(|t| t.total_time_ms);
+            }
             let entry = lib_id.and_then(|id| local_plays.get(id));
             info.play_count = match entry {
                 Some(p) => Some(p.play_count),
@@ -6413,6 +6426,7 @@ mod tests {
                 play_count: None,
                 rating: None,
                 skip_count: None,
+                duration_ms: None,
             }],
         );
         build_match_sets(&mut app.device);
@@ -6495,6 +6509,7 @@ mod tests {
                 play_count: None,
                 rating: None,
                 skip_count: None,
+                duration_ms: None,
             }],
         );
         build_match_sets(&mut app.device);
@@ -6609,6 +6624,7 @@ mod tests {
                     play_count: None,
                     rating: None,
                     skip_count: None,
+                    duration_ms: None,
                 },
                 DeviceTrackInfo {
                     name: "Bohemian Rhapsody".into(),
@@ -6622,6 +6638,7 @@ mod tests {
                     play_count: None,
                     rating: None,
                     skip_count: None,
+                    duration_ms: None,
                 },
                 DeviceTrackInfo {
                     name: "Bohemian Rhapsody".into(),
@@ -6635,6 +6652,7 @@ mod tests {
                     play_count: None,
                     rating: None,
                     skip_count: None,
+                    duration_ms: None,
                 },
                 // Unique within the same album — must NOT appear in the
                 // dedupe set.
@@ -6649,6 +6667,7 @@ mod tests {
                     play_count: None,
                     rating: None,
                     skip_count: None,
+                    duration_ms: None,
                 },
             ],
         );
@@ -6667,6 +6686,7 @@ mod tests {
                 play_count: None,
                 rating: None,
                 skip_count: None,
+                duration_ms: None,
             }],
         );
         build_match_sets(&mut app.device);
@@ -6698,6 +6718,7 @@ mod tests {
                     play_count: None,
                     rating: None,
                     skip_count: None,
+                    duration_ms: None,
                 },
                 DeviceTrackInfo {
                     name: "Bohemian Rhapsody".into(),
@@ -6711,6 +6732,7 @@ mod tests {
                     play_count: None,
                     rating: None,
                     skip_count: None,
+                    duration_ms: None,
                 },
             ],
         );
@@ -6749,6 +6771,7 @@ mod tests {
                 play_count: None,
                 rating: None,
                 skip_count: None,
+                duration_ms: None,
             }],
         );
         build_match_sets(&mut app.device);
@@ -6783,6 +6806,7 @@ mod tests {
                     play_count: None,
                     rating: None,
                     skip_count: None,
+                    duration_ms: None,
                 },
                 DeviceTrackInfo {
                     name: "Bohemian Rhapsody".into(),
@@ -6796,6 +6820,7 @@ mod tests {
                     play_count: None,
                     rating: None,
                     skip_count: None,
+                    duration_ms: None,
                 },
                 DeviceTrackInfo {
                     name: "Love of My Life".into(),
@@ -6808,6 +6833,7 @@ mod tests {
                     play_count: None,
                     rating: None,
                     skip_count: None,
+                    duration_ms: None,
                 },
             ],
         );
@@ -6844,6 +6870,7 @@ mod tests {
                 play_count: None,
                 rating: None,
                 skip_count: None,
+                duration_ms: None,
             }],
         );
         build_match_sets(&mut app.device);
@@ -7070,6 +7097,7 @@ mod tests {
                 play_count: None,
                 rating: None,
                 skip_count: None,
+                duration_ms: None,
             }],
         );
         build_match_sets(&mut app.device);
@@ -7278,6 +7306,80 @@ mod tests {
         let local_plays = LocalPlays::new();
         let infos = device_tracks_to_info(dt, None, &local_plays, None);
         assert_eq!(infos[0].skip_count, None);
+    }
+
+    #[test]
+    fn device_tracks_to_info_uses_device_duration() {
+        let mut app = App::new();
+        app.device.tracks = vec![DeviceEntry {
+            duration_ms: Some(240_000),
+            ..make_device_entry("Artist/Album/timed.mp3", 4_000_000)
+        }];
+        app.build_device_index();
+        let dt = app
+            .device
+            .album_tracks
+            .get(&("Artist".into(), "Album".into()))
+            .unwrap();
+        let infos = device_tracks_to_info(dt, None, &LocalPlays::new(), None);
+        assert_eq!(infos[0].duration_ms, Some(240_000));
+    }
+
+    #[test]
+    fn device_tracks_to_info_falls_back_to_library_duration() {
+        let mut app = App::new();
+        app.device.tracks = vec![make_device_entry(
+            "Nirvana/Nevermind/Lithium.mp3",
+            4_000_000,
+        )];
+        app.build_device_index();
+        let dt = app
+            .device
+            .album_tracks
+            .get(&("Nirvana".into(), "Nevermind".into()))
+            .unwrap();
+        assert_eq!(dt[0].duration_ms, None);
+
+        let lib: Box<dyn zytunes::library::MusicLibrary + Send> = Box::new(VecLibrary {
+            tracks: vec![zytunes::library::Track {
+                id: 7,
+                name: "Lithium".into(),
+                artist: "Nirvana".into(),
+                album: "Nevermind".into(),
+                total_time_ms: Some(257_000),
+                ..Default::default()
+            }],
+        });
+        let infos = device_tracks_to_info(dt, Some(&*lib), &LocalPlays::new(), None);
+        assert_eq!(infos[0].duration_ms, Some(257_000));
+        assert_eq!(infos[0].library_id, Some(7));
+    }
+
+    #[test]
+    fn device_tracks_to_info_prefers_device_duration_over_library() {
+        let mut app = App::new();
+        app.device.tracks = vec![DeviceEntry {
+            duration_ms: Some(240_000),
+            ..make_device_entry("Nirvana/Nevermind/Lithium.mp3", 4_000_000)
+        }];
+        app.build_device_index();
+        let dt = app
+            .device
+            .album_tracks
+            .get(&("Nirvana".into(), "Nevermind".into()))
+            .unwrap();
+        let lib: Box<dyn zytunes::library::MusicLibrary + Send> = Box::new(VecLibrary {
+            tracks: vec![zytunes::library::Track {
+                id: 7,
+                name: "Lithium".into(),
+                artist: "Nirvana".into(),
+                album: "Nevermind".into(),
+                total_time_ms: Some(257_000),
+                ..Default::default()
+            }],
+        });
+        let infos = device_tracks_to_info(dt, Some(&*lib), &LocalPlays::new(), None);
+        assert_eq!(infos[0].duration_ms, Some(240_000));
     }
 
     #[test]
@@ -7630,6 +7732,7 @@ mod tests {
             model: None,
             usb_mode: None,
             family: None,
+            volume_format: None,
             storage: None,
             tracks: device.tracks.clone(),
             loading_tracks: false,
@@ -7816,6 +7919,7 @@ mod tests {
             manufacturer: None,
             model: None,
             family: zytunes::device::DeviceFamily::Ipod,
+            volume_format: None,
         }));
         app.handle_bg_event(BgEvent::SessionReady(Some(StorageInfo {
             used_bytes: 1,
@@ -8771,6 +8875,7 @@ mod tests {
                 play_count: None,
                 rating: None,
                 skip_count: None,
+                duration_ms: None,
             }],
         );
         build_match_sets(&mut device);
@@ -8949,6 +9054,7 @@ mod tests {
                 play_count: None,
                 rating: None,
                 skip_count: None,
+                duration_ms: None,
             }],
         );
         build_match_sets(&mut app.device);
@@ -9009,6 +9115,7 @@ mod tests {
                 play_count: None,
                 rating: None,
                 skip_count: None,
+                duration_ms: None,
             }],
         );
         build_match_sets(&mut device);
@@ -9107,6 +9214,7 @@ mod tests {
                     play_count: None,
                     rating: None,
                     skip_count: None,
+                    duration_ms: None,
                 },
                 DeviceTrackInfo {
                     name: "Karma Police".into(),
@@ -9119,6 +9227,7 @@ mod tests {
                     play_count: None,
                     rating: None,
                     skip_count: None,
+                    duration_ms: None,
                 },
             ],
         );
@@ -9135,6 +9244,7 @@ mod tests {
                 play_count: None,
                 rating: None,
                 skip_count: None,
+                duration_ms: None,
             }],
         );
         build_match_sets(&mut app.device);

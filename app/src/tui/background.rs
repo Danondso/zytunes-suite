@@ -34,6 +34,23 @@ fn is_device_gone_str(err: &str) -> bool {
         || err.contains("read_bulk timed out")
 }
 
+/// Panel title: keep a user-assigned name; the backend's unnamed sentinel
+/// (`"iPod"`) is replaced with the composed model + capacity string.
+fn ipod_panel_title(detected_name: &str, model: &str) -> String {
+    if detected_name.eq_ignore_ascii_case("ipod") {
+        model.to_string()
+    } else {
+        detected_name.to_string()
+    }
+}
+
+fn ipod_usb_label(pid: Option<u16>) -> String {
+    match pid {
+        Some(p) => format!("Mass Storage {p:04x}"),
+        None => "Mass Storage".into(),
+    }
+}
+
 /// Drain every command pending on `cmd_rx` during a sync run: appended
 /// items are spliced onto the back of `sync_queue` (bumping `total`), and
 /// `CancelSync` is reported via the return value. Any other command is
@@ -77,7 +94,8 @@ use zytunes::cd::drive::{enumerate_drives, read_disc_toc, CdDrive, DriveError};
 use zytunes::cd::metadata::{ripped_track_destination, tag_ripped_file, tag_ripped_fingerprint};
 use zytunes::cd::rip::{eject_drive, rip_track_cancellable, RipError, RipFidelity};
 use zytunes::device::{
-    DeviceBackend, DeviceCapabilities, DeviceFamily, IpodBackend, ZuneBackend, ZuneDeviceData,
+    DeviceBackend, DeviceCapabilities, DeviceFamily, IpodBackend, IpodDeviceData, ZuneBackend,
+    ZuneDeviceData,
 };
 use zytunes::mtp::native::NativeSession;
 use zytunes::mtp::parse::DeviceEntry;
@@ -358,6 +376,8 @@ pub struct DeviceInfo {
     pub manufacturer: Option<String>,
     pub model: Option<String>,
     pub family: DeviceFamily,
+    /// iPod volume format (`FAT`, `HFS+ (read-only)`). Unused on Zune.
+    pub volume_format: Option<String>,
 }
 
 /// Storage info from the MTP session.
@@ -724,14 +744,39 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
 
                     // Build initial DeviceInfo from detection data.
                     let zune_data = detected.backend_data.downcast_ref::<ZuneDeviceData>();
+                    let ipod_data = detected.backend_data.downcast_ref::<IpodDeviceData>();
+                    let initial_model = match detected.family {
+                        DeviceFamily::Ipod => {
+                            let label = ipod_data
+                                .map(|d| d.model_label(detected.model.as_deref(), None))
+                                .unwrap_or_else(|| "iPod".into());
+                            (label != "iPod")
+                                .then_some(label)
+                                .or(detected.model.clone())
+                        }
+                        DeviceFamily::Zune => detected.model.clone(),
+                    };
+                    let initial_name = match detected.family {
+                        DeviceFamily::Ipod => ipod_panel_title(
+                            &detected.name,
+                            initial_model.as_deref().unwrap_or("iPod"),
+                        ),
+                        DeviceFamily::Zune => detected.name.clone(),
+                    };
                     let device_info = DeviceInfo {
-                        name: detected.name.clone(),
+                        name: initial_name,
                         firmware_version: detected.firmware.clone(),
                         serial_number: detected.serial.clone(),
-                        usb_mode: zune_data.and_then(|d| d.usb_mode.clone()),
+                        usb_mode: match detected.family {
+                            DeviceFamily::Ipod => {
+                                Some(ipod_usb_label(ipod_data.and_then(|d| d.usb_pid)))
+                            }
+                            DeviceFamily::Zune => zune_data.and_then(|d| d.usb_mode.clone()),
+                        },
                         manufacturer: None,
-                        model: None,
+                        model: initial_model,
                         family: detected.family,
+                        volume_format: ipod_data.and_then(|d| d.volume_format.clone()),
                     };
                     let _ = event_tx.send(BgEvent::DeviceDetected(device_info));
 
@@ -769,6 +814,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                         manufacturer: Some("Microsoft".to_string()),
                                         model: Some(model.to_string()),
                                         family: DeviceFamily::Zune,
+                                        volume_format: None,
                                     }));
                                     let _ =
                                         event_tx.send(BgEvent::SessionReady(Some(StorageInfo {
@@ -831,14 +877,28 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                 if let Ok((total, free)) = s.get_storage_info() {
                                     let used = total.saturating_sub(free);
                                     let pct = (used * 100).checked_div(total).unwrap_or(0) as u8;
+                                    let model = ipod_data
+                                        .map(|d| {
+                                            d.model_label(detected.model.as_deref(), Some(total))
+                                        })
+                                        .unwrap_or_else(|| "iPod".into());
+                                    // Keep an iTunes-assigned name as the
+                                    // panel title; unnamed / automount-UUID
+                                    // volumes use the model + capacity string
+                                    // (same pattern as Zune 80 etc.).
+                                    let name = ipod_panel_title(&detected.name, &model);
                                     let _ = event_tx.send(BgEvent::DeviceDetected(DeviceInfo {
-                                        name: detected.name.clone(),
+                                        name,
                                         firmware_version: detected.firmware.clone(),
                                         serial_number: detected.serial.clone(),
-                                        usb_mode: None,
+                                        usb_mode: Some(ipod_usb_label(
+                                            ipod_data.and_then(|d| d.usb_pid),
+                                        )),
                                         manufacturer: Some("Apple".to_string()),
-                                        model: detected.model.clone(),
+                                        model: Some(model),
                                         family: detected.family,
+                                        volume_format: ipod_data
+                                            .and_then(|d| d.volume_format.clone()),
                                     }));
                                     let _ =
                                         event_tx.send(BgEvent::SessionReady(Some(StorageInfo {
@@ -3094,6 +3154,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn ipod_panel_title_uses_model_when_unnamed() {
+        assert_eq!(
+            ipod_panel_title("iPod", "iPod Video 5.5G 30GB"),
+            "iPod Video 5.5G 30GB"
+        );
+        assert_eq!(
+            ipod_panel_title("Dublin's iPod", "iPod Classic 80GB"),
+            "Dublin's iPod"
+        );
+        assert_eq!(ipod_usb_label(Some(0x1209)), "Mass Storage 1209");
+        assert_eq!(ipod_usb_label(None), "Mass Storage");
     }
 
     #[test]

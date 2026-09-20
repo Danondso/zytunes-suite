@@ -1,5 +1,6 @@
 use super::{DetectedDevice, DeviceBackend, DeviceCapabilities, DeviceFamily};
 use crate::mtp::DeviceSession;
+use rusb::UsbContext;
 
 /// Backend-specific data for a detected iPod, stored in `DetectedDevice::backend_data`.
 pub struct IpodDeviceData {
@@ -7,6 +8,30 @@ pub struct IpodDeviceData {
     /// FirewireGuid (USB serial number) used for hash58 database signing.
     /// Required for iPod Classic; `None` for older models that don't check.
     pub firewire_id: Option<String>,
+    /// SysInfoExtended `FamilyID`, when the plist is present and parseable.
+    pub family_id: Option<u32>,
+    /// USB product ID (`05ac:xxxx`) from sysfs/rusb. Used for generation
+    /// when SysInfo is empty.
+    pub usb_pid: Option<u16>,
+    /// SysInfo `boardHwSwInterfaceRev` gestalt.
+    pub gestalt: Option<u32>,
+    /// SysInfo present but empty (post-2006 firmware).
+    pub sysinfo_empty: bool,
+    /// Mount filesystem label (`FAT`, `HFS+ (read-only)`, …).
+    pub volume_format: Option<String>,
+}
+
+impl IpodDeviceData {
+    pub fn model_label(&self, model_num: Option<&str>, total_bytes: Option<u64>) -> String {
+        super::ipod_model_label(super::IpodModelHints {
+            model_num,
+            family_id: self.family_id,
+            usb_pid: self.usb_pid,
+            gestalt: self.gestalt,
+            sysinfo_empty: self.sysinfo_empty,
+            total_bytes,
+        })
+    }
 }
 
 /// iPod device backend implementing the `DeviceBackend` trait.
@@ -21,11 +46,21 @@ impl DeviceBackend for IpodBackend {
     fn detect(&self) -> Result<DetectedDevice, String> {
         let detected = ipod_db::detect::detect_ipod().map_err(|e| format!("{}", e))?;
 
-        // Read the FirewireGuid from the USB serial number.
-        // On macOS, ioreg reports it; on Linux, it's in /sys or via lsusb.
-        let firewire_id = read_firewire_id();
+        let usb = read_usb_ipod();
+        let usb_pid = usb.as_ref().map(|(pid, _)| *pid);
+        let usb_serial = usb.and_then(|(_, serial)| serial);
+        #[cfg(target_os = "macos")]
+        let firewire_id = read_firewire_id().or(usb_serial);
+        #[cfg(not(target_os = "macos"))]
+        let firewire_id = usb_serial;
 
-        let name = "iPod".to_string();
+        // Detect already drops generic / automount labels. Unnamed devices
+        // use the "iPod" sentinel so the TUI can swap in the composed model.
+        let name = detected.name.unwrap_or_else(|| "iPod".into());
+        // Keep SysInfo `ModelNumStr` on `DetectedDevice.model` so the
+        // connect path can combine it with storage capacity. The TUI
+        // DeviceInfo emission maps it to a friendly label.
+
         Ok(DetectedDevice {
             family: DeviceFamily::Ipod,
             name,
@@ -35,6 +70,11 @@ impl DeviceBackend for IpodBackend {
             backend_data: Box::new(IpodDeviceData {
                 mount_point: detected.mount_point,
                 firewire_id,
+                family_id: detected.family_id,
+                usb_pid,
+                gestalt: detected.gestalt,
+                sysinfo_empty: detected.sysinfo_empty,
+                volume_format: detected.volume_format,
             }),
         })
     }
@@ -142,48 +182,92 @@ impl DeviceBackend for IpodBackend {
     }
 }
 
-/// Try to read the iPod's FirewireGuid (USB serial number) from the OS.
+/// Read the connected Apple iPod's USB product ID and serial.
 ///
-/// On macOS, queries ioreg for the iPod USB device's serial string.
-/// On Linux, could parse /sys/bus/usb/devices or use lsusb (not yet implemented).
-fn read_firewire_id() -> Option<String> {
-    #[cfg(target_os = "macos")]
+/// Linux prefers sysfs so we don't have to open a device that mass-storage
+/// already claimed. rusb descriptor listing is the fallback (macOS, or
+/// sysfs missing).
+fn read_usb_ipod() -> Option<(u16, Option<String>)> {
+    #[cfg(target_os = "linux")]
     {
-        // Query ioreg for iPod USB device serial.
-        let output = std::process::Command::new("ioreg")
-            .args(["-r", "-c", "IOUSBHostDevice"])
-            .output()
-            .ok()?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        if let Some(found) = read_sysfs_usb_ipod() {
+            return Some(found);
+        }
+    }
+    read_rusb_usb_ipod()
+}
 
-        // Look for an iPod device block and extract its serial.
-        let mut in_ipod_block = false;
-        for line in stdout.lines() {
-            if line.contains("iPod@") || line.contains("\"USB Product Name\" = \"iPod\"") {
-                in_ipod_block = true;
-            }
-            if in_ipod_block && line.contains("kUSBSerialNumberString") {
-                // Format: |   "kUSBSerialNumberString" = "000A2700215CDB22"
-                if let Some(val) = line.split('=').nth(1) {
-                    let serial = val.trim().trim_matches('"').to_string();
-                    if !serial.is_empty() {
-                        return Some(serial);
-                    }
+#[cfg(target_os = "linux")]
+fn read_sysfs_usb_ipod() -> Option<(u16, Option<String>)> {
+    let root = std::path::Path::new("/sys/bus/usb/devices");
+    for ent in std::fs::read_dir(root).ok()? {
+        let path = ent.ok()?.path();
+        let vid = read_sysfs_hex_u16(&path.join("idVendor"))?;
+        if vid != 0x05AC {
+            continue;
+        }
+        let pid = read_sysfs_hex_u16(&path.join("idProduct"))?;
+        if !super::ipod_models::ipod_usb_pid_known(pid) {
+            continue;
+        }
+        let serial = std::fs::read_to_string(path.join("serial"))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        return Some((pid, serial));
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn read_sysfs_hex_u16(path: &std::path::Path) -> Option<u16> {
+    let s = std::fs::read_to_string(path).ok()?;
+    u16::from_str_radix(s.trim(), 16).ok()
+}
+
+fn read_rusb_usb_ipod() -> Option<(u16, Option<String>)> {
+    let ctx = rusb::Context::new().ok()?;
+    for dev in ctx.devices().ok()?.iter() {
+        let desc = dev.device_descriptor().ok()?;
+        if desc.vendor_id() != 0x05AC {
+            continue;
+        }
+        let pid = desc.product_id();
+        if super::ipod_models::ipod_usb_pid_known(pid) {
+            return Some((pid, None));
+        }
+    }
+    None
+}
+
+/// macOS: FirewireGuid from ioreg. Linux uses the USB serial from sysfs
+/// in `read_usb_ipod`.
+#[cfg(target_os = "macos")]
+fn read_firewire_id() -> Option<String> {
+    let output = std::process::Command::new("ioreg")
+        .args(["-r", "-c", "IOUSBHostDevice"])
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    let mut in_ipod_block = false;
+    for line in stdout.lines() {
+        if line.contains("iPod@") || line.contains("\"USB Product Name\" = \"iPod\"") {
+            in_ipod_block = true;
+        }
+        if in_ipod_block && line.contains("kUSBSerialNumberString") {
+            if let Some(val) = line.split('=').nth(1) {
+                let serial = val.trim().trim_matches('"').to_string();
+                if !serial.is_empty() {
+                    return Some(serial);
                 }
             }
-            // ioreg blocks end when indentation decreases; reset on next top-level device.
-            if in_ipod_block && line.starts_with("+-o ") && !line.contains("iPod") {
-                in_ipod_block = false;
-            }
         }
-        None
+        if in_ipod_block && line.starts_with("+-o ") && !line.contains("iPod") {
+            in_ipod_block = false;
+        }
     }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        // Linux: try reading from /sys or lsusb. For now, fall back to SysInfo.
-        None
-    }
+    None
 }
 
 #[cfg(test)]

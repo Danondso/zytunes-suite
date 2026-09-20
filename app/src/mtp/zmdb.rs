@@ -285,6 +285,7 @@ impl Zmdb {
                     last_played: None,
                     skip_count: None,
                     rating: None,
+                    duration_ms: None,
                 }
             })
             .collect()

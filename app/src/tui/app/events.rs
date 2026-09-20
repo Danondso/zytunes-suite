@@ -553,6 +553,7 @@ impl App {
         self.device.model = info.model;
         self.device.usb_mode = info.usb_mode;
         self.device.family = Some(info.family);
+        self.device.volume_format = info.volume_format;
         self.device.status = DeviceStatus::Connecting;
     }
 

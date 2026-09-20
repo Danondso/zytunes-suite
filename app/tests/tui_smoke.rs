@@ -61,6 +61,7 @@ fn device_connect_flow() {
         manufacturer: Some("Microsoft".into()),
         model: Some("Zune 30".into()),
         family: DeviceFamily::Zune,
+        volume_format: None,
     }));
     h.push_event(BgEvent::SessionReady(Some(StorageInfo {
         used_bytes: 1_000_000_000,
@@ -116,6 +117,7 @@ fn device_entry(object_id: u64, name: &str) -> zytunes::mtp::parse::DeviceEntry 
         last_played: None,
         skip_count: None,
         rating: None,
+        duration_ms: None,
     }
 }
 

@@ -26,6 +26,7 @@ pub const PROP_REPRESENTATIVE_SAMPLE_DATA: u16 = 0xDC86;
 // question. Phase 4a probes test which (if any) of these the Zune exposes
 // for audio objects.
 pub const PROP_DATE_ADDED: u16 = 0xDC4E;
+pub const PROP_DURATION: u16 = 0xDC89;
 pub const PROP_RATING: u16 = 0xDC8A;
 pub const PROP_USE_COUNT: u16 = 0xDC91;
 pub const PROP_SKIP_COUNT: u16 = 0xDC92;
