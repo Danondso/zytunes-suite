@@ -44,6 +44,13 @@ fn ipod_panel_title(detected_name: &str, model: &str) -> String {
     }
 }
 
+fn ipod_usb_label(pid: Option<u16>) -> String {
+    match pid {
+        Some(p) => format!("Mass Storage {p:04x}"),
+        None => "Mass Storage".into(),
+    }
+}
+
 /// Drain every command pending on `cmd_rx` during a sync run: appended
 /// items are spliced onto the back of `sync_queue` (bumping `total`), and
 /// `CancelSync` is reported via the return value. Any other command is
@@ -369,6 +376,8 @@ pub struct DeviceInfo {
     pub manufacturer: Option<String>,
     pub model: Option<String>,
     pub family: DeviceFamily,
+    /// iPod volume format (`FAT`, `HFS+ (read-only)`). Unused on Zune.
+    pub volume_format: Option<String>,
 }
 
 /// Storage info from the MTP session.
@@ -758,10 +767,16 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                         name: initial_name,
                         firmware_version: detected.firmware.clone(),
                         serial_number: detected.serial.clone(),
-                        usb_mode: zune_data.and_then(|d| d.usb_mode.clone()),
+                        usb_mode: match detected.family {
+                            DeviceFamily::Ipod => {
+                                Some(ipod_usb_label(ipod_data.and_then(|d| d.usb_pid)))
+                            }
+                            DeviceFamily::Zune => zune_data.and_then(|d| d.usb_mode.clone()),
+                        },
                         manufacturer: None,
                         model: initial_model,
                         family: detected.family,
+                        volume_format: ipod_data.and_then(|d| d.volume_format.clone()),
                     };
                     let _ = event_tx.send(BgEvent::DeviceDetected(device_info));
 
@@ -799,6 +814,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                         manufacturer: Some("Microsoft".to_string()),
                                         model: Some(model.to_string()),
                                         family: DeviceFamily::Zune,
+                                        volume_format: None,
                                     }));
                                     let _ =
                                         event_tx.send(BgEvent::SessionReady(Some(StorageInfo {
@@ -875,10 +891,14 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>) -> mpsc::Sender<BgCommand> {
                                         name,
                                         firmware_version: detected.firmware.clone(),
                                         serial_number: detected.serial.clone(),
-                                        usb_mode: Some("Mass Storage".into()),
+                                        usb_mode: Some(ipod_usb_label(
+                                            ipod_data.and_then(|d| d.usb_pid),
+                                        )),
                                         manufacturer: Some("Apple".to_string()),
                                         model: Some(model),
                                         family: detected.family,
+                                        volume_format: ipod_data
+                                            .and_then(|d| d.volume_format.clone()),
                                     }));
                                     let _ =
                                         event_tx.send(BgEvent::SessionReady(Some(StorageInfo {
@@ -3146,6 +3166,8 @@ mod tests {
             ipod_panel_title("Dublin's iPod", "iPod Classic 80GB"),
             "Dublin's iPod"
         );
+        assert_eq!(ipod_usb_label(Some(0x1209)), "Mass Storage 1209");
+        assert_eq!(ipod_usb_label(None), "Mass Storage");
     }
 
     #[test]

@@ -55,7 +55,7 @@ CLI commands: `ls [path]`, `push <files...>`, `rm <paths...>`, `sync <type> <nam
 **Key modules:** (all under `app/src/` unless noted)
 - `device/mod.rs` — `DeviceBackend` trait, `DeviceCapabilities`, `DeviceFamily` (`Zune` | `Ipod`), `DetectedDevice` with type-erased `backend_data`
 - `device/zune.rs` — `ZuneBackend` / `ZuneDevice` / `ZuneDeviceData`. rusb-based scan for VID `0x045e`, opens a `NativeSession` over IOKit
-- `device/ipod.rs` — `IpodBackend` / `IpodDeviceData`. Detects a mounted classic iPod's `iPod_Control/` root, opens an `IpodSession`
+- `device/ipod.rs` — `IpodBackend` / `IpodDeviceData`. Detects a mounted classic iPod's `iPod_Control/` root, opens an `IpodSession`. `IpodDeviceData` carries USB PID, FamilyID, gestalt, empty-SysInfo flag, and volume format for the TUI panel
 - `device/ipod_models.rs` — `ipod_model_label(IpodModelHints)`: composes generation + marketing GB from SysInfo `ModelNumStr` (libgpod suffix after leading `M`/`P`), SysInfoExtended `FamilyID` (on-disk XML), `boardHwSwInterfaceRev` gestalt, USB product ID, empty-SysInfo+Video-PID → 5.5G, and snapped storage. Unknown SKUs stay `"iPod 80GB"` rather than guessing Classic. Touch/iPhone omitted (they don't mount `iPod_Control/`)
 - `lib.rs` — Crate root, exports `SyncType` enum (`Artist`, `Album`, `Track`) with `FromStr`/`Display` impls, plus the backend traits. Re-exports the transcode pipeline from `transcode.rs` so callers import it from the crate root. Also home to `sync_to_device()`, `find_matching_tracks()`, and the `collect_music/photo/video_files` path expanders (one shared `collect_files_by_extension` body)
 - `transcode.rs` — the full transcode pipeline: `transcode_for_device` (3-way dispatch), the pure-Rust MP3 path (symphonia decode → LAME encode → Xing header patch → id3 tag + resized art), ffmpeg-backed `transcode_flac_to_alac` and `transcode_to_wmv`, and `check_ffmpeg_available()` — video-sync shells out to ffmpeg for the WMV2/WMAv2 transcode the Zune expects
@@ -153,7 +153,7 @@ Scopes are optional: `feat(tui): add theme picker` is fine. Commits that don't m
 
 ## iPod Classic Constraints
 
-- Device must be formatted for Windows/FAT (macOS HFS+ iPods are not supported — no backend-side HFS driver)
+- Device must be formatted for Windows/FAT (macOS HFS+ iPods are not supported — no backend-side HFS driver). Identity still reads from an HFS+ mount: TUI shows `FS: HFS+ (read-only)` and firmware from `/sys/block/{disk}/device/rev` when SysInfo is empty
 - Firmware matches `.mp3`/`.m4a` case-sensitively in some code paths; all files written under `iPod_Control/Music/F00..F49/` use lowercased extensions
 - New tracks get IDs from `FIRST_IPOD_ID = 52`, uniform mhit size, iTunes-matching mystery constants. Existing tracks round-trip losslessly via raw mhit blob replay (avoids losing unknown fields)
 - `id_0x24` must come from `mhbd+0x24`, not `db_id` — getting this wrong produces a database the iPod silently discards

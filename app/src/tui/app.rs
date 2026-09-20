@@ -564,6 +564,7 @@ pub struct DeviceState {
     pub model: Option<String>,
     pub usb_mode: Option<String>,
     pub family: Option<zytunes::device::DeviceFamily>,
+    pub volume_format: Option<String>,
     pub storage: Option<StorageInfo>,
     pub tracks: Vec<DeviceEntry>,
     pub loading_tracks: bool,
@@ -603,6 +604,7 @@ impl DeviceState {
             model: None,
             usb_mode: None,
             family: None,
+            volume_format: None,
             storage: None,
             tracks: Vec::new(),
             loading_tracks: false,
@@ -7730,6 +7732,7 @@ mod tests {
             model: None,
             usb_mode: None,
             family: None,
+            volume_format: None,
             storage: None,
             tracks: device.tracks.clone(),
             loading_tracks: false,
@@ -7916,6 +7919,7 @@ mod tests {
             manufacturer: None,
             model: None,
             family: zytunes::device::DeviceFamily::Ipod,
+            volume_format: None,
         }));
         app.handle_bg_event(BgEvent::SessionReady(Some(StorageInfo {
             used_bytes: 1,

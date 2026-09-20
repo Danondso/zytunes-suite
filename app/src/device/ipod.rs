@@ -17,6 +17,8 @@ pub struct IpodDeviceData {
     pub gestalt: Option<u32>,
     /// SysInfo present but empty (post-2006 firmware).
     pub sysinfo_empty: bool,
+    /// Mount filesystem label (`FAT`, `HFS+ (read-only)`, …).
+    pub volume_format: Option<String>,
 }
 
 impl IpodDeviceData {
@@ -72,6 +74,7 @@ impl DeviceBackend for IpodBackend {
                 usb_pid,
                 gestalt: detected.gestalt,
                 sysinfo_empty: detected.sysinfo_empty,
+                volume_format: detected.volume_format,
             }),
         })
     }

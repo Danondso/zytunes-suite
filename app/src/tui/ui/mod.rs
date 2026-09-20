@@ -1529,6 +1529,12 @@ fn draw_device_info_connected(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(mode.as_str(), body),
         ]));
     }
+    if let Some(ref fmt) = app.device.volume_format {
+        lines.push(Line::from(vec![
+            Span::styled(" FS: ", t.dim()),
+            Span::styled(fmt.as_str(), body),
+        ]));
+    }
     if let Some(ref serial) = app.device.serial {
         let display = if serial.chars().count() > 12 {
             format!("{}...", serial.chars().take(12).collect::<String>())

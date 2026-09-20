@@ -23,6 +23,8 @@ pub struct DetectedIpod {
     /// Post-2006 firmware creates `SysInfo` at 0 bytes. Combined with USB
     /// PID this distinguishes Video 5.5G from 5G.
     pub sysinfo_empty: bool,
+    /// Mount filesystem, e.g. `FAT` or `HFS+ (read-only)`.
+    pub volume_format: Option<String>,
 }
 
 /// Check if a path looks like an iPod mount point.
@@ -242,6 +244,113 @@ fn apply_sysinfo_extended_xml(
     }
 }
 
+fn pretty_fstype(fs: &str) -> String {
+    match fs {
+        "vfat" | "msdos" | "fat" | "exfat" => "FAT".into(),
+        "hfsplus" => "HFS+".into(),
+        "hfs" => "HFS".into(),
+        other => other.to_string(),
+    }
+}
+
+/// `/dev/sdb1` → `/dev/sdb`; `nvme0n1p1` → `nvme0n1`.
+fn whole_disk(dev: &Path) -> PathBuf {
+    let Some(name) = dev.file_name().and_then(|n| n.to_str()) else {
+        return dev.to_path_buf();
+    };
+    let parent = match name {
+        n if n.starts_with("nvme") || n.starts_with("mmcblk") => n
+            .rsplit_once('p')
+            .filter(|(_, p)| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+            .map(|(disk, _)| disk.to_string()),
+        n if n.starts_with("sd") || n.starts_with("hd") || n.starts_with("vd") => {
+            let disk: String = n.chars().take_while(|c| !c.is_ascii_digit()).collect();
+            (!disk.is_empty() && disk != n).then_some(disk)
+        }
+        _ => None,
+    };
+    match parent {
+        Some(disk) => dev.with_file_name(disk),
+        None => dev.to_path_buf(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxMount {
+    source: PathBuf,
+    fstype: String,
+    readonly: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn unescape_mount(s: &str) -> String {
+    s.replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+}
+
+#[cfg(target_os = "linux")]
+fn linux_mount_for(mount: &Path) -> Option<LinuxMount> {
+    let want = mount.canonicalize().unwrap_or_else(|_| mount.to_path_buf());
+    let mounts = std::fs::read_to_string("/proc/self/mounts").ok()?;
+    for line in mounts.lines() {
+        let mut parts = line.split_whitespace();
+        let source = parts.next()?;
+        let target = unescape_mount(parts.next()?);
+        let fstype = parts.next()?.to_string();
+        let opts = parts.next().unwrap_or("");
+        let target_path = PathBuf::from(&target);
+        let target_canon = target_path.canonicalize().unwrap_or(target_path);
+        if target_canon == want {
+            return Some(LinuxMount {
+                source: PathBuf::from(source),
+                fstype,
+                readonly: opts.split(',').any(|o| o == "ro"),
+            });
+        }
+    }
+    None
+}
+
+fn volume_format(mount: &Path) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let info = linux_mount_for(mount)?;
+        let label = pretty_fstype(&info.fstype);
+        Some(if info.readonly {
+            format!("{label} (read-only)")
+        } else {
+            label
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = mount;
+        None
+    }
+}
+
+fn firmware_from_block_rev(mount: &Path) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let info = linux_mount_for(mount)?;
+        if !info.source.starts_with("/dev/") {
+            return None;
+        }
+        let disk = whole_disk(&info.source);
+        let name = disk.file_name()?.to_str()?;
+        let rev = std::fs::read_to_string(format!("/sys/block/{name}/device/rev")).ok()?;
+        let s = rev.trim();
+        (!s.is_empty()).then(|| s.to_string())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = mount;
+        None
+    }
+}
+
 /// Scan common mount points for connected iPods.
 ///
 /// Checks `/media/$USER/`, `/mnt/`, and `/run/media/$USER/` for directories
@@ -324,8 +433,11 @@ pub fn detect_ipods() -> Vec<DetectedIpod> {
             if let Some(xml) = read_sysinfo_extended_xml(&candidate) {
                 apply_sysinfo_extended_xml(&xml, &mut family_id, &mut serial, &mut firmware);
             }
+            if firmware.is_none() {
+                firmware = firmware_from_block_rev(&candidate);
+            }
             results.push(DetectedIpod {
-                mount_point: candidate,
+                mount_point: candidate.clone(),
                 model: sys.model,
                 serial,
                 firmware_version: firmware,
@@ -333,6 +445,7 @@ pub fn detect_ipods() -> Vec<DetectedIpod> {
                 family_id,
                 gestalt: sys.gestalt,
                 sysinfo_empty: sys.empty,
+                volume_format: volume_format(&candidate),
             });
         }
     }
@@ -534,6 +647,23 @@ mod tests {
         let mut serial = Some("keep".into());
         apply_sysinfo_extended_xml(xml, &mut family_id, &mut serial, &mut firmware);
         assert_eq!(serial.as_deref(), Some("keep"));
+    }
+
+    #[test]
+    fn test_pretty_fstype() {
+        assert_eq!(pretty_fstype("vfat"), "FAT");
+        assert_eq!(pretty_fstype("hfsplus"), "HFS+");
+        assert_eq!(pretty_fstype("ext4"), "ext4");
+    }
+
+    #[test]
+    fn test_whole_disk_strips_partition() {
+        assert_eq!(whole_disk(Path::new("/dev/sdb1")), Path::new("/dev/sdb"));
+        assert_eq!(whole_disk(Path::new("/dev/sda")), Path::new("/dev/sda"));
+        assert_eq!(
+            whole_disk(Path::new("/dev/nvme0n1p1")),
+            Path::new("/dev/nvme0n1")
+        );
     }
 
     #[test]
