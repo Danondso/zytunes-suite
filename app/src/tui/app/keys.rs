@@ -727,8 +727,8 @@ impl App {
     }
 
     /// Disconnect the device: drop the worker session and clear all
-    /// device-side UI state. The iPod volume stays mounted so `c` can
-    /// reconnect without a replug.
+    /// device-side UI state. iPod / GoGear volumes stay mounted so `c`
+    /// can reconnect without a replug.
     fn disconnect_device(&mut self, cmd_tx: &mpsc::Sender<BgCommand>) {
         self.device.ignore_session_events = true;
         let _ = cmd_tx.send(BgCommand::Disconnect);

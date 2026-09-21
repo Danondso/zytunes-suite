@@ -979,6 +979,11 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                                             used_bytes: used,
                                             used_percent: pct,
                                         })));
+                                } else {
+                                    // df/stat can fail on a just-mounted vfat stick;
+                                    // still finish connect so the TUI is not stuck
+                                    // on Connecting while tracks load.
+                                    let _ = event_tx.send(BgEvent::SessionReady(None));
                                 }
                                 let _ = log_tx.send(BgEvent::SyncMessage(format!(
                                     "Connected to {}",
