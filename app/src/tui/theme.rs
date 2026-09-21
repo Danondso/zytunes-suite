@@ -302,9 +302,9 @@ pub const GRUVBOX_DARK: Theme = Theme {
     accent_secondary: Color::Rgb(214, 93, 14),
     player_skin: &SKIN_GRUVBOX_DARK,
     spinner_set: &BRAILLE_SIX_DOUBLE,
-    soundbar_style: SoundbarStyle::Eq,
+    soundbar_style: SoundbarStyle::Meters,
     soundbar_ramp: RAMP_BLOCKS,
-    soundbar_color: SoundbarColor::Split,
+    soundbar_color: SoundbarColor::Height,
 };
 
 pub const GRUVBOX_LIGHT: Theme = Theme {
@@ -333,9 +333,9 @@ pub const GRUVBOX_LIGHT: Theme = Theme {
     accent_secondary: Color::Rgb(175, 58, 3),
     player_skin: &SKIN_GRUVBOX_LIGHT,
     spinner_set: &BRAILLE_SIX,
-    soundbar_style: SoundbarStyle::Eq,
+    soundbar_style: SoundbarStyle::Meters,
     soundbar_ramp: RAMP_BLOCKS,
-    soundbar_color: SoundbarColor::Split,
+    soundbar_color: SoundbarColor::Height,
 };
 
 pub const EVERFOREST_DARK: Theme = Theme {
@@ -364,7 +364,7 @@ pub const EVERFOREST_DARK: Theme = Theme {
     accent_secondary: Color::Rgb(167, 192, 128),
     player_skin: &SKIN_EVERFOREST_DARK,
     spinner_set: &OGHAM_A,
-    soundbar_style: SoundbarStyle::Pulse,
+    soundbar_style: SoundbarStyle::Meters,
     soundbar_ramp: RAMP_BLOCKS,
     soundbar_color: SoundbarColor::Height,
 };
@@ -395,7 +395,7 @@ pub const EVERFOREST_LIGHT: Theme = Theme {
     accent_secondary: Color::Rgb(141, 161, 1),
     player_skin: &SKIN_EVERFOREST_LIGHT,
     spinner_set: &OGHAM_B,
-    soundbar_style: SoundbarStyle::Pulse,
+    soundbar_style: SoundbarStyle::Meters,
     soundbar_ramp: RAMP_BLOCKS,
     soundbar_color: SoundbarColor::Height,
 };
@@ -1061,7 +1061,7 @@ mod tests {
         use crate::audio::SoundbarStyle::*;
         let cases = [
             ("iTunes 2004", Meters),
-            ("Gruvbox Dark", Eq),
+            ("Gruvbox Dark", Meters),
             ("WinAmp Classic", Mirror),
             ("BIOS", Eq),
             ("Zune Original", Pulse),

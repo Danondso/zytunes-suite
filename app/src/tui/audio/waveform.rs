@@ -43,6 +43,32 @@ impl Waveform {
         }
     }
 
+    /// Graphic-EQ columns: each centre in `centers` gets the max of the
+    /// log-frequency FFT bins nearest to it, so a 64 Hz meter reads 64 Hz.
+    pub fn columns_for(&self, centers: &[f32]) -> Vec<u8> {
+        if centers.is_empty() {
+            return Vec::new();
+        }
+        let mut out = vec![0u8; centers.len()];
+        for i in 0..BINS {
+            let hz = bin_hz(i);
+            let mut best = 0usize;
+            let mut best_d = f32::MAX;
+            for (j, c) in centers.iter().enumerate() {
+                let d = (hz.ln() - c.ln()).abs();
+                if d < best_d {
+                    best_d = d;
+                    best = j;
+                }
+            }
+            let v = self.bins[i].load(Ordering::Relaxed);
+            if v > out[best] {
+                out[best] = v;
+            }
+        }
+        out
+    }
+
     /// Left → right of the current snapshot, resampled to `n` columns.
     /// Empty `n` yields empty. Wider than [`BINS`] repeats neighbouring
     /// peaks; narrower takes the max in each source group so transients
@@ -148,20 +174,23 @@ impl<S: Source> WaveformTap<S> {
     }
 }
 
-/// Log-spaced FFT-bin ranges from ~40 Hz to 16 kHz (or Nyquist).
+/// Log-spaced FFT-bin ranges on the same 40 Hz–16 kHz axis as [`bin_hz`]
+/// and the EQ labels. Bands whose floor is above Nyquist stay empty so a
+/// 22 kHz file does not paint 11 kHz energy on the `16k` meter.
 fn band_ranges(sr: u32) -> [(usize, usize); BINS] {
     let sr = sr.max(1) as f32;
     let nyquist = sr / 2.0;
-    let bin_hz = sr / FFT_N as f32;
-    let f_min = F_MIN_HZ.min(nyquist / 4.0).max(bin_hz);
-    let f_max = nyquist.min(F_MAX_HZ).max(f_min * 2.0);
-    let ratio = f_max / f_min;
-    let mut out = [(1usize, 2usize); BINS];
+    let bin_w = sr / FFT_N as f32;
+    // `(1, 1)` is an empty `lo..hi` range — those published bins stay 0.
+    let mut out = [(1usize, 1usize); BINS];
     for (c, slot) in out.iter_mut().enumerate() {
-        let lo = f_min * ratio.powf(c as f32 / BINS as f32);
-        let hi = f_min * ratio.powf((c + 1) as f32 / BINS as f32);
-        let i0 = ((lo / bin_hz) as usize).clamp(1, FFT_N / 2 - 1);
-        let i1 = ((hi / bin_hz) as usize).clamp(i0 + 1, FFT_N / 2);
+        let lo = F_MIN_HZ * (F_MAX_HZ / F_MIN_HZ).powf(c as f32 / BINS as f32);
+        let hi = F_MIN_HZ * (F_MAX_HZ / F_MIN_HZ).powf((c + 1) as f32 / BINS as f32);
+        if lo >= nyquist {
+            continue;
+        }
+        let i0 = ((lo / bin_w) as usize).clamp(1, FFT_N / 2 - 1);
+        let i1 = ((hi.min(nyquist) / bin_w) as usize).clamp(i0 + 1, FFT_N / 2);
         *slot = (i0, i1);
     }
     out
@@ -286,10 +315,10 @@ pub const RAMP_CHUNKY: &[char] = &['▁', '▄', '█'];
 /// change column height, never slide sideways.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SoundbarStyle {
-    /// A dozen double-wide EQ meters (default).
+    /// Graphic-EQ meters (default).
     #[default]
     Meters,
-    /// Thinner graphic-EQ, more bands.
+    /// Thinner bars with extra space between them.
     Eq,
     /// Bass on both edges, treble meeting in the middle.
     Mirror,
@@ -371,16 +400,50 @@ pub fn render_soundbar(
 const F_MIN_HZ: f32 = 40.0;
 const F_MAX_HZ: f32 = 16_000.0;
 
-/// Geometric centre of band `i` of `n` log-spaced columns (40 Hz–16 kHz).
-fn band_center_hz(i: usize, n: usize) -> f32 {
-    if n == 0 {
-        return F_MIN_HZ;
-    }
-    let t = (i as f32 + 0.5) / n as f32;
+/// Graphic-EQ centres shown under the meters (octave steps).
+const EQ_HZ: [f32; 10] = [
+    32.0, 64.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0,
+];
+
+fn bin_hz(i: usize) -> f32 {
+    let t = (i as f32 + 0.5) / BINS as f32;
     F_MIN_HZ * (F_MAX_HZ / F_MIN_HZ).powf(t)
 }
 
-/// Compact Hz label that fits in `max` cells: `40`, `250`, `1k`, `16k`.
+fn eq_centers(n: usize) -> Vec<f32> {
+    let n = n.clamp(1, EQ_HZ.len());
+    if n == EQ_HZ.len() {
+        return EQ_HZ.to_vec();
+    }
+    (0..n)
+        .map(|i| {
+            let idx = if n == 1 {
+                EQ_HZ.len() / 2
+            } else {
+                i * (EQ_HZ.len() - 1) / (n - 1)
+            };
+            EQ_HZ[idx]
+        })
+        .collect()
+}
+
+fn palindrome_n<T: Copy>(half: &[T], n: usize) -> Vec<T> {
+    let mut out: Vec<T> = half
+        .iter()
+        .copied()
+        .chain(half.iter().rev().copied())
+        .collect();
+    if out.len() > n {
+        out.remove(out.len() / 2);
+    }
+    out
+}
+
+fn mirror_centers(n: usize) -> Vec<f32> {
+    palindrome_n(&eq_centers(n.div_ceil(2).max(1)), n)
+}
+
+/// Compact Hz label that fits in `max` cells: `32`, `64`, `125`, `1k`, `16k`.
 fn compact_hz(hz: f32, max: usize) -> String {
     if max == 0 {
         return String::new();
@@ -388,61 +451,44 @@ fn compact_hz(hz: f32, max: usize) -> String {
     let full = if hz < 1000.0 {
         format!("{}", hz.round() as u32)
     } else {
-        let k = hz / 1000.0;
-        if k < 10.0 && (k - k.round()).abs() >= 0.15 {
-            format!("{k:.1}k")
-        } else {
-            format!("{}k", k.round() as u32)
-        }
+        format!("{}k", (hz / 1000.0).round() as u32)
     };
     full.chars().take(max).collect()
 }
 
-fn hz_labels(n: usize) -> Vec<String> {
-    (0..n)
-        .map(|i| compact_hz(band_center_hz(i, n), 3))
-        .collect()
+fn hz_labels_for(centers: &[f32]) -> Vec<String> {
+    centers.iter().map(|&hz| compact_hz(hz, 3)).collect()
 }
 
-/// Double-wide gapped meters that fit in `width`: `██ ██ ██` is `3n - 1` cells.
-/// Every `W` layout uses this so they share one centered island instead of
-/// Eq/Mirror stretching to the panel edges.
+/// Cells per band: two for the bar (Eq uses one) and the rest as padding
+/// so `125` / `16k` sit in the same column as that meter. Every `W` layout
+/// uses this grid so bars and labels stay aligned when the style changes.
+const SLOT: usize = 4;
+
 fn meter_bands(width: usize) -> usize {
-    ((width + 1) / 3).clamp(1, 12)
+    (width / SLOT).clamp(1, EQ_HZ.len())
 }
 
-fn style_bands(style: SoundbarStyle, width: usize) -> (usize, bool) {
-    let n = meter_bands(width);
+fn bar_cells(style: SoundbarStyle) -> usize {
     match style {
-        SoundbarStyle::Eq => (((3 * n) / 2).max(1), false),
-        _ => (n, true),
+        SoundbarStyle::Eq => 1,
+        _ => 2,
     }
 }
 
-/// Hz shorthand under each meter, same cell width as [`soundbar_atoms`] so
-/// `Alignment::Center` keeps the two rows on the same island.
+/// Hz shorthand under each meter. Packed into the same [`SLOT`] grid as
+/// [`soundbar_atoms`] so each number sits under its bar when `W` cycles.
 pub fn soundbar_labels(style: SoundbarStyle, width: usize) -> String {
     if width == 0 {
         return String::new();
     }
-    let (n, double) = style_bands(style, width);
+    let n = meter_bands(width);
     let labels = match style {
-        SoundbarStyle::Mirror => {
-            let half_n = n.div_ceil(2).max(1);
-            let half = hz_labels(half_n);
-            let mut labs: Vec<String> = half
-                .iter()
-                .cloned()
-                .chain(half.iter().rev().cloned())
-                .collect();
-            if labs.len() > n {
-                labs.remove(labs.len() / 2);
-            }
-            labs
-        }
-        _ => hz_labels(n),
+        SoundbarStyle::Pulse => vec![String::new(); n],
+        SoundbarStyle::Mirror => hz_labels_for(&mirror_centers(n)),
+        _ => hz_labels_for(&eq_centers(n)),
     };
-    paint_labels(&labels, double)
+    paint_labels(&labels)
 }
 
 pub fn soundbar_atoms(
@@ -459,22 +505,15 @@ pub fn soundbar_atoms(
     } else {
         ramp
     };
-    let (n, double) = style_bands(style, width);
+    let n = meter_bands(width);
+    let bar = bar_cells(style);
     match style {
         SoundbarStyle::Meters | SoundbarStyle::Dots | SoundbarStyle::Eq => {
-            paint(&wave.columns(n), ramp, double)
+            paint(&wave.columns_for(&eq_centers(n)), ramp, bar)
         }
         SoundbarStyle::Mirror => {
-            let half = wave.columns(n.div_ceil(2).max(1));
-            let mut peaks: Vec<u8> = half
-                .iter()
-                .copied()
-                .chain(half.iter().rev().copied())
-                .collect();
-            if peaks.len() > n {
-                peaks.remove(peaks.len() / 2);
-            }
-            paint(&peaks, ramp, double)
+            let half = wave.columns_for(&eq_centers(n.div_ceil(2).max(1)));
+            paint(&palindrome_n(&half, n), ramp, bar)
         }
         SoundbarStyle::Pulse => {
             let level = f32::from(wave.columns(1).first().copied().unwrap_or(0));
@@ -488,7 +527,7 @@ pub fn soundbar_atoms(
                     (level * (1.0 - x * x).max(0.0)) as u8
                 })
                 .collect();
-            paint(&peaks, ramp, double)
+            paint(&peaks, ramp, bar)
         }
     }
 }
@@ -498,73 +537,44 @@ fn soundbar_plain(atoms: &[SoundbarAtom]) -> String {
     atoms.iter().map(|a| a.ch).collect()
 }
 
-fn paint(peaks: &[u8], ramp: &[char], double: bool) -> Vec<SoundbarAtom> {
+fn paint(peaks: &[u8], ramp: &[char], bar: usize) -> Vec<SoundbarAtom> {
     let n = peaks.len();
+    let bar = bar.min(SLOT);
     let mut out = Vec::new();
     for (i, p) in peaks.iter().enumerate() {
-        if i > 0 {
-            out.push(SoundbarAtom {
-                ch: ' ',
-                peak: 0,
-                pos: 0.0,
-                gap: true,
-            });
-        }
         let pos = if n <= 1 {
             0.5
         } else {
             i as f32 / (n - 1) as f32
         };
         let g = glyph_from_levels(*p, ramp);
-        out.push(SoundbarAtom {
-            ch: g,
-            peak: *p,
-            pos,
-            gap: false,
-        });
-        if double {
-            out.push(SoundbarAtom {
-                ch: g,
-                peak: *p,
-                pos,
-                gap: false,
-            });
+        for k in 0..SLOT {
+            if k < bar {
+                out.push(SoundbarAtom {
+                    ch: g,
+                    peak: *p,
+                    pos,
+                    gap: false,
+                });
+            } else {
+                out.push(SoundbarAtom {
+                    ch: ' ',
+                    peak: 0,
+                    pos,
+                    gap: true,
+                });
+            }
         }
     }
     out
 }
 
-/// Place each band's Hz shorthand in the same cells as that meter.
-/// Double-wide: two chars in the bar, space in the gap (`40  1k`).
-/// Eq: two chars straddle the bar and the following gap (`40 80 1k`).
-fn paint_labels(labels: &[String], double: bool) -> String {
-    let n = labels.len();
-    if n == 0 {
-        return String::new();
-    }
-    let len = if double { 3 * n - 1 } else { 2 * n - 1 };
-    let mut out = vec![' '; len];
-    let mut at = 0usize;
+/// Left-align each Hz label in that band's [`SLOT`] so it starts on the bar.
+fn paint_labels(labels: &[String]) -> String {
+    let mut out = vec![' '; labels.len() * SLOT];
     for (i, lab) in labels.iter().enumerate() {
-        let mut cs = lab.chars();
-        if at < len {
-            out[at] = cs.next().unwrap_or(' ');
-        }
-        if double {
-            if at + 1 < len {
-                out[at + 1] = cs.next().unwrap_or(' ');
-            }
-            at += 2;
-            if i + 1 < n {
-                at += 1;
-            }
-        } else if i + 1 < n {
-            if at + 1 < len {
-                out[at + 1] = cs.next().unwrap_or(' ');
-            }
-            at += 2;
-        } else {
-            at += 1;
+        for (k, ch) in lab.chars().take(SLOT).enumerate() {
+            out[i * SLOT + k] = ch;
         }
     }
     out.into_iter().collect()
@@ -685,11 +695,76 @@ mod tests {
 
     #[test]
     fn compact_hz_shorthand() {
-        assert_eq!(compact_hz(40.0, 2), "40");
+        assert_eq!(compact_hz(32.0, 2), "32");
+        assert_eq!(compact_hz(125.0, 3), "125");
         assert_eq!(compact_hz(250.0, 3), "250");
         assert_eq!(compact_hz(1000.0, 2), "1k");
         assert_eq!(compact_hz(16000.0, 3), "16k");
         assert_eq!(compact_hz(16000.0, 2), "16");
+    }
+
+    #[test]
+    fn band_ranges_leave_bins_above_nyquist_empty() {
+        let bands = band_ranges(22_050);
+        assert_eq!(
+            bands[BINS - 1],
+            (1, 1),
+            "16 kHz band must stay empty when Nyquist is 11 kHz"
+        );
+        let first = bands[0];
+        assert!(
+            first.1 > first.0,
+            "bass band must still have FFT bins: {first:?}"
+        );
+        let live = bands.iter().filter(|b| b.1 > b.0).count();
+        assert!(
+            live > 0 && live < BINS,
+            "some but not all bands live at 22 kHz, live={live}"
+        );
+    }
+
+    #[test]
+    fn labels_start_on_the_same_slot_as_the_bar() {
+        let wave = Waveform::new();
+        wave.publish(&[255; BINS]);
+        for style in [
+            SoundbarStyle::Meters,
+            SoundbarStyle::Eq,
+            SoundbarStyle::Dots,
+        ] {
+            let atoms = soundbar_atoms(&wave, style, 40, RAMP_BLOCKS);
+            let labels: Vec<char> = soundbar_labels(style, 40).chars().collect();
+            assert!(!atoms[0].gap, "{style:?} slot 0 must be the bar");
+            assert_eq!(
+                &labels[..2],
+                &['3', '2'],
+                "{style:?} 32 Hz must start on the bar"
+            );
+        }
+    }
+
+    #[test]
+    fn columns_for_puts_500hz_on_the_500_meter() {
+        let wave = Waveform::new();
+        let mut frame = [0u8; BINS];
+        for (i, slot) in frame.iter_mut().enumerate() {
+            let hz = bin_hz(i);
+            if (hz.ln() - 500.0_f32.ln()).abs() < (hz.ln() - 250.0_f32.ln()).abs()
+                && (hz.ln() - 500.0_f32.ln()).abs() < (hz.ln() - 1000.0_f32.ln()).abs()
+            {
+                *slot = 200;
+            }
+        }
+        wave.publish(&frame);
+        let cols = wave.columns_for(&EQ_HZ);
+        let peak = cols
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, v)| *v)
+            .map(|(i, _)| i)
+            .unwrap();
+        assert_eq!(EQ_HZ[peak], 500.0, "cols={cols:?}");
+        assert!(cols.iter().filter(|&&v| v > 0).count() <= 3);
     }
 
     #[test]
@@ -714,16 +789,47 @@ mod tests {
         }
         let meters = soundbar_labels(SoundbarStyle::Meters, 40);
         assert!(
-            meters.contains('4') || meters.contains('5'),
-            "bass end should show ~40–50 Hz, got {meters:?}"
+            meters.contains("32") && meters.contains("1k"),
+            "labels are graphic-EQ Hz, got {meters:?}"
+        );
+        let eq_labels = soundbar_labels(SoundbarStyle::Eq, 40);
+        assert_eq!(
+            eq_labels.chars().count(),
+            meters.chars().count(),
+            "Eq labels must occupy the same slots as meters"
+        );
+        assert!(
+            eq_labels.starts_with("32"),
+            "Eq uses the same Hz grid, got {eq_labels:?}"
         );
         let mirror = soundbar_labels(SoundbarStyle::Mirror, 40);
         let chars: Vec<char> = mirror.chars().collect();
-        assert!(chars.len() >= 4);
+        assert!(chars.len() >= SLOT * 2);
         assert_eq!(
             &chars[..2],
-            &chars[chars.len() - 2..],
+            &chars[chars.len() - SLOT..chars.len() - SLOT + 2],
             "mirror bass labels must match at both edges, got {mirror:?}"
+        );
+        let pulse = soundbar_labels(SoundbarStyle::Pulse, 40);
+        assert!(
+            pulse.chars().all(|c| c == ' '),
+            "Pulse is a level mountain, not Hz bands, got {pulse:?}"
+        );
+    }
+
+    #[test]
+    fn eq_uses_the_same_bands_with_wider_gaps() {
+        let wave = Waveform::new();
+        wave.publish(&[255; BINS]);
+        let meters = render_soundbar(&wave, SoundbarStyle::Meters, 40, RAMP_BLOCKS);
+        let eq = render_soundbar(&wave, SoundbarStyle::Eq, 40, RAMP_BLOCKS);
+        assert!(eq.contains("   "), "Eq pads each slot, got {eq:?}");
+        let meter_glyphs = meters.chars().filter(|c| *c != ' ').count();
+        let eq_glyphs = eq.chars().filter(|c| *c != ' ').count();
+        assert_eq!(
+            eq_glyphs * 2,
+            meter_glyphs,
+            "Eq is single-wide at the same band count"
         );
     }
 
@@ -797,10 +903,9 @@ mod tests {
                     .chars()
                     .count();
                 assert!(n <= width, "{style:?} overflowed {n} > {width}");
-                let delta = (n as i32 - meters as i32).unsigned_abs();
-                assert!(
-                    delta <= 1,
-                    "{style:?} painted {n} vs meters {meters} at width {width}"
+                assert_eq!(
+                    n, meters,
+                    "{style:?} must share the meters slot grid at width {width}"
                 );
             }
         }
