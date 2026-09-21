@@ -181,7 +181,10 @@ fn read_sysfs_hex_u16(path: &Path) -> Option<u16> {
 fn find_usb_sysfs() -> Option<UsbGogear> {
     let root = Path::new("/sys/bus/usb/devices");
     for ent in std::fs::read_dir(root).ok()? {
-        let path = ent.ok()?.path();
+        let Ok(ent) = ent else {
+            continue;
+        };
+        let path = ent.path();
         let Some(vid) = read_sysfs_hex_u16(&path.join("idVendor")) else {
             continue;
         };

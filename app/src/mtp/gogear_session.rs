@@ -43,33 +43,64 @@ impl GogearSession {
         self.mount.join("MUSIC")
     }
 
-    fn resolve(&self, path: &str) -> PathBuf {
+    fn resolve(&self, path: &str) -> Option<PathBuf> {
         let stripped = path.trim_start_matches('/').replace('\\', "/");
+        if has_parent_dir(&stripped) {
+            return None;
+        }
         if stripped.is_empty() {
-            self.mount.clone()
+            Some(self.mount.clone())
         } else if stripped.eq_ignore_ascii_case("MUSIC") {
-            self.music_dir()
+            Some(self.music_dir())
         } else if let Some(rest) = stripped
             .strip_prefix("MUSIC/")
             .or_else(|| stripped.strip_prefix("Music/"))
         {
-            self.music_dir().join(rest)
+            Some(self.music_dir().join(rest))
         } else {
-            self.mount.join(stripped)
+            Some(self.mount.join(stripped))
         }
     }
+
+    /// TUI rows are `/Music/{display}`; the HashMap is keyed on `display`.
+    fn display_key(path: &str) -> String {
+        let key = path.trim_start_matches('/').replace('\\', "/");
+        if let Some(rest) = key
+            .strip_prefix("MUSIC/")
+            .or_else(|| key.strip_prefix("Music/"))
+        {
+            rest.to_string()
+        } else {
+            key
+        }
+    }
+
+    fn lookup_on_disk(&self, device_path: &str) -> Option<PathBuf> {
+        let key = Self::display_key(device_path);
+        if has_parent_dir(&key) {
+            return None;
+        }
+        self.by_display
+            .get(&key)
+            .cloned()
+            .or_else(|| self.resolve(device_path))
+    }
+}
+
+fn has_parent_dir(path: &str) -> bool {
+    path.split(['/', '\\']).any(|p| p == "..")
 }
 
 fn is_skipped_name(name: &str) -> bool {
     matches!(
-        name,
+        name.to_ascii_lowercase().as_str(),
         "_system"
-            | "System Volume Information"
-            | ".Trash"
-            | ".Trashes"
+            | "system volume information"
+            | ".trash"
+            | ".trashes"
             | ".fseventsd"
-            | ".Spotlight-V100"
-            | "FOUND.000"
+            | ".spotlight-v100"
+            | "found.000"
     )
 }
 
@@ -154,7 +185,9 @@ fn tags_for(path: &Path) -> (String, String, String, Option<u32>, Option<u32>) {
 
 impl DeviceSession for GogearSession {
     fn ls(&mut self, path: &str) -> Result<Vec<DeviceEntry>, DeviceError> {
-        let real = self.resolve(path);
+        let Some(real) = self.resolve(path) else {
+            return Ok(Vec::new());
+        };
         if !real.exists() {
             return Ok(Vec::new());
         }
@@ -250,12 +283,9 @@ impl DeviceSession for GogearSession {
     }
 
     fn rm(&mut self, device_path: &str) -> Result<(), DeviceError> {
-        let key = device_path.trim_start_matches('/');
-        let real = self
-            .by_display
-            .get(key)
-            .cloned()
-            .unwrap_or_else(|| self.resolve(device_path));
+        let Some(real) = self.lookup_on_disk(device_path) else {
+            return Err(format!("Not found: {device_path}").into());
+        };
         if real.is_dir() {
             std::fs::remove_dir_all(&real)
                 .map_err(|e| format!("Cannot remove {}: {e}", real.display()))?;
@@ -275,7 +305,8 @@ impl DeviceSession for GogearSession {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::MetadataExt;
-                (meta.ino() as u32 == object_id).then(|| p.clone())
+                let ino = meta.ino();
+                (ino <= u64::from(u32::MAX) && ino as u32 == object_id).then(|| p.clone())
             }
             #[cfg(not(unix))]
             {
@@ -371,9 +402,9 @@ impl DeviceSession for GogearSession {
                 .to_lowercase();
             let display = format!(
                 "{}/{}/{}.{}",
-                sanitise(&artist).replace('/', "_"),
-                sanitise(&album).replace('/', "_"),
-                sanitise(&title).replace('/', "_"),
+                sanitise(&artist),
+                sanitise(&album),
+                sanitise(&title),
                 ext
             );
             let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
@@ -381,7 +412,14 @@ impl DeviceSession for GogearSession {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::MetadataExt;
-                    std::fs::metadata(&path).map(|m| m.ino()).unwrap_or(0)
+                    let ino = std::fs::metadata(&path).map(|m| m.ino()).unwrap_or(0);
+                    // Worker `rm_by_id` takes u32; if the inode does not
+                    // fit, leave 0 so removal falls back to the display path.
+                    if ino <= u64::from(u32::MAX) {
+                        ino
+                    } else {
+                        0
+                    }
                 }
                 #[cfg(not(unix))]
                 {
@@ -500,6 +538,40 @@ mod tests {
     }
 
     #[test]
+    fn rm_accepts_tui_music_prefix() {
+        let (dir, mut s) = tmp();
+        let src = dir.join("gone.mp3");
+        write_mp3(&src);
+        s.import_track(
+            src.to_str().unwrap(),
+            Some(&TrackMeta {
+                artist: "Art".into(),
+                album: "Alb".into(),
+                title: "Gone".into(),
+                track_number: None,
+                genre: None,
+            }),
+        )
+        .unwrap();
+        let tracks = s.collect_all_tracks("/MUSIC").unwrap();
+        assert_eq!(tracks.len(), 1);
+        s.rm(&format!("/Music/{}", tracks[0].name)).unwrap();
+        assert!(s.collect_all_tracks("/MUSIC").unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rm_rejects_parent_dir_escape() {
+        let (dir, mut s) = tmp();
+        std::fs::write(dir.join("STDBDATA.DAT"), b"idx").unwrap();
+        write_mp3(&dir.join("MUSIC").join("Art").join("Alb").join("t.mp3"));
+        let _ = s.collect_all_tracks("/MUSIC").unwrap();
+        assert!(s.rm("MUSIC/../STDBDATA.DAT").is_err());
+        assert!(dir.join("STDBDATA.DAT").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn ls_hides_system_dir() {
         let (dir, mut s) = tmp();
         std::fs::create_dir(dir.join("_system")).unwrap();
@@ -507,6 +579,16 @@ mod tests {
         let names: Vec<_> = s.ls("/").unwrap().into_iter().map(|e| e.name).collect();
         assert!(names.contains(&"MUSIC".into()));
         assert!(!names.contains(&"_system".into()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ls_hides_uppercase_system_dir() {
+        let (dir, mut s) = tmp();
+        std::fs::create_dir(dir.join("_SYSTEM")).unwrap();
+        std::fs::create_dir(dir.join("MUSIC")).unwrap();
+        let names: Vec<_> = s.ls("/").unwrap().into_iter().map(|e| e.name).collect();
+        assert!(!names.iter().any(|n| n.eq_ignore_ascii_case("_system")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
