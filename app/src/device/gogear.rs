@@ -336,6 +336,7 @@ fn linux_mount_for_usb(_usb: Option<&UsbGogear>) -> Option<(PathBuf, Option<Stri
     None
 }
 
+#[cfg(target_os = "linux")]
 fn mount_for_disk(disk: &str) -> Option<(PathBuf, Option<String>)> {
     let mounts = std::fs::read_to_string("/proc/mounts").ok()?;
     let prefix = format!("/dev/{disk}");
