@@ -668,6 +668,9 @@ impl App {
             {
                 self.pending_removal = Some(self.removal_queue.clone());
             }
+            KeyCode::Char('D') => {
+                self.handle_delete_key(cmd_tx);
+            }
             KeyCode::Char('C') => {
                 self.handle_clear_key();
             }
@@ -700,7 +703,7 @@ impl App {
     /// require tabbing over to the Device panel first.
     fn handle_delete_key(&mut self, cmd_tx: &mpsc::Sender<BgCommand>) {
         match self.active_panel {
-            Panel::SyncQueue => {
+            Panel::SyncQueue if !self.sync.queue.is_empty() => {
                 self.remove_queue_item();
                 return;
             }
@@ -709,8 +712,8 @@ impl App {
                     self.sidebar_items.get(self.sidebar_selected).cloned()
                 {
                     self.pending_playlist_delete = Some(id);
+                    return;
                 }
-                return;
             }
             Panel::TrackList if self.browse_mode == BrowseMode::Playlists => {
                 self.remove_selected_track_from_playlist();
@@ -730,6 +733,9 @@ impl App {
         self.device.ignore_session_events = true;
         let _ = cmd_tx.send(BgCommand::Disconnect);
         self.device.status = DeviceStatus::Disconnected;
+        self.device.loading_tracks = false;
+        self.device.sync_status = None;
+        self.connection_anim_start = None;
         self.device.clear_panel_identity();
         self.device.tracks.clear();
         self.clear_device_index();

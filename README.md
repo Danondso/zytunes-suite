@@ -4,17 +4,18 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.98%2B-orange.svg)](https://www.rust-lang.org)
 
-A Rust tool for syncing music (and photos/videos on Zune) to a Microsoft Zune or classic iPod from macOS and Linux.
+A Rust tool for syncing music (and photos/videos on Zune) to a Microsoft Zune, classic iPod, or Philips GoGear from macOS and Linux.
 
 ## Status
 
-**Active development.** Core functionality is working: device detection for both Zune and iPod Classic, MTPZ authentication (Zune), iTunesDB reads/writes (iPod), file listing, music push/remove, library sync (by artist, album, or track), and automatic transcoding of unsupported formats.
+**Active development.** Core functionality is working: device detection for Zune, iPod Classic, and Philips GoGear (ViBE UMS), MTPZ authentication (Zune), iTunesDB reads/writes (iPod), file listing, music push/remove, library sync (by artist, album, or track), and automatic transcoding of unsupported formats.
 
 ## What works
 
-- **Multi-device detection** — scans for both Microsoft Zune (VID `0x045e`, classic models + Zune HD PID `0x063e`) and classic iPod via `rusb` plus mounted-volume probing. CLI and TUI iterate registered backends and open a session against whichever device is connected
+- **Multi-device detection** — scans for Microsoft Zune (VID `0x045e`, classic models + Zune HD PID `0x063e`), classic iPod via `rusb` plus mounted-volume probing, and Philips GoGear flash players (VID `0x0471`, ViBE PID `0x20b6` and other known MSC PIDs). CLI and TUI iterate registered backends and open a session against whichever device is connected. A GoGear that is plugged in but not mounted is still detected so the TUI can ask you to mount the volume (override with `GOGEAR_MOUNT_PATH`)
 - **MTPZ authentication (Zune)** — the Zune requires Microsoft's encrypted MTPZ handshake before exposing storage. Handled automatically by `zune-mtp` (IOKit on macOS, libusb on Linux). Credentials are **not shipped**: copy a 5-line hex `.mtpz-data` file to `~/.mtpz-data`, or set `mtpz_data` / `ZYTUNES_MTPZ_DATA`. iPod sync does not use this file
 - **iPod Classic sync** — full music sync via a pure-Rust `ipod-db` crate. iTunesDB parser/writer with hash58 signing, ArtworkDB + ITHMB thumbnails, from-scratch libgpod-ported mhit writer for new tracks, and raw blob replay for lossless round-trip of existing tracks
+- **Philips GoGear sync** — USB mass-storage (no MTP). Music lands under `MUSIC/{Artist}/{Album}/` as MP3/WMA/WAV; other formats transcode to MP3. Firmware-owned `_system/` is never listed or deleted. Playlist/photo/video sync is not implemented. The ViBE indexes ID3 after you unplug
 - **File listing** — `ls [path]` enumerates storage and prints the device's directory tree (device browser in the TUI shows human-readable `Artist/Album/Title.ext` paths on the iPod instead of the hashed F-dir filenames)
 - **Music push** — `push <files...>` uploads music files to the device with proper metadata
 - **Music removal** — `rm <device-paths...>` removes files/folders from the device (leaf-first for directories; firmware `DeleteObject` on a non-empty folder does not cascade)
@@ -22,13 +23,13 @@ A Rust tool for syncing music (and photos/videos on Zune) to a Microsoft Zune or
 - **Library scan** — `scan` pre-warms the directory-library cache without opening the TUI (useful for large libraries)
 - **Photo & video sync (Zune)** — `photo-sync [dir]` and `video-sync [dir]` push images and videos to the Zune's Pictures/Video stores. Videos are transcoded to WMV2/WMAv2 via ffmpeg; photos are JPEG-normalised and resized to fit 240×320. iPod photo/video sync is not implemented
 - **Auto-transcoding (audio)** — formats the connected device does not play natively are transcoded via pure-Rust symphonia + LAME (MP3) or ffmpeg (FLAC→ALAC on iPod). Default MP3 quality is LAME `-V 2` (~190 kbps VBR); override with `--quality` / `-q`, `ZYTUNES_TRANSCODE_QUALITY`, or `transcode_quality` in config (`v0` / `v2` / `v4` / `cbr-128` / `cbr-192` / `cbr-256` / `cbr-320`). Sync and push encode those tracks in parallel (rayon) before sequential USB upload. Zune album art is resized to 200×200 JPEG. The M4A/ALAC→MP3 path trims trailing silence leaked by symphonia's unapplied `elst` edit-list atoms
-- **Native-format passthrough** — Zune natives (MP3, WMA, AAC) skip transcoding. iPod natives are broader (MP3, M4A, AAC, ALAC, WAV, AIFF); only OGG/OPUS drop to MP3 on iPod
+- **Native-format passthrough** — Zune natives (MP3, WMA, AAC) skip transcoding. iPod natives are broader (MP3, M4A, AAC, ALAC, WAV, AIFF); only OGG/OPUS drop to MP3 on iPod. GoGear natives are MP3, WMA, and WAV
 - **Per-device lossless promotion** — FLAC library tracks pushed to iPod transcode to ALAC (lossless) instead of dropping to MP3. Zune still falls through to MP3 since its firmware has no lossless container. Controlled by `DeviceCapabilities::lossless_target`
 - **CD import** — insert an audio CD and zytunes shows a status bar with the disc's artist/album (identified via MusicBrainz; libdiscid reads the disc TOC and our pure-Rust `compute_disc_id` derives the MB disc ID from it). Press `i` to open an import overlay: toggle individual tracks, cycle through alternate release matches, pick a fidelity (FLAC, WAV, or MP3 V2 / V0 / 320 CBR), and optionally auto-eject when done. Files land under `{music_dir}/{Artist}/{Album}/01 - Title.{ext}` with Picard-equivalent tags (identity, numbering, ISRC / barcode / catalog / label, and 6 MusicBrainz IDs — track, recording, release, release-group, release-artist, and track-artist — that the tag manager keys on)
 - **Library browsing** — `library [query]` browses/searches your music library
 - **Directory scanning** — point zytunes at a music folder. It reads tags via lofty (FLAC, M4A, OGG, WAV, MP3, etc.) and infers metadata from the directory structure (`Artist/Album/Track.ext`) for untagged files. Set `ZYTUNES_MUSIC_DIR` or add `music_dir` to `~/.config/zytunes/config.toml`
-- **Interactive TUI** — `zytunes-tui` launches a terminal UI (ratatui) for browsing your music library, connecting to the device, managing a sync queue, and monitoring sync progress. Library scanning runs in the background on startup. The left panel draws Zune-shaped ASCII art (same drawing for iPod) plus firmware / serial / model, a storage bar, loading spinner, track count, and queue count; the sidebar/header labels the connected family (`Zune` / `iPod`). iPod titles use the iTunes-assigned name from `iPod_Control/iTunes/DeviceInfo` when present, otherwise a generation + capacity label composed from SysInfo `ModelNumStr` (libgpod suffix table covering 1G through Classic, plus mini / nano / shuffle), SysInfoExtended `FamilyID`, USB product ID, and storage size. The panel also shows USB PID, volume format (`FAT` / `HFS+`, including read-only; from the mount table on Linux and macOS), and firmware from SysInfo or — on Linux — the block-device revision in sysfs when SysInfo is empty. Capacity uses Apple marketing sizes when the measured disk is within ~15% of a shipped SKU; flash-modded volumes keep the measured GB.
-- **Device content browsing** — `v` cycles Library → Device (when connected) → Playlists. Device mode organises tracks by artist/album; the sidebar auto-labels itself `Zune: …` or `iPod: …`. The Duration column is filled from the device (MTP `0xDC89` on Zune, iTunesDB mhit on iPod) with a library-tag fallback so matched tracks aren't blank while handles are still merging
+- **Interactive TUI** — `zytunes-tui` launches a terminal UI (ratatui) for browsing your music library, connecting to the device, managing a sync queue, and monitoring sync progress. Library scanning runs in the background on startup. The left panel draws Zune-shaped ASCII art (same drawing for iPod) plus firmware / serial / model, a storage bar, loading spinner, track count, and queue count; the sidebar/header labels the connected family (`Zune` / `iPod` / `GoGear`). iPod titles use the iTunes-assigned name from `iPod_Control/iTunes/DeviceInfo` when present, otherwise a generation + capacity label composed from SysInfo `ModelNumStr` (libgpod suffix table covering 1G through Classic, plus mini / nano / shuffle), SysInfoExtended `FamilyID`, USB product ID, and storage size. The panel also shows USB PID, volume format (`FAT` / `HFS+`, including read-only; from the mount table on Linux and macOS), and firmware from SysInfo or — on Linux — the block-device revision in sysfs when SysInfo is empty. Capacity uses Apple marketing sizes when the measured disk is within ~15% of a shipped SKU; flash-modded volumes keep the measured GB.
+- **Device content browsing** — `v` cycles Library → Device (when connected) → Playlists. Device mode organises tracks by artist/album; the sidebar auto-labels itself `Zune: …`, `iPod: …`, or `GoGear: …`. The Duration column is filled from the device (MTP `0xDC89` on Zune, iTunesDB mhit on iPod) with a library-tag fallback so matched tracks aren't blank while handles are still merging
 - **Playlists** — a third browse mode for manual and generated playlists (Discover Weekly-style form). Create (`N`), rename (`e`), regenerate (`R`), generate from a library selection (`G`), add a library track (`+`), delete a playlist or drop a track (`d`). Playlists can be queued for device sync with `a`
 - **Device track removal** — in Device mode, `a` (and `A` on the track list) queues the current selection for removal; `D` confirms and executes the removal queue; `C` clears it. `U` dedupes copies on the device, keeping the newest. Progress is shown during removal and the device track list auto-refreshes afterward
 - **Album-art rendering** — two renderers: unicode `halfblock` (default) and a 10-char luminance ramp `ascii` renderer. Press `T` to toggle; choice persists to `config.toml`. Per-album renderings are cached at `~/.cache/zytunes/art/` keyed by `(artist, album)` with `(mtime, size)` fingerprint invalidation so re-tagging refreshes automatically
@@ -90,7 +91,7 @@ The TUI reads `music_dir` from `~/.config/zytunes/config.toml`, or falls back to
 `v` cycles through:
 
 - **Library** (default) — browse your music library by Artists (`1`) or Albums (`2`). Digit keys become stem toggles instead while the stem strip is on screen (see Playback)
-- **Device** — tracks on the connected device, organised by Artist/Album. Skipped in the cycle when nothing is connected. Sidebar header auto-labels itself "Zune: …" or "iPod: …"
+- **Device** — tracks on the connected device, organised by Artist/Album. Skipped in the cycle when nothing is connected. Sidebar header auto-labels itself "Zune: …", "iPod: …", or "GoGear: …"
 - **Playlists** — manual and generated playlists. Reachable with `v` even with no device plugged in
 
 The album detail view shows a ZIP disk ASCII art with album metadata (artist, album, year, track count, duration) alongside the track table.
@@ -139,9 +140,9 @@ Bindings are context-sensitive. An open modal (search, help, CD import, tag mana
 
 | Key | Action |
 |-----|--------|
-| `c` | Connect (only when disconnected; USB detect, then MTPZ handshake on Zune or volume mount on iPod) |
+| `c` | Connect (only when disconnected; USB detect, then MTPZ handshake on Zune or volume mount on iPod / GoGear) |
 | `r` | Refresh device track list (when connected) |
-| `d` | Disconnect (from any panel that does not claim `d` for dequeue / playlist delete). The iPod volume stays mounted so `c` can reconnect without a replug |
+| `d` | Disconnect (from any panel that does not claim `d` for dequeue / playlist delete). The iPod / GoGear volume stays mounted so `c` can reconnect without a replug |
 | `a` | Queue the current selection for removal |
 | `A` | Same as `a` on the current selection (not "remove all") |
 | `D` | Confirm and execute the removal queue |
@@ -258,9 +259,9 @@ The TUI works in any EAW-compliant terminal (Alacritty, kitty, wezterm, Zed's em
 ### Sync workflow
 
 1. Browse your music library and press `a` to add artists, albums, or individual tracks to the sync queue
-2. Press `c` to connect to the device (auto-detects via USB, performs MTPZ handshake on Zune / mounts the iPod volume)
+2. Press `c` to connect to the device (auto-detects via USB, performs MTPZ handshake on Zune / uses the mounted iPod or GoGear volume). A plugged-in GoGear that is not mounted still shows up so you can mount it and press `c` again (`GOGEAR_MOUNT_PATH` overrides)
 3. Press `S` or switch to the queue and press `Enter` to start syncing
-4. Formats the device does not play natively are transcoded (Zune → MP3 at the configured quality, default LAME `-V 2` ~190 kbps, with 200×200 art; iPod keeps WAV/AIFF/M4A/ALAC and promotes FLAC → ALAC). `--quality` / `ZYTUNES_TRANSCODE_QUALITY` / `transcode_quality` select `v0`, `v2`, `v4`, or CBR 128–320; FLAC→ALAC ignores the MP3 setting
+4. Formats the device does not play natively are transcoded (Zune → MP3 at the configured quality, default LAME `-V 2` ~190 kbps, with 200×200 art; iPod keeps WAV/AIFF/M4A/ALAC and promotes FLAC → ALAC; GoGear natives are MP3/WMA/WAV). `--quality` / `ZYTUNES_TRANSCODE_QUALITY` / `transcode_quality` select `v0`, `v2`, `v4`, or CBR 128–320; FLAC→ALAC ignores the MP3 setting
 5. Progress and results appear in the log panel; device track list auto-refreshes on completion. Tracks already on the device are skipped automatically and noted in the log
 6. If the device disconnects mid-sync (unplug, unrecoverable stall), the TUI aborts remaining items, drops the session, and tells you to replug
 
@@ -420,7 +421,7 @@ cargo build
 cargo run
 ```
 
-Connect a Zune or iPod via USB, then run the tool.
+Connect a Zune, iPod, or GoGear via USB, then run the tool.
 
 ### Debugging
 
@@ -589,7 +590,7 @@ MIT — see [LICENSE](LICENSE). Third-party notices in [THIRD_PARTY.md](THIRD_PA
 
 ## Trademarks
 
-"Zune" is a trademark of Microsoft Corporation. "iPod" and "iTunes" are
+"Zune" is a trademark of Microsoft Corporation. "GoGear" is a trademark of Koninklijke Philips N.V. "iPod" and "iTunes" are
 trademarks of Apple Inc. zytunes is an independent interoperability tool and
 is not affiliated with, endorsed by, or sponsored by Microsoft or Apple. All
 product names are used under nominative fair use for the sole purpose of

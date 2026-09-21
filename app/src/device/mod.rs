@@ -1,7 +1,9 @@
+pub mod gogear;
 pub mod ipod;
 mod ipod_models;
 pub mod zune;
 
+pub use gogear::{gogear_capacity_label, GogearBackend, GogearDeviceData};
 pub use ipod::{IpodBackend, IpodDeviceData};
 pub use ipod_models::{ipod_model_label, IpodModelHints};
 pub use zune::{zune_model_from_storage, ZuneBackend, ZuneDetectError, ZuneDevice, ZuneDeviceData};
@@ -13,6 +15,7 @@ use crate::mtp::DeviceSession;
 pub enum DeviceFamily {
     Zune,
     Ipod,
+    Gogear,
 }
 
 impl DeviceFamily {
@@ -21,6 +24,7 @@ impl DeviceFamily {
         match self {
             DeviceFamily::Zune => "Zune",
             DeviceFamily::Ipod => "iPod",
+            DeviceFamily::Gogear => "GoGear",
         }
     }
 }
@@ -37,8 +41,8 @@ pub struct DeviceCapabilities {
     /// Highest-fidelity *lossless* container the device's firmware accepts
     /// natively. `Some("alac")` for iPod Classic (FLAC sources transcode
     /// up to lossless ALAC on push instead of falling through to lossy
-    /// MP3); `None` for the Zune (no native lossless support — sources
-    /// always go through the lossy `transcode_target` path).
+    /// MP3); `None` for Zune and GoGear (no native lossless support —
+    /// sources always go through the lossy `transcode_target` path).
     pub lossless_target: Option<&'static str>,
 }
 
@@ -75,5 +79,6 @@ mod tests {
     fn family_label() {
         assert_eq!(DeviceFamily::Zune.label(), "Zune");
         assert_eq!(DeviceFamily::Ipod.label(), "iPod");
+        assert_eq!(DeviceFamily::Gogear.label(), "GoGear");
     }
 }

@@ -8029,6 +8029,33 @@ mod tests {
     }
 
     #[test]
+    fn d_on_empty_sync_queue_disconnects() {
+        use crate::audio::AudioCommand;
+        use crate::background::BgCommand;
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<BgCommand>();
+        let (audio_tx, _audio_rx) = std::sync::mpsc::channel::<AudioCommand>();
+        let mut app = App::new();
+        app.device.status = DeviceStatus::Connected;
+        app.active_panel = Panel::SyncQueue;
+        assert!(app.sync.queue.is_empty());
+
+        app.handle_key(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('d'),
+                crossterm::event::KeyModifiers::empty(),
+            ),
+            &cmd_tx,
+            &audio_tx,
+        );
+
+        assert_eq!(app.device.status, DeviceStatus::Disconnected);
+        assert!(
+            matches!(cmd_rx.try_recv(), Ok(BgCommand::Disconnect)),
+            "empty queue must not swallow disconnect"
+        );
+    }
+
+    #[test]
     fn d_when_disconnected_is_a_noop() {
         use crate::audio::AudioCommand;
         use crate::background::BgCommand;

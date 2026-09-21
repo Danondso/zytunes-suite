@@ -198,7 +198,8 @@ pub fn connection_screen_lines(
             (dots, found_label)
         }
         2 => match family {
-            Some(zytunes::device::DeviceFamily::Ipod) => {
+            Some(zytunes::device::DeviceFamily::Ipod)
+            | Some(zytunes::device::DeviceFamily::Gogear) => {
                 let dots = match (sub / 5) % 4 {
                     0 => "Opening",
                     1 => "Opening.",
@@ -837,7 +838,12 @@ mod tests {
     #[test]
     fn connection_screen_lines_fit_width() {
         use zytunes::device::DeviceFamily;
-        for family in [None, Some(DeviceFamily::Zune), Some(DeviceFamily::Ipod)] {
+        for family in [
+            None,
+            Some(DeviceFamily::Zune),
+            Some(DeviceFamily::Ipod),
+            Some(DeviceFamily::Gogear),
+        ] {
             for frame in 0..100 {
                 let (line1, line2) = connection_screen_lines(frame, family);
                 assert!(

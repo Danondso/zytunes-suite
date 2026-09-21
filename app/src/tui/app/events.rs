@@ -652,7 +652,7 @@ impl App {
         let allow = match family {
             Some(zytunes::device::DeviceFamily::Zune) => true,
             Some(zytunes::device::DeviceFamily::Ipod) => self.experimental_playlist_sync,
-            None => false,
+            Some(zytunes::device::DeviceFamily::Gogear) | None => false,
         };
         let drained = std::mem::take(&mut self.pending_playlist_imports);
         for spec in drained {
@@ -670,6 +670,9 @@ impl App {
                         "iPod playlist sync gated off after 2026-04-26 \
                          iTunesDB-corruption incident; set \
                          ZYTUNES_EXPERIMENTAL_PLAYLIST_SYNC=1 to opt in"
+                    }
+                    Some(zytunes::device::DeviceFamily::Gogear) => {
+                        "playlist sync is not supported on GoGear"
                     }
                     _ => "no device session active",
                 };
