@@ -32,7 +32,7 @@ use zytunes::mtp::parse::DeviceEntry;
 
 use std::path::PathBuf;
 
-use crate::audio::{AudioCommand, AudioEvent};
+use crate::audio::{AudioCommand, AudioEvent, SoundbarStyle, Waveform};
 use crate::background::{BgCommand, StorageInfo, SyncItem};
 use crate::theme::{all_themes, Theme};
 use crossterm::event::{KeyCode, KeyEvent};
@@ -1108,6 +1108,8 @@ pub struct App {
     pub anim_frame: usize,
     pub connection_anim_start: Option<usize>,
     pub now_playing: Option<NowPlaying>,
+    /// Live spectrum bars written by the audio thread; the soundbar reads it.
+    pub waveform: Arc<Waveform>,
     pub removal_queue: Vec<(String, u64)>,
     pub pending_removal: Option<Vec<(String, u64)>>,
     pub pending_cache_clear: bool,
@@ -1159,6 +1161,9 @@ pub struct App {
     album_art_size: (u16, u16),
     /// Renderer style for album art: halfblock (Unicode half-block) or ascii (character ramp).
     pub album_art_style: AlbumArtStyle,
+    /// Now-playing soundbar draw style. `None` follows the active theme.
+    /// `W` sets an override; picking a theme clears it.
+    pub soundbar_style: Option<SoundbarStyle>,
     /// User preference for the now-playing panel. `None` means "auto" (show
     /// whenever there's a track and the terminal is tall enough); `Some(false)`
     /// force-hides the panel regardless. Persisted to `config.toml`.
@@ -1425,6 +1430,7 @@ impl App {
             anim_frame: 0,
             connection_anim_start: None,
             now_playing: None,
+            waveform: Waveform::new(),
             removal_queue: Vec::new(),
             pending_removal: None,
             pending_cache_clear: false,
@@ -1453,6 +1459,7 @@ impl App {
             album_art_cache: None,
             album_art_size: (0, 0),
             album_art_style: AlbumArtStyle::Halfblock, // overwritten below from config
+            soundbar_style: None,                      // overwritten below from config
             show_player: None,                         // overwritten below from config
             pending_bg_commands: Vec::new(),
             // Disk state is loaded explicitly by `load_local_plays_from_disk`
@@ -1505,6 +1512,7 @@ impl App {
             .as_deref()
             .and_then(|s| s.parse().ok())
             .unwrap_or(AlbumArtStyle::Halfblock);
+        app.soundbar_style = cfg.soundbar_style.as_deref().and_then(|s| s.parse().ok());
         app.show_player = cfg.show_player;
         app.mb_base_url = cfg.musicbrainz_base_url;
         app.mb_user_agent = cfg.musicbrainz_user_agent;
@@ -2146,13 +2154,13 @@ impl App {
     /// Rows the now-playing panel occupies when shown: one extra while a
     /// stem strip is rendering inside it. The single source of truth for
     /// `ui::draw`'s layout AND the run loop's album-art pre-render — the
-    /// pre-render sizing art against a hardcoded 9 clipped the art's
+    /// pre-render sizing art against a hardcoded height clipped the art's
     /// bottom row whenever stems were engaged.
     pub fn player_panel_height(&self) -> u16 {
         if self.stems.status != StemStatus::Off {
-            10
+            11
         } else {
-            9
+            10
         }
     }
 
@@ -2185,6 +2193,33 @@ impl App {
         self.album_art_size = (0, 0);
     }
 
+    /// Cycle the now-playing soundbar style and persist it. Returns a
+    /// toast label for the new style. Starts from the theme default when
+    /// no override is set.
+    pub fn cycle_soundbar_style(&mut self) -> &'static str {
+        let label = self.cycle_soundbar_style_in_memory();
+        let style = self.soundbar_style.map(|s| s.as_str().to_string());
+        crate::config::update(|c| c.soundbar_style = style);
+        label
+    }
+
+    fn cycle_soundbar_style_in_memory(&mut self) -> &'static str {
+        let next = self.effective_soundbar_style().next();
+        self.soundbar_style = Some(next);
+        next.label()
+    }
+
+    /// Style actually drawn: theme default, unless `W` overrode it.
+    /// While the theme picker is open the highlighted theme always wins
+    /// so live preview shows that theme's visualizer.
+    pub fn effective_soundbar_style(&self) -> SoundbarStyle {
+        if self.show_theme_picker {
+            self.theme.soundbar_style
+        } else {
+            self.soundbar_style.unwrap_or(self.theme.soundbar_style)
+        }
+    }
+
     pub fn theme(&self) -> &'static Theme {
         self.theme
     }
@@ -2205,8 +2240,12 @@ impl App {
 
     pub fn theme_picker_confirm(&mut self) {
         self.show_theme_picker = false;
+        self.soundbar_style = None;
         let theme_name = self.theme.name.to_string();
-        crate::config::update(|c| c.theme = Some(theme_name));
+        crate::config::update(|c| {
+            c.theme = Some(theme_name);
+            c.soundbar_style = None;
+        });
     }
 
     pub fn theme_picker_cancel(&mut self) {
@@ -9336,6 +9375,40 @@ mod tests {
     }
 
     #[test]
+    fn cycle_soundbar_style_in_memory_rotates() {
+        let mut app = App::new();
+        app.theme = crate::theme::theme_by_name("iTunes 2004");
+        app.soundbar_style = None;
+        assert_eq!(app.effective_soundbar_style(), SoundbarStyle::Meters);
+        assert_eq!(app.cycle_soundbar_style_in_memory(), "Soundbar: eq");
+        assert_eq!(app.soundbar_style, Some(SoundbarStyle::Eq));
+        assert_eq!(app.cycle_soundbar_style_in_memory(), "Soundbar: mirror");
+        assert_eq!(app.cycle_soundbar_style_in_memory(), "Soundbar: pulse");
+        assert_eq!(app.cycle_soundbar_style_in_memory(), "Soundbar: dots");
+        assert_eq!(app.cycle_soundbar_style_in_memory(), "Soundbar: meters");
+        assert_eq!(app.soundbar_style, Some(SoundbarStyle::Meters));
+    }
+
+    #[test]
+    fn soundbar_follows_theme_until_overridden() {
+        let mut app = App::new();
+        app.soundbar_style = None;
+        app.theme = crate::theme::theme_by_name("WinAmp Classic");
+        assert_eq!(app.effective_soundbar_style(), SoundbarStyle::Mirror);
+        app.theme = crate::theme::theme_by_name("BIOS");
+        assert_eq!(app.effective_soundbar_style(), SoundbarStyle::Eq);
+        app.soundbar_style = Some(SoundbarStyle::Eq);
+        assert_eq!(app.effective_soundbar_style(), SoundbarStyle::Eq);
+        app.show_theme_picker = true;
+        app.theme = crate::theme::theme_by_name("WinAmp Classic");
+        assert_eq!(
+            app.effective_soundbar_style(),
+            SoundbarStyle::Mirror,
+            "theme picker preview ignores the W override"
+        );
+    }
+
+    #[test]
     fn render_album_art_populates_only_active_cache() {
         use image::{DynamicImage, RgbaImage};
 
@@ -12669,13 +12742,13 @@ mod tests {
     #[test]
     fn player_panel_height_grows_while_stems_engaged() {
         let mut app = stem_playing_app("/lib/song.mp3");
-        assert_eq!(app.player_panel_height(), 9);
+        assert_eq!(app.player_panel_height(), 10);
         app.stems.status = StemStatus::Separating { pct: None };
-        assert_eq!(app.player_panel_height(), 10);
+        assert_eq!(app.player_panel_height(), 11);
         app.stems.status = StemStatus::Active;
-        assert_eq!(app.player_panel_height(), 10);
+        assert_eq!(app.player_panel_height(), 11);
         app.stems.status = StemStatus::Off;
-        assert_eq!(app.player_panel_height(), 9);
+        assert_eq!(app.player_panel_height(), 10);
     }
 
     #[test]

@@ -18,6 +18,10 @@ pub struct Config {
     /// string reads as unset. iPod sync does not use this file.
     pub mtpz_data: Option<String>,
     pub album_art_style: Option<String>,
+    /// Now-playing soundbar draw style (`meters` / `eq` / `mirror` /
+    /// `pulse` / `dots`). Unset follows the active theme. `W` writes an
+    /// override; picking a theme clears it.
+    pub soundbar_style: Option<String>,
     /// User preference for the now-playing panel. `None` means "auto" (show
     /// when there's a track and the terminal is tall enough). `Some(false)`
     /// force-hides the panel even when playback is active.
@@ -296,6 +300,7 @@ music_dir = "/home/user/Music"
         assert!(config.cache_dir.is_none());
         assert!(config.mtpz_data.is_none());
         assert!(config.album_art_style.is_none());
+        assert!(config.soundbar_style.is_none());
         assert!(config.show_player.is_none());
     }
 
@@ -343,6 +348,7 @@ music_dir = "/home/user/Music"
         assert!(config.cache_dir.is_none());
         assert!(config.mtpz_data.is_none());
         assert!(config.album_art_style.is_none());
+        assert!(config.soundbar_style.is_none());
         assert!(config.show_player.is_none());
         assert!(config.fingerprinting.is_none());
         assert!(config.acoustid_fingerprint.is_none());
@@ -499,6 +505,19 @@ music_dir = "/home/user/Music"
             let serialized = toml::to_string_pretty(&config).unwrap();
             let deserialized: Config = toml::from_str(&serialized).unwrap();
             assert_eq!(deserialized.album_art_style.as_deref(), Some(style));
+        }
+    }
+
+    #[test]
+    fn config_round_trip_soundbar_style() {
+        for style in ["meters", "eq", "mirror", "pulse", "dots"] {
+            let config = Config {
+                soundbar_style: Some(style.into()),
+                ..Config::default()
+            };
+            let serialized = toml::to_string_pretty(&config).unwrap();
+            let deserialized: Config = toml::from_str(&serialized).unwrap();
+            assert_eq!(deserialized.soundbar_style.as_deref(), Some(style));
         }
     }
 

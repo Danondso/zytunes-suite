@@ -50,7 +50,7 @@ const STANDARD_TIER_MAX_W: u16 = 140;
 /// Terminal height below which the now-playing panel can't physically fit.
 /// `pub(crate)` because `App::stem_strip_visible` mirrors this floor when
 /// deciding whether the stem keys may claim input.
-pub(crate) const PLAYER_MIN_H: u16 = 12;
+pub(crate) const PLAYER_MIN_H: u16 = 13;
 
 impl LayoutMetrics {
     /// `show_player` is the final resolved decision from the caller — it
@@ -1842,6 +1842,7 @@ fn draw_keys_panel(f: &mut Frame, app: &App, area: Rect) {
         ("v", "Lib/Dev/Plist"),
         ("t", "Theme picker"),
         ("T", "Art style"),
+        ("W", "Soundbar"),
         ("P", "Player panel"),
         ("M", "Stem mixer/batch"),
         ("o", "Stem settings"),
@@ -2077,35 +2078,42 @@ fn draw_now_playing(f: &mut Frame, app: &App, np: &NowPlaying, area: Rect, art_w
     }
 
     // --- Info (left side) ---
-    // Slot the metadata marquee in just under the time row when there's
-    // both content to show and a row of vertical headroom. Falls back to
-    // the original 5-row layout otherwise so cramped windows degrade
-    // gracefully.
-    let show_marquee = !np.metadata_marquee.is_empty() && info_area.height >= 6;
-    let rows = if show_marquee {
+    // Soundbar takes a leftover inner row (height ≥ 6), plus Hz labels
+    // under it (≥ 7). The metadata marquee needs one more (≥ 8) so all
+    // three fit in the default 8-row inner area. Cramped windows drop
+    // the marquee first, then the labels, then the bar.
+    let show_wave = info_area.height >= 6;
+    let show_wave_labels = show_wave && info_area.height >= 7;
+    let show_marquee = !np.metadata_marquee.is_empty()
+        && info_area.height
+            >= if show_wave_labels {
+                8
+            } else if show_wave {
+                7
+            } else {
+                6
+            };
+    let rows = {
+        let mut constraints = vec![
+            Constraint::Length(1), // track name
+            Constraint::Length(1), // artist — album (year)
+            Constraint::Length(1), // controls
+            Constraint::Length(1), // progress bar
+            Constraint::Length(1), // time + hints
+        ];
+        if show_marquee {
+            constraints.push(Constraint::Length(1));
+        }
+        if show_wave {
+            constraints.push(Constraint::Length(1));
+        }
+        if show_wave_labels {
+            constraints.push(Constraint::Length(1));
+        }
+        constraints.push(Constraint::Min(0)); // stem strip / absorb extra
         Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1), // track name
-                Constraint::Length(1), // artist — album (year)
-                Constraint::Length(1), // controls
-                Constraint::Length(1), // progress bar
-                Constraint::Length(1), // time + hints
-                Constraint::Length(1), // metadata marquee
-                Constraint::Min(0),    // absorb extra
-            ])
-            .split(info_area)
-    } else {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1), // track name
-                Constraint::Length(1), // artist — album (year)
-                Constraint::Length(1), // controls
-                Constraint::Length(1), // progress bar
-                Constraint::Length(1), // time + hints
-                Constraint::Min(0),    // absorb extra
-            ])
+            .constraints(constraints)
             .split(info_area)
     };
 
@@ -2201,6 +2209,47 @@ fn draw_now_playing(f: &mut Frame, app: &App, np: &NowPlaying, area: Rect, art_w
             Paragraph::new(format!("  {}", scrolled)).style(Style::default().fg(t.dim_text)),
             rows[5],
         );
+    }
+
+    let mut extra = if show_marquee { 6 } else { 5 };
+    if show_wave {
+        let wave_row = rows[extra];
+        extra += 1;
+        let bar_w = wave_row.width.saturating_sub(2) as usize;
+        let color = if np.state == PlaybackState::Playing {
+            None
+        } else {
+            Some(t.dim_text)
+        };
+        // Theme owns glyph alphabet + colouring; `W` only switches layout.
+        let style = app.effective_soundbar_style();
+        let atoms = crate::audio::soundbar_atoms(&app.waveform, style, bar_w, t.soundbar_ramp);
+        let spans: Vec<Span> = atoms
+            .into_iter()
+            .map(|a| {
+                if a.gap {
+                    Span::raw(" ")
+                } else {
+                    let fg = color.unwrap_or_else(|| t.soundbar_fg(a.peak, a.pos));
+                    Span::styled(a.ch.to_string(), Style::default().fg(fg))
+                }
+            })
+            .collect();
+        f.render_widget(
+            Paragraph::new(Line::from(spans)).alignment(Alignment::Center),
+            wave_row,
+        );
+        if show_wave_labels {
+            let labels = crate::audio::soundbar_labels(style, bar_w);
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    labels,
+                    Style::default().fg(t.dim_text).add_modifier(Modifier::DIM),
+                )))
+                .alignment(Alignment::Center),
+                rows[extra],
+            );
+        }
     }
 
     // Stem strip — the Min(0) absorber row at the bottom (the panel is one
@@ -2738,6 +2787,7 @@ fn draw_help_overlay(f: &mut Frame, app: &App) {
         "  v           Cycle Library / Device / Playlists",
         "  t           Theme picker",
         "  T           Toggle album art style (halfblock/ASCII)",
+        "  W           Cycle soundbar (overrides the theme default)",
         "  P           Cycle player panel (auto / hidden / always)",
         "  o           Stem settings",
         "  i           CD import",
@@ -4745,13 +4795,13 @@ mod tests {
         // LayoutMetrics only enforces the absolute floor below which the panel
         // can't physically fit. Height-vs-auto semantics live in
         // `App::should_show_player`, which is the input here.
-        let area = Rect::new(0, 0, 160, 11);
-        let m = LayoutMetrics::new(area, false, false, true);
-        assert!(!m.show_now_playing, "height 11 < 12-row floor");
-
         let area = Rect::new(0, 0, 160, 12);
         let m = LayoutMetrics::new(area, false, false, true);
-        assert!(m.show_now_playing, "height 12 meets floor");
+        assert!(!m.show_now_playing, "height 12 < 13-row floor");
+
+        let area = Rect::new(0, 0, 160, 13);
+        let m = LayoutMetrics::new(area, false, false, true);
+        assert!(m.show_now_playing, "height 13 meets floor");
 
         // Force-hide wins regardless of height.
         let area = Rect::new(0, 0, 160, 40);

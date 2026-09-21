@@ -8,8 +8,6 @@
 
 - **Theming (remaining)**
   - Theme preview screenshots in docs
-- **Player Support (remaining)**
-  - Soundbar/waveform visualizer effect (research terminal audio visualizers — rodio already exposes the sample stream)
 - **Radio Support**
   - Research a terminal radio source we can pipe into the rodio player.
 - **Scrobbling** — hook into TUI player track-change events to submit listens
@@ -83,6 +81,7 @@
 
 ## Done
 
+- **Now-playing soundbar** — lock-free spectrum snapshot drawn centered in the now-playing panel. Each theme picks a layout, glyph alphabet, and colour mode; `W` overrides the layout until the next theme change. Quiet bands keep a floor mark; graphic-EQ Hz (`32` `64` `125` `1k` …) sits under each band (Pulse is a level mountain and has no Hz labels). Pause freezes the bars, Play/Stop clear them.
 - **Diagnostics: playlist/listen-log Logger** — `PlaylistStore` and `ListenLog` take a `Logger`; CLI uses stderr, TUI routes into `SyncMessage`. No `eprintln!` on those hot paths.
 - **Diagnostics: playlist lookup USB errors** — `find_existing_playlist` propagates `get_object_handles` failures and `DeviceGone` from `get_object_info` instead of falling through to create a duplicate `.zpl`. Non-fatal per-object errors skip that handle (logged). The TUI worker drops the session on `DeviceGone`.
 - **Batch transcoding** — CLI `sync`/`push` and the TUI sync queue encode non-native tracks in parallel via rayon (`transcode_paths_parallel`) then upload sequentially over USB. The TUI only prefetches a CPU-width window of upcoming encodes so `AppendSyncQueue` can still extend a run. Temp outputs include a source-path hash so same-stem files (two albums' `01 - Intro.flac`) do not clobber each other. The TUI now uses `transcode_for_device` (FLAC→ALAC on iPod) rather than always dropping to MP3.

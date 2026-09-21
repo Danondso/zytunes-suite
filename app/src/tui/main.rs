@@ -83,7 +83,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Set up audio thread.
     let (audio_event_tx, audio_event_rx) = mpsc::channel();
-    let audio_cmd_tx = audio::spawn(audio_event_tx);
+    let audio_cmd_tx = audio::spawn(audio_event_tx, std::sync::Arc::clone(&app.waveform));
 
     // Kick off async library load. `fingerprinting` defaults to true when
     // unset; setting `fingerprinting = false` in config.toml skips the
@@ -148,7 +148,7 @@ fn run_loop(
             // a minimum of 4 rows for the track list, borders, footer, player.
             let show_player = app.should_show_player(size.height);
             // borders + footer + player; the player height comes from the
-            // same accessor draw() uses (10 while stems are engaged) so
+            // same accessor draw() uses (11 while stems are engaged) so
             // the art is sized for the panel that will actually be drawn.
             let overhead: u16 = 2
                 + 3
