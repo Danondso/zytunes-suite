@@ -552,6 +552,7 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
             Some(family) => match family {
                 zytunes::device::DeviceFamily::Ipod => "iPod: ",
                 zytunes::device::DeviceFamily::Zune => "Zune: ",
+                zytunes::device::DeviceFamily::Gogear => "GoGear: ",
             },
             None => "",
         },
@@ -1891,6 +1892,7 @@ fn draw_keys_panel(f: &mut Frame, app: &App, area: Rect) {
                 match app.device.family {
                     Some(zytunes::device::DeviceFamily::Ipod) => " iPod Library",
                     Some(zytunes::device::DeviceFamily::Zune) => " Zune Library",
+                    Some(zytunes::device::DeviceFamily::Gogear) => " GoGear Library",
                     None => " Device Library",
                 }
             } else {
@@ -2244,7 +2246,7 @@ fn draw_now_playing(f: &mut Frame, app: &App, np: &NowPlaying, area: Rect, art_w
             f.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     labels,
-                    Style::default().fg(t.dim_text).add_modifier(Modifier::DIM),
+                    Style::default().fg(t.header_text),
                 )))
                 .alignment(Alignment::Center),
                 rows[extra],

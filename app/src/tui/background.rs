@@ -122,8 +122,8 @@ use zytunes::cd::drive::{enumerate_drives, read_disc_toc, CdDrive, DriveError};
 use zytunes::cd::metadata::{ripped_track_destination, tag_ripped_file, tag_ripped_fingerprint};
 use zytunes::cd::rip::{eject_drive, rip_track_cancellable, RipError, RipFidelity};
 use zytunes::device::{
-    DeviceBackend, DeviceCapabilities, DeviceFamily, IpodBackend, IpodDeviceData, ZuneBackend,
-    ZuneDeviceData,
+    gogear_capacity_label, DeviceBackend, DeviceCapabilities, DeviceFamily, GogearBackend,
+    GogearDeviceData, IpodBackend, IpodDeviceData, ZuneBackend, ZuneDeviceData,
 };
 use zytunes::mtp::native::NativeSession;
 use zytunes::mtp::parse::DeviceEntry;
@@ -741,8 +741,11 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                     // Try each backend in order until one detects a device.
                     let _ = event_tx.send(BgEvent::SyncMessage("Scanning for device...".into()));
 
-                    let backends: Vec<Box<dyn DeviceBackend>> =
-                        vec![Box::new(ZuneBackend), Box::new(IpodBackend)];
+                    let backends: Vec<Box<dyn DeviceBackend>> = vec![
+                        Box::new(ZuneBackend),
+                        Box::new(IpodBackend),
+                        Box::new(GogearBackend),
+                    ];
 
                     let mut detected_result: Option<(
                         Box<dyn DeviceBackend>,
@@ -774,6 +777,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                     // Build initial DeviceInfo from detection data.
                     let zune_data = detected.backend_data.downcast_ref::<ZuneDeviceData>();
                     let ipod_data = detected.backend_data.downcast_ref::<IpodDeviceData>();
+                    let gogear_data = detected.backend_data.downcast_ref::<GogearDeviceData>();
                     let initial_model = match detected.family {
                         DeviceFamily::Ipod => {
                             let label = ipod_data
@@ -783,14 +787,14 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                                 .then_some(label)
                                 .or(detected.model.clone())
                         }
-                        DeviceFamily::Zune => detected.model.clone(),
+                        DeviceFamily::Zune | DeviceFamily::Gogear => detected.model.clone(),
                     };
                     let initial_name = match detected.family {
                         DeviceFamily::Ipod => ipod_panel_title(
                             &detected.name,
                             initial_model.as_deref().unwrap_or("iPod"),
                         ),
-                        DeviceFamily::Zune => detected.name.clone(),
+                        DeviceFamily::Zune | DeviceFamily::Gogear => detected.name.clone(),
                     };
                     let device_info = DeviceInfo {
                         name: initial_name,
@@ -801,11 +805,16 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                                 Some(ipod_usb_label(ipod_data.and_then(|d| d.usb_pid)))
                             }
                             DeviceFamily::Zune => zune_data.and_then(|d| d.usb_mode.clone()),
+                            DeviceFamily::Gogear => gogear_data
+                                .and_then(|d| d.usb_pid)
+                                .map(|pid| format!("USB 0x{pid:04x}")),
                         },
                         manufacturer: None,
                         model: initial_model,
                         family: detected.family,
-                        volume_format: ipod_data.and_then(|d| d.volume_format.clone()),
+                        volume_format: ipod_data
+                            .and_then(|d| d.volume_format.clone())
+                            .or_else(|| gogear_data.and_then(|d| d.volume_format.clone())),
                     };
                     let _ = event_tx.send(BgEvent::DeviceDetected(device_info));
 
@@ -906,28 +915,62 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                                 if let Ok((total, free)) = s.get_storage_info() {
                                     let used = total.saturating_sub(free);
                                     let pct = (used * 100).checked_div(total).unwrap_or(0) as u8;
-                                    let model = ipod_data
-                                        .map(|d| {
-                                            d.model_label(detected.model.as_deref(), Some(total))
-                                        })
-                                        .unwrap_or_else(|| "iPod".into());
-                                    // Keep an iTunes-assigned name as the
-                                    // panel title; unnamed / automount-UUID
-                                    // volumes use the model + capacity string
-                                    // (same pattern as Zune 80 etc.).
-                                    let name = ipod_panel_title(&detected.name, &model);
+                                    let (name, model, manufacturer, usb_mode, volume_format) =
+                                        match detected.family {
+                                            DeviceFamily::Ipod => {
+                                                let model = ipod_data
+                                                    .map(|d| {
+                                                        d.model_label(
+                                                            detected.model.as_deref(),
+                                                            Some(total),
+                                                        )
+                                                    })
+                                                    .unwrap_or_else(|| "iPod".into());
+                                                let name = ipod_panel_title(&detected.name, &model);
+                                                (
+                                                    name,
+                                                    Some(model),
+                                                    Some("Apple".into()),
+                                                    Some(ipod_usb_label(
+                                                        ipod_data.and_then(|d| d.usb_pid),
+                                                    )),
+                                                    ipod_data.and_then(|d| d.volume_format.clone()),
+                                                )
+                                            }
+                                            DeviceFamily::Gogear => {
+                                                let base = detected
+                                                    .model
+                                                    .clone()
+                                                    .unwrap_or_else(|| detected.name.clone());
+                                                let model = gogear_capacity_label(&base, total);
+                                                (
+                                                    model.clone(),
+                                                    Some(model),
+                                                    Some("Philips".into()),
+                                                    gogear_data
+                                                        .and_then(|d| d.usb_pid)
+                                                        .map(|pid| format!("USB 0x{pid:04x}")),
+                                                    gogear_data
+                                                        .and_then(|d| d.volume_format.clone()),
+                                                )
+                                            }
+                                            DeviceFamily::Zune => (
+                                                detected.name.clone(),
+                                                detected.model.clone(),
+                                                Some("Microsoft".into()),
+                                                zune_data.and_then(|d| d.usb_mode.clone()),
+                                                None,
+                                            ),
+                                        };
                                     let _ = event_tx.send(BgEvent::DeviceDetected(DeviceInfo {
                                         name,
                                         firmware_version: detected.firmware.clone(),
                                         serial_number: detected.serial.clone(),
-                                        usb_mode: Some(ipod_usb_label(
-                                            ipod_data.and_then(|d| d.usb_pid),
-                                        )),
-                                        manufacturer: Some("Apple".to_string()),
-                                        model: Some(model),
+                                        usb_mode,
+                                        manufacturer,
+                                        model,
                                         family: detected.family,
-                                        volume_format: ipod_data
-                                            .and_then(|d| d.volume_format.clone()),
+                                        volume_format,
                                     }));
                                     let _ =
                                         event_tx.send(BgEvent::SessionReady(Some(StorageInfo {
@@ -936,9 +979,16 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                                             used_bytes: used,
                                             used_percent: pct,
                                         })));
+                                } else {
+                                    // df/stat can fail on a just-mounted vfat stick;
+                                    // still finish connect so the TUI is not stuck
+                                    // on Connecting while tracks load.
+                                    let _ = event_tx.send(BgEvent::SessionReady(None));
                                 }
-                                let _ =
-                                    log_tx.send(BgEvent::SyncMessage("Connected to iPod".into()));
+                                let _ = log_tx.send(BgEvent::SyncMessage(format!(
+                                    "Connected to {}",
+                                    detected.family.label()
+                                )));
                                 Ok(s)
                             }
                             Err(e) => Err(e),

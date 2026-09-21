@@ -65,12 +65,7 @@
   - **Video sync** — iPod Classic plays MP4/M4V with specific constraints (320x240/640x480, H.264 baseline). Videos go in `iPod_Control/Music/F*/` alongside audio (not a separate directory). iTunesDB entries use `mediatype = 0x02` at mhit +0xD0 (we hardcode `1` for audio). Zune has `cmd_video_sync` + `transcode_and_import_video` as reference. Need to transcode to iPod-compatible MP4 via ffmpeg, set `mediatype = 2`, set video-specific mhod types.
   - **User playlist sync from iTunes XML** — currently we only preserve the master playlist via raw blob replay. iTunes user playlists (type 2 mhsd, non-master mhyps) could be added from iTunes Library.xml parsing. Would need mhip writing per playlist member.
   - **Track rating write-back** — read `Play Counts` on connect, apply ratings/play counts back into the iTunesDB on next sync (currently we delete it like libgpod does, losing the data).
-- **Philips GoGear support** — user has a couple of units, worth attempting
-  - Identify which models (VID/PID, firmware generation — SA/HDD vs Vibe vs Ariaz etc.)
-  - Transport: most GoGears are UMS/MSC (plain mass storage) — no MTPZ/iTunesDB lift needed, just file copy + folder conventions
-  - Some later models use MTP (non-encrypted); `zune-mtp` transport is reusable, auth path is not
-  - Check if any model needs a proprietary DB (SA52xx songdb.dat) vs pure tag-based playback
-  - Slot into `DeviceSession` trait once scoped
+- **Philips GoGear (remaining)** — ViBE (SA1VBE, PID `0x20b6`) UMS music sync is in Done. Still open: later MTP GoGears, HDD/SA songdb.dat models, playlist-on-the-go, SMV video
 - **Tag manager: composer / lyricist / performer fields** — `build_track_fields` emits Picard-standard release-level fields but not track-level credits. MB models these as recording–artist relationships. Scope: extend `lookup_release_full` / `lookup_disc` `inc` with `work-rels+recording-rels+artist-rels`; add `relations: Vec<Relation>` on `Recording`; walk relations in `build_track_fields` (join with `; `); map to `ItemKey::{Composer,Lyricist,Conductor,Performer}` in `apply_field` (bare `Performer` first, defer per-instrument TXXX); section them in the diff UI without regressing credit-only track-header summaries. Contained to `musicbrainz.rs` + `tag_ops.rs` + tests.
 - **AcoustID lookup as tag-manager fallback** — resolution is currently `mb_release_id` → direct lookup, else MB search (Solr-only). Untagged files with a Chromaprint `acoustic_id` should hit AcoustID, then `/recording/{mbid}?inc=releases`. Scope: `src/acoustid.rs` GET client (`meta=recordings+releases`, 3 req/sec); `acoustid_app_key` in config (feature stays dark until set); disk cache keyed on `(acoustic_id, duration_secs_rounded)`; worker `AcoustIdLookup` / `AcoustIdResolved` token-fenced like MB; high-confidence hit (score > 0.9) auto-advances, ambiguous hits present as a pick list. Out of scope: submitting fingerprints, album-wide untagged batch scan.
 - **Stems export** — make it easy to grab separated stem FLACs out of the cache (beyond `[stems] cache_dir` pointing at a convenient disk).
@@ -81,6 +76,7 @@
 
 ## Done
 
+- **GoGear ViBE music sync** — Philips VID `0x0471` / ViBE PID `0x20b6` as USB mass storage. Detects the stick even when unmounted. Files copy to `MUSIC/{Artist}/{Album}/`; `_system/` is skipped. MP3/WMA/WAV pass through; everything else transcodes to MP3. No playlist/photo/video.
 - **Now-playing soundbar** — lock-free spectrum snapshot drawn centered in the now-playing panel. Each theme picks a layout, glyph alphabet, and colour mode; `W` overrides the layout until the next theme change. Quiet bands keep a floor mark; graphic-EQ Hz (`32` `64` `125` `1k` …) sits under each band (Pulse is a level mountain and has no Hz labels). Pause freezes the bars, Play/Stop clear them.
 - **Diagnostics: playlist/listen-log Logger** — `PlaylistStore` and `ListenLog` take a `Logger`; CLI uses stderr, TUI routes into `SyncMessage`. No `eprintln!` on those hot paths.
 - **Diagnostics: playlist lookup USB errors** — `find_existing_playlist` propagates `get_object_handles` failures and `DeviceGone` from `get_object_info` instead of falling through to create a duplicate `.zpl`. Non-fatal per-object errors skip that handle (logged). The TUI worker drops the session on `DeviceGone`.

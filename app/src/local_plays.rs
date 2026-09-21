@@ -47,6 +47,7 @@ pub fn device_baseline_key(
     let family_str = match family {
         DeviceFamily::Zune => "Zune",
         DeviceFamily::Ipod => "Ipod",
+        DeviceFamily::Gogear => "Gogear",
     };
     // Trim and reject empty/whitespace at each step so a whitespace-only
     // serial still falls through to firmware instead of collapsing onto the

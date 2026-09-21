@@ -60,7 +60,8 @@ pub mod theme;
 pub mod ui;
 
 use device::{
-    DetectedDevice, DeviceBackend, DeviceCapabilities, DeviceFamily, IpodBackend, ZuneBackend,
+    DetectedDevice, DeviceBackend, DeviceCapabilities, DeviceFamily, GogearBackend, IpodBackend,
+    ZuneBackend,
 };
 use library::MusicLibrary;
 use mtp::DeviceSession;
@@ -171,7 +172,11 @@ pub fn connect() -> Result<
     ),
     String,
 > {
-    let backends: Vec<Box<dyn DeviceBackend>> = vec![Box::new(ZuneBackend), Box::new(IpodBackend)];
+    let backends: Vec<Box<dyn DeviceBackend>> = vec![
+        Box::new(ZuneBackend),
+        Box::new(IpodBackend),
+        Box::new(GogearBackend),
+    ];
 
     let mut last_err = String::from("No devices detected");
     for backend in &backends {
@@ -184,6 +189,7 @@ pub fn connect() -> Result<
             match detected.family {
                 DeviceFamily::Zune => "Zune",
                 DeviceFamily::Ipod => "iPod",
+                DeviceFamily::Gogear => "GoGear",
             }
         );
 
