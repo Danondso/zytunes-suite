@@ -7,7 +7,7 @@ description = "Native MTP/MTPZ library for USB device communication (macOS IOKit
 license = "MIT"
 
 [dependencies]
-aes = "0.8"
+aes = "0.9"
 cbc = "0.1"
 cmac = "0.7"
 cipher = "0.4"
