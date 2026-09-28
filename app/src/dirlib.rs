@@ -184,10 +184,9 @@ impl DirectoryLibrary {
         let working: Mutex<HashMap<String, crate::cache::CachedFile>> = Mutex::new(cached.clone());
 
         // Tracks how many entries genuinely changed since the last on-disk
-        // save. Increments only when (a) the file wasn't in the cache, or
-        // (b) the file was cached but its `acoustic_id` is now different.
-        // A pure reload (every file is a cache hit with the same fingerprint)
-        // accumulates zero — and skips both per-chunk and final save.
+        // save. Increments when the file is new, its acoustic id changed, or
+        // its fingerprint-failed flag changed. A pure reload accumulates
+        // zero and skips both per-chunk and final save.
         let pending_changes = AtomicU64::new(0);
         let total_changes = AtomicU64::new(0);
 
@@ -452,16 +451,15 @@ const BACKFILL_CHUNK: usize = 32;
 /// entry and skipped on later launches until the file's mtime or size
 /// changes.
 ///
-/// `cancel` is polled between files and from worker threads. `on_batch`
-/// receives each group of ids that landed in the cache, as
-/// `(track id, acoustic id)`, on the backfill thread.
+/// `cancel` is polled between files on this thread. `on_batch` receives each
+/// group of ids that landed in the cache, as `(track id, acoustic id)`.
 pub fn backfill_acoustic_ids<C, B>(
     root: &str,
     log: &crate::cache::Logger,
     cancel: C,
     mut on_batch: B,
 ) where
-    C: Fn() -> bool + Sync,
+    C: Fn() -> bool,
     B: FnMut(&[(u64, String)]),
 {
     if cancel() {
@@ -506,7 +504,8 @@ pub fn backfill_acoustic_ids<C, B>(
     let mut embedded_paths = HashSet::new();
     let mut embedded_n = 0u64;
     if !embedded_hits.is_empty() && !cancel() {
-        let updates = crate::cache::commit_acoustic_ids(root, log, &embedded_hits, || !cancel());
+        let updates =
+            crate::cache::commit_fingerprint_progress(root, log, &embedded_hits, &[], || !cancel());
         embedded_n = updates.len() as u64;
         embedded_paths.extend(embedded_hits.into_iter().map(|(path, _, _)| path));
         if !updates.is_empty() {
@@ -563,14 +562,12 @@ pub fn backfill_acoustic_ids<C, B>(
                 }
             }
         }
-        if !hits.is_empty() {
-            let updates = crate::cache::commit_acoustic_ids(root, log, &hits, || !cancel());
+        if !hits.is_empty() || !misses.is_empty() {
+            let updates =
+                crate::cache::commit_fingerprint_progress(root, log, &hits, &misses, || !cancel());
             if !updates.is_empty() {
                 on_batch(&updates);
             }
-        }
-        if !misses.is_empty() {
-            crate::cache::commit_fingerprint_failures(root, log, &misses, || !cancel());
         }
     }
 

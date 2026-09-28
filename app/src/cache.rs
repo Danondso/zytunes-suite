@@ -443,28 +443,35 @@ pub(crate) fn finish_scan_cache(
     }
 }
 
-/// Write acoustic ids for cache entries whose `(mtime, size)` still matches.
+/// Write one chunk of fingerprint results in a single cache rewrite.
 ///
-/// `still_current` runs while the write lock is held. A library reload that
-/// cancelled this backfill gets `false` and the commit is dropped, so a scan
-/// snapshot cannot be overwritten by a job it already superseded.
+/// Hits and misses share one read/modify/write so a large library cache is
+/// parsed and replaced once per chunk. `still_current` runs while the write
+/// lock is held. A library reload that cancelled this backfill gets `false`
+/// and the commit is dropped, so a scan snapshot cannot be overwritten by a
+/// job it already superseded.
+///
+/// A stored id clears `fingerprint_failed`. A miss sets that flag and is
+/// skipped on later launches until the file's `(mtime, size)` changes.
 ///
 /// Returns the `(track id, acoustic id)` pairs that landed.
-pub(crate) fn commit_acoustic_ids<F>(
+pub(crate) fn commit_fingerprint_progress<F>(
     dir_path: &str,
     log: &Logger,
     hits: &[(String, FileFingerprint, String)],
+    misses: &[(String, FileFingerprint)],
     still_current: F,
 ) -> Vec<(u64, String)>
 where
     F: Fn() -> bool,
 {
     let _guard = dirlib_write_lock();
-    if !still_current() {
+    if !still_current() || (hits.is_empty() && misses.is_empty()) {
         return Vec::new();
     }
     let mut files = load_dirlib_cache(dir_path, log);
     let mut updates = Vec::new();
+    let mut changed = false;
     for (path, fp, acoustic_id) in hits {
         let Some(entry) = files.get_mut(path) else {
             continue;
@@ -473,9 +480,22 @@ where
             continue;
         }
         entry.track.acoustic_id = Some(acoustic_id.clone());
+        entry.fingerprint_failed = false;
+        changed = true;
         updates.push((entry.track.id, acoustic_id.clone()));
     }
-    if updates.is_empty() {
+    for (path, fp) in misses {
+        let Some(entry) = files.get_mut(path) else {
+            continue;
+        };
+        if entry.fingerprint != *fp || entry.track.acoustic_id.is_some() || entry.fingerprint_failed
+        {
+            continue;
+        }
+        entry.fingerprint_failed = true;
+        changed = true;
+    }
+    if !changed {
         return updates;
     }
     let cached = CachedLibrary {
@@ -486,50 +506,6 @@ where
     save_raw(dir_path, &cached, log);
     ACOUSTIC_EPOCH.fetch_add(1, Ordering::Release);
     updates
-}
-
-/// Remember files whose Chromaprint attempt returned nothing.
-///
-/// Without this, every launch retries the same undecodable files. The flag
-/// clears when the file's `(mtime, size)` changes and the scan rebuilds the
-/// entry.
-pub(crate) fn commit_fingerprint_failures<F>(
-    dir_path: &str,
-    log: &Logger,
-    misses: &[(String, FileFingerprint)],
-    still_current: F,
-) -> usize
-where
-    F: Fn() -> bool,
-{
-    let _guard = dirlib_write_lock();
-    if !still_current() || misses.is_empty() {
-        return 0;
-    }
-    let mut files = load_dirlib_cache(dir_path, log);
-    let mut marked = 0usize;
-    for (path, fp) in misses {
-        let Some(entry) = files.get_mut(path) else {
-            continue;
-        };
-        if entry.fingerprint != *fp || entry.track.acoustic_id.is_some() || entry.fingerprint_failed
-        {
-            continue;
-        }
-        entry.fingerprint_failed = true;
-        marked += 1;
-    }
-    if marked == 0 {
-        return 0;
-    }
-    let cached = CachedLibrary {
-        root: dir_path.to_string(),
-        schema_version: CACHE_SCHEMA_VERSION,
-        files,
-    };
-    save_raw(dir_path, &cached, log);
-    ACOUSTIC_EPOCH.fetch_add(1, Ordering::Release);
-    marked
 }
 
 #[cfg(test)]
@@ -736,6 +712,70 @@ mod tests {
         );
 
         // Clean up.
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn commit_fingerprint_progress_writes_hits_and_misses_together() {
+        // One chunk used to rewrite the cache twice, and a stored id left
+        // `fingerprint_failed` set. Both outcomes have to land in one write,
+        // and a success has to clear a previous failure.
+        let dir_path = "/tmp/zytunes-cache-fp-progress";
+        let cache_name = dirlib_cache_name(dir_path);
+        let Some(path) = cache_path(&cache_name) else {
+            return;
+        };
+        let fp = FileFingerprint {
+            mtime_secs: 1,
+            size: 10,
+        };
+        let hit_path = format!("{dir_path}/ok.wav");
+        let miss_path = format!("{dir_path}/bad.mp3");
+        let track = |id, name: &str| crate::library::Track {
+            id,
+            name: name.into(),
+            artist: "A".into(),
+            album: "B".into(),
+            ..Default::default()
+        };
+        let mut files = HashMap::new();
+        files.insert(
+            hit_path.clone(),
+            CachedFile {
+                fingerprint: fp,
+                fingerprint_failed: true,
+                track: track(7, "Ok"),
+            },
+        );
+        files.insert(
+            miss_path.clone(),
+            CachedFile {
+                fingerprint: fp,
+                fingerprint_failed: false,
+                track: track(8, "Bad"),
+            },
+        );
+        let log = default_logger();
+        save_dirlib_cache(dir_path, files, &log);
+        let epoch = acoustic_cache_epoch();
+        let updates = commit_fingerprint_progress(
+            dir_path,
+            &log,
+            &[(hit_path.clone(), fp, "fp-ok".into())],
+            &[(miss_path.clone(), fp)],
+            || true,
+        );
+        assert_eq!(updates, vec![(7, "fp-ok".into())]);
+        assert!(acoustic_cache_epoch() > epoch);
+
+        let cached = load_dirlib_cache(dir_path, &log);
+        let hit = cached.get(&hit_path).expect("hit entry");
+        assert_eq!(hit.track.acoustic_id.as_deref(), Some("fp-ok"));
+        assert!(!hit.fingerprint_failed);
+        let miss = cached.get(&miss_path).expect("miss entry");
+        assert!(miss.track.acoustic_id.is_none());
+        assert!(miss.fingerprint_failed);
+
         let _ = std::fs::remove_file(&path);
     }
 }
