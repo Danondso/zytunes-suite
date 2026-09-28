@@ -26,11 +26,12 @@ pub struct Config {
     /// when there's a track and the terminal is tall enough). `Some(false)`
     /// force-hides the panel even when playback is active.
     pub show_player: Option<bool>,
-    /// Compute Chromaprint acoustic fingerprints during the library scan.
+    /// Compute Chromaprint acoustic fingerprints for the library.
     /// `None` (default) and `Some(true)` enable; `Some(false)` skips the
-    /// expensive symphonia + chromaprint pass entirely. When disabled the
-    /// scan is fast (lofty tag read only) but Phase 2+ playcount-merge
-    /// features that key on `acoustic_id` won't have anything to match on.
+    /// symphonia + chromaprint pass entirely. The TUI shows the library as
+    /// soon as tags are read and fingerprints afterwards, so this no longer
+    /// blocks browsing. When disabled, playcount-merge features that key on
+    /// `acoustic_id` have nothing to match on.
     pub fingerprinting: Option<bool>,
     /// Compute and embed a Chromaprint fingerprint into each freshly-ripped
     /// CD track as an `ACOUSTID_FINGERPRINT` tag. `None` (default) and
