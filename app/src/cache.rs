@@ -9,6 +9,8 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
@@ -59,6 +61,10 @@ impl FileFingerprint {
 pub struct CachedFile {
     pub fingerprint: FileFingerprint,
     pub track: Track,
+    /// A Chromaprint attempt returned nothing. Skip further attempts until the
+    /// file's `(mtime, size)` changes and this entry is rebuilt.
+    #[serde(default)]
+    pub fingerprint_failed: bool,
 }
 
 /// Bumped whenever the on-disk shape of a cached `Track` changes such that
@@ -340,10 +346,54 @@ fn migrate_cache(
     }
 }
 
+/// Serialises writers of one dirlib cache. The file replace itself is atomic;
+/// the lock keeps a scan snapshot from landing between a fingerprint
+/// backfill's read and its write.
+fn dirlib_write_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Bumped once per successful acoustic-id commit. A scan that started
+/// earlier can tell that a backfill wrote ids its in-memory snapshot lacks.
+static ACOUSTIC_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn acoustic_cache_epoch() -> u64 {
+    ACOUSTIC_EPOCH.load(Ordering::Acquire)
+}
+
+/// Copy acoustic ids and remembered fingerprint failures from the on-disk
+/// cache onto `files` entries that still share that file's `(mtime, size)`.
+fn merge_disk_acoustic_ids(dir_path: &str, files: &mut HashMap<String, CachedFile>, log: &Logger) {
+    let Some(existing) = load_raw(dir_path, log) else {
+        return;
+    };
+    if existing.root != dir_path || existing.schema_version != CACHE_SCHEMA_VERSION {
+        return;
+    }
+    for (path, entry) in files.iter_mut() {
+        if entry.track.acoustic_id.is_some() {
+            continue;
+        }
+        let Some(prev) = existing.files.get(path) else {
+            continue;
+        };
+        if prev.fingerprint == entry.fingerprint {
+            if let Some(id) = prev.track.acoustic_id.clone() {
+                entry.track.acoustic_id = Some(id);
+                entry.fingerprint_failed = false;
+            } else if prev.fingerprint_failed {
+                entry.fingerprint_failed = true;
+            }
+        }
+    }
+}
+
 /// Save the per-file cache for `dir_path`.
 ///
 /// `log` receives any diagnostic messages (write errors, serialisation failures, etc.).
 pub fn save_dirlib_cache(dir_path: &str, files: HashMap<String, CachedFile>, log: &Logger) {
+    let _guard = dirlib_write_lock();
     save_raw(
         dir_path,
         &CachedLibrary {
@@ -353,6 +403,110 @@ pub fn save_dirlib_cache(dir_path: &str, files: HashMap<String, CachedFile>, log
         },
         log,
     );
+}
+
+/// Checkpoint a scan snapshot. When `epoch_at_start` is behind
+/// [`acoustic_cache_epoch`], acoustic ids committed since the scan began
+/// are copied onto matching entries before the snapshot replaces the file.
+pub(crate) fn save_dirlib_cache_preserving_acoustic_ids(
+    dir_path: &str,
+    files: HashMap<String, CachedFile>,
+    epoch_at_start: u64,
+    log: &Logger,
+) {
+    let _ = finish_scan_cache(dir_path, files, epoch_at_start, true, log);
+}
+
+/// Merge any acoustic ids committed during a deferred scan, optionally
+/// persist the snapshot, and return the map the caller builds its library from.
+pub(crate) fn finish_scan_cache(
+    dir_path: &str,
+    mut files: HashMap<String, CachedFile>,
+    epoch_at_start: u64,
+    save: bool,
+    log: &Logger,
+) -> HashMap<String, CachedFile> {
+    let _guard = dirlib_write_lock();
+    if acoustic_cache_epoch() != epoch_at_start {
+        merge_disk_acoustic_ids(dir_path, &mut files, log);
+    }
+    if save {
+        let cached = CachedLibrary {
+            root: dir_path.to_string(),
+            schema_version: CACHE_SCHEMA_VERSION,
+            files,
+        };
+        save_raw(dir_path, &cached, log);
+        cached.files
+    } else {
+        files
+    }
+}
+
+/// Write one chunk of fingerprint results in a single cache rewrite.
+///
+/// Hits and misses share one read/modify/write so a large library cache is
+/// parsed and replaced once per chunk. `still_current` runs while the write
+/// lock is held. A library reload that cancelled this backfill gets `false`
+/// and the commit is dropped, so a scan snapshot cannot be overwritten by a
+/// job it already superseded.
+///
+/// A stored id clears `fingerprint_failed`. A miss sets that flag and is
+/// skipped on later launches until the file's `(mtime, size)` changes.
+///
+/// Returns the `(path, track id, acoustic id)` triples that landed. The path
+/// is the cache key, so the caller can tell which inputs were stored.
+pub(crate) fn commit_fingerprint_progress<F>(
+    dir_path: &str,
+    log: &Logger,
+    hits: &[(String, FileFingerprint, String)],
+    misses: &[(String, FileFingerprint)],
+    still_current: F,
+) -> Vec<(String, u64, String)>
+where
+    F: Fn() -> bool,
+{
+    let _guard = dirlib_write_lock();
+    if !still_current() || (hits.is_empty() && misses.is_empty()) {
+        return Vec::new();
+    }
+    let mut files = load_dirlib_cache(dir_path, log);
+    let mut updates = Vec::new();
+    let mut changed = false;
+    for (path, fp, acoustic_id) in hits {
+        let Some(entry) = files.get_mut(path) else {
+            continue;
+        };
+        if entry.fingerprint != *fp || entry.track.acoustic_id.is_some() {
+            continue;
+        }
+        entry.track.acoustic_id = Some(acoustic_id.clone());
+        entry.fingerprint_failed = false;
+        changed = true;
+        updates.push((path.clone(), entry.track.id, acoustic_id.clone()));
+    }
+    for (path, fp) in misses {
+        let Some(entry) = files.get_mut(path) else {
+            continue;
+        };
+        if entry.fingerprint != *fp || entry.track.acoustic_id.is_some() || entry.fingerprint_failed
+        {
+            continue;
+        }
+        entry.fingerprint_failed = true;
+        changed = true;
+    }
+    if !changed {
+        return updates;
+    }
+    let cached = CachedLibrary {
+        root: dir_path.to_string(),
+        schema_version: CACHE_SCHEMA_VERSION,
+        files,
+    };
+    save_raw(dir_path, &cached, log);
+    ACOUSTIC_EPOCH.fetch_add(1, Ordering::Release);
+    updates
 }
 
 #[cfg(test)]
@@ -416,6 +570,7 @@ mod tests {
                         mtime_secs: 0,
                         size: 0,
                     },
+                    fingerprint_failed: false,
                     track: crate::library::Track {
                         id: 1,
                         name: "Title  ".into(),
@@ -481,6 +636,7 @@ mod tests {
                         mtime_secs: 0,
                         size: 0,
                     },
+                    fingerprint_failed: false,
                     track: crate::library::Track {
                         id: 1,
                         name: "Stale".into(),
@@ -557,6 +713,70 @@ mod tests {
         );
 
         // Clean up.
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn commit_fingerprint_progress_writes_hits_and_misses_together() {
+        // One chunk used to rewrite the cache twice, and a stored id left
+        // `fingerprint_failed` set. Both outcomes have to land in one write,
+        // and a success has to clear a previous failure.
+        let dir_path = "/tmp/zytunes-cache-fp-progress";
+        let cache_name = dirlib_cache_name(dir_path);
+        let Some(path) = cache_path(&cache_name) else {
+            return;
+        };
+        let fp = FileFingerprint {
+            mtime_secs: 1,
+            size: 10,
+        };
+        let hit_path = format!("{dir_path}/ok.wav");
+        let miss_path = format!("{dir_path}/bad.mp3");
+        let track = |id, name: &str| crate::library::Track {
+            id,
+            name: name.into(),
+            artist: "A".into(),
+            album: "B".into(),
+            ..Default::default()
+        };
+        let mut files = HashMap::new();
+        files.insert(
+            hit_path.clone(),
+            CachedFile {
+                fingerprint: fp,
+                fingerprint_failed: true,
+                track: track(7, "Ok"),
+            },
+        );
+        files.insert(
+            miss_path.clone(),
+            CachedFile {
+                fingerprint: fp,
+                fingerprint_failed: false,
+                track: track(8, "Bad"),
+            },
+        );
+        let log = default_logger();
+        save_dirlib_cache(dir_path, files, &log);
+        let epoch = acoustic_cache_epoch();
+        let updates = commit_fingerprint_progress(
+            dir_path,
+            &log,
+            &[(hit_path.clone(), fp, "fp-ok".into())],
+            &[(miss_path.clone(), fp)],
+            || true,
+        );
+        assert_eq!(updates, vec![(hit_path.clone(), 7, "fp-ok".into())]);
+        assert!(acoustic_cache_epoch() > epoch);
+
+        let cached = load_dirlib_cache(dir_path, &log);
+        let hit = cached.get(&hit_path).expect("hit entry");
+        assert_eq!(hit.track.acoustic_id.as_deref(), Some("fp-ok"));
+        assert!(!hit.fingerprint_failed);
+        let miss = cached.get(&miss_path).expect("miss entry");
+        assert!(miss.track.acoustic_id.is_none());
+        assert!(miss.fingerprint_failed);
+
         let _ = std::fs::remove_file(&path);
     }
 }

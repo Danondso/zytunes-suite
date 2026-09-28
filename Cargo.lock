@@ -712,9 +712,9 @@ dependencies = [
 
 [[package]]
 name = "discid"
-version = "0.7.0"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f5a3b96caa586f4f08a16bfdb903f8e6249b05edc31749d7bc2c9f0b07f2aa82"
+checksum = "5f1124bcb6689b952987eb94f02f5bcf3dbc58dad04912bfd020dc5111ba9dca"
 dependencies = [
  "bitflags 2.13.2",
  "discid-sys",

@@ -8242,6 +8242,15 @@ mod tests {
         fn music_folder(&self) -> Option<&str> {
             None
         }
+        fn apply_acoustic_ids(&mut self, updates: &[(u64, String)]) {
+            for (id, acoustic_id) in updates {
+                if let Some(track) = self.tracks.iter_mut().find(|t| t.id == *id) {
+                    if track.acoustic_id.is_none() {
+                        track.acoustic_id = Some(acoustic_id.clone());
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -8263,6 +8272,53 @@ mod tests {
         let (msg, _, is_error) = app.toast_message.as_ref().unwrap();
         assert!(is_error);
         assert!(msg.contains("bad path"));
+    }
+
+    #[test]
+    fn acoustic_ids_update_patches_tracks_without_resetting_selection() {
+        let mut app = App::new();
+        let lib = VecLibrary {
+            tracks: vec![zytunes::library::Track {
+                id: 7,
+                name: "Song".into(),
+                artist: "A".into(),
+                album: "B".into(),
+                ..Default::default()
+            }],
+        };
+        app.handle_bg_event(BgEvent::LibraryLoaded(Ok(Box::new(lib))));
+        app.sidebar_selected = 3;
+        app.album_selected = 2;
+        app.track_selected = 4;
+        app.track_info_lib = Some(zytunes::library::Track {
+            id: 7,
+            name: "Song".into(),
+            artist: "A".into(),
+            album: "B".into(),
+            ..Default::default()
+        });
+        app.sync.log.push("already here".into());
+
+        app.handle_bg_event(BgEvent::AcousticIdsUpdated(vec![(7, "fp-1".into())]));
+
+        assert_eq!(app.sidebar_selected, 3);
+        assert_eq!(app.album_selected, 2);
+        assert_eq!(app.track_selected, 4);
+        assert_eq!(
+            app.library
+                .as_ref()
+                .unwrap()
+                .track_by_id(7)
+                .unwrap()
+                .acoustic_id
+                .as_deref(),
+            Some("fp-1")
+        );
+        assert_eq!(
+            app.track_info_lib.as_ref().unwrap().acoustic_id.as_deref(),
+            Some("fp-1")
+        );
+        assert_eq!(app.sync.log, vec!["already here".to_string()]);
     }
 
     #[test]
