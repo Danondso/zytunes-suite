@@ -177,4 +177,10 @@ pub trait MusicLibrary {
     fn track_by_id(&self, id: u64) -> Option<&Track> {
         self.all_tracks().find(|t| t.id == id)
     }
+
+    /// Fill in Chromaprint ids computed after the library was already shown.
+    ///
+    /// Existing ids are left alone. The default is a no-op so backends that
+    /// do not participate in background fingerprinting stay unchanged.
+    fn apply_acoustic_ids(&mut self, _updates: &[(u64, String)]) {}
 }

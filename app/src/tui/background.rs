@@ -1,5 +1,36 @@
+use std::sync::atomic::AtomicU64;
 use std::sync::mpsc;
 use std::thread;
+
+/// Generation of the in-flight Chromaprint backfill. Bumped on every
+/// `LoadLibrary` so a reload supersedes a pass that is still decoding.
+static ACOUSTIC_GEN: AtomicU64 = AtomicU64::new(0);
+
+fn spawn_acoustic_backfill(gen: u64, dir: String, event_tx: mpsc::Sender<BgEvent>) {
+    let err_tx = event_tx.clone();
+    let spawned = thread::Builder::new()
+        .name("acoustic-backfill".into())
+        .spawn(move || {
+            let log_tx = event_tx.clone();
+            let log: zytunes::cache::Logger = std::sync::Arc::new(move |msg: &str| {
+                let _ = log_tx.send(BgEvent::SyncMessage(msg.to_string()));
+            });
+            let batch_tx = event_tx;
+            zytunes::dirlib::backfill_acoustic_ids(
+                &dir,
+                &log,
+                || ACOUSTIC_GEN.load(Ordering::SeqCst) != gen,
+                |batch| {
+                    let _ = batch_tx.send(BgEvent::AcousticIdsUpdated(batch.to_vec()));
+                },
+            );
+        });
+    if let Err(e) = spawned {
+        let _ = err_tx.send(BgEvent::SyncMessage(format!(
+            "zytunes: fingerprint: failed to start background pass: {e}"
+        )));
+    }
+}
 
 /// True when `err` indicates the MTP session is effectively dead and no
 /// further bulk ops on this session will succeed — only a physical replug
@@ -143,9 +174,10 @@ use zytunes::{
 pub enum BgCommand {
     LoadLibrary {
         music_dir: Option<String>,
-        /// Whether to compute acoustic fingerprints during the scan.
-        /// `false` skips the symphonia + chromaprint pass — faster scan, no
-        /// `acoustic_id` for cross-device playcount merging.
+        /// Whether to compute acoustic fingerprints after the tag scan.
+        /// The library is published first either way. `false` skips the
+        /// symphonia + chromaprint pass, so nothing is available to match
+        /// on `acoustic_id`.
         fingerprint: bool,
     },
     Connect,
@@ -421,6 +453,10 @@ pub struct StorageInfo {
 pub enum BgEvent {
     LibraryLoaded(Result<Box<dyn zytunes::library::MusicLibrary + Send>, String>),
     LibraryScanProgress(zytunes::dirlib::ScanProgress),
+    /// Chromaprint ids computed after [`BgEvent::LibraryLoaded`]. Each pair
+    /// is `(track id, acoustic id)`. Applied in place so the sidebar stays
+    /// where the user left it.
+    AcousticIdsUpdated(Vec<(u64, String)>),
     DeviceDetected(DeviceInfo),
     SessionReady(Option<StorageInfo>),
     SessionFailed(String),
@@ -720,22 +756,32 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                     music_dir,
                     fingerprint,
                 } => {
+                    // Supersede any backfill still running from the previous
+                    // library. The tag scan itself never decodes audio.
+                    let gen = ACOUSTIC_GEN.fetch_add(1, Ordering::SeqCst) + 1;
                     let log_tx = event_tx.clone();
                     let scan_log: zytunes::cache::Logger = std::sync::Arc::new(move |msg: &str| {
                         let _ = log_tx.send(BgEvent::SyncMessage(msg.to_string()));
                     });
                     let opts = zytunes::dirlib::ScanOptions {
-                        fingerprint,
+                        fingerprint: false,
                         log: scan_log,
                     };
-                    let result = zytunes::resolve_music_dir(music_dir.as_deref()).and_then(|dir| {
+                    let resolved = zytunes::resolve_music_dir(music_dir.as_deref());
+                    let result = resolved.as_ref().map_err(Clone::clone).and_then(|dir| {
                         let progress_tx = event_tx.clone();
-                        zytunes::dirlib::DirectoryLibrary::scan_with_options(&dir, opts, |p| {
+                        zytunes::dirlib::DirectoryLibrary::scan_with_options(dir, opts, |p| {
                             let _ = progress_tx.send(BgEvent::LibraryScanProgress(p));
                         })
                         .map(|l| Box::new(l) as Box<dyn zytunes::library::MusicLibrary + Send>)
                     });
+                    let loaded = result.is_ok();
                     let _ = event_tx.send(BgEvent::LibraryLoaded(result));
+                    if fingerprint && loaded {
+                        if let Ok(dir) = resolved {
+                            spawn_acoustic_backfill(gen, dir, event_tx.clone());
+                        }
+                    }
                 }
                 BgCommand::Connect => {
                     // Try each backend in order until one detects a device.

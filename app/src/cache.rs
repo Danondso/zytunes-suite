@@ -9,6 +9,8 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
@@ -340,10 +342,51 @@ fn migrate_cache(
     }
 }
 
+/// Serialises writers of one dirlib cache. The file replace itself is atomic;
+/// the lock keeps a scan snapshot from landing between a fingerprint
+/// backfill's read and its write.
+fn dirlib_write_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Bumped once per successful acoustic-id commit. A scan that started
+/// earlier can tell that a backfill wrote ids its in-memory snapshot lacks.
+static ACOUSTIC_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn acoustic_cache_epoch() -> u64 {
+    ACOUSTIC_EPOCH.load(Ordering::Acquire)
+}
+
+/// Copy acoustic ids from the on-disk cache onto `files` entries that still
+/// share that file's `(mtime, size)` and have no id of their own.
+fn merge_disk_acoustic_ids(dir_path: &str, files: &mut HashMap<String, CachedFile>, log: &Logger) {
+    let Some(existing) = load_raw(dir_path, log) else {
+        return;
+    };
+    if existing.root != dir_path || existing.schema_version != CACHE_SCHEMA_VERSION {
+        return;
+    }
+    for (path, entry) in files.iter_mut() {
+        if entry.track.acoustic_id.is_some() {
+            continue;
+        }
+        let Some(prev) = existing.files.get(path) else {
+            continue;
+        };
+        if prev.fingerprint == entry.fingerprint {
+            if let Some(id) = prev.track.acoustic_id.clone() {
+                entry.track.acoustic_id = Some(id);
+            }
+        }
+    }
+}
+
 /// Save the per-file cache for `dir_path`.
 ///
 /// `log` receives any diagnostic messages (write errors, serialisation failures, etc.).
 pub fn save_dirlib_cache(dir_path: &str, files: HashMap<String, CachedFile>, log: &Logger) {
+    let _guard = dirlib_write_lock();
     save_raw(
         dir_path,
         &CachedLibrary {
@@ -353,6 +396,89 @@ pub fn save_dirlib_cache(dir_path: &str, files: HashMap<String, CachedFile>, log
         },
         log,
     );
+}
+
+/// Checkpoint a scan snapshot. When `epoch_at_start` is behind
+/// [`acoustic_cache_epoch`], acoustic ids committed since the scan began
+/// are copied onto matching entries before the snapshot replaces the file.
+pub(crate) fn save_dirlib_cache_preserving_acoustic_ids(
+    dir_path: &str,
+    files: HashMap<String, CachedFile>,
+    epoch_at_start: u64,
+    log: &Logger,
+) {
+    let _ = finish_scan_cache(dir_path, files, epoch_at_start, true, log);
+}
+
+/// Merge any acoustic ids committed during a deferred scan, optionally
+/// persist the snapshot, and return the map the caller builds its library from.
+pub(crate) fn finish_scan_cache(
+    dir_path: &str,
+    mut files: HashMap<String, CachedFile>,
+    epoch_at_start: u64,
+    save: bool,
+    log: &Logger,
+) -> HashMap<String, CachedFile> {
+    let _guard = dirlib_write_lock();
+    if acoustic_cache_epoch() != epoch_at_start {
+        merge_disk_acoustic_ids(dir_path, &mut files, log);
+    }
+    if save {
+        let cached = CachedLibrary {
+            root: dir_path.to_string(),
+            schema_version: CACHE_SCHEMA_VERSION,
+            files,
+        };
+        save_raw(dir_path, &cached, log);
+        cached.files
+    } else {
+        files
+    }
+}
+
+/// Write acoustic ids for cache entries whose `(mtime, size)` still matches.
+///
+/// `still_current` runs while the write lock is held. A library reload that
+/// cancelled this backfill gets `false` and the commit is dropped, so a scan
+/// snapshot cannot be overwritten by a job it already superseded.
+///
+/// Returns the `(track id, acoustic id)` pairs that landed.
+pub(crate) fn commit_acoustic_ids<F>(
+    dir_path: &str,
+    log: &Logger,
+    hits: &[(String, FileFingerprint, String)],
+    still_current: F,
+) -> Vec<(u64, String)>
+where
+    F: Fn() -> bool,
+{
+    let _guard = dirlib_write_lock();
+    if !still_current() {
+        return Vec::new();
+    }
+    let mut files = load_dirlib_cache(dir_path, log);
+    let mut updates = Vec::new();
+    for (path, fp, acoustic_id) in hits {
+        let Some(entry) = files.get_mut(path) else {
+            continue;
+        };
+        if entry.fingerprint != *fp || entry.track.acoustic_id.is_some() {
+            continue;
+        }
+        entry.track.acoustic_id = Some(acoustic_id.clone());
+        updates.push((entry.track.id, acoustic_id.clone()));
+    }
+    if updates.is_empty() {
+        return updates;
+    }
+    let cached = CachedLibrary {
+        root: dir_path.to_string(),
+        schema_version: CACHE_SCHEMA_VERSION,
+        files,
+    };
+    save_raw(dir_path, &cached, log);
+    ACOUSTIC_EPOCH.fetch_add(1, Ordering::Release);
+    updates
 }
 
 #[cfg(test)]

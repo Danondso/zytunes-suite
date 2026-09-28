@@ -66,9 +66,10 @@
 # Library scan
 # ---------------------------------------------------------------------------
 
-# Chromaprint fingerprints during the directory scan. Default true.
-# false skips the expensive pass; playcount-merge that keys on acoustic_id
-# then has nothing to match.
+# Chromaprint fingerprints. Default true.
+# The TUI shows the library as soon as tags are read, then fingerprints in
+# the background. false skips that pass; playcount-merge that keys on
+# acoustic_id then has nothing to match.
 # fingerprinting = true
 
 # ---------------------------------------------------------------------------

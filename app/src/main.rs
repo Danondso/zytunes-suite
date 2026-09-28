@@ -373,14 +373,12 @@ fn cmd_sync(args: &[String], quality: Mp3Quality) -> Result<(), String> {
 }
 
 /// Pre-warm the dirlib cache by scanning the music directory and printing
-/// progress to stdout. Useful for large libraries where the first scan is
-/// expensive (audio decode + chromaprint per file without an embedded
-/// fingerprint) — run this in a background terminal while you keep working,
-/// then the TUI launches instantly afterward against a warm cache.
+/// progress to stdout. Useful for large libraries where the first tag pass
+/// is expensive. With fingerprinting enabled this also computes Chromaprint
+/// up front, so the TUI's background pass finds nothing left to do.
 ///
 /// Inherits the `fingerprinting` config knob so users who'd rather skip
-/// chromaprint compute can disable it for the prewarm and just populate
-/// tags + cached fingerprints.
+/// chromaprint compute can disable it for the prewarm and just populate tags.
 fn cmd_scan() -> Result<(), String> {
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};

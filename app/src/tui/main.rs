@@ -86,8 +86,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let audio_cmd_tx = audio::spawn(audio_event_tx, std::sync::Arc::clone(&app.waveform));
 
     // Kick off async library load. `fingerprinting` defaults to true when
-    // unset; setting `fingerprinting = false` in config.toml skips the
-    // expensive symphonia + chromaprint pass.
+    // unset. The tag scan finishes first and the library becomes usable;
+    // Chromaprint then runs in the background and reports in the log panel.
+    // `fingerprinting = false` skips that pass.
     let _ = cmd_tx.send(BgCommand::LoadLibrary {
         music_dir: cfg.music_dir.clone(),
         fingerprint: cfg.fingerprinting.unwrap_or(true),

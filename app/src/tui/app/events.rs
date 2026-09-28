@@ -18,6 +18,7 @@ impl App {
         match event {
             BgEvent::LibraryLoaded(result) => self.on_library_loaded(result),
             BgEvent::LibraryScanProgress(p) => self.on_library_scan_progress(p),
+            BgEvent::AcousticIdsUpdated(updates) => self.on_acoustic_ids_updated(updates),
             BgEvent::DeviceDetected(info) => self.on_device_detected(info),
             BgEvent::SessionReady(storage) => self.on_session_ready(storage),
             BgEvent::SessionFailed(e) => self.on_session_failed(e),
@@ -540,6 +541,23 @@ impl App {
             self.scan_samples.push(sample);
         }
         self.maybe_rotate_scan_phrase();
+    }
+
+    /// Chromaprint ids that arrived after the library was already on screen.
+    /// Patches the open library in place. Sidebar and track selection stay
+    /// put — a fingerprint does not change artist, album, or title.
+    fn on_acoustic_ids_updated(&mut self, updates: Vec<(u64, String)>) {
+        let Some(lib) = self.library.as_mut() else {
+            return;
+        };
+        lib.apply_acoustic_ids(&updates);
+        if let Some(shown) = self.track_info_lib.as_mut() {
+            if shown.acoustic_id.is_none() {
+                if let Some((_, fp)) = updates.iter().find(|(id, _)| *id == shown.id) {
+                    shown.acoustic_id = Some(fp.clone());
+                }
+            }
+        }
     }
 
     fn on_device_detected(&mut self, info: DeviceInfo) {
