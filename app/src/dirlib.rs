@@ -154,17 +154,13 @@ impl DirectoryLibrary {
         // distinct situations:
         //   - cache predates the field (post-upgrade backfill), and
         //   - earlier scan tried to fingerprint and got `None` (corrupt /
-        //     unsupported codec / too-short clip).
+        //     unsupported codec / too-short clip). Those are recorded on the
+        //     cache entry (`fingerprint_failed`) and skipped until the file's
+        //     mtime or size changes. Retrying them on every launch just
+        //     walks the same failures again.
         //
-        // The retry on case-2 is INTENTIONAL: not caching negative results
-        // means a file that becomes fingerprintable later (codec support
-        // improves, broken file is repaired or re-downloaded) automatically
-        // picks up its fingerprint without a cache wipe. The cost is one
-        // extra decode per launch per pathological file — bounded by the
-        // (mtime,size) outer cache to actually-pathological files only,
-        // and small relative to the value of self-healing on case 2.
-        //
-        // Cached tracks that already have an `acoustic_id` are reused as-is.
+        // Cached tracks that already have an `acoustic_id`, and tracks
+        // already marked `fingerprint_failed`, are reused as-is.
         let completed = AtomicU64::new(0);
         // Counters for the post-scan summary. Plain atomics — no lock
         // contention because they're only read once at the end.
@@ -202,15 +198,20 @@ impl DirectoryLibrary {
                     let key = p.to_string_lossy().to_string();
                     let fingerprint = crate::cache::FileFingerprint::from_path(p)?;
 
-                    let (mut track, came_from_cache, prev_acoustic) = match cached.get(&key) {
-                        Some(entry) if entry.fingerprint == fingerprint => {
-                            (entry.track.clone(), true, entry.track.acoustic_id.clone())
-                        }
-                        _ => {
-                            cache_miss.fetch_add(1, Ordering::Relaxed);
-                            (build_track(p, hash_path(p)), false, None)
-                        }
-                    };
+                    let (mut track, came_from_cache, prev_acoustic, mut fingerprint_failed) =
+                        match cached.get(&key) {
+                            Some(entry) if entry.fingerprint == fingerprint => (
+                                entry.track.clone(),
+                                true,
+                                entry.track.acoustic_id.clone(),
+                                entry.fingerprint_failed,
+                            ),
+                            _ => {
+                                cache_miss.fetch_add(1, Ordering::Relaxed);
+                                (build_track(p, hash_path(p)), false, None, false)
+                            }
+                        };
+                    let prev_failed = fingerprint_failed;
 
                     if came_from_cache {
                         if track.acoustic_id.is_some() {
@@ -220,7 +221,7 @@ impl DirectoryLibrary {
                         }
                     }
 
-                    if options.fingerprint && track.acoustic_id.is_none() {
+                    if options.fingerprint && track.acoustic_id.is_none() && !fingerprint_failed {
                         // Fresh-parse already tried `read_embedded_fingerprint`
                         // inside `track_from_lofty`; if that turned up nothing,
                         // re-trying it would just re-open + re-parse the tag
@@ -238,12 +239,17 @@ impl DirectoryLibrary {
                         };
                         if track.acoustic_id.is_some() {
                             fp_computed.fetch_add(1, Ordering::Relaxed);
+                            fingerprint_failed = false;
                         } else {
                             fp_failed.fetch_add(1, Ordering::Relaxed);
+                            fingerprint_failed = true;
                         }
                     }
 
-                    if !came_from_cache || track.acoustic_id != prev_acoustic {
+                    if !came_from_cache
+                        || track.acoustic_id != prev_acoustic
+                        || fingerprint_failed != prev_failed
+                    {
                         pending_changes.fetch_add(1, Ordering::Relaxed);
                         total_changes.fetch_add(1, Ordering::Relaxed);
                     }
@@ -259,7 +265,14 @@ impl DirectoryLibrary {
                         }),
                     });
 
-                    Some((key, crate::cache::CachedFile { fingerprint, track }))
+                    Some((
+                        key,
+                        crate::cache::CachedFile {
+                            fingerprint,
+                            track,
+                            fingerprint_failed,
+                        },
+                    ))
                 })
                 .collect();
 
@@ -399,11 +412,13 @@ impl DirectoryLibrary {
             if fingerprint && track.acoustic_id.is_none() {
                 track.acoustic_id = crate::fingerprint::compute_fingerprint(p);
             }
+            let fingerprint_failed = fingerprint && track.acoustic_id.is_none();
             cached.insert(
                 key,
                 crate::cache::CachedFile {
                     fingerprint: fp,
                     track,
+                    fingerprint_failed,
                 },
             );
         }
@@ -427,11 +442,15 @@ const BACKFILL_CHUNK: usize = 32;
 
 /// Compute Chromaprint ids for cached tracks that lack one.
 ///
-/// The TUI calls this after the tag scan has already published the library,
-/// so browsing does not wait on audio decode. Embedded `ACOUSTID_FINGERPRINT`
-/// tags are picked up first (a tag read), then the remaining files are
-/// decoded. A failed decode is not stored — the next launch tries again, the
-/// same way the blocking scan did.
+/// The TUI calls this on its own thread after the tag scan has already
+/// published the library, so browsing and playback keep running. Files are
+/// handled one at a time on that thread — a rayon fan-out saturates every
+/// core and playback hitches — but the thread is not lowered in priority,
+/// so the queue keeps moving while a track is playing. Embedded
+/// `ACOUSTID_FINGERPRINT` tags are picked up first (a tag read), then the
+/// remaining files are decoded. A failed decode is stored on the cache
+/// entry and skipped on later launches until the file's mtime or size
+/// changes.
 ///
 /// `cancel` is polled between files and from worker threads. `on_batch`
 /// receives each group of ids that landed in the cache, as
@@ -452,7 +471,7 @@ pub fn backfill_acoustic_ids<C, B>(
     let cached = crate::cache::load_dirlib_cache(root, log);
     let pending: Vec<(String, crate::cache::FileFingerprint)> = cached
         .iter()
-        .filter(|(_, entry)| entry.track.acoustic_id.is_none())
+        .filter(|(_, entry)| entry.track.acoustic_id.is_none() && !entry.fingerprint_failed)
         .map(|(path, entry)| (path.clone(), entry.fingerprint))
         .collect();
     drop(cached);
@@ -468,16 +487,21 @@ pub fn backfill_acoustic_ids<C, B>(
 
     let total = pending.len() as u64;
 
-    let embedded_hits: Vec<(String, crate::cache::FileFingerprint, String)> = pending
-        .par_iter()
-        .filter_map(|(path, fp)| {
-            if cancel() {
-                return None;
-            }
-            let id = crate::fingerprint::read_embedded_fingerprint(Path::new(path))?;
-            Some((path.clone(), *fp, id))
-        })
-        .collect();
+    let mut embedded_hits = Vec::new();
+    for (i, (path, fp)) in pending.iter().enumerate() {
+        if cancel() {
+            break;
+        }
+        if i.is_multiple_of(BACKFILL_CHUNK) {
+            log(&format!(
+                "zytunes: fingerprint: checking tags {}/{total}",
+                i + 1
+            ));
+        }
+        if let Some(id) = crate::fingerprint::read_embedded_fingerprint(Path::new(path)) {
+            embedded_hits.push((path.clone(), *fp, id));
+        }
+    }
 
     let mut embedded_paths = HashSet::new();
     let mut embedded_n = 0u64;
@@ -507,78 +531,64 @@ pub fn backfill_acoustic_ids<C, B>(
         .filter(|(path, _)| !embedded_paths.contains(path))
         .collect();
 
-    let computed = AtomicU64::new(0);
-    let failed = AtomicU64::new(0);
+    let mut computed = 0u64;
+    let mut failed = 0u64;
     for chunk in rest.chunks(BACKFILL_CHUNK) {
         if cancel() {
-            log_fingerprint_stopped(
-                log,
-                started,
-                embedded_n,
-                computed.load(Ordering::Relaxed),
-                failed.load(Ordering::Relaxed),
-            );
+            log_fingerprint_stopped(log, started, embedded_n, computed, failed);
             return;
         }
-        let hits: Vec<(String, crate::cache::FileFingerprint, String)> = chunk
-            .par_iter()
-            .filter_map(|(path, fp)| {
-                if cancel() {
-                    return None;
+        let mut hits = Vec::new();
+        let mut misses = Vec::new();
+        for (path, fp) in chunk {
+            if cancel() {
+                break;
+            }
+            let name = Path::new(path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(path);
+            let started_n = embedded_n + computed + failed + 1;
+            log(&format!(
+                "zytunes: fingerprint: {started_n}/{total} — {name}"
+            ));
+            match crate::fingerprint::compute_fingerprint(Path::new(path)) {
+                Some(id) => {
+                    computed += 1;
+                    hits.push((path.clone(), *fp, id));
                 }
-                match crate::fingerprint::compute_fingerprint(Path::new(path)) {
-                    Some(id) => {
-                        computed.fetch_add(1, Ordering::Relaxed);
-                        Some((path.clone(), *fp, id))
-                    }
-                    None => {
-                        failed.fetch_add(1, Ordering::Relaxed);
-                        None
-                    }
+                None => {
+                    failed += 1;
+                    misses.push((path.clone(), *fp));
                 }
-            })
-            .collect();
+            }
+        }
         if !hits.is_empty() {
             let updates = crate::cache::commit_acoustic_ids(root, log, &hits, || !cancel());
             if !updates.is_empty() {
                 on_batch(&updates);
             }
         }
-        let done = embedded_n + computed.load(Ordering::Relaxed) + failed.load(Ordering::Relaxed);
-        let sample = hits
-            .last()
-            .map(|(path, _, _)| path.as_str())
-            .or_else(|| chunk.last().map(|(path, _)| path.as_str()));
-        let name = sample
-            .and_then(|path| Path::new(path).file_name())
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
-        log(&format!(
-            "zytunes: fingerprint: {done}/{total}{}",
-            if name.is_empty() {
-                String::new()
-            } else {
-                format!(" — {name}")
-            }
-        ));
+        if !misses.is_empty() {
+            crate::cache::commit_fingerprint_failures(root, log, &misses, || !cancel());
+        }
     }
 
     if cancel() {
-        log_fingerprint_stopped(
-            log,
-            started,
-            embedded_n,
-            computed.load(Ordering::Relaxed),
-            failed.load(Ordering::Relaxed),
-        );
+        log_fingerprint_stopped(log, started, embedded_n, computed, failed);
         return;
     }
 
+    let skip_note = if failed > 0 {
+        " — failed files are skipped until they change"
+    } else {
+        ""
+    };
     log(&format!(
-        "zytunes: fingerprint: Done: {:.1}s | embedded: {embedded_n} | computed: {} | failed: {}",
+        "zytunes: fingerprint: Done: {:.1}s | embedded: {embedded_n} | computed: {} | failed: {}{skip_note}",
         started.elapsed().as_secs_f64(),
-        computed.load(Ordering::Relaxed),
-        failed.load(Ordering::Relaxed),
+        computed,
+        failed,
     ));
 }
 
@@ -1464,6 +1474,7 @@ mod tests {
         let fp = crate::cache::FileFingerprint::from_path(&file).unwrap();
         let seed = crate::cache::CachedFile {
             fingerprint: fp,
+            fingerprint_failed: false,
             track: Track {
                 id: 42,
                 name: "Back Song".into(),
@@ -1557,6 +1568,69 @@ mod tests {
     }
 
     #[test]
+    fn backfill_acoustic_ids_writes_fingerprint_back_to_cache() {
+        // The id has to land in the on-disk cache, not only the callback.
+        // A later launch loads that cache and must not decode the file again.
+        let dir = std::env::temp_dir().join("zytunes-dirlib-fp-written-back");
+        let _ = fs::remove_dir_all(&dir);
+        let album = dir.join("WriteArtist").join("WriteAlbum");
+        fs::create_dir_all(&album).unwrap();
+        let file = album.join("01 Write.wav");
+        write_sine_wav(&file, 10);
+
+        let opts = ScanOptions {
+            fingerprint: false,
+            ..ScanOptions::default()
+        };
+        DirectoryLibrary::scan_with_options(dir.to_str().unwrap(), opts, |_| {}).unwrap();
+
+        let log = crate::cache::default_logger();
+        let path_key = file.to_string_lossy().to_string();
+        let fingerprint_before = crate::cache::FileFingerprint::from_path(&file).unwrap();
+        let mut landed = Vec::new();
+        backfill_acoustic_ids(
+            dir.to_str().unwrap(),
+            &log,
+            || false,
+            |batch| {
+                landed.extend_from_slice(batch);
+            },
+        );
+        assert_eq!(landed.len(), 1, "backfill should compute one fingerprint");
+        let (track_id, acoustic_id) = landed[0].clone();
+
+        let cached = crate::cache::load_dirlib_cache(dir.to_str().unwrap(), &log);
+        let entry = cached
+            .get(&path_key)
+            .expect("cache should still contain the scanned file");
+        assert_eq!(entry.track.id, track_id);
+        assert_eq!(
+            entry.track.acoustic_id.as_deref(),
+            Some(acoustic_id.as_str())
+        );
+        assert_eq!(
+            entry.fingerprint, fingerprint_before,
+            "writing the id back must not invalidate the file's mtime/size fingerprint"
+        );
+
+        let mut again = Vec::new();
+        backfill_acoustic_ids(
+            dir.to_str().unwrap(),
+            &log,
+            || false,
+            |batch| {
+                again.extend_from_slice(batch);
+            },
+        );
+        assert!(
+            again.is_empty(),
+            "a fingerprint already stored in the cache must not be recomputed"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn backfill_acoustic_ids_honours_cancel_before_decode() {
         let dir = std::env::temp_dir().join("zytunes-dirlib-fp-cancel");
         let _ = fs::remove_dir_all(&dir);
@@ -1588,7 +1662,73 @@ mod tests {
         let cached = crate::cache::load_dirlib_cache(dir.to_str().unwrap(), &log);
         assert!(cached
             .values()
-            .all(|entry| entry.track.acoustic_id.is_none()));
+            .all(|entry| entry.track.acoustic_id.is_none() && !entry.fingerprint_failed));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn backfill_remembers_files_that_cannot_be_fingerprinted() {
+        // A decode that returns nothing used to leave acoustic_id unset, so
+        // every launch queued the same files again. The failure has to stick
+        // until the file itself changes.
+        let dir = std::env::temp_dir().join("zytunes-dirlib-fp-failed");
+        let _ = fs::remove_dir_all(&dir);
+        let album = dir.join("FailArtist").join("FailAlbum");
+        fs::create_dir_all(&album).unwrap();
+        let file = album.join("01 NotAudio.mp3");
+        fs::write(&file, b"this is not audio").unwrap();
+
+        let opts = ScanOptions {
+            fingerprint: false,
+            ..ScanOptions::default()
+        };
+        DirectoryLibrary::scan_with_options(dir.to_str().unwrap(), opts, |_| {}).unwrap();
+
+        let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log_lines = std::sync::Arc::clone(&lines);
+        let log: crate::cache::Logger = std::sync::Arc::new(move |msg: &str| {
+            log_lines.lock().expect("log lock").push(msg.to_string());
+        });
+        backfill_acoustic_ids(dir.to_str().unwrap(), &log, || false, |_| {});
+
+        let logged = lines.lock().expect("log lock").clone();
+        assert!(
+            logged.iter().any(|l| l.contains("failed: 1")),
+            "the undecodable file should be counted as a failure: {logged:?}"
+        );
+        assert!(
+            logged
+                .iter()
+                .any(|l| l.contains("skipped until they change")),
+            "the summary should say failures are not retried: {logged:?}"
+        );
+
+        let path_key = file.to_string_lossy().to_string();
+        let cached = crate::cache::load_dirlib_cache(dir.to_str().unwrap(), &log);
+        let entry = cached.get(&path_key).expect("cache entry");
+        assert!(entry.track.acoustic_id.is_none());
+        assert!(entry.fingerprint_failed);
+
+        // A later launch reloads the same cache and must not queue the file.
+        lines.lock().expect("log lock").clear();
+        DirectoryLibrary::scan_with_options(
+            dir.to_str().unwrap(),
+            ScanOptions {
+                fingerprint: false,
+                ..ScanOptions::default()
+            },
+            |_| {},
+        )
+        .unwrap();
+        backfill_acoustic_ids(dir.to_str().unwrap(), &log, || false, |_| {});
+        let again = lines.lock().expect("log lock").clone();
+        assert!(
+            again.iter().all(|l| !l.contains("tracks queued")),
+            "a remembered failure must not be queued again: {again:?}"
+        );
+        let cached = crate::cache::load_dirlib_cache(dir.to_str().unwrap(), &log);
+        assert!(cached.get(&path_key).unwrap().fingerprint_failed);
 
         let _ = fs::remove_dir_all(&dir);
     }

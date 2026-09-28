@@ -61,6 +61,10 @@ impl FileFingerprint {
 pub struct CachedFile {
     pub fingerprint: FileFingerprint,
     pub track: Track,
+    /// A Chromaprint attempt returned nothing. Skip further attempts until the
+    /// file's `(mtime, size)` changes and this entry is rebuilt.
+    #[serde(default)]
+    pub fingerprint_failed: bool,
 }
 
 /// Bumped whenever the on-disk shape of a cached `Track` changes such that
@@ -358,8 +362,8 @@ pub(crate) fn acoustic_cache_epoch() -> u64 {
     ACOUSTIC_EPOCH.load(Ordering::Acquire)
 }
 
-/// Copy acoustic ids from the on-disk cache onto `files` entries that still
-/// share that file's `(mtime, size)` and have no id of their own.
+/// Copy acoustic ids and remembered fingerprint failures from the on-disk
+/// cache onto `files` entries that still share that file's `(mtime, size)`.
 fn merge_disk_acoustic_ids(dir_path: &str, files: &mut HashMap<String, CachedFile>, log: &Logger) {
     let Some(existing) = load_raw(dir_path, log) else {
         return;
@@ -377,6 +381,9 @@ fn merge_disk_acoustic_ids(dir_path: &str, files: &mut HashMap<String, CachedFil
         if prev.fingerprint == entry.fingerprint {
             if let Some(id) = prev.track.acoustic_id.clone() {
                 entry.track.acoustic_id = Some(id);
+                entry.fingerprint_failed = false;
+            } else if prev.fingerprint_failed {
+                entry.fingerprint_failed = true;
             }
         }
     }
@@ -481,6 +488,50 @@ where
     updates
 }
 
+/// Remember files whose Chromaprint attempt returned nothing.
+///
+/// Without this, every launch retries the same undecodable files. The flag
+/// clears when the file's `(mtime, size)` changes and the scan rebuilds the
+/// entry.
+pub(crate) fn commit_fingerprint_failures<F>(
+    dir_path: &str,
+    log: &Logger,
+    misses: &[(String, FileFingerprint)],
+    still_current: F,
+) -> usize
+where
+    F: Fn() -> bool,
+{
+    let _guard = dirlib_write_lock();
+    if !still_current() || misses.is_empty() {
+        return 0;
+    }
+    let mut files = load_dirlib_cache(dir_path, log);
+    let mut marked = 0usize;
+    for (path, fp) in misses {
+        let Some(entry) = files.get_mut(path) else {
+            continue;
+        };
+        if entry.fingerprint != *fp || entry.track.acoustic_id.is_some() || entry.fingerprint_failed
+        {
+            continue;
+        }
+        entry.fingerprint_failed = true;
+        marked += 1;
+    }
+    if marked == 0 {
+        return 0;
+    }
+    let cached = CachedLibrary {
+        root: dir_path.to_string(),
+        schema_version: CACHE_SCHEMA_VERSION,
+        files,
+    };
+    save_raw(dir_path, &cached, log);
+    ACOUSTIC_EPOCH.fetch_add(1, Ordering::Release);
+    marked
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -542,6 +593,7 @@ mod tests {
                         mtime_secs: 0,
                         size: 0,
                     },
+                    fingerprint_failed: false,
                     track: crate::library::Track {
                         id: 1,
                         name: "Title  ".into(),
@@ -607,6 +659,7 @@ mod tests {
                         mtime_secs: 0,
                         size: 0,
                     },
+                    fingerprint_failed: false,
                     track: crate::library::Track {
                         id: 1,
                         name: "Stale".into(),
