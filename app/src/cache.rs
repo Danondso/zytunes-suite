@@ -454,14 +454,15 @@ pub(crate) fn finish_scan_cache(
 /// A stored id clears `fingerprint_failed`. A miss sets that flag and is
 /// skipped on later launches until the file's `(mtime, size)` changes.
 ///
-/// Returns the `(track id, acoustic id)` pairs that landed.
+/// Returns the `(path, track id, acoustic id)` triples that landed. The path
+/// is the cache key, so the caller can tell which inputs were stored.
 pub(crate) fn commit_fingerprint_progress<F>(
     dir_path: &str,
     log: &Logger,
     hits: &[(String, FileFingerprint, String)],
     misses: &[(String, FileFingerprint)],
     still_current: F,
-) -> Vec<(u64, String)>
+) -> Vec<(String, u64, String)>
 where
     F: Fn() -> bool,
 {
@@ -482,7 +483,7 @@ where
         entry.track.acoustic_id = Some(acoustic_id.clone());
         entry.fingerprint_failed = false;
         changed = true;
-        updates.push((entry.track.id, acoustic_id.clone()));
+        updates.push((path.clone(), entry.track.id, acoustic_id.clone()));
     }
     for (path, fp) in misses {
         let Some(entry) = files.get_mut(path) else {
@@ -765,7 +766,7 @@ mod tests {
             &[(miss_path.clone(), fp)],
             || true,
         );
-        assert_eq!(updates, vec![(7, "fp-ok".into())]);
+        assert_eq!(updates, vec![(hit_path.clone(), 7, "fp-ok".into())]);
         assert!(acoustic_cache_epoch() > epoch);
 
         let cached = load_dirlib_cache(dir_path, &log);

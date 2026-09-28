@@ -504,20 +504,17 @@ pub fn backfill_acoustic_ids<C, B>(
     let mut embedded_paths = HashSet::new();
     let mut embedded_n = 0u64;
     if !embedded_hits.is_empty() && !cancel() {
-        let updates =
+        let stored =
             crate::cache::commit_fingerprint_progress(root, log, &embedded_hits, &[], || !cancel());
-        embedded_n = updates.len() as u64;
-        embedded_paths.extend(embedded_hits.into_iter().map(|(path, _, _)| path));
-        if !updates.is_empty() {
+        embedded_n = stored.len() as u64;
+        // Only files whose id actually landed leave the decode list. A tag
+        // read that did not stick still needs a compute, and still counts.
+        embedded_paths.extend(stored.iter().map(|(path, _, _)| path.clone()));
+        if !stored.is_empty() {
+            let updates: Vec<(u64, String)> =
+                stored.iter().map(|(_, id, fp)| (*id, fp.clone())).collect();
             on_batch(&updates);
         }
-    }
-
-    if embedded_n > 0 {
-        log(&format!(
-            "zytunes: fingerprint: {embedded_n}/{total} from tags, {} left to compute",
-            total.saturating_sub(embedded_n)
-        ));
     }
 
     if cancel() {
@@ -529,6 +526,15 @@ pub fn backfill_acoustic_ids<C, B>(
         .into_iter()
         .filter(|(path, _)| !embedded_paths.contains(path))
         .collect();
+    // Tag hits are already done. The fraction below counts only files that
+    // still need a decode, so it finishes at N/N instead of stopping short
+    // of a total that still includes the tag hits.
+    let remaining = rest.len() as u64;
+    if embedded_n > 0 {
+        log(&format!(
+            "zytunes: fingerprint: {embedded_n} from tags, {remaining} left to compute"
+        ));
+    }
 
     let mut computed = 0u64;
     let mut failed = 0u64;
@@ -547,10 +553,8 @@ pub fn backfill_acoustic_ids<C, B>(
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or(path);
-            let started_n = embedded_n + computed + failed + 1;
-            log(&format!(
-                "zytunes: fingerprint: {started_n}/{total} — {name}"
-            ));
+            let n = computed + failed + 1;
+            log(&format!("zytunes: fingerprint: {n}/{remaining} — {name}"));
             match crate::fingerprint::compute_fingerprint(Path::new(path)) {
                 Some(id) => {
                     computed += 1;
@@ -563,9 +567,11 @@ pub fn backfill_acoustic_ids<C, B>(
             }
         }
         if !hits.is_empty() || !misses.is_empty() {
-            let updates =
+            let stored =
                 crate::cache::commit_fingerprint_progress(root, log, &hits, &misses, || !cancel());
-            if !updates.is_empty() {
+            if !stored.is_empty() {
+                let updates: Vec<(u64, String)> =
+                    stored.iter().map(|(_, id, fp)| (*id, fp.clone())).collect();
                 on_batch(&updates);
             }
         }
@@ -1726,6 +1732,68 @@ mod tests {
         );
         let cached = crate::cache::load_dirlib_cache(dir.to_str().unwrap(), &log);
         assert!(cached.get(&path_key).unwrap().fingerprint_failed);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn backfill_progress_counts_only_files_still_to_compute() {
+        // Files resolved from an embedded tag are finished before the decode
+        // loop. They must not stay in that loop's denominator, or the counter
+        // ends at (remaining)/(queued) — short of the total by exactly the
+        // tag hits.
+        let dir = std::env::temp_dir().join("zytunes-dirlib-fp-progress");
+        let _ = fs::remove_dir_all(&dir);
+        let album = dir.join("ProgArtist").join("ProgAlbum");
+        fs::create_dir_all(&album).unwrap();
+        let tagged = album.join("01 Tagged.wav");
+        let plain = album.join("02 Plain.wav");
+        write_sine_wav(&tagged, 2);
+        write_sine_wav(&plain, 2);
+
+        let opts = ScanOptions {
+            fingerprint: false,
+            ..ScanOptions::default()
+        };
+        DirectoryLibrary::scan_with_options(dir.to_str().unwrap(), opts, |_| {}).unwrap();
+
+        // Tag after the scan so the cache row still has no acoustic id.
+        {
+            use id3::frame::ExtendedText;
+            use id3::{Tag, TagLike, Version};
+            let mut tag = Tag::new();
+            tag.set_title("Tagged");
+            tag.add_frame(ExtendedText {
+                description: "ACOUSTID_FINGERPRINT".into(),
+                value: "SENTINEL-FROM-TAG".into(),
+            });
+            tag.write_to_path(&tagged, Version::Id3v24).unwrap();
+        }
+
+        let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log_lines = std::sync::Arc::clone(&lines);
+        let log: crate::cache::Logger = std::sync::Arc::new(move |msg: &str| {
+            log_lines.lock().expect("log lock").push(msg.to_string());
+        });
+        backfill_acoustic_ids(dir.to_str().unwrap(), &log, || false, |_| {});
+
+        let logged = lines.lock().expect("log lock").clone();
+        assert!(
+            logged
+                .iter()
+                .any(|l| l.contains("1 from tags, 1 left to compute")),
+            "tag hits should be reported apart from the decode queue: {logged:?}"
+        );
+        assert!(
+            logged
+                .iter()
+                .any(|l| l.contains("1/1 —") && l.contains("02 Plain.wav")),
+            "the decode counter should be 1/1 for the only file still to compute: {logged:?}"
+        );
+        assert!(
+            logged.iter().all(|l| !l.contains("/2 —")),
+            "tag hits must not inflate the decode denominator: {logged:?}"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
