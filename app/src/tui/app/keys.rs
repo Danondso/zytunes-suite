@@ -493,7 +493,12 @@ impl App {
             KeyCode::Char('2') => {
                 self.set_sidebar_mode(SidebarMode::Albums);
             }
-            KeyCode::Char('4') if !self.sync.queue.is_empty() => {
+            KeyCode::Char('3') => {
+                self.close_track_info();
+                self.active_panel = Panel::TrackList;
+            }
+            KeyCode::Char('4') => {
+                self.close_track_info();
                 self.active_panel = Panel::SyncQueue;
             }
             KeyCode::Char('o') => {
@@ -556,19 +561,16 @@ impl App {
                 // exercised end-to-end.
                 self.handle_cd_import_key();
             }
-            // Cancel an active rip. Takes priority over the device-connect
-            // binding so the user doesn't need a separate key to abort.
+            // Cancel an active rip. Takes priority over the connection
+            // toggle so the user doesn't need a separate key to abort.
             KeyCode::Char('c') if self.cd.rip.is_some() => {
                 self.cancel_rip();
             }
-            KeyCode::Char('c') if self.device.status == DeviceStatus::Disconnected => {
-                self.device.ignore_session_events = false;
-                self.device.status = DeviceStatus::Detecting;
-                self.connection_anim_start = Some(self.anim_frame);
-                let _ = cmd_tx.send(BgCommand::Connect);
+            KeyCode::Char('c') => {
+                self.toggle_connection(cmd_tx);
             }
             KeyCode::Char('d') => {
-                self.handle_delete_key(cmd_tx);
+                self.handle_delete_key();
             }
             KeyCode::Char('N') if self.browse_mode == BrowseMode::Playlists => {
                 self.playlist_name_input = Some(String::new());
@@ -603,10 +605,10 @@ impl App {
                 let _ = cmd_tx.send(BgCommand::LoadDeviceTracks);
                 self.set_toast("Refreshing device tracks...".into(), false);
             }
-            KeyCode::Up => {
+            KeyCode::Up | KeyCode::Char('k') => {
                 self.move_up();
             }
-            KeyCode::Down => {
+            KeyCode::Down | KeyCode::Char('j') => {
                 self.move_down();
             }
             KeyCode::PageUp => {
@@ -668,8 +670,8 @@ impl App {
             {
                 self.pending_removal = Some(self.removal_queue.clone());
             }
-            KeyCode::Char('D') => {
-                self.handle_delete_key(cmd_tx);
+            KeyCode::Char('D') if self.browse_mode == BrowseMode::Device => {
+                self.set_toast("No tracks queued for removal".into(), false);
             }
             KeyCode::Char('C') => {
                 self.handle_clear_key();
@@ -697,11 +699,22 @@ impl App {
         self.active_panel = Panel::Library;
     }
 
+    /// `c` — connect when disconnected, disconnect otherwise. Rip-cancel
+    /// is matched earlier so an in-flight CD import still uses `c` to abort.
+    fn toggle_connection(&mut self, cmd_tx: &mpsc::Sender<BgCommand>) {
+        if self.device.status == DeviceStatus::Disconnected {
+            self.device.ignore_session_events = false;
+            self.device.status = DeviceStatus::Detecting;
+            self.connection_anim_start = Some(self.anim_frame);
+            let _ = cmd_tx.send(BgCommand::Connect);
+        } else {
+            self.disconnect_device(cmd_tx);
+        }
+    }
+
     /// `d` — panel-dependent delete: dequeue a sync item or delete a
-    /// playlist / playlist track. On any panel that doesn't claim `d`
-    /// for itself, it disconnects the device — disconnecting shouldn't
-    /// require tabbing over to the Device panel first.
-    fn handle_delete_key(&mut self, cmd_tx: &mpsc::Sender<BgCommand>) {
+    /// playlist / playlist track. Does not disconnect — that is `c`.
+    fn handle_delete_key(&mut self) {
         match self.active_panel {
             Panel::SyncQueue if !self.sync.queue.is_empty() => {
                 self.remove_queue_item();
@@ -722,7 +735,7 @@ impl App {
             _ => {}
         }
         if self.device.status != DeviceStatus::Disconnected {
-            self.disconnect_device(cmd_tx);
+            self.set_toast("Use c to disconnect".into(), false);
         }
     }
 

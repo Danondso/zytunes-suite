@@ -7897,10 +7897,7 @@ mod tests {
     }
 
     #[test]
-    fn d_disconnects_from_any_panel_when_connected() {
-        // Regression: `d` only disconnected when the Device panel was
-        // active; from any other panel it was a no-op, forcing the user
-        // to Tab over to the device panel first.
+    fn c_disconnects_from_any_panel_when_connected() {
         use crate::audio::AudioCommand;
         use crate::background::BgCommand;
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<BgCommand>();
@@ -7915,7 +7912,7 @@ mod tests {
 
         app.handle_key(
             crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Char('d'),
+                crossterm::event::KeyCode::Char('c'),
                 crossterm::event::KeyModifiers::empty(),
             ),
             &cmd_tx,
@@ -7938,7 +7935,7 @@ mod tests {
     }
 
     #[test]
-    fn d_on_ipod_ignores_late_session_events() {
+    fn c_on_ipod_ignores_late_session_events() {
         use crate::audio::AudioCommand;
         use crate::background::{BgCommand, BgEvent, DeviceInfo, StorageInfo};
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<BgCommand>();
@@ -7950,7 +7947,7 @@ mod tests {
 
         app.handle_key(
             crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Char('d'),
+                crossterm::event::KeyCode::Char('c'),
                 crossterm::event::KeyModifiers::empty(),
             ),
             &cmd_tx,
@@ -8029,7 +8026,7 @@ mod tests {
     }
 
     #[test]
-    fn d_on_empty_sync_queue_disconnects() {
+    fn d_on_empty_sync_queue_does_not_disconnect() {
         use crate::audio::AudioCommand;
         use crate::background::BgCommand;
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<BgCommand>();
@@ -8048,11 +8045,155 @@ mod tests {
             &audio_tx,
         );
 
-        assert_eq!(app.device.status, DeviceStatus::Disconnected);
+        assert_eq!(app.device.status, DeviceStatus::Connected);
         assert!(
-            matches!(cmd_rx.try_recv(), Ok(BgCommand::Disconnect)),
-            "empty queue must not swallow disconnect"
+            !matches!(cmd_rx.try_recv(), Ok(BgCommand::Disconnect)),
+            "empty queue must not disconnect"
         );
+        assert_eq!(
+            app.toast_message.as_ref().map(|(m, _, _)| m.as_str()),
+            Some("Use c to disconnect")
+        );
+    }
+
+    #[test]
+    fn d_in_library_does_not_disconnect() {
+        use crate::audio::AudioCommand;
+        use crate::background::BgCommand;
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<BgCommand>();
+        let (audio_tx, _audio_rx) = std::sync::mpsc::channel::<AudioCommand>();
+        let mut app = App::new();
+        app.device.status = DeviceStatus::Connected;
+        app.active_panel = Panel::Library;
+
+        app.handle_key(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('d'),
+                crossterm::event::KeyModifiers::empty(),
+            ),
+            &cmd_tx,
+            &audio_tx,
+        );
+
+        assert_eq!(app.device.status, DeviceStatus::Connected);
+        assert!(cmd_rx.try_recv().is_err());
+        assert_eq!(
+            app.toast_message.as_ref().map(|(m, _, _)| m.as_str()),
+            Some("Use c to disconnect")
+        );
+    }
+
+    #[test]
+    fn shift_d_in_library_does_not_disconnect() {
+        use crate::audio::AudioCommand;
+        use crate::background::BgCommand;
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<BgCommand>();
+        let (audio_tx, _audio_rx) = std::sync::mpsc::channel::<AudioCommand>();
+        let mut app = App::new();
+        app.device.status = DeviceStatus::Connected;
+        app.browse_mode = BrowseMode::Library;
+        app.active_panel = Panel::Library;
+
+        app.handle_key(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('D'),
+                crossterm::event::KeyModifiers::SHIFT,
+            ),
+            &cmd_tx,
+            &audio_tx,
+        );
+
+        assert_eq!(app.device.status, DeviceStatus::Connected);
+        assert!(cmd_rx.try_recv().is_err());
+        assert!(app.pending_removal.is_none());
+    }
+
+    #[test]
+    fn c_when_disconnected_starts_connect() {
+        use crate::audio::AudioCommand;
+        use crate::background::BgCommand;
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<BgCommand>();
+        let (audio_tx, _audio_rx) = std::sync::mpsc::channel::<AudioCommand>();
+        let mut app = App::new();
+        assert_eq!(app.device.status, DeviceStatus::Disconnected);
+
+        app.handle_key(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('c'),
+                crossterm::event::KeyModifiers::empty(),
+            ),
+            &cmd_tx,
+            &audio_tx,
+        );
+
+        assert_eq!(app.device.status, DeviceStatus::Detecting);
+        assert!(matches!(cmd_rx.try_recv(), Ok(BgCommand::Connect)));
+    }
+
+    #[test]
+    fn jk_move_sidebar_selection() {
+        use crate::audio::AudioCommand;
+        use crate::background::BgCommand;
+        let (cmd_tx, _cmd_rx) = std::sync::mpsc::channel::<BgCommand>();
+        let (audio_tx, _audio_rx) = std::sync::mpsc::channel::<AudioCommand>();
+        let mut app = App::new();
+        app.active_panel = Panel::Library;
+        app.sidebar_items = vec![
+            SidebarEntry::Artist("Apple".into()),
+            SidebarEntry::Artist("Banana".into()),
+        ];
+        app.sidebar_selected = 0;
+
+        app.handle_key(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('j'),
+                crossterm::event::KeyModifiers::empty(),
+            ),
+            &cmd_tx,
+            &audio_tx,
+        );
+        assert_eq!(app.sidebar_selected, 1);
+
+        app.handle_key(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('k'),
+                crossterm::event::KeyModifiers::empty(),
+            ),
+            &cmd_tx,
+            &audio_tx,
+        );
+        assert_eq!(app.sidebar_selected, 0);
+    }
+
+    #[test]
+    fn digit_3_and_4_jump_panels() {
+        use crate::audio::AudioCommand;
+        use crate::background::BgCommand;
+        let (cmd_tx, _cmd_rx) = std::sync::mpsc::channel::<BgCommand>();
+        let (audio_tx, _audio_rx) = std::sync::mpsc::channel::<AudioCommand>();
+        let mut app = App::new();
+        app.active_panel = Panel::Library;
+        assert!(app.sync.queue.is_empty());
+
+        app.handle_key(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('3'),
+                crossterm::event::KeyModifiers::empty(),
+            ),
+            &cmd_tx,
+            &audio_tx,
+        );
+        assert_eq!(app.active_panel, Panel::TrackList);
+
+        app.handle_key(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('4'),
+                crossterm::event::KeyModifiers::empty(),
+            ),
+            &cmd_tx,
+            &audio_tx,
+        );
+        assert_eq!(app.active_panel, Panel::SyncQueue);
     }
 
     #[test]

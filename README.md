@@ -98,7 +98,7 @@ The album detail view shows a ZIP disk ASCII art with album metadata (artist, al
 
 ### Keybindings
 
-Bindings are context-sensitive. An open modal (search, help, CD import, tag manager, stem settings, confirms) consumes keys first. `1`/`2` are Artists/Albums unless the stem strip is visible and claiming those digits.
+Bindings are context-sensitive. An open modal (search, help, CD import, tag manager, stem settings, confirms) consumes keys first. `1`/`2` are Artists/Albums unless the stem strip is visible and claiming those digits. `c` connects or disconnects; `d` never unplugs.
 
 **Navigation**
 
@@ -106,10 +106,12 @@ Bindings are context-sensitive. An open modal (search, help, CD import, tag mana
 |-----|--------|
 | `Tab` / `Shift+Tab` | Cycle between panels |
 | `Up` / `Down` | Navigate lists |
+| `j` / `k` | Same as Down / Up |
 | `Left` / `Right` | Letter-group skip in the sidebar; year-group skip on the Albums panel |
 | `Enter` | Sidebar: expand. Albums: open tracks. Track list: play. Sync queue: start sync |
 | `1` / `2` | Switch sidebar to Artists / Albums (when stems are not claiming the digits) |
-| `4` | Jump to sync queue (only if the queue is non-empty) |
+| `3` | Jump to the track list |
+| `4` | Jump to the sync queue |
 | `v` | Cycle Library → Device (if connected) → Playlists |
 
 **Library**
@@ -140,12 +142,11 @@ Bindings are context-sensitive. An open modal (search, help, CD import, tag mana
 
 | Key | Action |
 |-----|--------|
-| `c` | Connect (only when disconnected; USB detect, then MTPZ handshake on Zune or volume mount on iPod / GoGear) |
+| `c` | Connect when disconnected; disconnect when connected (USB detect, then MTPZ handshake on Zune or volume mount on iPod / GoGear). The iPod / GoGear volume stays mounted so `c` can reconnect without a replug |
 | `r` | Refresh device track list (when connected) |
-| `d` | Disconnect (from any panel that does not claim `d` for dequeue / playlist delete). The iPod / GoGear volume stays mounted so `c` can reconnect without a replug |
 | `a` | Queue the current selection for removal |
 | `A` | Same as `a` on the current selection (not "remove all") |
-| `D` | Confirm and execute the removal queue |
+| `D` | Confirm and execute the removal queue (Device browse mode only) |
 | `C` | Clear the removal queue |
 | `U` | Dedupe copies on the device, keeping the newest |
 | `X` | Confirm-clear the playback cache |
@@ -156,7 +157,7 @@ Bindings are context-sensitive. An open modal (search, help, CD import, tag mana
 |-----|--------|
 | `S` | Start sync (queue must be non-empty; also focuses the queue panel) |
 | `Enter` (in queue) | Start sync |
-| `d` (in queue) | Remove the selected queue item |
+| `d` (in queue) | Remove the selected queue item (does not disconnect) |
 | `C` (in queue) | Clear the sync queue (Library/Playlists; Device mode `C` clears the removal queue instead) |
 | `Esc` | Cancel a running sync |
 
@@ -191,7 +192,7 @@ Inside the stem settings panel (`o`):
 | Key | Action |
 |-----|--------|
 | `i` | Always responds — opens the import overlay when a disc is identified, otherwise toasts one of: "No optical drive detected" (no drive on the system) / "Insert a CD to import" (drive empty) / "Cannot import — {reason}" (TOC read but MB lookup failed — common reason: `musicbrainz_user_agent` not configured) |
-| `c` (during rip) | Cancel the active rip (SIGTERMs ffmpeg, skips remaining tracks). Falls through to `c` for connect when no rip is running |
+| `c` (during rip) | Cancel the active rip (SIGTERMs ffmpeg, skips remaining tracks). Falls through to `c` for connect/disconnect when no rip is running |
 
 Inside the import overlay:
 
@@ -259,7 +260,7 @@ The TUI works in any EAW-compliant terminal (Alacritty, kitty, wezterm, Zed's em
 ### Sync workflow
 
 1. Browse your music library and press `a` to add artists, albums, or individual tracks to the sync queue
-2. Press `c` to connect to the device (auto-detects via USB, performs MTPZ handshake on Zune / uses the mounted iPod or GoGear volume). A plugged-in GoGear that is not mounted still shows up so you can mount it and press `c` again (`GOGEAR_MOUNT_PATH` overrides)
+2. Press `c` to connect to the device (auto-detects via USB, performs MTPZ handshake on Zune / uses the mounted iPod or GoGear volume). Press `c` again to disconnect. A plugged-in GoGear that is not mounted still shows up so you can mount it and press `c` again (`GOGEAR_MOUNT_PATH` overrides)
 3. Press `S` or switch to the queue and press `Enter` to start syncing
 4. Formats the device does not play natively are transcoded (Zune → MP3 at the configured quality, default LAME `-V 2` ~190 kbps, with 200×200 art; iPod keeps WAV/AIFF/M4A/ALAC and promotes FLAC → ALAC; GoGear natives are MP3/WMA/WAV). `--quality` / `ZYTUNES_TRANSCODE_QUALITY` / `transcode_quality` select `v0`, `v2`, `v4`, or CBR 128–320; FLAC→ALAC ignores the MP3 setting
 5. Progress and results appear in the log panel; device track list auto-refreshes on completion. Tracks already on the device are skipped automatically and noted in the log

@@ -1399,7 +1399,7 @@ fn draw_device_info(f: &mut Frame, app: &App, area: Rect) {
 
     match app.device.status {
         DeviceStatus::Disconnected => {
-            let zune_art = build_zune_art("No Device", "Press [C]");
+            let zune_art = build_zune_art("No Device", "Press [c]");
             let pulse = anim::animated_accent(
                 t.dim_text,
                 t.accent_secondary,
@@ -1832,6 +1832,11 @@ fn draw_keys_panel(f: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
 
     // Global keys — always shown.
+    let connect_label = if app.device.status == DeviceStatus::Disconnected {
+        "Connect"
+    } else {
+        "Disconnect"
+    };
     let global = [
         ("q", "Quit"),
         ("h", "Toggle keys"),
@@ -1839,7 +1844,9 @@ fn draw_keys_panel(f: &mut Frame, app: &App, area: Rect) {
         ("Tab", "Next panel"),
         ("S-Tab", "Prev panel"),
         ("1/2", "Artists/Albums"),
+        ("3", "Tracks"),
         ("4", "Sync queue"),
+        ("j/k", "Move list"),
         ("v", "Lib/Dev/Plist"),
         ("t", "Theme picker"),
         ("T", "Art style"),
@@ -1848,7 +1855,7 @@ fn draw_keys_panel(f: &mut Frame, app: &App, area: Rect) {
         ("M", "Stem mixer/batch"),
         ("o", "Stem settings"),
         ("/", "Search"),
-        ("c", "Connect"),
+        ("c", connect_label),
         ("X", "Clear cache"),
     ];
     lines.push(Line::from(Span::styled(
@@ -1900,6 +1907,7 @@ fn draw_keys_panel(f: &mut Frame, app: &App, area: Rect) {
             },
             vec![
                 ("\u{2191}\u{2193}", "Navigate"),
+                ("j/k", "Same as arrows"),
                 ("\u{2190}\u{2192}", "Skip A\u{2192}B\u{2192}C"),
                 ("Enter", "Select"),
                 ("a", add_label),
@@ -1926,13 +1934,14 @@ fn draw_keys_panel(f: &mut Frame, app: &App, area: Rect) {
             " Device",
             if is_device_mode {
                 vec![
+                    ("c", connect_label),
                     ("r", "Refresh"),
-                    ("d", "Disconnect"),
                     ("U", "Dedupe"),
                     ("D", "Execute rm"),
+                    ("C", "Clear rm q"),
                 ]
             } else {
-                vec![("r", "Refresh"), ("d", "Disconnect")]
+                vec![("c", connect_label), ("r", "Refresh")]
             },
         ),
         Panel::SyncQueue => (
@@ -2647,15 +2656,17 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect, footer_left_width: u16) {
         }
     });
     let right = match app.browse_mode {
-        BrowseMode::Device => "v:cycle | a:queue rm | D:delete | C:clr | ?:help".to_string(),
+        BrowseMode::Device => {
+            "v:cycle | a:queue rm | D:delete | C:clr | c:disc | ?:help".to_string()
+        }
         BrowseMode::Playlists => {
             "v:cycle | N:new | G:generate | R:regen | e:rename | d:delete | a:sync".to_string()
         }
         BrowseMode::Library => {
             if app.device.status == DeviceStatus::Connected {
-                "✓=synced ◐=partial | v:cycle | a:add | +:playlist | S:sync | ?:help".to_string()
+                "✓=synced ◐=partial | v:cycle | a:add | c:disc | S:sync | ?:help".to_string()
             } else {
-                "v:cycle | a:add | +:playlist | S:sync | q:quit | ?:help".to_string()
+                "v:cycle | a:add | c:connect | S:sync | q:quit | ?:help".to_string()
             }
         }
     };
@@ -2783,9 +2794,10 @@ fn draw_help_overlay(f: &mut Frame, app: &App) {
         "",
         "  Navigation",
         "  Tab         Cycle panels",
-        "  Up/Down     Navigate items",
+        "  Up/Down/j/k Navigate items",
         "  Enter       Select / expand",
         "  1/2         Artists / Albums (stem strip claims these digits when visible)",
+        "  3/4         Jump to track list / sync queue",
         "  v           Cycle Library / Device / Playlists",
         "  t           Theme picker",
         "  T           Toggle album art style (halfblock/ASCII)",
@@ -2797,7 +2809,7 @@ fn draw_help_overlay(f: &mut Frame, app: &App) {
         "  Playback",
         "  Space       Play / pause selected track",
         "  n / p       Next / previous track",
-        "  < / >       Seek -/+ 5 seconds",
+        "  < / >       Seek -/+ 5 seconds (also , / .)",
         "  M           Stem mixer (album sidebar = batch pre-warm)",
         stem_toggle_line,
         "",
@@ -2814,17 +2826,15 @@ fn draw_help_overlay(f: &mut Frame, app: &App) {
         "  Sync",
         "  a           Add track to queue",
         "  A           Add all visible tracks",
-        "  4           Jump to sync queue",
         "  S / Enter   Execute sync",
-        "  d           Remove from queue",
+        "  d           Remove from queue (does not disconnect)",
         "  C           Clear queue (SyncQueue panel)",
         "",
         "  Device view",
         "  a           Queue selection for removal",
-        "  D           Confirm / execute removal queue",
+        "  D           Confirm / execute removal queue (Device mode only)",
         "  C           Clear removal queue",
         "  U           Dedupe (keep newest copy)",
-        "  d           Disconnect (when queue/playlists do not claim it)",
         "",
         "  Playlists view",
         "  N           New manual playlist",
@@ -2842,10 +2852,11 @@ fn draw_help_overlay(f: &mut Frame, app: &App) {
         "  G           Generate playlist seeded by selected artist/album",
         "",
         "  Device",
-        "  c           Connect to device",
+        "  c           Connect / disconnect (iPod/GoGear stay mounted)",
         "  r           Refresh device tracks",
         "  X           Clear playback cache",
         "  Esc         Close / cancel",
+        "  h           Toggle keys panel",
         "  q           Quit",
     ];
 

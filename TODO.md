@@ -15,11 +15,6 @@
   - ListenBrainz (token auth, listen submission + feedback)
   - Config in `~/.config/zytunes/config.toml`, opt-in per service
   - Respect scrobble rules (≥50% played or ≥4min, ≥30s track length)
-- **UX Audit**
-  - Commands have been made organically
-  - Audit mappings
-  - Suggest improvements / redundant / confusing
-  - Make controls more intuitive
 - **Unify cache implementations** — four device-scoped caches plus the album-art cache are hand-rolled with no shared abstraction. The dirlib library scan cache stays out of this work: it lives at `$HOME/.cache/zytunes` precisely so sibling worktrees pointed at the same `~/Music` reuse one scan, which is the entire reason `ZYTUNES_CACHE_DIR` exists (it isolates device caches per-worktree without dragging the library scan along). Goal: one cache layer for everything else, with on-disk formats designed for **export** (a user can bundle their cache, ship it to another machine or back it up, and reimport it).
   - **In scope:**
     - `src/art_cache.rs` — album art, raw JPEG + `.meta.json` sidecar, `$HOME/.cache/zytunes/art/{hash(artist,album)}.jpg`, source-file `(mtime,size)` fingerprint. Worth exporting (regenerating across a large library is expensive).
@@ -76,6 +71,7 @@
 
 ## Done
 
+- **TUI UX audit** — `c` toggles connect/disconnect; `d` only dequeues/deletes (toasts "Use c to disconnect" if it would have unplugged). `D`/`C` removal actions stay in Device mode. `j`/`k` match arrows; `3`/`4` jump to tracks / sync queue. Keys panel, `?` help, footer, and empty-device art (`Press [c]`) match the map.
 - **GoGear ViBE music sync** — Philips VID `0x0471` / ViBE PID `0x20b6` as USB mass storage. Detects the stick even when unmounted. Files copy to `MUSIC/{Artist}/{Album}/`; `_system/` is skipped. MP3/WMA/WAV pass through; everything else transcodes to MP3. No playlist/photo/video.
 - **Now-playing soundbar** — lock-free spectrum snapshot drawn centered in the now-playing panel. Each theme picks a layout, glyph alphabet, and colour mode; `W` overrides the layout until the next theme change. Quiet bands keep a floor mark; graphic-EQ Hz (`32` `64` `125` `1k` …) sits under each band (Pulse is a level mountain and has no Hz labels). Pause freezes the bars, Play/Stop clear them.
 - **Diagnostics: playlist/listen-log Logger** — `PlaylistStore` and `ListenLog` take a `Logger`; CLI uses stderr, TUI routes into `SyncMessage`. No `eprintln!` on those hot paths.
