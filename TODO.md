@@ -72,10 +72,10 @@
 - **Dedupe menu** — richer UI than the Device-mode `U` keep-newest hotkey.
 - **CD TUI panel with graphic** — dedicated CD panel art, not just the import overlay.
 - **Trash on delete** — library-side deletes always go to the system trash, never unlink in place.
-- **Import from directory / auto sorting** — drop a folder of files and sort them into the library layout.
 
 ## Done
 
+- **Import from directory / auto sorting** — sibling inbox `{parent(music_dir)}/Automatically Add to Music` plus `F` on a Library artist/album. Identify on MusicBrainz (MBID → AcoustID → search), preview the tag-manager diff, apply tags and file into `{AlbumArtist}/{Album}/`. Inbox is polled from the TUI tick; dismissed clusters are skipped for the session.
 - **GoGear ViBE music sync** — Philips VID `0x0471` / ViBE PID `0x20b6` as USB mass storage. Detects the stick even when unmounted. Files copy to `MUSIC/{Artist}/{Album}/`; `_system/` is skipped. MP3/WMA/WAV pass through; everything else transcodes to MP3. No playlist/photo/video.
 - **Now-playing soundbar** — lock-free spectrum snapshot drawn centered in the now-playing panel. Each theme picks a layout, glyph alphabet, and colour mode; `W` overrides the layout until the next theme change. Quiet bands keep a floor mark; graphic-EQ Hz (`32` `64` `125` `1k` …) sits under each band (Pulse is a level mountain and has no Hz labels). Pause freezes the bars, Play/Stop clear them.
 - **Diagnostics: playlist/listen-log Logger** — `PlaylistStore` and `ListenLog` take a `Logger`; CLI uses stderr, TUI routes into `SyncMessage`. No `eprintln!` on those hot paths.

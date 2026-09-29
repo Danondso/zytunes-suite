@@ -14,6 +14,7 @@ pub mod dirlib;
 pub mod fingerprint;
 pub mod genre_norm;
 pub mod library;
+pub mod library_layout;
 pub mod listen_log;
 pub mod local_plays;
 pub mod mtp;

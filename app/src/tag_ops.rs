@@ -22,7 +22,9 @@ use crate::cd::metadata::{
     probe_by_content, ripped_track_destination, set_string, set_unknown_string,
 };
 use crate::library::Track;
-use crate::musicbrainz::{render_artist_credit, Medium, Release, Track as MbTrack};
+use crate::musicbrainz::{
+    canonical_album_artist, render_artist_credit, Medium, Release, Track as MbTrack,
+};
 
 /// Tag-side values the library `Track` schema doesn't model — but the diff
 /// still wants to surface. Read directly from the audio file once per
@@ -198,6 +200,30 @@ impl ReleaseTagDiff {
         self.tracks
             .iter()
             .any(|t| t.fields.iter().any(|f| f.enabled))
+    }
+
+    /// Dest paths that an enabled Filename rename would overwrite.
+    /// Used by the filing overlay to confirm before replace.
+    pub fn replacing_existing_dests(&self) -> Vec<PathBuf> {
+        let sources: std::collections::HashSet<&PathBuf> =
+            self.tracks.iter().map(|t| &t.src_path).collect();
+        self.tracks
+            .iter()
+            .filter_map(|t| {
+                let dest = t.dest_path.as_ref()?;
+                if dest == &t.src_path || sources.contains(dest) {
+                    return None;
+                }
+                if !t
+                    .fields
+                    .iter()
+                    .any(|f| f.kind == FieldKind::Filename && f.enabled)
+                {
+                    return None;
+                }
+                dest.exists().then(|| dest.clone())
+            })
+            .collect()
     }
 }
 
@@ -456,7 +482,7 @@ fn build_track_fields(
         Some(lib.album.clone()),
         Some(release.title.clone()),
     );
-    let album_artist = render_artist_credit(&release.artist_credit);
+    let album_artist = canonical_album_artist(&release.artist_credit);
     push(
         FieldKind::Identity,
         "Album Artist",
@@ -741,6 +767,18 @@ fn build_track_fields(
 pub fn apply_release_diff(
     diff: &ReleaseTagDiff,
 ) -> (Vec<Result<(), String>>, HashMap<PathBuf, PathBuf>) {
+    apply_release_diff_with(diff, false)
+}
+
+/// Same as [`apply_release_diff`], but when `replace_existing` is set a
+/// dest that already exists (the usual "feat folder" reshelve onto an
+/// album that's already in `{AlbumArtist}/{Album}/`) is overwritten
+/// instead of recorded as a collision. Filing uses this so `F` does not
+/// leave a second copy behind.
+pub fn apply_release_diff_with(
+    diff: &ReleaseTagDiff,
+    replace_existing: bool,
+) -> (Vec<Result<(), String>>, HashMap<PathBuf, PathBuf>) {
     let mut results: Vec<Result<(), String>> = vec![Ok(()); diff.tracks.len()];
     let mut rename_map: HashMap<PathBuf, PathBuf> = HashMap::new();
 
@@ -782,12 +820,20 @@ pub fn apply_release_diff(
             continue;
         }
         if dest.exists() && !source_set.contains(dest) && dest != src {
-            results[idx] = Err(format!(
-                "rename collision: {} already exists",
-                dest.display()
-            ));
-            skipped.insert(idx);
-            continue;
+            if replace_existing {
+                if let Err(e) = std::fs::remove_file(dest) {
+                    results[idx] = Err(format!("replace {}: {e}", dest.display()));
+                    skipped.insert(idx);
+                    continue;
+                }
+            } else {
+                results[idx] = Err(format!(
+                    "rename collision: {} already exists",
+                    dest.display()
+                ));
+                skipped.insert(idx);
+                continue;
+            }
         }
         to_rename.push((idx, src, dest));
     }
@@ -811,6 +857,9 @@ pub fn apply_release_diff(
         match perform_rename(src, dest) {
             Ok(()) => {
                 rename_map.insert(src.clone(), dest.clone());
+                if let Some(parent) = src.parent() {
+                    prune_empty_parents(parent);
+                }
             }
             Err(e) => {
                 if results[idx].is_ok() {
@@ -947,6 +996,26 @@ fn apply_field(tag: &mut Tag, field: &FieldDiff) {
         _ => {
             // Unmapped (kind, name) — silently skip rather than panicking,
             // so future additions don't crash the apply path.
+        }
+    }
+}
+
+fn prune_empty_parents(start: &Path) {
+    let mut dir = start.to_path_buf();
+    for _ in 0..8 {
+        let empty = match std::fs::read_dir(&dir) {
+            Ok(mut rd) => rd.next().is_none(),
+            Err(_) => break,
+        };
+        if !empty {
+            break;
+        }
+        if std::fs::remove_dir(&dir).is_err() {
+            break;
+        }
+        match dir.parent() {
+            Some(p) => dir = p.to_path_buf(),
+            None => break,
         }
     }
 }
@@ -2125,5 +2194,218 @@ mod tests {
             Some("*NSYNC"),
             "Album Artist must come from the release-level credit so dirlib groups under the canonical artist",
         );
+    }
+
+    #[test]
+    fn feat_on_release_credit_files_under_primary_artist() {
+        let dir = fresh_dir("feat-release-folder");
+        let src_dir = dir
+            .join("2Pac featuring the Notorious B.I.G.")
+            .join("All Eyez On Me");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let path = src_dir.join("01 - Track.wav");
+        write_sine_wav(&path, 1);
+
+        let mut rel = make_release("All Eyez On Me", "2Pac");
+        rel.artist_credit = vec![
+            ArtistCredit {
+                name: "2Pac".into(),
+                joinphrase: Some(" featuring ".into()),
+                artist: Some(Artist {
+                    id: "art-2pac".into(),
+                    name: "2Pac".into(),
+                    sort_name: None,
+                }),
+            },
+            ArtistCredit {
+                name: "The Notorious B.I.G.".into(),
+                joinphrase: None,
+                artist: Some(Artist {
+                    id: "art-big".into(),
+                    name: "The Notorious B.I.G.".into(),
+                    sort_name: None,
+                }),
+            },
+        ];
+        rel.media[0].tracks[0].title = "Track".into();
+
+        let lib = make_lib_track(&path, "Track", 1);
+        let diff = build_release_diff(&[lib], &rel, &dir, DiffScope::Track, None);
+        let track = &diff.tracks[0];
+        assert_eq!(
+            track
+                .fields
+                .iter()
+                .find(|f| f.name == "Album Artist")
+                .and_then(|f| f.proposed.as_deref()),
+            Some("2Pac"),
+        );
+        let dest = track.dest_path.as_ref().expect("rename proposed");
+        assert_eq!(
+            dest,
+            &dir.join("2Pac")
+                .join("All Eyez On Me")
+                .join("01 - Track.wav")
+        );
+    }
+
+    #[test]
+    fn apply_release_diff_replace_existing_overwrites_and_prunes() {
+        let dir = fresh_dir("replace-existing");
+        let feat_album = dir
+            .join("2Pac featuring the Notorious B.I.G.")
+            .join("Album");
+        std::fs::create_dir_all(&feat_album).unwrap();
+        let src = feat_album.join("01 - Track.wav");
+        let dest_album = dir.join("2Pac").join("Album");
+        std::fs::create_dir_all(&dest_album).unwrap();
+        let dest = dest_album.join("01 - Track.wav");
+        write_sine_wav(&src, 2);
+        write_sine_wav(&dest, 1);
+        let dest_len_before = dest.metadata().unwrap().len();
+
+        let diff = ReleaseTagDiff {
+            release_mbid: "rel-1".into(),
+            summary: "test".into(),
+            tracks: vec![TrackTagDiff {
+                src_path: src.clone(),
+                dest_path: Some(dest.clone()),
+                library_id: 1,
+                fields: vec![FieldDiff {
+                    kind: FieldKind::Filename,
+                    name: "Filename",
+                    current: Some(src.display().to_string()),
+                    proposed: Some(dest.display().to_string()),
+                    enabled: true,
+                }],
+            }],
+        };
+
+        let (results, map) = apply_release_diff_with(&diff, true);
+        assert!(results[0].is_ok(), "{:?}", results[0]);
+        assert_eq!(map.get(&src), Some(&dest));
+        assert!(!src.exists(), "feat-folder copy must be gone");
+        assert!(dest.exists());
+        assert_ne!(
+            dest.metadata().unwrap().len(),
+            dest_len_before,
+            "canonical file must be replaced"
+        );
+        assert!(
+            !feat_album.exists(),
+            "empty feat album dir should be pruned"
+        );
+        assert!(
+            !feat_album.parent().unwrap().exists(),
+            "empty feat artist dir should be pruned"
+        );
+    }
+
+    #[test]
+    fn apply_release_diff_moves_into_musicbrainz_spelling_and_prunes() {
+        let dir = fresh_dir("case-fold-move");
+        let src_album = dir.join("Alice in Chains").join("Dirt");
+        std::fs::create_dir_all(&src_album).unwrap();
+        let src = src_album.join("01 - Them Bones.wav");
+        write_sine_wav(&src, 1);
+        let dest = dir
+            .join("Alice In Chains")
+            .join("Dirt")
+            .join("01 - Them Bones.wav");
+
+        let diff = ReleaseTagDiff {
+            release_mbid: "rel-1".into(),
+            summary: "test".into(),
+            tracks: vec![TrackTagDiff {
+                src_path: src.clone(),
+                dest_path: Some(dest.clone()),
+                library_id: 1,
+                fields: vec![FieldDiff {
+                    kind: FieldKind::Filename,
+                    name: "Filename",
+                    current: Some(src.display().to_string()),
+                    proposed: Some(dest.display().to_string()),
+                    enabled: true,
+                }],
+            }],
+        };
+
+        let (results, map) = apply_release_diff(&diff);
+        assert!(results[0].is_ok(), "{:?}", results[0]);
+        assert_eq!(map.get(&src), Some(&dest));
+        assert!(dest.exists());
+        assert!(!src.exists());
+        assert!(
+            !src_album.exists(),
+            "empty wrong-case album dir should be pruned"
+        );
+        assert!(
+            !src_album.parent().unwrap().exists(),
+            "empty wrong-case artist dir should be pruned"
+        );
+        assert!(dest.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn apply_release_diff_without_replace_keeps_both_on_collision() {
+        let dir = fresh_dir("no-replace-collision");
+        let src = dir.join("feat").join("01 - Track.wav");
+        std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+        let dest = dir.join("2Pac").join("01 - Track.wav");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        write_sine_wav(&src, 1);
+        write_sine_wav(&dest, 1);
+
+        let diff = ReleaseTagDiff {
+            release_mbid: "rel-1".into(),
+            summary: "test".into(),
+            tracks: vec![TrackTagDiff {
+                src_path: src.clone(),
+                dest_path: Some(dest.clone()),
+                library_id: 1,
+                fields: vec![FieldDiff {
+                    kind: FieldKind::Filename,
+                    name: "Filename",
+                    current: Some(src.display().to_string()),
+                    proposed: Some(dest.display().to_string()),
+                    enabled: true,
+                }],
+            }],
+        };
+
+        let (results, map) = apply_release_diff(&diff);
+        assert!(results[0]
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.contains("collision")));
+        assert!(map.is_empty());
+        assert!(src.exists());
+        assert!(dest.exists());
+    }
+
+    #[test]
+    fn replacing_existing_dests_lists_on_disk_targets() {
+        let dir = fresh_dir("replacing-dests");
+        let src = dir.join("src.wav");
+        let dest = dir.join("dest.wav");
+        write_sine_wav(&src, 1);
+        write_sine_wav(&dest, 1);
+        let diff = ReleaseTagDiff {
+            release_mbid: "rel-1".into(),
+            summary: "test".into(),
+            tracks: vec![TrackTagDiff {
+                src_path: src.clone(),
+                dest_path: Some(dest.clone()),
+                library_id: 1,
+                fields: vec![FieldDiff {
+                    kind: FieldKind::Filename,
+                    name: "Filename",
+                    current: Some(src.display().to_string()),
+                    proposed: Some(dest.display().to_string()),
+                    enabled: true,
+                }],
+            }],
+        };
+        assert_eq!(diff.replacing_existing_dests(), vec![dest]);
     }
 }

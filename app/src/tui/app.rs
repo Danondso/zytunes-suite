@@ -19,7 +19,7 @@ pub use tag_manager::{
     FocusRow, SearchInputField, SelectionAnchor, TagManagerOverlay, TagManagerPhase,
 };
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1074,6 +1074,75 @@ impl Default for CdState {
     }
 }
 
+/// Inbox / reshelve queue. Polling lives on the App tick (same as CD
+/// detect) so the worker stays command-driven. The drop folder is a
+/// sibling of `music_dir` — see `library_layout::default_inbox_dir`.
+pub struct InboxState {
+    /// When the most recent `ScanInbox` was sent. Seeded to `now` at
+    /// startup so the first tick doesn't mkdir-scan before the library
+    /// has loaded.
+    pub last_request: Option<Instant>,
+    pub scan_in_flight: bool,
+    /// Remaining album clusters waiting for the tag-manager overlay.
+    pub queue: VecDeque<zytunes::library_layout::AlbumCluster>,
+    /// Inbox locations the user dismissed this session. Filtered out of
+    /// later scans until the TUI restarts.
+    pub dismissed: HashSet<String>,
+}
+
+impl Default for InboxState {
+    fn default() -> Self {
+        Self {
+            last_request: Some(Instant::now()),
+            scan_in_flight: false,
+            queue: VecDeque::new(),
+            dismissed: HashSet::new(),
+        }
+    }
+}
+
+fn track_name_matches(t: &Track, track_name: Option<&str>) -> bool {
+    match track_name {
+        Some(name) => t.name.eq_ignore_ascii_case(name),
+        None => true,
+    }
+}
+
+fn most_common_release_mbid<'a>(
+    tracks: impl Iterator<Item = &'a Track>,
+    track_name: Option<&str>,
+) -> Option<String> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for t in tracks {
+        if !track_name_matches(t, track_name) {
+            continue;
+        }
+        if let Some(mbid) = t.mb_release_id.as_ref() {
+            if !mbid.is_empty() {
+                *counts.entry(mbid.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+    counts.into_iter().max_by_key(|(_, n)| *n).map(|(m, _)| m)
+}
+
+fn first_acoustid_input<'a>(
+    tracks: impl Iterator<Item = &'a Track>,
+    track_name: Option<&str>,
+) -> Option<(String, u32)> {
+    for t in tracks {
+        if !track_name_matches(t, track_name) {
+            continue;
+        }
+        if let (Some(fp), Some(ms)) = (t.acoustic_id.as_deref(), t.total_time_ms) {
+            if !fp.is_empty() && ms > 0 {
+                return Some((fp.to_string(), (ms / 1000) as u32));
+            }
+        }
+    }
+    None
+}
+
 pub struct App {
     pub active_panel: Panel,
     pub library: Option<Box<dyn MusicLibrary>>,
@@ -1259,6 +1328,8 @@ pub struct App {
     /// last-seen MusicBrainz match. Driven by periodic `DetectCd` commands
     /// issued from the TUI tick.
     pub cd: CdState,
+    /// Automatically Add to Music inbox + `F` reshelve queue.
+    pub inbox: InboxState,
     /// MusicBrainz base URL pulled from config at startup. Sent on each
     /// `DetectCd` so the worker stays config-free. `None` uses the public
     /// host; set to e.g. `http://localhost:5000/ws/2` for a local mirror.
@@ -1481,6 +1552,7 @@ impl App {
             experimental_playlist_sync: device_playlist_sync_enabled(),
             listen_log: ListenLog::new(),
             cd: CdState::default(),
+            inbox: InboxState::default(),
             mb_base_url: None,      // overwritten below from config
             mb_user_agent: None,    // overwritten below from config
             acoustid_app_key: None, // overwritten below from config
@@ -2366,6 +2438,137 @@ impl App {
                 (t.artist.clone(), t.album.clone(), Some(t.name.clone()))
             }
         };
+        self.open_tag_manager_for_tracks(scope, artist, album, track_name, None, Some(cmd_tx));
+    }
+
+    /// Re-sort and enrich the current Library selection the way Apple Music
+    /// files a drop: MusicBrainz lookup, tag-manager diff, then rename into
+    /// `{AlbumArtist}/{Album}/`. Sidebar artist queues every album.
+    pub fn start_file_and_enrich(&mut self, cmd_tx: &mpsc::Sender<BgCommand>) {
+        if self.tag_manager.is_some() {
+            return;
+        }
+        if self.browse_mode != BrowseMode::Library {
+            self.set_toast("File into library is a Library-mode action".into(), true);
+            return;
+        }
+        if self.library.is_none() {
+            return;
+        }
+
+        let tracks: Vec<Track> = match self.active_panel {
+            Panel::Library => match self.sidebar_items.get(self.sidebar_selected) {
+                Some(SidebarEntry::Artist(name)) => {
+                    let name = name.clone();
+                    self.library
+                        .as_ref()
+                        .unwrap()
+                        .artist_tracks(&name)
+                        .cloned()
+                        .collect()
+                }
+                Some(SidebarEntry::Album { artist, album }) => {
+                    let artist = artist.clone();
+                    let album = album.clone();
+                    self.library
+                        .as_ref()
+                        .unwrap()
+                        .album_tracks_by_artist(&artist, &album)
+                        .cloned()
+                        .collect()
+                }
+                _ => {
+                    self.set_toast("Select an artist or album to file".into(), true);
+                    return;
+                }
+            },
+            Panel::Albums => {
+                let Some(info) = self.album_list.get(self.album_selected) else {
+                    return;
+                };
+                let artist = info.artist.clone();
+                let album = info.name.clone();
+                self.library
+                    .as_ref()
+                    .unwrap()
+                    .album_tracks_by_artist(&artist, &album)
+                    .cloned()
+                    .collect()
+            }
+            Panel::TrackList => {
+                let Some(t) = self.track_list.get(self.track_selected) else {
+                    return;
+                };
+                let artist = t.artist.clone();
+                let album = t.album.clone();
+                self.library
+                    .as_ref()
+                    .unwrap()
+                    .album_tracks_by_artist(&artist, &album)
+                    .cloned()
+                    .collect()
+            }
+            _ => return,
+        };
+        if tracks.is_empty() {
+            self.set_toast("No tracks to file".into(), true);
+            return;
+        }
+        self.enqueue_file_clusters(
+            zytunes::library_layout::cluster_by_album(tracks),
+            Some(cmd_tx),
+        );
+    }
+
+    fn enqueue_file_clusters(
+        &mut self,
+        mut clusters: Vec<zytunes::library_layout::AlbumCluster>,
+        cmd_tx: Option<&mpsc::Sender<BgCommand>>,
+    ) {
+        if clusters.is_empty() {
+            return;
+        }
+        let first = clusters.remove(0);
+        self.inbox.queue.extend(clusters);
+        self.open_filing_cluster(first, cmd_tx);
+    }
+
+    fn open_filing_cluster(
+        &mut self,
+        cluster: zytunes::library_layout::AlbumCluster,
+        cmd_tx: Option<&mpsc::Sender<BgCommand>>,
+    ) {
+        self.open_tag_manager_for_tracks(
+            zytunes::tag_ops::DiffScope::Album,
+            cluster.artist,
+            cluster.album,
+            None,
+            Some(cluster.tracks),
+            cmd_tx,
+        );
+    }
+
+    fn open_next_file_cluster(&mut self, cmd_tx: Option<&mpsc::Sender<BgCommand>>) {
+        if self.tag_manager.is_some() {
+            return;
+        }
+        let Some(cluster) = self.inbox.queue.pop_front() else {
+            return;
+        };
+        self.open_filing_cluster(cluster, cmd_tx);
+    }
+
+    /// Shared overlay open: library retag (`source_tracks = None`) or
+    /// inbox/`F` filing (`source_tracks = Some`).
+    fn open_tag_manager_for_tracks(
+        &mut self,
+        scope: zytunes::tag_ops::DiffScope,
+        artist: String,
+        album: String,
+        track_name: Option<String>,
+        source_tracks: Option<Vec<Track>>,
+        cmd_tx: Option<&mpsc::Sender<BgCommand>>,
+    ) {
         // Defensive trim against stale-cache padding. Dirlib normalises
         // these at scan time now, but a v2 cache may still hold padded
         // values until the CACHE_SCHEMA_VERSION bump forces a re-scan.
@@ -2385,21 +2588,27 @@ impl App {
         };
 
         // Resolution chain:
-        //   1. library has mb_release_id  → direct MB lookup
-        //   2. library has acoustic_id + acoustid_app_key configured
+        //   1. tracks have mb_release_id  → direct MB lookup
+        //   2. tracks have acoustic_id + acoustid_app_key configured
         //                                  → AcoustID fingerprint lookup,
         //                                    surfaced as SearchResults
         //   3. fallback                    → MB search (needs Solr — fails
         //                                    on un-indexed mirrors but we
         //                                    try anyway).
-        let known_release_mbid = self.resolve_known_release_mbid(&artist, &album, &track_name);
+        let known_release_mbid = match source_tracks.as_ref() {
+            Some(tracks) => most_common_release_mbid(tracks.iter(), track_name.as_deref()),
+            None => self.resolve_known_release_mbid(&artist, &album, &track_name),
+        };
         let acoustid_input = if known_release_mbid.is_none() {
             self.acoustid_app_key
                 .as_deref()
                 .filter(|k| !k.is_empty())
                 .and_then(|key| {
-                    self.resolve_acoustid_input(&artist, &album, &track_name)
-                        .map(|(fp, secs)| (key.to_string(), fp, secs))
+                    let pair = match source_tracks.as_ref() {
+                        Some(tracks) => first_acoustid_input(tracks.iter(), track_name.as_deref()),
+                        None => self.resolve_acoustid_input(&artist, &album, &track_name),
+                    };
+                    pair.map(|(fp, secs)| (key.to_string(), fp, secs))
                 })
         } else {
             None
@@ -2407,16 +2616,21 @@ impl App {
 
         let mut overlay =
             TagManagerOverlay::new(scope, artist.clone(), album.clone(), track_name, anchor);
+        overlay.source_tracks = source_tracks;
+        overlay.filing = overlay.source_tracks.is_some();
         let token = overlay.next_request_token();
         if let Some(mbid) = known_release_mbid.clone() {
             overlay.phase = TagManagerPhase::LoadingRelease;
             self.tag_manager = Some(overlay);
-            let _ = cmd_tx.send(BgCommand::MbReleaseDetails {
-                token,
-                mbid,
-                mb_base_url: self.mb_base_url.clone(),
-                mb_user_agent: self.mb_user_agent.clone(),
-            });
+            self.dispatch_bg(
+                BgCommand::MbReleaseDetails {
+                    token,
+                    mbid,
+                    mb_base_url: self.mb_base_url.clone(),
+                    mb_user_agent: self.mb_user_agent.clone(),
+                },
+                cmd_tx,
+            );
         } else if let Some((app_key, fingerprint, duration_secs)) = acoustid_input {
             // AcoustID resolves to a list of release candidates the user
             // picks from — overlay phase stays SearchPending so the
@@ -2424,21 +2638,35 @@ impl App {
             // via `handle_acoustid_resolved` and the phase advances to
             // SearchResults.
             self.tag_manager = Some(overlay);
-            let _ = cmd_tx.send(BgCommand::AcoustIdLookup {
-                token,
-                fingerprint,
-                duration_secs,
-                app_key,
-            });
+            self.dispatch_bg(
+                BgCommand::AcoustIdLookup {
+                    token,
+                    fingerprint,
+                    duration_secs,
+                    app_key,
+                },
+                cmd_tx,
+            );
         } else {
             self.tag_manager = Some(overlay);
-            let _ = cmd_tx.send(BgCommand::MbSearchReleases {
-                token,
-                artist,
-                album,
-                mb_base_url: self.mb_base_url.clone(),
-                mb_user_agent: self.mb_user_agent.clone(),
-            });
+            self.dispatch_bg(
+                BgCommand::MbSearchReleases {
+                    token,
+                    artist,
+                    album,
+                    mb_base_url: self.mb_base_url.clone(),
+                    mb_user_agent: self.mb_user_agent.clone(),
+                },
+                cmd_tx,
+            );
+        }
+    }
+
+    fn dispatch_bg(&mut self, cmd: BgCommand, cmd_tx: Option<&mpsc::Sender<BgCommand>>) {
+        if let Some(tx) = cmd_tx {
+            let _ = tx.send(cmd);
+        } else {
+            self.pending_bg_commands.push(cmd);
         }
     }
 
@@ -2454,19 +2682,10 @@ impl App {
         track_name: &Option<String>,
     ) -> Option<(String, u32)> {
         let lib = self.library.as_ref()?;
-        for t in lib.album_tracks_by_artist(artist, album) {
-            if let Some(name) = track_name.as_ref() {
-                if !t.name.eq_ignore_ascii_case(name) {
-                    continue;
-                }
-            }
-            if let (Some(fp), Some(ms)) = (t.acoustic_id.as_deref(), t.total_time_ms) {
-                if !fp.is_empty() && ms > 0 {
-                    return Some((fp.to_string(), (ms / 1000) as u32));
-                }
-            }
-        }
-        None
+        first_acoustid_input(
+            lib.album_tracks_by_artist(artist, album),
+            track_name.as_deref(),
+        )
     }
 
     /// Walk the library tracks scoped to this selection and return the
@@ -2483,24 +2702,31 @@ impl App {
         track_name: &Option<String>,
     ) -> Option<String> {
         let lib = self.library.as_ref()?;
-        let mut counts: HashMap<String, usize> = HashMap::new();
-        for t in lib.album_tracks_by_artist(artist, album) {
-            if let Some(name) = track_name.as_ref() {
-                if !t.name.eq_ignore_ascii_case(name) {
-                    continue;
-                }
-            }
-            if let Some(mbid) = t.mb_release_id.as_ref() {
-                if !mbid.is_empty() {
-                    *counts.entry(mbid.clone()).or_insert(0) += 1;
-                }
-            }
-        }
-        counts.into_iter().max_by_key(|(_, n)| *n).map(|(m, _)| m)
+        most_common_release_mbid(
+            lib.album_tracks_by_artist(artist, album),
+            track_name.as_deref(),
+        )
     }
 
     pub fn close_tag_manager(&mut self) {
-        self.tag_manager = None;
+        let Some(overlay) = self.tag_manager.take() else {
+            return;
+        };
+        let filing = overlay.filing;
+        let applied = matches!(overlay.phase, TagManagerPhase::Done);
+        if filing && !applied {
+            if let Some(tracks) = overlay.source_tracks.as_ref() {
+                for t in tracks {
+                    if let Some(loc) = t.location.as_ref() {
+                        self.inbox.dismissed.insert(loc.clone());
+                    }
+                }
+            }
+            self.inbox.queue.clear();
+        }
+        if filing && applied {
+            self.open_next_file_cluster(None);
+        }
     }
 
     /// Worker returned a recording lookup with its release list — used as
@@ -2735,33 +2961,36 @@ impl App {
                 return;
             }
         };
-        let lib = match self.library.as_ref() {
-            Some(l) => l,
-            None => {
-                overlay.error = Some("library not loaded".into());
-                overlay.phase = TagManagerPhase::Error;
-                return;
-            }
-        };
-
-        // Resolve library tracks scoped to (artist, album).
-        let lib_tracks: Vec<zytunes::library::Track> = match overlay.scope {
-            zytunes::tag_ops::DiffScope::Album => lib
-                .album_tracks_by_artist(&overlay.source_artist, &overlay.source_album)
-                .cloned()
-                .collect(),
-            zytunes::tag_ops::DiffScope::Track => {
-                let Some(name) = overlay.source_track_name.as_ref() else {
-                    overlay.error = Some("track-scope overlay missing track name".into());
-                    overlay.phase = TagManagerPhase::Error;
-                    return;
+        let lib_tracks: Vec<zytunes::library::Track> =
+            if let Some(tracks) = overlay.source_tracks.clone() {
+                tracks
+            } else {
+                let lib = match self.library.as_ref() {
+                    Some(l) => l,
+                    None => {
+                        overlay.error = Some("library not loaded".into());
+                        overlay.phase = TagManagerPhase::Error;
+                        return;
+                    }
                 };
-                lib.album_tracks_by_artist(&overlay.source_artist, &overlay.source_album)
-                    .filter(|t| t.name.eq_ignore_ascii_case(name))
-                    .cloned()
-                    .collect()
-            }
-        };
+                match overlay.scope {
+                    zytunes::tag_ops::DiffScope::Album => lib
+                        .album_tracks_by_artist(&overlay.source_artist, &overlay.source_album)
+                        .cloned()
+                        .collect(),
+                    zytunes::tag_ops::DiffScope::Track => {
+                        let Some(name) = overlay.source_track_name.as_ref() else {
+                            overlay.error = Some("track-scope overlay missing track name".into());
+                            overlay.phase = TagManagerPhase::Error;
+                            return;
+                        };
+                        lib.album_tracks_by_artist(&overlay.source_artist, &overlay.source_album)
+                            .filter(|t| t.name.eq_ignore_ascii_case(name))
+                            .cloned()
+                            .collect()
+                    }
+                }
+            };
 
         if lib_tracks.is_empty() {
             overlay.error = Some("no library tracks matched the source selection".into());
@@ -3024,6 +3253,9 @@ impl App {
             TagManagerPhase::DiffPreview => {
                 self.handle_tag_manager_key_diff_preview(key, cmd_tx);
             }
+            TagManagerPhase::ConfirmReplace => {
+                self.handle_tag_manager_key_confirm_replace(key, cmd_tx);
+            }
             TagManagerPhase::SearchPending | TagManagerPhase::LoadingRelease => {
                 // Only Esc cancels (closes overlay) — Apply-in-flight can't
                 // be cancelled safely.
@@ -3144,110 +3376,156 @@ impl App {
         key: KeyEvent,
         cmd_tx: &mpsc::Sender<BgCommand>,
     ) {
-        let Some(overlay) = self.tag_manager.as_mut() else {
-            return;
-        };
-        match key.code {
-            KeyCode::Esc => {
-                // If we got here via the auto-resolved-MBID fast path
-                // (library carried `mb_release_id`), there are no search
-                // hits behind us — dropping back to SearchResults would
-                // strand the user on an empty list. Skip straight to
-                // SearchInput so they can pick a different release.
-                overlay.phase = if overlay.search_hits.is_empty() {
-                    TagManagerPhase::SearchInput
-                } else {
-                    TagManagerPhase::SearchResults
-                };
-            }
-            // Explicit "search MusicBrainz instead". Useful when the
-            // auto-resolved release is wrong (e.g. file is tagged against
-            // MB's `[unknown]` special-purpose artist and the user wants
-            // to retag against a real release).
-            KeyCode::Char('s') => {
-                overlay.phase = TagManagerPhase::SearchInput;
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                overlay.move_focus(-1);
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                overlay.move_focus(1);
-            }
-            // Page-sized jumps. 10 is a reasonable approximation of one
-            // screenful for the overlay's typical 70% × terminal-height
-            // sizing on a normal terminal — doesn't need to be exact since
-            // the table auto-scrolls to keep focus visible.
-            KeyCode::PageUp => {
-                overlay.move_focus(-10);
-            }
-            KeyCode::PageDown => {
-                overlay.move_focus(10);
-            }
-            KeyCode::Home => {
-                overlay.focus_first();
-            }
-            KeyCode::End => {
-                overlay.focus_last();
-            }
-            KeyCode::Char(' ') => {
-                overlay.toggle_focused_field();
-            }
-            KeyCode::Char('a') => {
-                overlay.set_all_enabled(true);
-            }
-            KeyCode::Char('n') => {
-                overlay.set_all_enabled(false);
-            }
-            // `c` folds/unfolds the focused track. Works from either the
-            // track header or any of its field rows — the user shouldn't
-            // have to scroll back to the header to collapse a track they're
-            // looking at. Shift-C collapses every track at once
-            // (header-only summary view); Shift-X / Shift-E expands.
-            KeyCode::Char('c') => {
-                overlay.toggle_collapse_focused_track();
-            }
-            KeyCode::Char('C') => {
-                overlay.collapse_all_tracks();
-            }
-            KeyCode::Char('X') | KeyCode::Char('E') => {
-                overlay.expand_all_tracks();
-            }
-            KeyCode::Enter => {
-                let Some(diff) = overlay.diff.clone() else {
-                    return;
-                };
-                if !diff.has_any_enabled() {
-                    // Nothing to apply — close instead of leaving a no-op
-                    // Applying phase the user can't escape.
-                    self.close_tag_manager();
-                    return;
+        enum Outcome {
+            Stay,
+            Close,
+            Apply { replace_existing: bool },
+        }
+        let outcome = {
+            let Some(overlay) = self.tag_manager.as_mut() else {
+                return;
+            };
+            match key.code {
+                KeyCode::Esc => {
+                    overlay.phase = if overlay.search_hits.is_empty() {
+                        TagManagerPhase::SearchInput
+                    } else {
+                        TagManagerPhase::SearchResults
+                    };
+                    Outcome::Stay
                 }
-                let music_dir = self
-                    .music_dir_cache
-                    .as_ref()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .or_else(|| {
-                        self.library
-                            .as_ref()
-                            .and_then(|l| l.music_folder().map(String::from))
-                    });
-                let Some(music_dir) = music_dir else {
-                    overlay.error = Some("music directory unknown".into());
-                    overlay.phase = TagManagerPhase::Error;
-                    return;
-                };
-                overlay.phase = TagManagerPhase::Applying;
-                let token = overlay.next_request_token();
-                let fingerprint = self.scan_fingerprint;
-                let _ = cmd_tx.send(BgCommand::ApplyTagDiff {
-                    token,
-                    diff: Box::new(diff),
-                    music_dir,
-                    fingerprint,
-                });
+                KeyCode::Char('s') => {
+                    overlay.phase = TagManagerPhase::SearchInput;
+                    Outcome::Stay
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    overlay.move_focus(-1);
+                    Outcome::Stay
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    overlay.move_focus(1);
+                    Outcome::Stay
+                }
+                KeyCode::PageUp => {
+                    overlay.move_focus(-10);
+                    Outcome::Stay
+                }
+                KeyCode::PageDown => {
+                    overlay.move_focus(10);
+                    Outcome::Stay
+                }
+                KeyCode::Home => {
+                    overlay.focus_first();
+                    Outcome::Stay
+                }
+                KeyCode::End => {
+                    overlay.focus_last();
+                    Outcome::Stay
+                }
+                KeyCode::Char(' ') => {
+                    overlay.toggle_focused_field();
+                    Outcome::Stay
+                }
+                KeyCode::Char('a') => {
+                    overlay.set_all_enabled(true);
+                    Outcome::Stay
+                }
+                KeyCode::Char('n') => {
+                    overlay.set_all_enabled(false);
+                    Outcome::Stay
+                }
+                KeyCode::Char('c') => {
+                    overlay.toggle_collapse_focused_track();
+                    Outcome::Stay
+                }
+                KeyCode::Char('C') => {
+                    overlay.collapse_all_tracks();
+                    Outcome::Stay
+                }
+                KeyCode::Char('X') | KeyCode::Char('E') => {
+                    overlay.expand_all_tracks();
+                    Outcome::Stay
+                }
+                KeyCode::Enter => {
+                    let Some(diff) = overlay.diff.as_ref() else {
+                        return;
+                    };
+                    if !diff.has_any_enabled() {
+                        Outcome::Close
+                    } else if overlay.filing && !diff.replacing_existing_dests().is_empty() {
+                        overlay.phase = TagManagerPhase::ConfirmReplace;
+                        Outcome::Stay
+                    } else {
+                        Outcome::Apply {
+                            replace_existing: overlay.filing,
+                        }
+                    }
+                }
+                _ => Outcome::Stay,
+            }
+        };
+        match outcome {
+            Outcome::Stay => {}
+            Outcome::Close => self.close_tag_manager(),
+            Outcome::Apply { replace_existing } => {
+                self.dispatch_tag_diff_apply(cmd_tx, replace_existing);
+            }
+        }
+    }
+
+    fn handle_tag_manager_key_confirm_replace(
+        &mut self,
+        key: KeyEvent,
+        cmd_tx: &mpsc::Sender<BgCommand>,
+    ) {
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.dispatch_tag_diff_apply(cmd_tx, true);
+            }
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                if let Some(overlay) = self.tag_manager.as_mut() {
+                    overlay.phase = TagManagerPhase::DiffPreview;
+                }
             }
             _ => {}
         }
+    }
+
+    fn dispatch_tag_diff_apply(
+        &mut self,
+        cmd_tx: &mpsc::Sender<BgCommand>,
+        replace_existing: bool,
+    ) {
+        let Some(overlay) = self.tag_manager.as_mut() else {
+            return;
+        };
+        let Some(diff) = overlay.diff.clone() else {
+            return;
+        };
+        let music_dir = self
+            .music_dir_cache
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string())
+            .or_else(|| {
+                self.library
+                    .as_ref()
+                    .and_then(|l| l.music_folder().map(String::from))
+            });
+        let Some(music_dir) = music_dir else {
+            overlay.error = Some("music directory unknown".into());
+            overlay.phase = TagManagerPhase::Error;
+            return;
+        };
+        overlay.phase = TagManagerPhase::Applying;
+        let token = overlay.next_request_token();
+        let fingerprint = self.scan_fingerprint;
+        let _ = cmd_tx.send(BgCommand::ApplyTagDiff {
+            token,
+            diff: Box::new(diff),
+            music_dir,
+            fingerprint,
+            replace_existing,
+        });
     }
 
     // -- Playback controls --
@@ -4657,20 +4935,23 @@ impl App {
 
         match &entry {
             SidebarEntry::Artist(artist) => {
-                let mut album_map: std::collections::BTreeMap<String, Option<u32>> =
-                    std::collections::BTreeMap::new();
+                let album_names = zytunes::library::collapse_ascii_case(
+                    lib.artist_tracks(artist).map(|t| t.album.as_str()),
+                );
+                let mut years: std::collections::HashMap<String, Option<u32>> =
+                    std::collections::HashMap::new();
                 for t in lib.artist_tracks(artist) {
-                    let e = album_map.entry(t.album.clone()).or_insert(t.year);
+                    let e = years.entry(t.album.to_ascii_lowercase()).or_insert(t.year);
                     if e.is_none() && t.year.is_some() {
                         *e = t.year;
                     }
                 }
-                self.album_list = album_map
+                self.album_list = album_names
                     .into_iter()
-                    .map(|(name, year)| AlbumInfo {
-                        name,
+                    .map(|name| AlbumInfo {
+                        year: years.get(&name.to_ascii_lowercase()).copied().flatten(),
+                        name: name.to_string(),
                         artist: artist.clone(),
-                        year,
                     })
                     .collect();
                 // Sort by year (oldest first), albums without a year go last.
@@ -5693,6 +5974,61 @@ impl App {
             mb_base_url: self.mb_base_url.clone(),
             mb_user_agent: self.mb_user_agent.clone(),
         });
+    }
+
+    /// Request an inbox scan if we haven't recently, one isn't in flight,
+    /// and the tag-manager isn't already showing a filing diff.
+    pub fn maybe_request_inbox_scan(&mut self) {
+        const POLL_INTERVAL: Duration = Duration::from_secs(5);
+        if self.inbox.scan_in_flight {
+            return;
+        }
+        if self.tag_manager.is_some() || self.import_overlay.is_some() {
+            return;
+        }
+        if !self.inbox.queue.is_empty() {
+            return;
+        }
+        if self.library.is_none() {
+            return;
+        }
+        let Some(music_dir) = self.music_dir_cache.as_ref() else {
+            return;
+        };
+        let Some(inbox) = zytunes::library_layout::default_inbox_dir(music_dir) else {
+            return;
+        };
+        let due = match self.inbox.last_request {
+            None => true,
+            Some(t) => t.elapsed() >= POLL_INTERVAL,
+        };
+        if !due {
+            return;
+        }
+        self.inbox.last_request = Some(Instant::now());
+        self.inbox.scan_in_flight = true;
+        let fingerprint = self.scan_fingerprint && self.acoustid_app_key.is_some();
+        self.pending_bg_commands
+            .push(BgCommand::ScanInbox { inbox, fingerprint });
+    }
+
+    pub fn on_inbox_scanned(&mut self, tracks: Vec<Track>) {
+        self.inbox.scan_in_flight = false;
+        if self.tag_manager.is_some() || self.import_overlay.is_some() {
+            return;
+        }
+        let tracks: Vec<Track> = tracks
+            .into_iter()
+            .filter(|t| {
+                t.location
+                    .as_ref()
+                    .is_none_or(|loc| !self.inbox.dismissed.contains(loc))
+            })
+            .collect();
+        if tracks.is_empty() {
+            return;
+        }
+        self.enqueue_file_clusters(zytunes::library_layout::cluster_by_album(tracks), None);
     }
 
     pub fn set_toast(&mut self, msg: String, is_error: bool) {
@@ -8199,9 +8535,14 @@ mod tests {
         }
         fn artist_tracks<'a>(
             &'a self,
-            _: &str,
+            artist: &str,
         ) -> Box<dyn Iterator<Item = &'a zytunes::library::Track> + 'a> {
-            Box::new(std::iter::empty())
+            let a = artist.to_string();
+            Box::new(
+                self.tracks
+                    .iter()
+                    .filter(move |t| t.grouping_artist().eq_ignore_ascii_case(&a)),
+            )
         }
         fn album_tracks<'a>(
             &'a self,
@@ -13948,5 +14289,212 @@ mod tests {
             .error
             .as_deref()
             .is_some_and(|e| e.contains("no releases")));
+    }
+
+    #[test]
+    fn inbox_scan_opens_filing_overlay_from_source_tracks() {
+        let mut app = make_app_with_library_for_tagmgr();
+        app.on_inbox_scanned(vec![zytunes::library::Track {
+            name: "Song".into(),
+            artist: "*NSYNC feat. Lisa Lopes".into(),
+            album: "No Strings Attached".into(),
+            album_artist: Some("*NSYNC".into()),
+            location: Some("/inbox/01.mp3".into()),
+            mb_release_id: Some("rel-inbox".into()),
+            ..Default::default()
+        }]);
+        let overlay = app.tag_manager.as_ref().expect("overlay");
+        assert!(overlay.filing);
+        assert!(overlay.source_tracks.is_some());
+        assert_eq!(overlay.source_artist, "*NSYNC");
+        assert_eq!(overlay.phase, TagManagerPhase::LoadingRelease);
+        assert!(
+            app.pending_bg_commands.iter().any(
+                |c| matches!(c, BgCommand::MbReleaseDetails { mbid, .. } if mbid == "rel-inbox")
+            ),
+            "inbox MBID should skip search"
+        );
+    }
+
+    #[test]
+    fn dismissing_filing_overlay_snoozes_inbox_paths() {
+        let mut app = make_app_with_library_for_tagmgr();
+        let track = zytunes::library::Track {
+            name: "Song".into(),
+            artist: "A".into(),
+            album: "B".into(),
+            location: Some("/inbox/skip.mp3".into()),
+            ..Default::default()
+        };
+        app.on_inbox_scanned(vec![track.clone()]);
+        assert!(app.tag_manager.as_ref().is_some_and(|o| o.filing));
+        app.close_tag_manager();
+        assert!(app.tag_manager.is_none());
+        assert!(app.inbox.dismissed.contains("/inbox/skip.mp3"));
+        app.on_inbox_scanned(vec![track]);
+        assert!(
+            app.tag_manager.is_none(),
+            "dismissed inbox path must not reopen"
+        );
+    }
+
+    #[test]
+    fn filing_done_close_opens_next_album_cluster() {
+        let mut app = make_app_with_library_for_tagmgr();
+        app.on_inbox_scanned(vec![
+            zytunes::library::Track {
+                name: "One".into(),
+                artist: "A".into(),
+                album: "Album One".into(),
+                location: Some("/inbox/1.mp3".into()),
+                ..Default::default()
+            },
+            zytunes::library::Track {
+                name: "Two".into(),
+                artist: "A".into(),
+                album: "Album Two".into(),
+                location: Some("/inbox/2.mp3".into()),
+                ..Default::default()
+            },
+        ]);
+        assert_eq!(app.tag_manager.as_ref().unwrap().source_album, "Album One");
+        assert_eq!(app.inbox.queue.len(), 1);
+        app.tag_manager.as_mut().unwrap().phase = TagManagerPhase::Done;
+        app.close_tag_manager();
+        let overlay = app.tag_manager.as_ref().expect("next cluster");
+        assert!(overlay.filing);
+        assert_eq!(overlay.source_album, "Album Two");
+        assert!(app.inbox.queue.is_empty());
+    }
+
+    #[test]
+    fn start_file_and_enrich_queues_artist_albums() {
+        let (tx, _rx) = mpsc::channel::<BgCommand>();
+        let mut app = make_app_with_library_for_tagmgr();
+        app.active_panel = Panel::Library;
+        app.sidebar_items = vec![SidebarEntry::Artist("Artist X".into())];
+        app.sidebar_selected = 0;
+        app.library = Some(Box::new(VecLibrary {
+            tracks: vec![
+                zytunes::library::Track {
+                    name: "A1".into(),
+                    artist: "Artist X".into(),
+                    album: "Album A".into(),
+                    ..Default::default()
+                },
+                zytunes::library::Track {
+                    name: "B1".into(),
+                    artist: "Artist X".into(),
+                    album: "Album B".into(),
+                    ..Default::default()
+                },
+            ],
+        }));
+        app.start_file_and_enrich(&tx);
+        let overlay = app.tag_manager.as_ref().expect("overlay");
+        assert!(overlay.filing);
+        assert_eq!(overlay.source_album, "Album A");
+        assert_eq!(app.inbox.queue.len(), 1);
+        assert_eq!(app.inbox.queue[0].album, "Album B");
+    }
+
+    #[test]
+    fn inbox_scan_does_not_fire_on_first_tick() {
+        let mut app = App::new();
+        app.library = Some(make_minimal_library());
+        app.music_dir_cache = Some(std::path::PathBuf::from("/tmp/zytunes-music"));
+        app.maybe_request_inbox_scan();
+        assert!(
+            app.pending_bg_commands
+                .iter()
+                .all(|c| !matches!(c, BgCommand::ScanInbox { .. })),
+            "first poll should be gated by the seeded last_request"
+        );
+    }
+
+    #[test]
+    fn inbox_scan_queues_when_due() {
+        let mut app = App::new();
+        app.library = Some(make_minimal_library());
+        app.music_dir_cache = Some(std::path::PathBuf::from("/tmp/zytunes-music"));
+        app.inbox.last_request = None;
+        app.maybe_request_inbox_scan();
+        match app.pending_bg_commands.first() {
+            Some(BgCommand::ScanInbox { inbox, fingerprint }) => {
+                assert!(inbox.ends_with("Automatically Add to Music"));
+                assert!(!*fingerprint, "no acoustid key → skip fingerprint");
+            }
+            _ => panic!("expected ScanInbox"),
+        }
+    }
+
+    fn filing_overlay_with_rename(src: &std::path::Path, dest: &std::path::Path) -> App {
+        use zytunes::tag_ops::{FieldDiff, FieldKind, ReleaseTagDiff, TrackTagDiff};
+        let mut app = make_app_with_library_for_tagmgr();
+        app.music_dir_cache = Some(src.parent().unwrap().to_path_buf());
+        let mut overlay = TagManagerOverlay::new(
+            zytunes::tag_ops::DiffScope::Album,
+            "2Pac".into(),
+            "Album".into(),
+            None,
+            SelectionAnchor::default(),
+        );
+        overlay.filing = true;
+        overlay.phase = TagManagerPhase::DiffPreview;
+        overlay.diff = Some(ReleaseTagDiff {
+            release_mbid: "rel-1".into(),
+            summary: "test".into(),
+            tracks: vec![TrackTagDiff {
+                src_path: src.to_path_buf(),
+                dest_path: Some(dest.to_path_buf()),
+                library_id: 1,
+                fields: vec![FieldDiff {
+                    kind: FieldKind::Filename,
+                    name: "Filename",
+                    current: Some(src.display().to_string()),
+                    proposed: Some(dest.display().to_string()),
+                    enabled: true,
+                }],
+            }],
+        });
+        overlay.rebuild_flattened_paths();
+        app.tag_manager = Some(overlay);
+        app
+    }
+
+    #[test]
+    fn filing_enter_asks_before_replacing_existing_dest() {
+        let dir = std::env::temp_dir().join("zytunes-confirm-replace");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("feat.wav");
+        let dest = dir.join("2pac.wav");
+        std::fs::write(&src, b"src").unwrap();
+        std::fs::write(&dest, b"dest").unwrap();
+
+        let (tx, rx) = mpsc::channel::<BgCommand>();
+        let mut app = filing_overlay_with_rename(&src, &dest);
+        app.handle_tag_manager_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        assert_eq!(
+            app.tag_manager.as_ref().unwrap().phase,
+            TagManagerPhase::ConfirmReplace
+        );
+        assert!(rx.try_recv().is_err(), "apply must wait for confirm");
+
+        app.handle_tag_manager_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+        assert_eq!(
+            app.tag_manager.as_ref().unwrap().phase,
+            TagManagerPhase::DiffPreview
+        );
+
+        app.handle_tag_manager_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        app.handle_tag_manager_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE), &tx);
+        match rx.try_recv().expect("apply after yes") {
+            BgCommand::ApplyTagDiff {
+                replace_existing, ..
+            } => assert!(replace_existing),
+            _ => panic!("expected ApplyTagDiff"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -422,6 +422,19 @@ impl DirectoryLibrary {
             );
         }
 
+        // Surgical updates only touch `paths`, but a rename in a previous
+        // apply (or an external move) can leave other cache keys pointing
+        // at files that no longer exist. Those ghosts show up as a second
+        // sidebar artist when the remaining tags use different casing.
+        let before = cached.len();
+        cached.retain(|path, _| Path::new(path).is_file());
+        let pruned = before - cached.len();
+        if pruned > 0 {
+            log(&format!(
+                "zytunes: reread: pruned {pruned} cache entries whose files are gone"
+            ));
+        }
+
         let tracks: HashMap<u64, Track> = cached
             .values()
             .map(|cf| (cf.track.id, cf.track.clone()))
@@ -632,13 +645,13 @@ fn collect_audio_paths(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-fn is_audio_file(path: &Path) -> bool {
+pub(crate) fn is_audio_file(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|ext| AUDIO_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
 }
 
-fn hash_path(path: &Path) -> u64 {
+pub(crate) fn hash_path(path: &Path) -> u64 {
     let mut hasher = DefaultHasher::new();
     path.to_string_lossy().hash(&mut hasher);
     hasher.finish()
@@ -855,26 +868,47 @@ fn parent_name(path: &Path, levels: usize) -> String {
 
 impl MusicLibrary for DirectoryLibrary {
     fn artists(&self) -> Vec<&str> {
-        let mut artists: Vec<&str> = self
-            .tracks
-            .values()
-            .map(|t| t.grouping_artist())
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
-        artists.sort_unstable();
-        artists
+        crate::library::collapse_ascii_case(self.tracks.values().map(|t| t.grouping_artist()))
     }
 
     fn albums(&self) -> Vec<(&str, &str)> {
-        let mut albums: Vec<(&str, &str)> = self
-            .tracks
-            .values()
-            .map(|t| (t.grouping_artist(), t.album.as_str()))
-            .collect::<std::collections::HashSet<_>>()
+        let artist_display: HashMap<String, &str> =
+            crate::library::collapse_ascii_case(self.tracks.values().map(|t| t.grouping_artist()))
+                .into_iter()
+                .map(|a| (a.to_ascii_lowercase(), a))
+                .collect();
+
+        let mut album_spell: HashMap<(String, String), HashMap<&str, usize>> = HashMap::new();
+        for t in self.tracks.values() {
+            let ak = t.grouping_artist().to_ascii_lowercase();
+            let alk = t.album.to_ascii_lowercase();
+            *album_spell
+                .entry((ak, alk))
+                .or_default()
+                .entry(t.album.as_str())
+                .or_insert(0) += 1;
+        }
+        let mut albums: Vec<(&str, &str)> = album_spell
             .into_iter()
+            .map(|((ak, _), spellings)| {
+                let artist = artist_display
+                    .get(&ak)
+                    .copied()
+                    .expect("album artist is a grouping_artist");
+                let album = spellings
+                    .into_iter()
+                    .max_by(|(a, na), (b, nb)| na.cmp(nb).then_with(|| (*a).cmp(*b)))
+                    .map(|(s, _)| s)
+                    .expect("non-empty album spelling group");
+                (artist, album)
+            })
             .collect();
-        albums.sort_unstable();
+        albums.sort_by(|a, b| {
+            a.0.to_ascii_lowercase()
+                .cmp(&b.0.to_ascii_lowercase())
+                .then_with(|| a.1.to_ascii_lowercase().cmp(&b.1.to_ascii_lowercase()))
+                .then_with(|| (a.0, a.1).cmp(&(b.0, b.1)))
+        });
         albums
     }
 
@@ -2009,5 +2043,93 @@ mod tests {
 
         assert_eq!(lib.artists(), vec!["Radiohead"]);
         assert_eq!(lib.artist_tracks("Radiohead").count(), 2);
+    }
+
+    #[test]
+    fn artists_and_albums_collapse_ascii_case_variants() {
+        let mut tracks = HashMap::new();
+        tracks.insert(
+            1,
+            Track {
+                id: 1,
+                name: "Them Bones".into(),
+                artist: "Alice In Chains".into(),
+                album: "Dirt".into(),
+                album_artist: Some("Alice In Chains".into()),
+                ..Default::default()
+            },
+        );
+        tracks.insert(
+            2,
+            Track {
+                id: 2,
+                name: "Rooster".into(),
+                artist: "Alice in Chains".into(),
+                album: "Dirt".into(),
+                album_artist: Some("Alice in Chains".into()),
+                ..Default::default()
+            },
+        );
+        tracks.insert(
+            3,
+            Track {
+                id: 3,
+                name: "Man in the Box".into(),
+                artist: "Alice in Chains".into(),
+                album: "Facelift".into(),
+                album_artist: Some("Alice in Chains".into()),
+                ..Default::default()
+            },
+        );
+        let lib = DirectoryLibrary {
+            tracks,
+            root: "/tmp/aic-case".into(),
+        };
+        assert_eq!(lib.artists(), vec!["Alice in Chains"]);
+        let albums = lib.albums();
+        assert_eq!(
+            albums,
+            vec![("Alice in Chains", "Dirt"), ("Alice in Chains", "Facelift")]
+        );
+        assert_eq!(lib.artist_tracks("Alice In Chains").count(), 3);
+        assert_eq!(
+            lib.album_tracks_by_artist("Alice In Chains", "Dirt")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn reread_paths_prunes_unlisted_missing_files() {
+        let dir = std::env::temp_dir().join("zytunes-dirlib-reread-prune-ghost");
+        let _ = fs::remove_dir_all(&dir);
+        let album = dir.join("ArtistP").join("AlbumP");
+        fs::create_dir_all(&album).unwrap();
+        let stay = album.join("01 Stay.mp3");
+        let gone = album.join("02 Gone.mp3");
+        fs::write(&stay, b"fake").unwrap();
+        fs::write(&gone, b"fake").unwrap();
+        let _ = DirectoryLibrary::scan_with_options(
+            dir.to_str().unwrap(),
+            ScanOptions::default(),
+            |_| {},
+        )
+        .unwrap();
+        fs::remove_file(&gone).unwrap();
+        let log = crate::cache::default_logger();
+        let lib = DirectoryLibrary::reread_paths(
+            dir.to_str().unwrap(),
+            std::slice::from_ref(&stay),
+            false,
+            &log,
+        )
+        .unwrap();
+        let paths: Vec<String> = lib
+            .all_tracks()
+            .filter_map(|t| t.location.clone())
+            .collect();
+        assert!(paths.iter().any(|p| p == stay.to_str().unwrap()));
+        assert!(!paths.iter().any(|p| p == gone.to_str().unwrap()));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

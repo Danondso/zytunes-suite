@@ -215,13 +215,24 @@ impl MusicBrainzClient {
     /// with the special characters that the Lucene parser treats as operators
     /// escaped (so `AC/DC` doesn't blow up). Returns up to `limit` hits ranked
     /// by MB's relevance score.
+    ///
+    /// Soundtracks are credited to Various Artists, not the per-track feat.
+    /// artist (`Jim Sturgess feat. T.V. Carpio` on *Across the Universe*).
+    /// When the first query returns no hits and the album title is non-empty,
+    /// a second query retries with artist `Various Artists`.
     pub fn search_releases(
         &self,
         artist: &str,
         album: &str,
         limit: u32,
     ) -> Result<ReleaseSearchResponse, MbError> {
-        self.get_json(&self.search_releases_url(artist, album, limit))
+        let resp: ReleaseSearchResponse =
+            self.get_json(&self.search_releases_url(artist, album, limit))?;
+        if resp.releases.is_empty() && should_retry_various_artists(artist, album) {
+            self.get_json(&self.search_releases_url(VARIOUS_ARTISTS, album, limit))
+        } else {
+            Ok(resp)
+        }
     }
 
     /// The URL that [`Self::search_releases`] would request. Exposed so callers
@@ -278,6 +289,22 @@ impl MusicBrainzClient {
         );
         self.get_json(&url)
     }
+}
+
+const VARIOUS_ARTISTS: &str = "Various Artists";
+
+/// Soundtrack releases are filed under Various Artists. Retry that artist
+/// when `artist`+`album` produced no Solr hits — not when the album title is
+/// blank (that query would match every VA release) or the artist is already VA.
+pub fn should_retry_various_artists(artist: &str, album: &str) -> bool {
+    !album.trim().is_empty() && !is_various_artists(artist)
+}
+
+fn is_various_artists(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "various artists" | "various"
+    )
 }
 
 /// Escape a string for use inside a Lucene quoted phrase. We always wrap the
@@ -592,6 +619,40 @@ pub fn render_artist_credit(credits: &[ArtistCredit]) -> String {
         }
     }
     out
+}
+
+/// Album-artist for tags and `{AlbumArtist}/{Album}` folders.
+///
+/// Featuring joins stay on the *track* artist. A release credited
+/// `2Pac feat. The Notorious B.I.G.` files under `2Pac`. Collaborations
+/// joined with `&` / `and` / `,` keep the full credit.
+pub fn canonical_album_artist(credits: &[ArtistCredit]) -> String {
+    if credits.is_empty() {
+        return String::new();
+    }
+    if is_featuring_credit(credits) {
+        primary_credit_name(&credits[0]).to_string()
+    } else {
+        render_artist_credit(credits)
+    }
+}
+
+fn primary_credit_name(ac: &ArtistCredit) -> &str {
+    ac.artist
+        .as_ref()
+        .map(|a| a.name.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(ac.name.trim())
+}
+
+fn is_featuring_credit(credits: &[ArtistCredit]) -> bool {
+    credits.iter().any(|c| {
+        c.joinphrase.as_deref().is_some_and(|j| {
+            let l = j.to_ascii_lowercase();
+            l.contains("feat") || l.contains("ft.") || l.contains("ft ") || l.contains("featuring")
+        })
+    })
 }
 
 #[cfg(test)]
@@ -937,6 +998,27 @@ mod tests {
             render_artist_credit(&credits),
             "Daft Punk feat. Pharrell Williams"
         );
+        assert_eq!(canonical_album_artist(&credits), "Daft Punk");
+    }
+
+    #[test]
+    fn canonical_album_artist_keeps_true_collaborations() {
+        let credits = vec![
+            ArtistCredit {
+                name: "Robert Plant".into(),
+                joinphrase: Some(" & ".into()),
+                artist: None,
+            },
+            ArtistCredit {
+                name: "Alison Krauss".into(),
+                joinphrase: None,
+                artist: None,
+            },
+        ];
+        assert_eq!(
+            canonical_album_artist(&credits),
+            "Robert Plant & Alison Krauss"
+        );
     }
 
     #[test]
@@ -960,6 +1042,24 @@ mod tests {
         let clean = c.search_releases_url("311", "", 12);
         assert_eq!(padded, clean);
         assert!(padded.contains("artist%3A%22311%22"));
+    }
+
+    #[test]
+    fn various_artists_fallback_skips_blank_album_and_existing_va() {
+        assert!(should_retry_various_artists(
+            "Jim Sturgess feat. T.V. Carpio",
+            "Across the Universe"
+        ));
+        assert!(!should_retry_various_artists(
+            "Various Artists",
+            "Across the Universe"
+        ));
+        assert!(!should_retry_various_artists(
+            "various",
+            "Across the Universe"
+        ));
+        assert!(!should_retry_various_artists("Jim Sturgess", "   "));
+        assert!(!should_retry_various_artists("Jim Sturgess", ""));
     }
 
     #[test]

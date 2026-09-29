@@ -158,6 +158,7 @@ impl App {
             BgEvent::MbRecordingReleases { token, result } => {
                 self.handle_mb_recording_releases(token, result);
             }
+            BgEvent::InboxScanned { tracks } => self.on_inbox_scanned(tracks),
             BgEvent::StemEngineProgress(line) => {
                 self.sync.log.push(format!("[stems] {line}"));
             }

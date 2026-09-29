@@ -519,6 +519,11 @@ impl App {
             {
                 self.open_tag_manager(cmd_tx);
             }
+            KeyCode::Char('F')
+                if self.browse_mode == BrowseMode::Library && self.library.is_some() =>
+            {
+                self.start_file_and_enrich(cmd_tx);
+            }
             KeyCode::Char('M') => {
                 // On an album sidebar entry (Library browse), M means
                 // "pre-warm this whole album" — or cancels the batch

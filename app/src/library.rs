@@ -1,5 +1,7 @@
 //! Music library trait and shared `Track` type.
 
+use std::collections::HashMap;
+
 /// A track in the music library.
 ///
 /// All `Option` fields use `#[serde(default, skip_serializing_if =
@@ -144,15 +146,49 @@ impl Track {
     }
 }
 
+/// Collapse strings that differ only by ASCII case, keeping the most
+/// common original spelling (ties: lexicographic). Sorted case-insensitively.
+///
+/// Lookups (`artist_tracks`, …) already use `eq_ignore_ascii_case`, so a
+/// case-sensitive unique list produces duplicate sidebar rows that show
+/// the same tracks — `Alice in Chains` vs `Alice In Chains`.
+pub fn collapse_ascii_case<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
+    let mut groups: HashMap<String, HashMap<&'a str, usize>> = HashMap::new();
+    for name in names {
+        *groups
+            .entry(name.to_ascii_lowercase())
+            .or_default()
+            .entry(name)
+            .or_insert(0) += 1;
+    }
+    let mut out: Vec<&str> = groups.into_values().map(preferred_ascii_spelling).collect();
+    out.sort_by(|a, b| {
+        a.to_ascii_lowercase()
+            .cmp(&b.to_ascii_lowercase())
+            .then_with(|| (*a).cmp(*b))
+    });
+    out
+}
+
+fn preferred_ascii_spelling(spellings: HashMap<&str, usize>) -> &str {
+    spellings
+        .into_iter()
+        .max_by(|(a, na), (b, nb)| na.cmp(nb).then_with(|| (*a).cmp(*b)))
+        .map(|(s, _)| s)
+        .expect("non-empty spelling group")
+}
+
 /// Trait abstracting a music library backend.
 ///
 /// The track-returning methods yield `Box<dyn Iterator>` so streaming callers
 /// (sidebar population, stats passes) don't force an intermediate `Vec` —
 /// callers that want materialized state `.collect()` themselves.
 pub trait MusicLibrary {
-    /// All unique artist names, sorted.
+    /// Unique artist names, sorted. ASCII-case variants collapse to the
+    /// most common original spelling.
     fn artists(&self) -> Vec<&str>;
-    /// All unique (artist, album) pairs, sorted.
+    /// Unique `(artist, album)` pairs, sorted. ASCII-case variants of either
+    /// half collapse the same way as [`Self::artists`].
     fn albums(&self) -> Vec<(&str, &str)>;
     /// All tracks by a given artist (case-insensitive).
     fn artist_tracks<'a>(&'a self, artist: &str) -> Box<dyn Iterator<Item = &'a Track> + 'a>;
@@ -183,4 +219,29 @@ pub trait MusicLibrary {
     /// Existing ids are left alone. The default is a no-op so backends that
     /// do not participate in background fingerprinting stay unchanged.
     fn apply_acoustic_ids(&mut self, _updates: &[(u64, String)]) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::collapse_ascii_case;
+
+    #[test]
+    fn collapse_ascii_case_keeps_most_common_spelling() {
+        let names = [
+            "Alice In Chains",
+            "Alice in Chains",
+            "Alice in Chains",
+            "Alice in Chains",
+        ];
+        assert_eq!(collapse_ascii_case(names), vec!["Alice in Chains"]);
+    }
+
+    #[test]
+    fn collapse_ascii_case_keeps_distinct_artists() {
+        let names = ["Radiohead", "Radiohead", "radiohead", "Alice in Chains"];
+        assert_eq!(
+            collapse_ascii_case(names),
+            vec!["Alice in Chains", "Radiohead"]
+        );
+    }
 }

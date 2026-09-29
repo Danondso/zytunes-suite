@@ -58,6 +58,9 @@ pub enum TagManagerPhase {
     LoadingRelease,
     /// Diff is rendered; user toggles fields with Space, applies with Enter.
     DiffPreview,
+    /// Filing would overwrite files already at the canonical path. Enter
+    /// replaces; Esc returns to [`Self::DiffPreview`].
+    ConfirmReplace,
     /// Apply is in flight — disabled all keys except a final "ack" once Done.
     Applying,
     /// Apply succeeded. Any key closes.
@@ -134,6 +137,12 @@ pub struct TagManagerOverlay {
     /// Picard-canonical TXXX frame. `None` for overlays that resolved via
     /// the MBID-direct or MB-search paths (no AcoustID hit available).
     pub acoustid_uuid: Option<String>,
+    /// Tracks to diff against instead of a library lookup. Inbox drops and
+    /// artist-wide reshelve pass files that may not be in `App.library`.
+    pub source_tracks: Option<Vec<zytunes::library::Track>>,
+    /// Inbox / `F` filing: titles say "File into library", dismiss snoozes
+    /// the cluster, and close continues the album queue.
+    pub filing: bool,
 }
 
 impl TagManagerOverlay {
@@ -164,6 +173,8 @@ impl TagManagerOverlay {
             last_rename_map: std::collections::HashMap::new(),
             pending_request_token: 0,
             acoustid_uuid: None,
+            source_tracks: None,
+            filing: false,
         }
     }
 

@@ -2810,6 +2810,7 @@ fn draw_help_overlay(f: &mut Frame, app: &App) {
         "  s           Cycle sort column",
         "  I           Show track info (TrackList panel)",
         "  m           MusicBrainz tag manager (Albums / TrackList)",
+        "  F           File + enrich (inbox / artist / album)",
         "",
         "  Sync",
         "  a           Add track to queue",
@@ -3867,21 +3868,29 @@ fn draw_tag_manager_overlay(f: &mut Frame, app: &App) {
 
     f.render_widget(Clear, rect);
 
+    let noun = if overlay.filing {
+        "File into library"
+    } else {
+        "Tag manager"
+    };
     let title = match overlay.phase {
         TagManagerPhase::SearchInput => {
-            " Tag manager — edit query (Enter to search, Esc to close) "
+            format!(" {noun} — edit query (Enter to search, Esc to close) ")
         }
-        TagManagerPhase::SearchPending => " Tag manager — searching MusicBrainz… ",
+        TagManagerPhase::SearchPending => format!(" {noun} — searching MusicBrainz… "),
         TagManagerPhase::SearchResults => {
-            " Tag manager — ↑↓ select · Enter pick · s edit query · Esc back "
+            format!(" {noun} — ↑↓ select · Enter pick · s edit query · Esc back ")
         }
-        TagManagerPhase::LoadingRelease => " Tag manager — loading release… ",
+        TagManagerPhase::LoadingRelease => format!(" {noun} — loading release… "),
         TagManagerPhase::DiffPreview => {
-            " Tag manager — j/k · Space · a/n · c fold · Enter apply · s search · Esc "
+            format!(" {noun} — j/k · Space · a/n · c fold · Enter apply · s search · Esc ")
         }
-        TagManagerPhase::Applying => " Tag manager — applying… ",
-        TagManagerPhase::Done => " Tag manager — done (any key to close) ",
-        TagManagerPhase::Error => " Tag manager — error (any key to close) ",
+        TagManagerPhase::ConfirmReplace => {
+            format!(" {noun} — replace existing files? Enter/y yes · Esc/n back ")
+        }
+        TagManagerPhase::Applying => format!(" {noun} — applying… "),
+        TagManagerPhase::Done => format!(" {noun} — done (any key to close) "),
+        TagManagerPhase::Error => format!(" {noun} — error (any key to close) "),
     };
     let block = t
         .block()
@@ -3906,6 +3915,9 @@ fn draw_tag_manager_overlay(f: &mut Frame, app: &App) {
         }
         TagManagerPhase::DiffPreview | TagManagerPhase::Applying => {
             draw_tag_manager_diff(f, app, overlay, inner);
+        }
+        TagManagerPhase::ConfirmReplace => {
+            draw_tag_manager_confirm_replace(f, app, overlay, inner);
         }
         TagManagerPhase::Done => {
             draw_centered_line(f, inner, "Done. Press any key to close.", t.success_text);
@@ -4060,6 +4072,56 @@ fn draw_tag_manager_search_results(
     ];
     let table = Table::new(rows, widths).header(header);
     f.render_widget(table, inner);
+}
+
+fn draw_tag_manager_confirm_replace(
+    f: &mut Frame,
+    app: &App,
+    overlay: &crate::app::TagManagerOverlay,
+    inner: Rect,
+) {
+    let t = app.theme();
+    let dests = overlay
+        .diff
+        .as_ref()
+        .map(|d| d.replacing_existing_dests())
+        .unwrap_or_default();
+    let n = dests.len();
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!(
+                " {n} file{} already exist at the destination.",
+                if n == 1 { "" } else { "s" }
+            ),
+            t.header(),
+        )),
+        Line::from(Span::styled(
+            " Replace them with the incoming copies?",
+            t.header(),
+        )),
+        Line::from(""),
+    ];
+    let shown = dests.iter().take(6);
+    for p in shown {
+        let label = p.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+        let parent = p
+            .parent()
+            .and_then(|d| d.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        lines.push(Line::from(format!("   {parent}/{label}")));
+    }
+    if n > 6 {
+        lines.push(Line::from(format!("   …and {} more", n - 6)));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " Enter/y: replace    Esc/n: back to diff",
+        t.dim(),
+    )));
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+    f.render_widget(para, inner);
 }
 
 fn draw_tag_manager_diff(

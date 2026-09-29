@@ -276,6 +276,9 @@ pub enum BgCommand {
         diff: Box<zytunes::tag_ops::ReleaseTagDiff>,
         music_dir: String,
         fingerprint: bool,
+        /// Filing (`F` / inbox): overwrite a dest that already exists so
+        /// a feat-folder copy does not sit beside the canonical file.
+        replace_existing: bool,
     },
     /// Look up a Chromaprint fingerprint against the AcoustID web service.
     /// Result is delivered as [`BgEvent::AcoustIdResolved`]. The tag-manager
@@ -390,6 +393,14 @@ pub enum BgCommand {
         /// Resolved stem-cache root (`[stems].cache_dir` override or the
         /// default). `None` only when `$HOME` can't be resolved.
         cache_dir: Option<PathBuf>,
+    },
+    /// Scan the Automatically Add to Music inbox (sibling of `music_dir`).
+    /// Fingerprints untagged files when `fingerprint` is set so AcoustID
+    /// can identify them the way a tag-manager retag does. Answered by
+    /// [`BgEvent::InboxScanned`].
+    ScanInbox {
+        inbox: PathBuf,
+        fingerprint: bool,
     },
 }
 
@@ -643,6 +654,11 @@ pub enum BgEvent {
         skipped: usize,
         failed: usize,
         cancelled: bool,
+    },
+    /// Inbox scan finished. Tracks are settled audio files (possibly
+    /// fingerprinted); the TUI clusters them and opens the tag manager.
+    InboxScanned {
+        tracks: Vec<zytunes::library::Track>,
     },
 }
 
@@ -2269,8 +2285,10 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                     diff,
                     music_dir,
                     fingerprint,
+                    replace_existing,
                 } => {
-                    let (results, rename_map) = zytunes::tag_ops::apply_release_diff(&diff);
+                    let (results, rename_map) =
+                        zytunes::tag_ops::apply_release_diff_with(&diff, replace_existing);
                     // Collect every src/dest path so the surgical re-read
                     // covers both the original locations (now stale) and the
                     // post-rename locations (now fresh).
@@ -2383,6 +2401,16 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                     }
                     let _ = event_tx.send(BgEvent::MbRecordingReleases { token, result });
                 }
+                BgCommand::ScanInbox { inbox, fingerprint } => {
+                    if let Err(e) = std::fs::create_dir_all(&inbox) {
+                        let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                            "inbox: mkdir {}: {e}",
+                            inbox.display()
+                        )));
+                    }
+                    let tracks = zytunes::library_layout::scan_inbox(&inbox, fingerprint);
+                    let _ = event_tx.send(BgEvent::InboxScanned { tracks });
+                }
             }
         }
     });
@@ -2435,6 +2463,12 @@ fn run_mb_search_releases_with_log(
         bytes_hex(album)
     )));
     let _ = log.send(BgEvent::SyncMessage(format!("tag-manager: URL={}", url)));
+    if zytunes::musicbrainz::should_retry_various_artists(artist, album) {
+        let _ = log.send(BgEvent::SyncMessage(format!(
+            "tag-manager: 0-hit fallback URL={}",
+            client.search_releases_url("Various Artists", album, 12)
+        )));
+    }
     client
         .search_releases(artist, album, 12)
         .map(|r| r.releases)
