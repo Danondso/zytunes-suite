@@ -245,7 +245,7 @@ pub fn build_release_diff(
         Some(release.media.len() as u32)
     };
 
-    let mut out: Vec<TrackTagDiff> = Vec::new();
+    let mut out: Vec<((u32, u32), TrackTagDiff)> = Vec::new();
     for lib in library_tracks {
         let location = match lib.location.as_deref() {
             Some(p) => PathBuf::from(p),
@@ -291,13 +291,20 @@ pub fn build_release_diff(
 
         let dest_path = proposed_filename.filter(|p| p != &location);
 
-        out.push(TrackTagDiff {
-            src_path: location,
-            dest_path,
-            library_id: lib.id,
-            fields,
-        });
+        out.push((
+            (medium.position.unwrap_or(0), position),
+            TrackTagDiff {
+                src_path: location,
+                dest_path,
+                library_id: lib.id,
+                fields,
+            },
+        ));
     }
+    // The library hands tracks over in hash order; list them the way the
+    // release does (disc, then track), and keep that stable for ties.
+    out.sort_by_key(|(order, _)| *order);
+    let out: Vec<TrackTagDiff> = out.into_iter().map(|(_, t)| t).collect();
 
     ReleaseTagDiff {
         release_mbid: release.id.clone(),
@@ -1918,6 +1925,33 @@ mod tests {
                 .collect();
             assert!(left.is_empty(), "{ext} still proposes {left:#?}");
         }
+    }
+
+    #[test]
+    fn diff_tracks_are_ordered_by_disc_and_track_number() {
+        // The library hands tracks over in hash order; the overlay must
+        // list them the way the release does.
+        let dir = fresh_dir("diff-order");
+        let rel = make_release("Album", "Artist");
+        let mut lib: Vec<LibTrack> = Vec::new();
+        for (n, title) in [(2u32, "Second"), (1, "First")] {
+            let path = dir.join(format!("{n:02} - {title}.wav"));
+            write_sine_wav(&path, 1);
+            lib.push(make_lib_track(&path, title, n));
+        }
+        let diff = build_release_diff(&lib, &rel, &dir, DiffScope::Album, None);
+        let order: Vec<String> = diff
+            .tracks
+            .iter()
+            .map(|t| {
+                t.src_path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(order, vec!["01 - First.wav", "02 - Second.wav"]);
     }
 
     #[test]
