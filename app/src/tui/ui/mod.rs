@@ -4079,11 +4079,7 @@ fn draw_tag_manager_confirm_replace(
     inner: Rect,
 ) {
     let t = app.theme();
-    let dests = overlay
-        .diff
-        .as_ref()
-        .map(|d| d.replacing_existing_dests())
-        .unwrap_or_default();
+    let dests = &overlay.replacing_dests;
     let n = dests.len();
     let mut lines = vec![
         Line::from(""),

@@ -3579,9 +3579,17 @@ impl App {
                         Outcome::AlreadyMatches
                     } else if !diff.has_any_enabled() {
                         Outcome::NothingEnabled
-                    } else if overlay.filing && !diff.replacing_existing_dests().is_empty() {
-                        overlay.phase = TagManagerPhase::ConfirmReplace;
-                        Outcome::Stay
+                    } else if overlay.filing {
+                        let replacing = diff.replacing_existing_dests();
+                        if replacing.is_empty() {
+                            Outcome::Apply {
+                                replace_existing: true,
+                            }
+                        } else {
+                            overlay.replacing_dests = replacing;
+                            overlay.phase = TagManagerPhase::ConfirmReplace;
+                            Outcome::Stay
+                        }
                     } else {
                         Outcome::Apply {
                             replace_existing: overlay.filing,
@@ -15152,6 +15160,12 @@ mod tests {
             TagManagerPhase::ConfirmReplace
         );
         assert!(rx.try_recv().is_err(), "apply must wait for confirm");
+        // The list the prompt shows is computed once on entry: the
+        // renderer runs every 50 ms and must not stat the library per frame.
+        assert_eq!(
+            app.tag_manager.as_ref().unwrap().replacing_dests,
+            vec![dest.clone()]
+        );
 
         app.handle_tag_manager_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
         assert_eq!(
