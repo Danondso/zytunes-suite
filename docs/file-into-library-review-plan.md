@@ -168,9 +168,9 @@ and 4 touch the same phase-0 block and land before 1 and 2, which change
   - `scan_inbox_missing_dir_returns_empty_without_creating_it` (`library_layout.rs`).
   - `inbox_create_failure_logged_once` (`tui/app.rs`): two ticks against an
     uncreatable inbox path produce one log line.
-- **Green** — remove `create_dir_all` from the `ScanInbox` arm. Create the
-  inbox once at TUI startup; on failure log once and disable polling for the
-  session.
+- **Green** — `ScanInbox` carries `create_dir`, set only on the first scan of
+  a session. A failure logs once; later polls just read (and pick the folder up
+  if the user creates it by hand).
 - **Decided** — the inbox is created by default. A place to drop music for
   sorting is part of using zytunes, so there is no opt-in or opt-out key. The
   review's "without any opt-in" point is declined; only the every-poll mkdir
@@ -184,27 +184,29 @@ and 4 touch the same phase-0 block and land before 1 and 2, which change
 
 ## Todo
 
-- [ ] 3a. Red: same-inode hard-link tests (apply + `replacing_existing_dests`)
-- [ ] 3b. Green/refactor: `dest_is_source` guard at both sites; commit; reply on PR
-- [ ] 4a. Red: dest survives a failed rename
-- [ ] 4b. Green: replace via rename-over, remove phase-0 delete; commit; reply
-- [ ] 1a. Red: merge-into-existing-folder test + rollback unit test
-- [ ] 1b. Green: different-inode target falls through to move; rollback; commit; reply
-- [ ] 2a. Red: multi-track retitle, sibling album, dirlib reread, queued cluster tests
-- [ ] 2b. Green: already-moved source is Ok; return `dir_renames`
-- [ ] 2c. Green: library + queue prefix remap in the apply-done handler
-- [ ] 2d. Refactor: `ApplyOutcome` struct; commit; reply
-- [ ] 5a. Red: Done-close leftover tests
-- [ ] 5b. Green: dismiss leftovers, keep inbox paths out of reread; commit; reply
-- [ ] 6a. Red: `scan_inbox` exclude test + command-carries-dismissed test
-- [ ] 6b. Green: `ScanInbox { dismissed }`; commit; reply
-- [ ] 7a. Red: `A & B feat. C` and `2Pac feat. X` tests
-- [ ] 7b. Green: prefix-before-feat rendering; commit; reply
-- [ ] 8a. Red: track-list `F` on a feat track
-- [ ] 8b. Green: grouping-artist lookup; commit; reply
-- [ ] 9a. Red: overlay-vs-modal tests
-- [ ] 9b. Green: `modal_or_input_active` gate; commit; reply
-- [ ] 10a. Red: missing-dir scan + log-once tests
-- [ ] 10b. Green: create once at startup, log once; commit; reply
-- [ ] README / CLAUDE.md sync
-- [ ] Final: `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test --workspace`; push
+Status: all items landed, one `fix:` commit each (see `git log`).
+
+- [x] 3a. Red: same-inode hard-link tests (apply + `replacing_existing_dests`)
+- [x] 3b. Green/refactor: `dest_is_source` guard at both sites; commit; reply on PR
+- [x] 4a. Red: dest survives a failed rename
+- [x] 4b. Green: replace via rename-over, remove phase-0 delete; commit; reply
+- [x] 1a. Red: merge-into-existing-folder test + rollback unit test
+- [x] 1b. Green: different-inode target falls through to move; rollback; commit; reply
+- [x] 2a. Red: multi-track retitle, sibling album, dirlib reread, queued cluster tests
+- [x] 2b. Green: already-moved source is Ok; return `dir_renames`
+- [x] 2c. Green: library + queue prefix remap in the apply-done handler
+- [x] 2d. Refactor: `ApplyOutcome` struct; commit; reply
+- [x] 5a. Red: Done-close leftover tests
+- [x] 5b. Green: dismiss leftovers, keep inbox paths out of reread; commit; reply
+- [x] 6a. Red: `scan_inbox` exclude test + command-carries-dismissed test
+- [x] 6b. Green: `ScanInbox { dismissed }`; commit; reply
+- [x] 7a. Red: `A & B feat. C` and `2Pac feat. X` tests
+- [x] 7b. Green: prefix-before-feat rendering; commit; reply
+- [x] 8a. Red: track-list `F` on a feat track
+- [x] 8b. Green: grouping-artist lookup; commit; reply
+- [x] 9a. Red: overlay-vs-modal tests
+- [x] 9b. Green: `modal_or_input_active` gate; commit; reply
+- [x] 10a. Red: missing-dir scan + log-once tests
+- [x] 10b. Green: create once at startup, log once; commit; reply
+- [x] README / CLAUDE.md sync
+- [x] Final: `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test --workspace`; push
