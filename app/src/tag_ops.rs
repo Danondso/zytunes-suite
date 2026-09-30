@@ -1091,10 +1091,7 @@ fn retitle_case_along(src: &Path, dest: &Path) -> Result<(), String> {
             (std::path::Component::Normal(have), std::path::Component::Normal(want)) => {
                 built.push(have);
                 if have != want {
-                    let parent = built
-                        .parent()
-                        .map(Path::to_path_buf)
-                        .unwrap_or_default();
+                    let parent = built.parent().map(Path::to_path_buf).unwrap_or_default();
                     let tmp = parent.join(format!(
                         ".zytunes-case-{}-{}",
                         std::process::id(),
