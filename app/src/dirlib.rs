@@ -389,10 +389,63 @@ impl DirectoryLibrary {
         fingerprint: bool,
         log: &crate::cache::Logger,
     ) -> Result<Self, String> {
+        Self::reread_paths_after(root, paths, &[], fingerprint, log)
+    }
+
+    /// [`Self::reread_paths`], plus whole-directory renames to follow.
+    ///
+    /// A case retitle (`Alice in Chains/` → `Alice In Chains/`) moves every
+    /// album under the folder, not only the files in `paths`. Each cached
+    /// entry under an `old` directory is re-keyed to its place under `new`
+    /// so those albums stay in the library without a full rescan. The
+    /// stored AcoustID rides along (the audio did not change).
+    pub fn reread_paths_after(
+        root: &str,
+        paths: &[PathBuf],
+        dir_renames: &[(PathBuf, PathBuf)],
+        fingerprint: bool,
+        log: &crate::cache::Logger,
+    ) -> Result<Self, String> {
         if !Path::new(root).is_dir() {
             return Err(format!("Not a directory: {root}"));
         }
         let mut cached = crate::cache::load_dirlib_cache(root, log);
+
+        // Re-key entries carried along by a directory rename. The old key
+        // is always dropped: on a case-folding volume it still resolves,
+        // so the ghost prune below would keep it as a duplicate.
+        for (old_dir, new_dir) in dir_renames {
+            let carried: Vec<String> = cached
+                .keys()
+                .filter(|k| Path::new(k).starts_with(old_dir))
+                .cloned()
+                .collect();
+            for key in carried {
+                let Some(entry) = cached.remove(&key) else {
+                    continue;
+                };
+                let moved = crate::tag_ops::remap_through_dir_renames(
+                    Path::new(&key),
+                    std::slice::from_ref(&(old_dir.clone(), new_dir.clone())),
+                );
+                let Some(fp) = crate::cache::FileFingerprint::from_path(&moved) else {
+                    continue;
+                };
+                let mut track = track_from_lofty(&moved, hash_path(&moved))
+                    .unwrap_or_else(|| track_from_path(&moved, hash_path(&moved)));
+                if track.acoustic_id.is_none() {
+                    track.acoustic_id = entry.track.acoustic_id;
+                }
+                cached.insert(
+                    moved.to_string_lossy().to_string(),
+                    crate::cache::CachedFile {
+                        fingerprint: fp,
+                        track,
+                        fingerprint_failed: entry.fingerprint_failed,
+                    },
+                );
+            }
+        }
 
         for p in paths {
             let key = p.to_string_lossy().to_string();
@@ -2097,6 +2150,54 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn reread_paths_follows_directory_rename() {
+        let dir = std::env::temp_dir().join("zytunes-dirlib-reread-dir-rename");
+        let _ = fs::remove_dir_all(&dir);
+        let old_artist = dir.join("artist d");
+        let new_artist = dir.join("Artist D");
+        let filed = old_artist.join("AlbumA").join("01 Filed.mp3");
+        let sibling = old_artist.join("AlbumB").join("01 Sibling.mp3");
+        fs::create_dir_all(filed.parent().unwrap()).unwrap();
+        fs::create_dir_all(sibling.parent().unwrap()).unwrap();
+        fs::write(&filed, b"fake").unwrap();
+        fs::write(&sibling, b"fake").unwrap();
+        let _ = DirectoryLibrary::scan_with_options(
+            dir.to_str().unwrap(),
+            ScanOptions::default(),
+            |_| {},
+        )
+        .unwrap();
+
+        // Filing AlbumA retitled the artist folder; AlbumB rode along.
+        fs::rename(&old_artist, &new_artist).unwrap();
+        let filed_new = new_artist.join("AlbumA").join("01 Filed.mp3");
+        let sibling_new = new_artist.join("AlbumB").join("01 Sibling.mp3");
+        let log = crate::cache::default_logger();
+        let lib = DirectoryLibrary::reread_paths_after(
+            dir.to_str().unwrap(),
+            &[filed.clone(), filed_new.clone()],
+            &[(old_artist.clone(), new_artist.clone())],
+            false,
+            &log,
+        )
+        .unwrap();
+        let mut paths: Vec<String> = lib
+            .all_tracks()
+            .filter_map(|t| t.location.clone())
+            .collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![
+                filed_new.to_str().unwrap().to_string(),
+                sibling_new.to_str().unwrap().to_string()
+            ],
+            "the sibling album must follow the folder, under its new path only"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

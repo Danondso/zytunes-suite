@@ -587,6 +587,10 @@ pub enum BgEvent {
         token: u64,
         results: Vec<Result<(), String>>,
         rename_map: std::collections::HashMap<std::path::PathBuf, std::path::PathBuf>,
+        /// Whole folders a case retitle renamed, `(old, new)` in order.
+        /// Albums outside the diff moved with them, so the app remaps any
+        /// queued filing cluster that still points under `old`.
+        dir_renames: Vec<(std::path::PathBuf, std::path::PathBuf)>,
     },
     /// Phase 2 of `ApplyTagDiff`: surgical re-scan complete. Replaces
     /// `App.library` and (when the token still matches the open overlay)
@@ -2318,7 +2322,11 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                     fingerprint,
                     replace_existing,
                 } => {
-                    let (results, rename_map) = zytunes::tag_ops::apply_release_diff_with(
+                    let zytunes::tag_ops::ApplyOutcome {
+                        results,
+                        rename_map,
+                        dir_renames,
+                    } = zytunes::tag_ops::apply_release_diff_with(
                         &diff,
                         replace_existing,
                         std::path::Path::new(&music_dir),
@@ -2337,15 +2345,17 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                         token,
                         results,
                         rename_map,
+                        dir_renames: dir_renames.clone(),
                     });
 
                     let log_tx = event_tx.clone();
                     let scan_log: zytunes::cache::Logger = std::sync::Arc::new(move |msg: &str| {
                         let _ = log_tx.send(BgEvent::SyncMessage(msg.to_string()));
                     });
-                    let lib_result = zytunes::dirlib::DirectoryLibrary::reread_paths(
+                    let lib_result = zytunes::dirlib::DirectoryLibrary::reread_paths_after(
                         &music_dir,
                         &paths,
+                        &dir_renames,
                         fingerprint,
                         &scan_log,
                     )

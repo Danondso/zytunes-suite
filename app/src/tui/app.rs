@@ -3032,7 +3032,24 @@ impl App {
         token: u64,
         results: Vec<Result<(), String>>,
         rename_map: std::collections::HashMap<PathBuf, PathBuf>,
+        dir_renames: &[(PathBuf, PathBuf)],
     ) {
+        // The folders moved on disk whether or not this overlay is still
+        // open, so queued clusters are remapped even for a stale token.
+        if !dir_renames.is_empty() {
+            let queued = self
+                .inbox
+                .queue
+                .iter_mut()
+                .flat_map(|c| c.tracks.iter_mut());
+            for loc in queued.filter_map(|t| t.location.as_mut()) {
+                let moved = zytunes::tag_ops::remap_through_dir_renames(
+                    std::path::Path::new(loc.as_str()),
+                    dir_renames,
+                );
+                *loc = moved.to_string_lossy().into_owned();
+            }
+        }
         // Per-track failures are surfaced via the sync log so the user sees
         // *which* tracks failed without sifting through the diff view. We log
         // them even on a stale token (the writes happened — the user
@@ -14365,6 +14382,37 @@ mod tests {
         assert!(overlay.filing);
         assert_eq!(overlay.source_album, "Album Two");
         assert!(app.inbox.queue.is_empty());
+    }
+
+    #[test]
+    fn queued_file_clusters_follow_directory_retitle() {
+        let mut app = make_app_with_library_for_tagmgr();
+        app.inbox
+            .queue
+            .push_back(zytunes::library_layout::AlbumCluster {
+                artist: "Alice in Chains".into(),
+                album: "Facelift".into(),
+                tracks: vec![zytunes::library::Track {
+                    name: "We Die Young".into(),
+                    location: Some("/m/Alice in Chains/Facelift/01.mp3".into()),
+                    ..Default::default()
+                }],
+            });
+        // Filing `Dirt` retitled the artist folder; the queued `Facelift`
+        // cluster moved with it and must not keep the dead source path.
+        app.handle_tags_applied(
+            0,
+            Vec::new(),
+            std::collections::HashMap::new(),
+            &[(
+                PathBuf::from("/m/Alice in Chains"),
+                PathBuf::from("/m/Alice In Chains"),
+            )],
+        );
+        assert_eq!(
+            app.inbox.queue[0].tracks[0].location.as_deref(),
+            Some("/m/Alice In Chains/Facelift/01.mp3")
+        );
     }
 
     #[test]

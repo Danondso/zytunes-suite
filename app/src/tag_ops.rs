@@ -741,6 +741,20 @@ fn build_track_fields(
     fields
 }
 
+/// What [`apply_release_diff_with`] did on disk.
+#[derive(Debug, Clone, Default)]
+pub struct ApplyOutcome {
+    /// One entry per diff track, in diff order.
+    pub results: Vec<Result<(), String>>,
+    /// Old path → new path for every file that moved. Successes only.
+    pub rename_map: HashMap<PathBuf, PathBuf>,
+    /// Whole directories renamed by a case retitle, `(old, new)`, in the
+    /// order they happened. Everything under `old` moved with it —
+    /// including albums that were not part of the diff — so callers must
+    /// remap any path they still hold under `old`.
+    pub dir_renames: Vec<(PathBuf, PathBuf)>,
+}
+
 /// Apply an approved `ReleaseTagDiff` to disk.
 ///
 /// Three phases:
@@ -760,8 +774,7 @@ fn build_track_fields(
 /// iteration order would be arbitrary and lossy — better to surface the
 /// conflict so the user disables one in the overlay.
 ///
-/// Returns `(per-track results, rename_map)`. The rename map covers only
-/// successful renames; callers feed both sets into
+/// Callers feed the [`ApplyOutcome`] into
 /// [`crate::dirlib::DirectoryLibrary::reread_paths`] so the cache picks up
 /// new tags AND new locations.
 ///
@@ -769,10 +782,7 @@ fn build_track_fields(
 /// removed only while they sit strictly inside the library or the sibling
 /// inbox. The library root, the inbox folder, and anything above either
 /// are left in place.
-pub fn apply_release_diff(
-    diff: &ReleaseTagDiff,
-    library_root: &Path,
-) -> (Vec<Result<(), String>>, HashMap<PathBuf, PathBuf>) {
+pub fn apply_release_diff(diff: &ReleaseTagDiff, library_root: &Path) -> ApplyOutcome {
     apply_release_diff_with(diff, false, library_root)
 }
 
@@ -785,7 +795,7 @@ pub fn apply_release_diff_with(
     diff: &ReleaseTagDiff,
     replace_existing: bool,
     library_root: &Path,
-) -> (Vec<Result<(), String>>, HashMap<PathBuf, PathBuf>) {
+) -> ApplyOutcome {
     let mut results: Vec<Result<(), String>> = vec![Ok(()); diff.tracks.len()];
     let mut rename_map: HashMap<PathBuf, PathBuf> = HashMap::new();
 
@@ -857,11 +867,21 @@ pub fn apply_release_diff_with(
     // still moves with whatever tags it has. The reverse direction (skip
     // rename on tag-write failure) would leave the file in the wrong
     // canonical location AND with old tags, which is the worse failure mode.
+    let mut dir_renames: Vec<(PathBuf, PathBuf)> = Vec::new();
     for (idx, src, dest) in to_rename {
-        match perform_rename(src, dest) {
+        // A case retitle renames whole folders, so an earlier track in
+        // this batch may already have carried this one along. Work from
+        // where the file is now, not where the diff last saw it.
+        let live_src = remap_through_dir_renames(src, &dir_renames);
+        let moved = if live_src == *dest {
+            Ok(())
+        } else {
+            perform_rename(&live_src, dest, &mut dir_renames)
+        };
+        match moved {
             Ok(()) => {
                 rename_map.insert(src.clone(), dest.clone());
-                if let Some(parent) = src.parent() {
+                for parent in [src.parent(), live_src.parent()].into_iter().flatten() {
                     prune_empty_parents(parent, library_root);
                 }
             }
@@ -873,7 +893,11 @@ pub fn apply_release_diff_with(
         }
     }
 
-    (results, rename_map)
+    ApplyOutcome {
+        results,
+        rename_map,
+        dir_renames,
+    }
 }
 
 fn write_track_tags(track: &TrackTagDiff) -> Result<(), String> {
@@ -1085,7 +1109,14 @@ fn same_inode(a: &Path, b: &Path) -> bool {
 
 /// Rename each path component whose stored spelling differs, via a
 /// temporary name so case-insensitive volumes actually update the case.
-fn retitle_case_along(src: &Path, dest: &Path) -> Result<(), String> {
+///
+/// Renaming a directory component moves everything under it, so each one
+/// is appended to `dir_renames` for the caller to follow.
+fn retitle_case_along(
+    src: &Path,
+    dest: &Path,
+    dir_renames: &mut Vec<(PathBuf, PathBuf)>,
+) -> Result<(), String> {
     let mut built = PathBuf::new();
     for (have_c, want_c) in src.components().zip(dest.components()) {
         match (have_c, want_c) {
@@ -1112,6 +1143,9 @@ fn retitle_case_along(src: &Path, dest: &Path) -> Result<(), String> {
                             renamed.display()
                         )
                     })?;
+                    if renamed.is_dir() {
+                        dir_renames.push((built, renamed.clone()));
+                    }
                     built = renamed;
                 }
             }
@@ -1121,6 +1155,17 @@ fn retitle_case_along(src: &Path, dest: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Follow `path` through directory renames, applied in order.
+pub fn remap_through_dir_renames(path: &Path, renames: &[(PathBuf, PathBuf)]) -> PathBuf {
+    let mut path = path.to_path_buf();
+    for (old, new) in renames {
+        if let Ok(rest) = path.strip_prefix(old) {
+            path = new.join(rest);
+        }
+    }
+    path
 }
 
 /// Some component's new spelling already names a DIFFERENT entry (a
@@ -1147,12 +1192,16 @@ fn retitle_target_taken(src: &Path, dest: &Path) -> bool {
     false
 }
 
-fn perform_rename(src: &Path, dest: &Path) -> Result<(), String> {
+fn perform_rename(
+    src: &Path,
+    dest: &Path,
+    dir_renames: &mut Vec<(PathBuf, PathBuf)>,
+) -> Result<(), String> {
     // Every new spelling is free (or is this same entry on a case-folding
     // volume): change the stored names in place. Otherwise the canonical
     // folder already exists separately and takes the normal move below.
     if is_case_only_rename(src, dest) && !retitle_target_taken(src, dest) {
-        return retitle_case_along(src, dest);
+        return retitle_case_along(src, dest, dir_renames);
     }
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
@@ -1524,7 +1573,7 @@ mod tests {
             }
         }
 
-        let (results, _rename_map) = apply_release_diff(&diff, &dir);
+        let ApplyOutcome { results, .. } = apply_release_diff(&diff, &dir);
         assert_eq!(results.len(), 1);
         assert!(results[0].is_ok(), "result: {:?}", results[0]);
 
@@ -1563,7 +1612,7 @@ mod tests {
             f.enabled = matches!(f.kind, FieldKind::Date) && f.name == "Year";
         }
 
-        let (results, _) = apply_release_diff(&diff, &dir);
+        let ApplyOutcome { results, .. } = apply_release_diff(&diff, &dir);
         assert!(results[0].is_ok(), "result: {:?}", results[0]);
 
         let tagged = lofty::probe::read_from_path(&path).unwrap();
@@ -1604,7 +1653,11 @@ mod tests {
             }],
         };
 
-        let (results, rename_map) = apply_release_diff(&diff, &dir);
+        let ApplyOutcome {
+            results,
+            rename_map,
+            ..
+        } = apply_release_diff(&diff, &dir);
         assert!(results[0].is_err(), "save should fail on non-audio bytes");
         assert!(rename_map.is_empty());
 
@@ -1641,7 +1694,7 @@ mod tests {
             }
         }
 
-        let (results, _) = apply_release_diff(&diff, &dir);
+        let ApplyOutcome { results, .. } = apply_release_diff(&diff, &dir);
         assert!(results[0].is_ok(), "result: {:?}", results[0]);
 
         let tmp = path.with_file_name("song.wav.tagtmp");
@@ -1671,7 +1724,11 @@ mod tests {
         let diff = build_release_diff(&[lib], &rel, &dir, DiffScope::Track, None);
         assert!(diff.tracks[0].dest_path.is_some());
 
-        let (results, rename_map) = apply_release_diff(&diff, &dir);
+        let ApplyOutcome {
+            results,
+            rename_map,
+            ..
+        } = apply_release_diff(&diff, &dir);
         assert!(results[0].is_ok(), "result: {:?}", results[0]);
         let new_path = diff.tracks[0].dest_path.as_ref().unwrap();
         assert!(
@@ -1736,7 +1793,11 @@ mod tests {
             ],
         };
 
-        let (results, rename_map) = apply_release_diff(&diff, &dir);
+        let ApplyOutcome {
+            results,
+            rename_map,
+            ..
+        } = apply_release_diff(&diff, &dir);
         // Both should fail with a collision error — neither side is treated
         // as the winner. Picking arbitrarily would silently overwrite.
         let collisions = results
@@ -1808,7 +1869,7 @@ mod tests {
             ],
         };
 
-        let (_results, _rename_map) = apply_release_diff(&diff, &dir);
+        let _ = apply_release_diff(&diff, &dir);
         // src1 had an enabled Album field — but because its rename collided
         // in phase 0, phase 1 must have skipped it. Verify no Album tag was
         // written to src1.
@@ -2017,7 +2078,7 @@ mod tests {
             assert!(f.enabled, "{name:?} should be a real delta on first build");
             assert!(f.current.is_none());
         }
-        let (results, _renames) = apply_release_diff(&diff1, &dir);
+        let ApplyOutcome { results, .. } = apply_release_diff(&diff1, &dir);
         for r in &results {
             r.as_ref().expect("apply should succeed");
         }
@@ -2159,7 +2220,7 @@ mod tests {
                 f.enabled = false;
             }
         }
-        let (results, _) = apply_release_diff(&diff, &dir);
+        let ApplyOutcome { results, .. } = apply_release_diff(&diff, &dir);
         assert!(results[0].is_ok(), "{:?}", results[0]);
 
         // Re-probe and look for the TXXX entries by name.
@@ -2422,7 +2483,11 @@ mod tests {
             }],
         };
 
-        let (results, map) = apply_release_diff_with(&diff, true, &dir);
+        let ApplyOutcome {
+            results,
+            rename_map: map,
+            ..
+        } = apply_release_diff_with(&diff, true, &dir);
         assert!(results[0].is_ok(), "{:?}", results[0]);
         assert_eq!(map.get(&src), Some(&dest));
         assert!(!src.exists(), "feat-folder copy must be gone");
@@ -2471,7 +2536,11 @@ mod tests {
             }],
         };
 
-        let (results, map) = apply_release_diff(&diff, &dir);
+        let ApplyOutcome {
+            results,
+            rename_map: map,
+            ..
+        } = apply_release_diff(&diff, &dir);
         assert!(results[0].is_ok(), "{:?}", results[0]);
         assert_eq!(map.get(&src), Some(&dest));
         let names: Vec<String> = std::fs::read_dir(&dir)
@@ -2535,7 +2604,7 @@ mod tests {
             }],
         };
 
-        let (results, _) = apply_release_diff(&diff, &music);
+        let ApplyOutcome { results, .. } = apply_release_diff(&diff, &music);
         assert!(results[0].is_ok(), "{:?}", results[0]);
         assert!(dest.exists());
         assert!(!feat.exists(), "empty inbox artist dir should go");
@@ -2571,7 +2640,11 @@ mod tests {
             }],
         };
 
-        let (results, map) = apply_release_diff(&diff, &dir);
+        let ApplyOutcome {
+            results,
+            rename_map: map,
+            ..
+        } = apply_release_diff(&diff, &dir);
         assert!(results[0]
             .as_ref()
             .err()
@@ -2632,7 +2705,8 @@ mod tests {
     fn same_inode_dest_is_a_retitle_not_a_collision() {
         let (src, dest) = same_file_two_unicode_spellings("same-inode-no-replace");
         let root = src.ancestors().nth(3).unwrap().to_path_buf();
-        let (results, _) = apply_release_diff(&rename_only_diff(&src, &dest), &root);
+        let ApplyOutcome { results, .. } =
+            apply_release_diff(&rename_only_diff(&src, &dest), &root);
         assert!(results[0].is_ok(), "{:?}", results[0]);
         assert!(dest.exists());
     }
@@ -2647,7 +2721,8 @@ mod tests {
             !dest_needs_replace(&src, &dest),
             "a second name for the source must never be queued for removal"
         );
-        let (results, _) = apply_release_diff_with(&rename_only_diff(&src, &dest), true, &root);
+        let ApplyOutcome { results, .. } =
+            apply_release_diff_with(&rename_only_diff(&src, &dest), true, &root);
         assert!(results[0].is_ok(), "{:?}", results[0]);
         assert_eq!(dest.metadata().unwrap().len(), len, "audio must survive");
     }
@@ -2676,7 +2751,11 @@ mod tests {
         // cannot succeed.
         std::fs::remove_file(&src).unwrap();
 
-        let (results, map) = apply_release_diff_with(&diff, true, &dir);
+        let ApplyOutcome {
+            results,
+            rename_map: map,
+            ..
+        } = apply_release_diff_with(&diff, true, &dir);
         assert!(results[0].is_err());
         assert!(map.is_empty());
         assert!(
@@ -2727,7 +2806,11 @@ mod tests {
             .join("Dirt")
             .join("01 - Them Bones.wav");
 
-        let (results, map) = apply_release_diff(&rename_only_diff(&src, &dest), &dir);
+        let ApplyOutcome {
+            results,
+            rename_map: map,
+            ..
+        } = apply_release_diff(&rename_only_diff(&src, &dest), &dir);
         assert!(results[0].is_ok(), "{:?}", results[0]);
         assert_eq!(map.get(&src), Some(&dest));
         assert!(dest.exists(), "track must land in the canonical folder");
@@ -2749,9 +2832,101 @@ mod tests {
             .join("Dirt")
             .join("01 - Them Bones.wav");
 
-        assert!(retitle_case_along(&src, &dest).is_err());
+        assert!(retitle_case_along(&src, &dest, &mut Vec::new()).is_err());
         assert!(src.exists(), "a failed retitle must restore the old name");
         assert_eq!(temp_case_entries(&dir), Vec::<String>::new());
+    }
+
+    /// `Alice in Chains/Dirt` (two tracks) plus a sibling `Facelift` album
+    /// that is NOT part of the diff, and a diff retitling `Dirt` into
+    /// `Alice In Chains/Dirt`.
+    fn two_track_case_retitle(
+        name: &str,
+    ) -> (
+        std::path::PathBuf,
+        ReleaseTagDiff,
+        Vec<std::path::PathBuf>,
+        Vec<std::path::PathBuf>,
+    ) {
+        let dir = fresh_dir(name);
+        let names = ["01 - Them Bones.wav", "02 - Dam That River.wav"];
+        let old_album = dir.join("Alice in Chains").join("Dirt");
+        let new_album = dir.join("Alice In Chains").join("Dirt");
+        std::fs::create_dir_all(&old_album).unwrap();
+        let facelift = dir.join("Alice in Chains").join("Facelift");
+        std::fs::create_dir_all(&facelift).unwrap();
+        write_sine_wav(&facelift.join("01 - We Die Young.wav"), 1);
+        let srcs: Vec<_> = names.iter().map(|n| old_album.join(n)).collect();
+        let dests: Vec<_> = names.iter().map(|n| new_album.join(n)).collect();
+        let mut diff = rename_only_diff(&srcs[0], &dests[0]);
+        for (i, src) in srcs.iter().enumerate() {
+            write_sine_wav(src, 1);
+            if i > 0 {
+                let mut t = rename_only_diff(src, &dests[i]).tracks.remove(0);
+                t.library_id = i as u64 + 1;
+                diff.tracks.push(t);
+            }
+        }
+        (dir, diff, srcs, dests)
+    }
+
+    #[test]
+    fn case_retitle_multi_track_album_all_succeed() {
+        let (dir, diff, srcs, dests) = two_track_case_retitle("case-multi-track");
+        let out = apply_release_diff(&diff, &dir);
+        for (i, r) in out.results.iter().enumerate() {
+            assert!(r.is_ok(), "track {i}: {r:?}");
+        }
+        for (src, dest) in srcs.iter().zip(&dests) {
+            assert_eq!(out.rename_map.get(src), Some(dest));
+            assert!(dest.exists());
+        }
+        assert_eq!(temp_case_entries(&dir), Vec::<String>::new());
+    }
+
+    #[test]
+    fn case_retitle_reports_the_directory_rename_that_moved_siblings() {
+        let (dir, diff, _, _) = two_track_case_retitle("case-dir-renames");
+        let out = apply_release_diff(&diff, &dir);
+        assert_eq!(
+            out.dir_renames,
+            vec![(dir.join("Alice in Chains"), dir.join("Alice In Chains"))],
+            "the artist folder moved as a unit and must be reported once"
+        );
+        // The untouched sibling album rode along with the folder.
+        let moved = remap_through_dir_renames(
+            &dir.join("Alice in Chains")
+                .join("Facelift")
+                .join("01 - We Die Young.wav"),
+            &out.dir_renames,
+        );
+        assert_eq!(
+            moved,
+            dir.join("Alice In Chains")
+                .join("Facelift")
+                .join("01 - We Die Young.wav")
+        );
+        assert!(moved.exists());
+    }
+
+    #[test]
+    fn remap_through_dir_renames_applies_renames_in_order() {
+        let renames = vec![
+            (PathBuf::from("/m/alice"), PathBuf::from("/m/Alice")),
+            (
+                PathBuf::from("/m/Alice/dirt"),
+                PathBuf::from("/m/Alice/Dirt"),
+            ),
+        ];
+        assert_eq!(
+            remap_through_dir_renames(Path::new("/m/alice/dirt/01.wav"), &renames),
+            PathBuf::from("/m/Alice/Dirt/01.wav")
+        );
+        assert_eq!(
+            remap_through_dir_renames(Path::new("/m/alicex/dirt/01.wav"), &renames),
+            PathBuf::from("/m/alicex/dirt/01.wav"),
+            "a name that merely shares the prefix string is not under the folder"
+        );
     }
 
     #[test]
