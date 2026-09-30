@@ -3052,6 +3052,21 @@ impl App {
             overlay.acoustid_uuid.as_deref(),
         );
 
+        // No source track paired with a release track. An empty diff has
+        // nothing enabled, which would read as "tags already match" and,
+        // on a filing overlay, snooze the files as handled. Say what
+        // happened instead; Esc from here returns to search.
+        if diff.tracks.is_empty() {
+            overlay.error = Some(format!(
+                "none of the {} source track(s) matched a track on \"{}\" — \
+                 check track numbers or titles, or pick another release",
+                lib_tracks.len(),
+                release.title
+            ));
+            overlay.phase = TagManagerPhase::Error;
+            return;
+        }
+
         overlay.diff = Some(diff);
         overlay.rebuild_flattened_paths();
         overlay.focused_row = 0;
@@ -14769,6 +14784,56 @@ mod tests {
         overlay.rebuild_flattened_paths();
         app.tag_manager = Some(overlay);
         app
+    }
+
+    #[test]
+    fn a_release_that_pairs_with_no_source_track_is_an_error_not_a_match() {
+        let dir = std::env::temp_dir().join("zytunes-unpaired-release");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("01 - Something Else.wav");
+        std::fs::write(&src, b"src").unwrap();
+        let mut app = make_app_with_library_for_tagmgr();
+        app.music_dir_cache = Some(dir.clone());
+        let mut overlay = TagManagerOverlay::new(
+            zytunes::tag_ops::DiffScope::Album,
+            "Unknown".into(),
+            "Unknown".into(),
+            None,
+            SelectionAnchor::default(),
+        );
+        overlay.filing = true;
+        // An untagged inbox drop: named by file stem, no track number, no MBID.
+        overlay.source_tracks = Some(vec![Track {
+            id: 1,
+            name: "01 - Something Else".into(),
+            artist: "Unknown".into(),
+            album: "Unknown".into(),
+            location: Some(src.display().to_string()),
+            ..Default::default()
+        }]);
+        app.tag_manager = Some(overlay);
+        let token = app.tag_manager.as_ref().unwrap().pending_request_token;
+        app.handle_mb_release_loaded(token, Ok(Box::new(dirt_release())));
+        let overlay = app.tag_manager.as_ref().unwrap();
+        assert_eq!(
+            overlay.phase,
+            TagManagerPhase::Error,
+            "nothing paired: that is a failure to report, not a match"
+        );
+        assert!(
+            overlay
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("matched")),
+            "error explains the pairing failure, got {:?}",
+            overlay.error
+        );
+        assert!(!overlay.tags_already_match());
+        assert!(
+            app.inbox.dismissed.is_empty(),
+            "sources are not snoozed by a pairing failure"
+        );
     }
 
     #[test]
