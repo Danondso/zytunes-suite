@@ -1654,6 +1654,112 @@ mod tests {
         assert!(!row.enabled, "second open must see the id as already set");
     }
 
+    /// A file whose comment frame carries a null language code. Some
+    /// taggers write `\0\0\0`; lofty refuses to write a tag containing it,
+    /// so a save of ANY field fails until the frame is repaired.
+    fn wav_with_null_language_comment(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        use lofty::config::WriteOptions;
+        use lofty::tag::{Accessor, ItemKey, Tag, TagExt, TagType};
+        let dir = fresh_dir(name);
+        let path = dir.join("song.wav");
+        write_sine_wav(&path, 1);
+        let mut tag = Tag::new(TagType::Id3v2);
+        tag.set_title("First".into());
+        tag.set_artist("Artist".into());
+        tag.insert_text(ItemKey::Comment, "Electro House".into());
+        tag.save_to_path(&path, WriteOptions::default()).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let at = bytes
+            .windows(4)
+            .position(|w| w == b"COMM")
+            .expect("comment frame present");
+        // 10-byte frame header, 1-byte text encoding, then the language.
+        bytes[at + 11..at + 14].copy_from_slice(&[0, 0, 0]);
+        std::fs::write(&path, bytes).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn null_language_repair_never_displaces_a_valid_comment() {
+        use lofty::id3::v2::{CommentFrame, Frame, Id3v2Tag};
+        use lofty::tag::TagExt;
+        use lofty::TextEncoding;
+        let dir = fresh_dir("null-lang-keep");
+        let path = dir.join("song.wav");
+        write_sine_wav(&path, 1);
+        // Two well-formed comments with the same (empty) description, then
+        // one of them gets the null language some taggers write.
+        let mut id3 = Id3v2Tag::default();
+        let comment = |lang: &[u8; 3], text: &str| {
+            Frame::Comment(CommentFrame::new(
+                TextEncoding::UTF8,
+                *lang,
+                String::new(),
+                text.into(),
+            ))
+        };
+        id3.insert(comment(b"eng", "Electro House"));
+        id3.insert(comment(b"XXX", "Purchased at Beatport.com"));
+        id3.set_title("First".into());
+        id3.save_to_path(&path, lofty::config::WriteOptions::default())
+            .unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let electro = bytes
+            .windows(13)
+            .position(|w| w == b"Electro House")
+            .unwrap();
+        let at = bytes[..electro]
+            .windows(4)
+            .rposition(|w| w == b"COMM")
+            .unwrap();
+        assert_eq!(&bytes[at + 11..at + 14], b"eng");
+        bytes[at + 11..at + 14].copy_from_slice(&[0, 0, 0]);
+        std::fs::write(&path, bytes).unwrap();
+
+        let tagged = probe_by_content(&path).unwrap();
+        save_tag(&tagged, TagType::Id3v2, &path).unwrap();
+
+        let after: Vec<(Vec<u8>, String)> = Id3v2Tag::from(
+            probe_by_content(&path)
+                .unwrap()
+                .tag(TagType::Id3v2)
+                .unwrap()
+                .clone(),
+        )
+        .comments()
+        .map(|c| (c.language.to_vec(), c.content.clone()))
+        .collect();
+        assert!(
+            after.iter().all(|(lang, _)| lang == b"XXX"),
+            "every comment is writable now: {after:?}"
+        );
+        assert!(
+            after.iter().any(|(_, c)| c == "Purchased at Beatport.com"),
+            "the valid comment is kept: {after:?}"
+        );
+    }
+
+    #[test]
+    fn apply_release_diff_repairs_a_null_comment_language() {
+        let (dir, path) = wav_with_null_language_comment("null-lang");
+        let mut lib = make_lib_track(&path, "First", 1);
+        lib.album = "Stale".into();
+        let rel = make_release("Album", "Artist");
+        let mut diff = build_release_diff(&[lib], &rel, &dir, DiffScope::Track, None);
+        for f in &mut diff.tracks[0].fields {
+            f.enabled = f.name == "Album";
+        }
+        let ApplyOutcome { results, .. } = apply_release_diff(&diff, &dir);
+        assert!(results[0].is_ok(), "{:?}", results[0]);
+        let reread = crate::dirlib::track_from_lofty(&path, 1).unwrap();
+        assert_eq!(reread.album, "Album");
+        assert_eq!(
+            reread.comment.as_deref(),
+            Some("Electro House"),
+            "the comment itself survives the repair"
+        );
+    }
+
     #[test]
     fn apply_release_diff_writes_year_field() {
         // Regression: `build_track_fields` pushes the date row with name

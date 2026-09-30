@@ -170,11 +170,60 @@ pub fn tag_ripped_file(
 pub(crate) fn save_tag(tagged: &TaggedFile, tag_type: TagType, path: &Path) -> Result<(), String> {
     let saved = match tagged.tag(tag_type) {
         Some(tag) if tag_type == TagType::Id3v2 => {
-            Id3v2Tag::from(tag.clone()).save_to_path(path, WriteOptions::default())
+            let mut id3 = Id3v2Tag::from(tag.clone());
+            repair_frame_languages(&mut id3);
+            id3.save_to_path(path, WriteOptions::default())
         }
         _ => tagged.save_to_path(path, WriteOptions::default()),
     };
     saved.map_err(|e| format!("lofty save failed on {}: {e}", path.display()))
+}
+
+/// Give comment and lyrics frames a writable language code.
+///
+/// ID3v2 requires three ASCII letters; some taggers write `\0\0\0`.
+/// lofty reads such a frame back fine but refuses to write a tag that
+/// contains it, so every save of every field failed with "Invalid frame
+/// language" until the file was fixed by hand. `XXX` is the spec's own
+/// "unknown language" value. A malformed frame never displaces a valid
+/// one: if the file already has an `XXX` frame with the same description
+/// the malformed copy is dropped instead.
+fn repair_frame_languages(id3: &mut Id3v2Tag) {
+    use lofty::id3::v2::Frame;
+    const UNKNOWN: [u8; 3] = *b"XXX";
+    let bad_lang = |lang: &[u8; 3]| lang.iter().any(|b| !b.is_ascii_alphabetic());
+    let needs_repair = |f: &Frame<'_>| match f {
+        Frame::Comment(c) => bad_lang(&c.language),
+        Frame::UnsynchronizedText(u) => bad_lang(&u.language),
+        _ => false,
+    };
+    let broken: Vec<Frame<'static>> = (&*id3)
+        .into_iter()
+        .filter(|f| needs_repair(f))
+        .cloned()
+        .collect();
+    if broken.is_empty() {
+        return;
+    }
+    id3.retain(|f| !needs_repair(f));
+    for mut frame in broken {
+        let taken = match &mut frame {
+            Frame::Comment(c) => {
+                c.language = UNKNOWN;
+                id3.comments()
+                    .any(|have| have.language == UNKNOWN && have.description == c.description)
+            }
+            Frame::UnsynchronizedText(u) => {
+                u.language = UNKNOWN;
+                id3.unsync_text()
+                    .any(|have| have.language == UNKNOWN && have.description == u.description)
+            }
+            _ => true,
+        };
+        if !taken {
+            id3.insert(frame);
+        }
+    }
 }
 
 /// Write release-level identifiers + Picard-compatible Unknown-keyed tags.
