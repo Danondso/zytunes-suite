@@ -6016,7 +6016,7 @@ impl App {
         if self.inbox.scan_in_flight {
             return;
         }
-        if self.tag_manager.is_some() || self.import_overlay.is_some() {
+        if self.modal_open() {
             return;
         }
         if !self.inbox.queue.is_empty() {
@@ -6050,7 +6050,9 @@ impl App {
 
     pub fn on_inbox_scanned(&mut self, tracks: Vec<Track>) {
         self.inbox.scan_in_flight = false;
-        if self.tag_manager.is_some() || self.import_overlay.is_some() {
+        // A modal opened while the scan was in flight. Drop this result;
+        // the next poll after it closes finds the same files.
+        if self.modal_open() {
             return;
         }
         let tracks: Vec<Track> = tracks
@@ -14538,6 +14540,38 @@ mod tests {
         let overlay = app.tag_manager.as_ref().expect("overlay should open");
         assert!(overlay.filing);
         assert_eq!(overlay.source_tracks.as_ref().map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn inbox_scan_does_not_open_overlay_over_another_modal() {
+        let drop = zytunes::library::Track {
+            name: "Song".into(),
+            artist: "A".into(),
+            album: "B".into(),
+            location: Some("/inbox/01.mp3".into()),
+            ..Default::default()
+        };
+        type SetModal = fn(&mut App, bool);
+        let modals: [(&str, SetModal); 3] = [
+            ("search input", |a, on| a.search_active = on),
+            ("theme picker", |a, on| a.show_theme_picker = on),
+            ("help", |a, on| a.show_help = on),
+        ];
+        for (name, set) in modals {
+            let mut app = make_app_with_library_for_tagmgr();
+            set(&mut app, true);
+            app.on_inbox_scanned(vec![drop.clone()]);
+            assert!(
+                app.tag_manager.is_none(),
+                "{name}: the filing overlay must not steal keys from an open modal"
+            );
+            set(&mut app, false);
+            app.on_inbox_scanned(vec![drop.clone()]);
+            assert!(
+                app.tag_manager.is_some(),
+                "{name}: the drop is picked up by the next poll once the modal closes"
+            );
+        }
     }
 
     #[test]
