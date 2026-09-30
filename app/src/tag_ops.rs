@@ -221,7 +221,7 @@ impl ReleaseTagDiff {
                 {
                     return None;
                 }
-                dest.exists().then(|| dest.clone())
+                dest_needs_replace(&t.src_path, dest).then(|| dest.clone())
             })
             .collect()
     }
@@ -826,14 +826,7 @@ pub fn apply_release_diff_with(
             skipped.insert(idx);
             continue;
         }
-        if dest.exists() && !source_set.contains(dest) && dest != src {
-            // APFS/HFS+ fold case, so `Alice in Chains/…` and
-            // `Alice In Chains/…` are the same file. That is a retitle,
-            // not a second copy. Deleting `dest` here would delete `src`.
-            if is_case_only_rename(src, dest) && same_inode(src, dest) {
-                to_rename.push((idx, src, dest));
-                continue;
-            }
+        if !source_set.contains(dest) && dest_needs_replace(src, dest) {
             if replace_existing {
                 if let Err(e) = std::fs::remove_file(dest) {
                     results[idx] = Err(format!("replace {}: {e}", dest.display()));
@@ -1047,6 +1040,17 @@ fn may_remove_empty_dir(dir: &Path, library_root: &Path, inbox: Option<&Path>) -
 
 fn is_strict_child(path: &Path, root: &Path) -> bool {
     path.starts_with(root) && path != root
+}
+
+/// `dest` is occupied by a file other than `src` itself, so landing there
+/// means overwriting a second copy.
+///
+/// The identity check is the inode, never the spelling: APFS/HFS+ resolve
+/// `Alice in Chains` / `Alice In Chains` and NFD / NFC `Beyoncé` to one
+/// entry, so a differently spelled `dest` can BE `src`. That is a retitle,
+/// and removing `dest` there would delete the source.
+fn dest_needs_replace(src: &Path, dest: &Path) -> bool {
+    dest != src && dest.exists() && !same_inode(src, dest)
 }
 
 /// Full paths differ only by ASCII case of one or more components.
@@ -2551,6 +2555,86 @@ mod tests {
         assert!(map.is_empty());
         assert!(src.exists());
         assert!(dest.exists());
+    }
+
+    /// One-track diff that only renames `src` to `dest`.
+    fn rename_only_diff(src: &std::path::Path, dest: &std::path::Path) -> ReleaseTagDiff {
+        ReleaseTagDiff {
+            release_mbid: "rel-1".into(),
+            summary: "test".into(),
+            tracks: vec![TrackTagDiff {
+                src_path: src.to_path_buf(),
+                dest_path: Some(dest.to_path_buf()),
+                library_id: 1,
+                fields: vec![FieldDiff {
+                    kind: FieldKind::Filename,
+                    name: "Filename",
+                    current: Some(src.display().to_string()),
+                    proposed: Some(dest.display().to_string()),
+                    enabled: true,
+                }],
+            }],
+        }
+    }
+
+    /// `(src, dest)` that are two spellings of ONE file, differing by
+    /// Unicode normalisation rather than ASCII case. APFS/HFS+ resolve
+    /// both names to the same entry on their own; elsewhere a hard link
+    /// stands in, so `same_inode` is true on every filesystem.
+    #[cfg(unix)]
+    fn same_file_two_unicode_spellings(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = fresh_dir(name);
+        let src = dir
+            .join("Beyonce\u{301}")
+            .join("Album")
+            .join("01 - Track.wav");
+        let dest = dir
+            .join("Beyonc\u{e9}")
+            .join("Album")
+            .join("01 - Track.wav");
+        std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+        write_sine_wav(&src, 1);
+        if !dest.exists() {
+            std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            std::fs::hard_link(&src, &dest).unwrap();
+        }
+        assert!(same_inode(&src, &dest));
+        assert!(!is_case_only_rename(&src, &dest));
+        (src, dest)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_inode_dest_is_a_retitle_not_a_collision() {
+        let (src, dest) = same_file_two_unicode_spellings("same-inode-no-replace");
+        let root = src.ancestors().nth(3).unwrap().to_path_buf();
+        let (results, _) = apply_release_diff(&rename_only_diff(&src, &dest), &root);
+        assert!(results[0].is_ok(), "{:?}", results[0]);
+        assert!(dest.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replace_never_deletes_source_when_dest_is_same_inode() {
+        let (src, dest) = same_file_two_unicode_spellings("same-inode-replace");
+        let len = src.metadata().unwrap().len();
+        let root = src.ancestors().nth(3).unwrap().to_path_buf();
+        assert!(
+            !dest_needs_replace(&src, &dest),
+            "a second name for the source must never be queued for removal"
+        );
+        let (results, _) = apply_release_diff_with(&rename_only_diff(&src, &dest), true, &root);
+        assert!(results[0].is_ok(), "{:?}", results[0]);
+        assert_eq!(dest.metadata().unwrap().len(), len, "audio must survive");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacing_existing_dests_ignores_same_inode_dest() {
+        let (src, dest) = same_file_two_unicode_spellings("same-inode-confirm");
+        assert!(rename_only_diff(&src, &dest)
+            .replacing_existing_dests()
+            .is_empty());
     }
 
     #[test]
