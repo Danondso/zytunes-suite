@@ -162,12 +162,18 @@ pub fn collapse_ascii_case<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<
             .or_insert(0) += 1;
     }
     let mut out: Vec<&str> = groups.into_values().map(preferred_ascii_spelling).collect();
-    out.sort_by(|a, b| {
-        a.to_ascii_lowercase()
-            .cmp(&b.to_ascii_lowercase())
-            .then_with(|| (*a).cmp(*b))
-    });
+    out.sort_by(|a, b| cmp_ignore_ascii_case(a, b).then_with(|| (*a).cmp(*b)));
     out
+}
+
+/// Ordering of `a.to_ascii_lowercase()` against `b.to_ascii_lowercase()`
+/// without building either string. Sort comparators run O(n log n) times;
+/// allocating two Strings per call made every sidebar refresh a heap
+/// storm on a large library.
+pub fn cmp_ignore_ascii_case(a: &str, b: &str) -> std::cmp::Ordering {
+    a.bytes()
+        .map(|c| c.to_ascii_lowercase())
+        .cmp(b.bytes().map(|c| c.to_ascii_lowercase()))
 }
 
 fn preferred_ascii_spelling(spellings: HashMap<&str, usize>) -> &str {
@@ -223,7 +229,38 @@ pub trait MusicLibrary {
 
 #[cfg(test)]
 mod tests {
-    use super::collapse_ascii_case;
+    use super::{cmp_ignore_ascii_case, collapse_ascii_case};
+
+    #[test]
+    fn cmp_ignore_ascii_case_orders_like_lowercased_strings() {
+        let samples = [
+            "alice",
+            "Alice",
+            "ALICE",
+            "Alice in Chains",
+            "alice In chains",
+            "Björk",
+            "björk",
+            "Zebra",
+            "aardvark",
+            "",
+            "a",
+            "B",
+            "𝐺𝑂𝑅𝐸",
+            "Gore",
+            "10cc",
+            "2Pac",
+        ];
+        for a in samples {
+            for b in samples {
+                assert_eq!(
+                    cmp_ignore_ascii_case(a, b),
+                    a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()),
+                    "{a:?} vs {b:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn collapse_ascii_case_keeps_most_common_spelling() {

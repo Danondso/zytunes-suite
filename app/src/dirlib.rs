@@ -1011,9 +1011,8 @@ impl MusicLibrary for DirectoryLibrary {
             })
             .collect();
         albums.sort_by(|a, b| {
-            a.0.to_ascii_lowercase()
-                .cmp(&b.0.to_ascii_lowercase())
-                .then_with(|| a.1.to_ascii_lowercase().cmp(&b.1.to_ascii_lowercase()))
+            crate::library::cmp_ignore_ascii_case(a.0, b.0)
+                .then_with(|| crate::library::cmp_ignore_ascii_case(a.1, b.1))
                 .then_with(|| (a.0, a.1).cmp(&(b.0, b.1)))
         });
         albums
