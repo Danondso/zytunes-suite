@@ -14721,4 +14721,187 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Tagged MP3 under `root/alice in chains/dirt/` (synthetic frames;
+    /// lofty only needs a valid header to attach ID3v2).
+    fn tagged_mp3(path: &std::path::Path) {
+        use lofty::config::WriteOptions;
+        use lofty::tag::{Accessor, ItemKey, Tag, TagExt, TagType};
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut b = Vec::new();
+        for _ in 0..40 {
+            b.extend_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
+            b.resize(b.len() + 413, 0);
+        }
+        std::fs::write(path, b).unwrap();
+        let mut tag = Tag::new(TagType::Id3v2);
+        tag.set_title("Them Bones".into());
+        tag.set_artist("alice in chains".into());
+        tag.set_album("dirt".into());
+        tag.set_track(1);
+        tag.insert_text(ItemKey::AlbumArtist, "alice in chains".into());
+        tag.save_to_path(path, WriteOptions::default()).unwrap();
+    }
+
+    fn dirt_release() -> zytunes::musicbrainz::Release {
+        use zytunes::musicbrainz::*;
+        let ac = vec![ArtistCredit {
+            name: "Alice In Chains".into(),
+            joinphrase: None,
+            artist: Some(Artist {
+                id: "art-1".into(),
+                name: "Alice In Chains".into(),
+                sort_name: None,
+            }),
+        }];
+        Release {
+            id: "rel-1".into(),
+            title: "Dirt".into(),
+            date: Some("1992-09-29".into()),
+            country: Some("US".into()),
+            artist_credit: ac.clone(),
+            media: vec![Medium {
+                position: Some(1),
+                format: Some("CD".into()),
+                track_count: Some(1),
+                tracks: vec![Track {
+                    id: "trk-1".into(),
+                    number: "1".into(),
+                    position: Some(1),
+                    title: "Them Bones".into(),
+                    length: Some(1000),
+                    recording: Some(Recording {
+                        id: "rec-1".into(),
+                        title: "Them Bones".into(),
+                        length: Some(1000),
+                        isrcs: vec!["USSM19200001".into()],
+                        artist_credit: vec![],
+                    }),
+                    artist_credit: ac,
+                }],
+            }],
+            release_group: Some(ReleaseGroup {
+                id: "rg-1".into(),
+                title: "Dirt".into(),
+                primary_type: Some("Album".into()),
+                first_release_date: Some("1992-09-29".into()),
+                genres: vec![],
+            }),
+            barcode: Some("074645147529".into()),
+            asin: None,
+            status: Some("Official".into()),
+            packaging: Some("Jewel Case".into()),
+            text_representation: Some(TextRepresentation {
+                language: Some("eng".into()),
+                script: Some("Latn".into()),
+            }),
+            label_info: vec![LabelInfo {
+                catalog_number: Some("CK 52475".into()),
+                label: Some(Label {
+                    id: "lab-1".into(),
+                    name: "Columbia".into(),
+                }),
+            }],
+            genres: vec![MbGenre {
+                name: "grunge".into(),
+                count: 5,
+            }],
+        }
+    }
+
+    /// The worker's ApplyTagDiff arm, run inline: apply, reread, and feed
+    /// both events back to the app.
+    fn apply_open_overlay_inline(app: &mut App, root: &std::path::Path) {
+        let overlay = app.tag_manager.as_ref().unwrap();
+        let diff = overlay.diff.clone().unwrap();
+        let token = overlay.pending_request_token;
+        let outcome = zytunes::tag_ops::apply_release_diff_with(&diff, false, root);
+        let paths = outcome.reread_paths(&diff, root);
+        let vacated = outcome.vacated();
+        let log = zytunes::cache::default_logger();
+        let lib = zytunes::dirlib::DirectoryLibrary::reread_paths_after(
+            root.to_str().unwrap(),
+            &paths,
+            &vacated,
+            &outcome.dir_renames,
+            false,
+            &log,
+        )
+        .unwrap();
+        app.handle_tags_applied(
+            token,
+            outcome.results,
+            outcome.rename_map,
+            &outcome.dir_renames,
+        );
+        app.handle_library_reread_complete(token, Ok(Box::new(lib)));
+    }
+
+    #[test]
+    fn filing_then_retagging_the_same_track_finds_nothing_left_to_change() {
+        let root = std::env::temp_dir().join("zytunes-file-then-retag");
+        let _ = std::fs::remove_dir_all(&root);
+        tagged_mp3(
+            &root
+                .join("alice in chains")
+                .join("dirt")
+                .join("01 - Them Bones.mp3"),
+        );
+        let (tx, _rx) = mpsc::channel::<BgCommand>();
+        let mut app = App::new();
+        app.music_dir_cache = Some(root.clone());
+        app.library = Some(Box::new(
+            zytunes::dirlib::DirectoryLibrary::scan(root.to_str().unwrap()).unwrap(),
+        ));
+        app.refresh_sidebar();
+        app.sidebar_selected = 0;
+        app.select_sidebar_item();
+        app.album_selected = 0;
+        app.select_album();
+        app.active_panel = Panel::TrackList;
+        app.track_selected = 0;
+
+        // F: file the track under the MusicBrainz spelling with full tags.
+        app.start_file_and_enrich(&tx);
+        let token = app.tag_manager.as_ref().unwrap().pending_request_token;
+        app.handle_mb_release_loaded(token, Ok(Box::new(dirt_release())));
+        assert!(app
+            .tag_manager
+            .as_ref()
+            .unwrap()
+            .diff
+            .as_ref()
+            .unwrap()
+            .has_any_enabled());
+        apply_open_overlay_inline(&mut app, &root);
+        assert_eq!(
+            app.tag_manager.as_ref().unwrap().phase,
+            TagManagerPhase::Done
+        );
+        app.close_tag_manager();
+
+        // m on the same (now renamed) row: everything must already match.
+        app.open_tag_manager(&tx);
+        let token = app.tag_manager.as_ref().unwrap().pending_request_token;
+        app.handle_mb_release_loaded(token, Ok(Box::new(dirt_release())));
+        let overlay = app.tag_manager.as_ref().unwrap();
+        assert_eq!(
+            overlay.phase,
+            TagManagerPhase::DiffPreview,
+            "{:?}",
+            overlay.error
+        );
+        let diff = overlay.diff.as_ref().unwrap();
+        let still_enabled: Vec<&str> = diff.tracks[0]
+            .fields
+            .iter()
+            .filter(|f| f.enabled)
+            .map(|f| f.name)
+            .collect();
+        assert!(
+            still_enabled.is_empty(),
+            "second open proposed {still_enabled:?} again"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

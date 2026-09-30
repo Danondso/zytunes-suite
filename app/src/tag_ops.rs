@@ -12,14 +12,14 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use lofty::config::{ParseOptions, WriteOptions};
-use lofty::file::{AudioFile, TaggedFileExt};
+use lofty::config::ParseOptions;
+use lofty::file::TaggedFileExt;
 use lofty::prelude::ItemKey;
 use lofty::probe::Probe;
 use lofty::tag::{ItemValue, Tag, TagType};
 
 use crate::cd::metadata::{
-    probe_by_content, ripped_track_destination, set_string, set_unknown_string,
+    probe_by_content, ripped_track_destination, save_tag, set_string, set_unknown_string,
 };
 use crate::library::Track;
 use crate::musicbrainz::{
@@ -978,9 +978,8 @@ fn write_then_swap(tmp: &Path, src: &Path, to_apply: &[&FieldDiff]) -> Result<()
     for field in to_apply {
         apply_field(tag, field);
     }
-    tagged
-        .save_to_path(tmp, WriteOptions::default())
-        .map_err(|e| format!("lofty save failed on {}: {e}", src.display()))?;
+    let _ = tag;
+    save_tag(&tagged, tag_type, tmp).map_err(|e| format!("{e} (source {})", src.display()))?;
     // fsync the temp's contents before swapping it in — otherwise a power
     // loss between rename and writeback can leave a renamed-but-empty file
     // on ext4/xfs.
@@ -1622,6 +1621,37 @@ mod tests {
             tag.title()
         );
         assert_eq!(tag.album().as_deref(), Some("Album"));
+    }
+
+    #[test]
+    fn apply_release_diff_writes_recording_id_to_id3v2() {
+        // Regression: lofty has no static ID3v2 key for the recording ID
+        // (it becomes a UFID frame at write time), so the checked insert
+        // dropped it and the field came back as a change on every open.
+        let dir = fresh_dir("apply-recording-id");
+        let path = dir.join("song.wav");
+        write_sine_wav(&path, 1);
+        let lib = make_lib_track(&path, "First", 1);
+        let rel = make_release("Album", "Artist");
+        let mut diff = build_release_diff(&[lib], &rel, &dir, DiffScope::Track, None);
+        for f in &mut diff.tracks[0].fields {
+            // Title too: the scanner ignores a tag with no title/artist.
+            f.enabled = matches!(f.name, "MB Recording ID" | "Title");
+        }
+        assert!(diff.has_any_enabled(), "release must carry a recording id");
+
+        let ApplyOutcome { results, .. } = apply_release_diff(&diff, &dir);
+        assert!(results[0].is_ok(), "{:?}", results[0]);
+
+        let reread = crate::dirlib::track_from_lofty(&path, 1).expect("tagged file");
+        assert_eq!(reread.mb_recording_id.as_deref(), Some("rec-1"));
+        let again = build_release_diff(&[reread], &rel, &dir, DiffScope::Track, None);
+        let row = again.tracks[0]
+            .fields
+            .iter()
+            .find(|f| f.name == "MB Recording ID")
+            .unwrap();
+        assert!(!row.enabled, "second open must see the id as already set");
     }
 
     #[test]

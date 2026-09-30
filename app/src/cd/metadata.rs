@@ -30,9 +30,10 @@
 use std::path::Path;
 
 use lofty::config::{ParseOptions, WriteOptions};
-use lofty::file::{AudioFile, TaggedFileExt};
+use lofty::file::{AudioFile, TaggedFile, TaggedFileExt};
+use lofty::id3::v2::Id3v2Tag;
 use lofty::probe::Probe;
-use lofty::tag::{ItemKey, ItemValue, Tag, TagItem, TagType};
+use lofty::tag::{ItemKey, ItemValue, Tag, TagExt, TagItem, TagType};
 
 use crate::library_layout::sanitise_filename_component;
 use crate::musicbrainz::{
@@ -154,12 +155,26 @@ pub fn tag_ripped_file(
 
     write_release_identifiers(tag, release, track, medium);
 
-    // Drop the borrow before save_to_path takes &self.
+    // Drop the borrow before the save takes &self.
     let _ = tag;
-    tagged
-        .save_to_path(path, WriteOptions::default())
-        .map_err(|e| format!("lofty save failed on {}: {e}", path.display()))?;
-    Ok(())
+    save_tag(&tagged, tag_type, path)
+}
+
+/// Write the edited tag of `tagged` back to `path`.
+///
+/// ID3v2 goes through the concrete `Id3v2Tag`: lofty's generic-tag writer
+/// has no frame for the MusicBrainz recording ID and drops it, while the
+/// owned conversion emits the `UFID` frame Picard writes (and its reader
+/// maps back). Only that tag is rewritten; the file's other tags were not
+/// edited and stay as they are on disk.
+pub(crate) fn save_tag(tagged: &TaggedFile, tag_type: TagType, path: &Path) -> Result<(), String> {
+    let saved = match tagged.tag(tag_type) {
+        Some(tag) if tag_type == TagType::Id3v2 => {
+            Id3v2Tag::from(tag.clone()).save_to_path(path, WriteOptions::default())
+        }
+        _ => tagged.save_to_path(path, WriteOptions::default()),
+    };
+    saved.map_err(|e| format!("lofty save failed on {}: {e}", path.display()))
 }
 
 /// Write release-level identifiers + Picard-compatible Unknown-keyed tags.
@@ -241,7 +256,17 @@ pub(crate) fn set_string(tag: &mut Tag, key: ItemKey, value: &str) {
     if value.is_empty() {
         return;
     }
-    tag.insert(TagItem::new(key, ItemValue::Text(value.to_string())));
+    let item = TagItem::new(key, ItemValue::Text(value.to_string()));
+    // The recording ID has no static ID3v2 key: lofty's writer turns the
+    // text into a `UFID` frame (owner `http://musicbrainz.org`, what Picard
+    // writes) as a special case. The checked `insert` looks the mapping up
+    // first, finds none, and silently drops the item — so every re-open
+    // proposed the id again. Skip the check; the writer knows this key.
+    if matches!(item.key(), ItemKey::MusicBrainzRecordingId) {
+        tag.insert_unchecked(item);
+    } else {
+        tag.insert(item);
+    }
 }
 
 pub(crate) fn set_unknown_string(tag: &mut Tag, name: &str, value: &str) {
@@ -289,10 +314,7 @@ pub fn tag_ripped_fingerprint(path: &Path, fingerprint: &str) -> Result<(), Stri
     set_unknown_string(tag, "ACOUSTID_FINGERPRINT", fingerprint);
 
     let _ = tag;
-    tagged
-        .save_to_path(path, WriteOptions::default())
-        .map_err(|e| format!("lofty save failed on {}: {e}", path.display()))?;
-    Ok(())
+    save_tag(&tagged, tag_type, path)
 }
 
 /// Open `path` for tag I/O using content-based format detection.
@@ -594,6 +616,28 @@ mod tests {
             read_text(&path, &ItemKey::Isrc).as_deref(),
             Some("GBAYE6900001"),
             "should take the first ISRC from the recording"
+        );
+    }
+
+    #[test]
+    fn tags_recording_id_survives_id3v2() {
+        // Regression: the recording ID reached the file only as a UFID
+        // frame, which the generic-tag save path never produced.
+        let path = write_test_wav("recording-id");
+        let mut track = mb_track("T", 1);
+        track.recording = Some(Recording {
+            id: "b1a9c0de-0000-4000-8000-000000000001".into(),
+            title: "T".into(),
+            length: None,
+            artist_credit: vec![],
+            isrcs: vec![],
+        });
+        let rel = release("Album", "Artist", None);
+        tag_ripped_file(&path, &rel, &track, 1, Some(1), None, None).unwrap();
+
+        assert_eq!(
+            read_text(&path, &ItemKey::MusicBrainzRecordingId).as_deref(),
+            Some("b1a9c0de-0000-4000-8000-000000000001")
         );
     }
 
