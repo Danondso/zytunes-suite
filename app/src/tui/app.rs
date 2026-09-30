@@ -2730,6 +2730,12 @@ impl App {
     }
 
     pub fn close_tag_manager(&mut self) {
+        self.close_tag_manager_with(None, false);
+    }
+
+    /// Close the overlay. `advance` opens the next queued filing cluster
+    /// as an apply would; a plain close (Esc, error) drops the queue.
+    fn close_tag_manager_with(&mut self, cmd_tx: Option<&mpsc::Sender<BgCommand>>, advance: bool) {
         let Some(overlay) = self.tag_manager.take() else {
             return;
         };
@@ -2753,8 +2759,8 @@ impl App {
                         .contains_key(std::path::Path::new(loc.as_str())))
             });
         self.inbox.dismissed.extend(still_there.cloned());
-        if applied {
-            self.open_next_file_cluster(None);
+        if applied || advance {
+            self.open_next_file_cluster(cmd_tx);
         } else {
             self.inbox.queue.clear();
         }
@@ -3454,8 +3460,11 @@ impl App {
     ) {
         enum Outcome {
             Stay,
-            /// Nothing enabled: close and tell the user why.
-            NothingToApply,
+            /// Nothing differs from MusicBrainz: close (moving on to the
+            /// next filing cluster) and say so.
+            AlreadyMatches,
+            /// Changes exist but the user disabled every row.
+            NothingEnabled,
             Apply {
                 replace_existing: bool,
             },
@@ -3529,8 +3538,10 @@ impl App {
                     let Some(diff) = overlay.diff.as_ref() else {
                         return;
                     };
-                    if !diff.has_any_enabled() {
-                        Outcome::NothingToApply
+                    if !diff.has_any_change() {
+                        Outcome::AlreadyMatches
+                    } else if !diff.has_any_enabled() {
+                        Outcome::NothingEnabled
                     } else if overlay.filing && !diff.replacing_existing_dests().is_empty() {
                         overlay.phase = TagManagerPhase::ConfirmReplace;
                         Outcome::Stay
@@ -3545,9 +3556,15 @@ impl App {
         };
         match outcome {
             Outcome::Stay => {}
-            Outcome::NothingToApply => {
-                self.close_tag_manager();
+            Outcome::AlreadyMatches => {
+                self.close_tag_manager_with(Some(cmd_tx), true);
                 self.set_toast("Tags already match MusicBrainz".into(), false);
+            }
+            Outcome::NothingEnabled => {
+                self.set_toast(
+                    "Nothing enabled — Space or a to select changes, Esc to skip".into(),
+                    false,
+                );
             }
             Outcome::Apply { replace_existing } => {
                 self.dispatch_tag_diff_apply(cmd_tx, replace_existing);
@@ -14834,6 +14851,82 @@ mod tests {
             app.inbox.dismissed.is_empty(),
             "sources are not snoozed by a pairing failure"
         );
+    }
+
+    #[test]
+    fn enter_with_every_row_disabled_stays_open_and_does_not_claim_a_match() {
+        let dir = std::env::temp_dir().join("zytunes-enter-rows-disabled");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("feat.wav");
+        let dest = dir.join("2pac.wav");
+        std::fs::write(&src, b"src").unwrap();
+        let (tx, rx) = mpsc::channel::<BgCommand>();
+        let mut app = filing_overlay_with_rename(&src, &dest);
+        for f in &mut app
+            .tag_manager
+            .as_mut()
+            .unwrap()
+            .diff
+            .as_mut()
+            .unwrap()
+            .tracks[0]
+            .fields
+        {
+            f.enabled = false;
+        }
+        app.handle_tag_manager_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        assert!(
+            app.tag_manager.is_some(),
+            "a rename is still proposed: the overlay stays for the user to re-enable it"
+        );
+        assert!(rx.try_recv().is_err());
+        let toast = app.toast_message.as_ref().map(|(m, _, _)| m.as_str());
+        assert!(
+            toast.is_some_and(|m| !m.contains("already match")),
+            "the user disabled the rows; nothing matches yet: {toast:?}"
+        );
+    }
+
+    #[test]
+    fn filing_moves_to_the_next_cluster_when_nothing_differs() {
+        let dir = std::env::temp_dir().join("zytunes-filing-nothing-differs");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("a.wav");
+        std::fs::write(&src, b"src").unwrap();
+        let (tx, _rx) = mpsc::channel::<BgCommand>();
+        let mut app = filing_overlay_with_rename(&src, &src);
+        {
+            let overlay = app.tag_manager.as_mut().unwrap();
+            let f = &mut overlay.diff.as_mut().unwrap().tracks[0].fields[0];
+            f.proposed = f.current.clone();
+            f.enabled = false;
+        }
+        let next = zytunes::library_layout::AlbumCluster {
+            artist: "Alice In Chains".into(),
+            album: "Facelift".into(),
+            tracks: vec![Track {
+                id: 2,
+                name: "We Die Young".into(),
+                artist: "Alice In Chains".into(),
+                album: "Facelift".into(),
+                location: Some(dir.join("b.wav").display().to_string()),
+                ..Default::default()
+            }],
+        };
+        app.inbox.queue.push_back(next);
+        app.handle_tag_manager_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        let overlay = app
+            .tag_manager
+            .as_ref()
+            .expect("the next queued cluster opens instead of the queue being dropped");
+        assert_eq!(overlay.source_album, "Facelift");
+        assert!(app.inbox.queue.is_empty());
+        assert!(app
+            .toast_message
+            .as_ref()
+            .is_some_and(|(m, _, _)| m.contains("already match MusicBrainz")));
     }
 
     #[test]

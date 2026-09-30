@@ -197,6 +197,14 @@ impl ReleaseTagDiff {
             .any(|t| t.fields.iter().any(|f| f.enabled))
     }
 
+    /// Any field whose on-disk value differs from MusicBrainz, whether or
+    /// not the user left it enabled. False means the tags already match.
+    pub fn has_any_change(&self) -> bool {
+        self.tracks
+            .iter()
+            .any(|t| t.fields.iter().any(|f| f.current != f.proposed))
+    }
+
     /// Dest paths that an enabled Filename rename would overwrite.
     /// Used by the filing overlay to confirm before replace.
     pub fn replacing_existing_dests(&self) -> Vec<PathBuf> {

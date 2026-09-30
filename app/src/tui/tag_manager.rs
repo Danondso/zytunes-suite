@@ -187,7 +187,7 @@ impl TagManagerOverlay {
     /// already carries what MusicBrainz says. Rendered as a status line
     /// in the diff view; Enter closes instead of applying.
     pub fn tags_already_match(&self) -> bool {
-        self.diff.as_ref().is_some_and(|d| !d.has_any_enabled())
+        self.diff.as_ref().is_some_and(|d| !d.has_any_change())
     }
 
     /// Key hint for the diff-preview title bar.
@@ -390,9 +390,18 @@ mod tests {
     }
 
     #[test]
-    fn tags_already_match_when_no_field_is_enabled() {
+    fn tags_already_match_when_no_field_differs() {
         assert!(overlay_with_diff(false).tags_already_match());
         assert!(!overlay_with_diff(true).tags_already_match());
+        // A user disabling every row is not the same as nothing differing.
+        let mut disabled = overlay_with_diff(true);
+        for f in &mut disabled.diff.as_mut().unwrap().tracks[0].fields {
+            f.enabled = false;
+        }
+        assert!(
+            !disabled.tags_already_match(),
+            "rows the user turned off still differ from MusicBrainz"
+        );
         let mut no_diff = overlay_with_field_count(0);
         no_diff.phase = TagManagerPhase::DiffPreview;
         assert!(
