@@ -57,8 +57,10 @@ pub struct AlbumCluster {
 }
 
 /// Read settled audio files under `inbox` into library `Track`s.
-/// Chromaprint runs when a file has no `acoustic_id` so AcoustID can
-/// identify untagged drops the way Apple Music does.
+///
+/// Pass `fingerprint = false` from the shared worker. Chromaprint belongs
+/// on [`fingerprint_missing`], which the TUI runs on its own thread so a
+/// pile of untagged drops does not stall connect, sync, or CD detection.
 pub fn scan_inbox(inbox: &Path, fingerprint: bool) -> Vec<Track> {
     let mut files = Vec::new();
     collect_audio(inbox, &mut files);
@@ -73,6 +75,21 @@ pub fn scan_inbox(inbox: &Path, fingerprint: bool) -> Vec<Track> {
             track.acoustic_id = crate::fingerprint::compute_fingerprint(&path);
         }
         tracks.push(track);
+    }
+    tracks
+}
+
+/// Fill `acoustic_id` on tracks that do not already have one.
+/// Decodes audio; do not call this on the TUI worker thread.
+pub fn fingerprint_missing(mut tracks: Vec<Track>) -> Vec<Track> {
+    for track in &mut tracks {
+        if track.acoustic_id.is_some() {
+            continue;
+        }
+        let Some(path) = track.location.as_deref() else {
+            continue;
+        };
+        track.acoustic_id = crate::fingerprint::compute_fingerprint(Path::new(path));
     }
     tracks
 }

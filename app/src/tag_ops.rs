@@ -764,10 +764,16 @@ fn build_track_fields(
 /// successful renames; callers feed both sets into
 /// [`crate::dirlib::DirectoryLibrary::reread_paths`] so the cache picks up
 /// new tags AND new locations.
+///
+/// `library_root` is the fence for empty-folder cleanup: parents are
+/// removed only while they sit strictly inside the library or the sibling
+/// inbox. The library root, the inbox folder, and anything above either
+/// are left in place.
 pub fn apply_release_diff(
     diff: &ReleaseTagDiff,
+    library_root: &Path,
 ) -> (Vec<Result<(), String>>, HashMap<PathBuf, PathBuf>) {
-    apply_release_diff_with(diff, false)
+    apply_release_diff_with(diff, false, library_root)
 }
 
 /// Same as [`apply_release_diff`], but when `replace_existing` is set a
@@ -778,6 +784,7 @@ pub fn apply_release_diff(
 pub fn apply_release_diff_with(
     diff: &ReleaseTagDiff,
     replace_existing: bool,
+    library_root: &Path,
 ) -> (Vec<Result<(), String>>, HashMap<PathBuf, PathBuf>) {
     let mut results: Vec<Result<(), String>> = vec![Ok(()); diff.tracks.len()];
     let mut rename_map: HashMap<PathBuf, PathBuf> = HashMap::new();
@@ -820,6 +827,13 @@ pub fn apply_release_diff_with(
             continue;
         }
         if dest.exists() && !source_set.contains(dest) && dest != src {
+            // APFS/HFS+ fold case, so `Alice in Chains/…` and
+            // `Alice In Chains/…` are the same file. That is a retitle,
+            // not a second copy. Deleting `dest` here would delete `src`.
+            if is_case_only_rename(src, dest) && same_inode(src, dest) {
+                to_rename.push((idx, src, dest));
+                continue;
+            }
             if replace_existing {
                 if let Err(e) = std::fs::remove_file(dest) {
                     results[idx] = Err(format!("replace {}: {e}", dest.display()));
@@ -858,7 +872,7 @@ pub fn apply_release_diff_with(
             Ok(()) => {
                 rename_map.insert(src.clone(), dest.clone());
                 if let Some(parent) = src.parent() {
-                    prune_empty_parents(parent);
+                    prune_empty_parents(parent, library_root);
                 }
             }
             Err(e) => {
@@ -1000,9 +1014,13 @@ fn apply_field(tag: &mut Tag, field: &FieldDiff) {
     }
 }
 
-fn prune_empty_parents(start: &Path) {
+fn prune_empty_parents(start: &Path, library_root: &Path) {
+    let inbox = crate::library_layout::default_inbox_dir(library_root);
     let mut dir = start.to_path_buf();
     for _ in 0..8 {
+        if !may_remove_empty_dir(&dir, library_root, inbox.as_deref()) {
+            break;
+        }
         let empty = match std::fs::read_dir(&dir) {
             Ok(mut rd) => rd.next().is_none(),
             Err(_) => break,
@@ -1020,7 +1038,105 @@ fn prune_empty_parents(start: &Path) {
     }
 }
 
+/// Empty dirs may be removed only when they are strictly inside the library
+/// or strictly inside the inbox. That keeps `music_dir`, the inbox folder,
+/// and every ancestor of both.
+fn may_remove_empty_dir(dir: &Path, library_root: &Path, inbox: Option<&Path>) -> bool {
+    is_strict_child(dir, library_root) || inbox.is_some_and(|root| is_strict_child(dir, root))
+}
+
+fn is_strict_child(path: &Path, root: &Path) -> bool {
+    path.starts_with(root) && path != root
+}
+
+/// Full paths differ only by ASCII case of one or more components.
+fn is_case_only_rename(src: &Path, dest: &Path) -> bool {
+    src != dest && paths_eq_ignore_ascii_case(src, dest)
+}
+
+fn paths_eq_ignore_ascii_case(a: &Path, b: &Path) -> bool {
+    let ac: Vec<_> = a.components().collect();
+    let bc: Vec<_> = b.components().collect();
+    ac.len() == bc.len()
+        && ac.iter().zip(bc.iter()).all(|(x, y)| match (x, y) {
+            (std::path::Component::Normal(xn), std::path::Component::Normal(yn)) => xn
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&yn.to_string_lossy()),
+            _ => x == y,
+        })
+}
+
+fn same_inode(a: &Path, b: &Path) -> bool {
+    let (Ok(ma), Ok(mb)) = (std::fs::metadata(a), std::fs::metadata(b)) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        ma.ino() == mb.ino() && ma.dev() == mb.dev()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (ma, mb);
+        false
+    }
+}
+
+/// Rename each path component whose stored spelling differs, via a
+/// temporary name so case-insensitive volumes actually update the case.
+fn retitle_case_along(src: &Path, dest: &Path) -> Result<(), String> {
+    let mut built = PathBuf::new();
+    for (have_c, want_c) in src.components().zip(dest.components()) {
+        match (have_c, want_c) {
+            (std::path::Component::Normal(have), std::path::Component::Normal(want)) => {
+                built.push(have);
+                if have != want {
+                    let parent = built
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_default();
+                    let tmp = parent.join(format!(
+                        ".zytunes-case-{}-{}",
+                        std::process::id(),
+                        have.to_string_lossy()
+                    ));
+                    std::fs::rename(&built, &tmp).map_err(|e| {
+                        format!("case retitle {} -> {}: {e}", built.display(), tmp.display())
+                    })?;
+                    let renamed = parent.join(want);
+                    std::fs::rename(&tmp, &renamed).map_err(|e| {
+                        format!(
+                            "case retitle {} -> {}: {e}",
+                            tmp.display(),
+                            renamed.display()
+                        )
+                    })?;
+                    built = renamed;
+                }
+            }
+            (other, _) => {
+                built.push(other);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn perform_rename(src: &Path, dest: &Path) -> Result<(), String> {
+    if is_case_only_rename(src, dest) {
+        let distinct_target = match (src.parent(), dest.parent()) {
+            (Some(src_parent), Some(dest_parent)) => {
+                dest_parent.exists() && !same_inode(src_parent, dest_parent)
+            }
+            _ => false,
+        };
+        // Same directory inode (or the target name does not exist yet):
+        // change the stored spelling in place. A separate target folder
+        // still takes the normal move below.
+        if !distinct_target {
+            return retitle_case_along(src, dest);
+        }
+    }
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
     }
@@ -1383,7 +1499,7 @@ mod tests {
             }
         }
 
-        let (results, _rename_map) = apply_release_diff(&diff);
+        let (results, _rename_map) = apply_release_diff(&diff, &dir);
         assert_eq!(results.len(), 1);
         assert!(results[0].is_ok(), "result: {:?}", results[0]);
 
@@ -1422,7 +1538,7 @@ mod tests {
             f.enabled = matches!(f.kind, FieldKind::Date) && f.name == "Year";
         }
 
-        let (results, _) = apply_release_diff(&diff);
+        let (results, _) = apply_release_diff(&diff, &dir);
         assert!(results[0].is_ok(), "result: {:?}", results[0]);
 
         let tagged = lofty::probe::read_from_path(&path).unwrap();
@@ -1463,7 +1579,7 @@ mod tests {
             }],
         };
 
-        let (results, rename_map) = apply_release_diff(&diff);
+        let (results, rename_map) = apply_release_diff(&diff, &dir);
         assert!(results[0].is_err(), "save should fail on non-audio bytes");
         assert!(rename_map.is_empty());
 
@@ -1500,7 +1616,7 @@ mod tests {
             }
         }
 
-        let (results, _) = apply_release_diff(&diff);
+        let (results, _) = apply_release_diff(&diff, &dir);
         assert!(results[0].is_ok(), "result: {:?}", results[0]);
 
         let tmp = path.with_file_name("song.wav.tagtmp");
@@ -1530,7 +1646,7 @@ mod tests {
         let diff = build_release_diff(&[lib], &rel, &dir, DiffScope::Track, None);
         assert!(diff.tracks[0].dest_path.is_some());
 
-        let (results, rename_map) = apply_release_diff(&diff);
+        let (results, rename_map) = apply_release_diff(&diff, &dir);
         assert!(results[0].is_ok(), "result: {:?}", results[0]);
         let new_path = diff.tracks[0].dest_path.as_ref().unwrap();
         assert!(
@@ -1595,7 +1711,7 @@ mod tests {
             ],
         };
 
-        let (results, rename_map) = apply_release_diff(&diff);
+        let (results, rename_map) = apply_release_diff(&diff, &dir);
         // Both should fail with a collision error — neither side is treated
         // as the winner. Picking arbitrarily would silently overwrite.
         let collisions = results
@@ -1667,7 +1783,7 @@ mod tests {
             ],
         };
 
-        let (_results, _rename_map) = apply_release_diff(&diff);
+        let (_results, _rename_map) = apply_release_diff(&diff, &dir);
         // src1 had an enabled Album field — but because its rename collided
         // in phase 0, phase 1 must have skipped it. Verify no Album tag was
         // written to src1.
@@ -1876,7 +1992,7 @@ mod tests {
             assert!(f.enabled, "{name:?} should be a real delta on first build");
             assert!(f.current.is_none());
         }
-        let (results, _renames) = apply_release_diff(&diff1);
+        let (results, _renames) = apply_release_diff(&diff1, &dir);
         for r in &results {
             r.as_ref().expect("apply should succeed");
         }
@@ -2018,7 +2134,7 @@ mod tests {
                 f.enabled = false;
             }
         }
-        let (results, _) = apply_release_diff(&diff);
+        let (results, _) = apply_release_diff(&diff, &dir);
         assert!(results[0].is_ok(), "{:?}", results[0]);
 
         // Re-probe and look for the TXXX entries by name.
@@ -2281,7 +2397,7 @@ mod tests {
             }],
         };
 
-        let (results, map) = apply_release_diff_with(&diff, true);
+        let (results, map) = apply_release_diff_with(&diff, true, &dir);
         assert!(results[0].is_ok(), "{:?}", results[0]);
         assert_eq!(map.get(&src), Some(&dest));
         assert!(!src.exists(), "feat-folder copy must be gone");
@@ -2330,20 +2446,77 @@ mod tests {
             }],
         };
 
-        let (results, map) = apply_release_diff(&diff);
+        let (results, map) = apply_release_diff(&diff, &dir);
         assert!(results[0].is_ok(), "{:?}", results[0]);
         assert_eq!(map.get(&src), Some(&dest));
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "Alice In Chains"),
+            "on-disk artist dir should use the MusicBrainz spelling, got {names:?}"
+        );
+        // Case-folding volumes still resolve the old spelling, so the
+        // leftover-path asserts only apply where the two names are distinct.
+        if !volume_folds_ascii_case(&dir) {
+            assert!(!src.exists());
+            assert!(
+                !src_album.exists(),
+                "empty wrong-case album dir should be pruned"
+            );
+            assert!(
+                !src_album.parent().unwrap().exists(),
+                "empty wrong-case artist dir should be pruned"
+            );
+        }
+        assert!(dir.join("Alice In Chains").join("Dirt").exists());
+    }
+
+    fn volume_folds_ascii_case(dir: &std::path::Path) -> bool {
+        let probe = dir.join("ZyTunesCaseProbe");
+        std::fs::write(&probe, b"x").unwrap();
+        let folds = dir.join("zytunescaseprobe").exists();
+        let _ = std::fs::remove_file(&probe);
+        folds
+    }
+
+    #[test]
+    fn prune_does_not_walk_above_library_or_inbox() {
+        let parent = fresh_dir("prune-fence");
+        let music = parent.join("Music");
+        let inbox_root = parent.join("Automatically Add to Music");
+        let feat = inbox_root.join("Feat Artist");
+        std::fs::create_dir_all(&feat).unwrap();
+        std::fs::create_dir_all(music.join("Canon")).unwrap();
+        let src = feat.join("01 - Track.wav");
+        let dest = music.join("Canon").join("01 - Track.wav");
+        write_sine_wav(&src, 1);
+
+        let diff = ReleaseTagDiff {
+            release_mbid: "rel-1".into(),
+            summary: "test".into(),
+            tracks: vec![TrackTagDiff {
+                src_path: src.clone(),
+                dest_path: Some(dest.clone()),
+                library_id: 1,
+                fields: vec![FieldDiff {
+                    kind: FieldKind::Filename,
+                    name: "Filename",
+                    current: Some(src.display().to_string()),
+                    proposed: Some(dest.display().to_string()),
+                    enabled: true,
+                }],
+            }],
+        };
+
+        let (results, _) = apply_release_diff(&diff, &music);
+        assert!(results[0].is_ok(), "{:?}", results[0]);
         assert!(dest.exists());
-        assert!(!src.exists());
-        assert!(
-            !src_album.exists(),
-            "empty wrong-case album dir should be pruned"
-        );
-        assert!(
-            !src_album.parent().unwrap().exists(),
-            "empty wrong-case artist dir should be pruned"
-        );
-        assert!(dest.parent().unwrap().exists());
+        assert!(!feat.exists(), "empty inbox artist dir should go");
+        assert!(inbox_root.exists(), "inbox folder itself must stay");
+        assert!(music.exists(), "library root must stay");
+        assert!(parent.exists(), "parent of the library must stay");
     }
 
     #[test]
@@ -2373,7 +2546,7 @@ mod tests {
             }],
         };
 
-        let (results, map) = apply_release_diff(&diff);
+        let (results, map) = apply_release_diff(&diff, &dir);
         assert!(results[0]
             .as_ref()
             .err()

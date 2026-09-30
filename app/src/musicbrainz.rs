@@ -226,13 +226,24 @@ impl MusicBrainzClient {
         album: &str,
         limit: u32,
     ) -> Result<ReleaseSearchResponse, MbError> {
-        let resp: ReleaseSearchResponse =
-            self.get_json(&self.search_releases_url(artist, album, limit))?;
+        let resp = self.search_releases_exact(artist, album, limit)?;
         if resp.releases.is_empty() && should_retry_various_artists(artist, album) {
-            self.get_json(&self.search_releases_url(VARIOUS_ARTISTS, album, limit))
+            self.search_releases_exact(VARIOUS_ARTISTS, album, limit)
         } else {
             Ok(resp)
         }
+    }
+
+    /// One Solr query, with no Various Artists retry. Callers that log the
+    /// fallback (the tag-manager worker) use this so the retry line is
+    /// emitted only after the first query actually returned nothing.
+    pub fn search_releases_exact(
+        &self,
+        artist: &str,
+        album: &str,
+        limit: u32,
+    ) -> Result<ReleaseSearchResponse, MbError> {
+        self.get_json(&self.search_releases_url(artist, album, limit))
     }
 
     /// The URL that [`Self::search_releases`] would request. Exposed so callers

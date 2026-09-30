@@ -32,6 +32,37 @@ fn spawn_acoustic_backfill(gen: u64, dir: String, event_tx: mpsc::Sender<BgEvent
     }
 }
 
+/// Chromaprint inbox drops off the worker thread. The tracks are handed
+/// over only after `spawn` succeeds so a failure still delivers
+/// `InboxScanned` and the poll does not stay in flight.
+fn spawn_inbox_fingerprints(
+    tracks: Vec<zytunes::library::Track>,
+    event_tx: &mpsc::Sender<BgEvent>,
+) {
+    let (work_tx, work_rx) = mpsc::channel();
+    let tx = event_tx.clone();
+    let spawned = thread::Builder::new()
+        .name("inbox-fingerprint".into())
+        .spawn(move || {
+            let Ok(tracks) = work_rx.recv() else {
+                return;
+            };
+            let tracks = zytunes::library_layout::fingerprint_missing(tracks);
+            let _ = tx.send(BgEvent::InboxScanned { tracks });
+        });
+    match spawned {
+        Ok(_) => {
+            let _ = work_tx.send(tracks);
+        }
+        Err(e) => {
+            let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                "inbox: fingerprint thread failed to start: {e}"
+            )));
+            let _ = event_tx.send(BgEvent::InboxScanned { tracks });
+        }
+    }
+}
+
 /// True when `err` indicates the MTP session is effectively dead and no
 /// further bulk ops on this session will succeed — only a physical replug
 /// recovers.
@@ -395,9 +426,9 @@ pub enum BgCommand {
         cache_dir: Option<PathBuf>,
     },
     /// Scan the Automatically Add to Music inbox (sibling of `music_dir`).
-    /// Fingerprints untagged files when `fingerprint` is set so AcoustID
-    /// can identify them the way a tag-manager retag does. Answered by
-    /// [`BgEvent::InboxScanned`].
+    /// When `fingerprint` is set, Chromaprint runs on a side thread and
+    /// [`BgEvent::InboxScanned`] arrives after those ids are filled. The
+    /// worker itself only reads tags.
     ScanInbox {
         inbox: PathBuf,
         fingerprint: bool,
@@ -2287,8 +2318,11 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                     fingerprint,
                     replace_existing,
                 } => {
-                    let (results, rename_map) =
-                        zytunes::tag_ops::apply_release_diff_with(&diff, replace_existing);
+                    let (results, rename_map) = zytunes::tag_ops::apply_release_diff_with(
+                        &diff,
+                        replace_existing,
+                        std::path::Path::new(&music_dir),
+                    );
                     // Collect every src/dest path so the surgical re-read
                     // covers both the original locations (now stale) and the
                     // post-rename locations (now fresh).
@@ -2408,8 +2442,18 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                             inbox.display()
                         )));
                     }
-                    let tracks = zytunes::library_layout::scan_inbox(&inbox, fingerprint);
-                    let _ = event_tx.send(BgEvent::InboxScanned { tracks });
+                    // Tag read only. Chromaprint stays off this thread — the
+                    // worker also serves Connect, sync, and CD detection.
+                    let tracks = zytunes::library_layout::scan_inbox(&inbox, false);
+                    let needs_fp = fingerprint
+                        && tracks
+                            .iter()
+                            .any(|t| t.acoustic_id.is_none() && t.location.is_some());
+                    if needs_fp {
+                        spawn_inbox_fingerprints(tracks, &event_tx);
+                    } else {
+                        let _ = event_tx.send(BgEvent::InboxScanned { tracks });
+                    }
                 }
             }
         }
@@ -2463,16 +2507,23 @@ fn run_mb_search_releases_with_log(
         bytes_hex(album)
     )));
     let _ = log.send(BgEvent::SyncMessage(format!("tag-manager: URL={}", url)));
-    if zytunes::musicbrainz::should_retry_various_artists(artist, album) {
+    let first = client
+        .search_releases_exact(artist, album, 12)
+        .map_err(|e| e.to_string())?;
+    if first.releases.is_empty()
+        && zytunes::musicbrainz::should_retry_various_artists(artist, album)
+    {
+        let fallback = client.search_releases_url("Various Artists", album, 12);
         let _ = log.send(BgEvent::SyncMessage(format!(
-            "tag-manager: 0-hit fallback URL={}",
-            client.search_releases_url("Various Artists", album, 12)
+            "tag-manager: 0 hits, retrying as Various Artists: {fallback}"
         )));
+        client
+            .search_releases_exact("Various Artists", album, 12)
+            .map(|r| r.releases)
+            .map_err(|e| e.to_string())
+    } else {
+        Ok(first.releases)
     }
-    client
-        .search_releases(artist, album, 12)
-        .map(|r| r.releases)
-        .map_err(|e| e.to_string())
 }
 
 fn bytes_hex(s: &str) -> String {
