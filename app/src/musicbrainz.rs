@@ -634,18 +634,22 @@ pub fn render_artist_credit(credits: &[ArtistCredit]) -> String {
 
 /// Album-artist for tags and `{AlbumArtist}/{Album}` folders.
 ///
-/// Featuring joins stay on the *track* artist. A release credited
-/// `2Pac feat. The Notorious B.I.G.` files under `2Pac`. Collaborations
-/// joined with `&` / `and` / `,` keep the full credit.
+/// Featuring joins stay on the *track* artist: the credit is cut at the
+/// first featuring join phrase. `2Pac feat. The Notorious B.I.G.` files
+/// under `2Pac`, and `A & B feat. C` under `A & B`. Collaborations joined
+/// with `&` / `and` / `,` keep the full credit.
 pub fn canonical_album_artist(credits: &[ArtistCredit]) -> String {
-    if credits.is_empty() {
-        return String::new();
+    let Some(feat_at) = credits.iter().position(has_featuring_join) else {
+        return render_artist_credit(credits);
+    };
+    // A lone billed artist uses the artist entity's own name, which drops
+    // any "credited as" styling on this one release.
+    if feat_at == 0 {
+        return primary_credit_name(&credits[0]).to_string();
     }
-    if is_featuring_credit(credits) {
-        primary_credit_name(&credits[0]).to_string()
-    } else {
-        render_artist_credit(credits)
-    }
+    let mut out = render_artist_credit(&credits[..feat_at]);
+    out.push_str(&credits[feat_at].name);
+    out.trim().to_string()
 }
 
 fn primary_credit_name(ac: &ArtistCredit) -> &str {
@@ -657,12 +661,11 @@ fn primary_credit_name(ac: &ArtistCredit) -> &str {
         .unwrap_or(ac.name.trim())
 }
 
-fn is_featuring_credit(credits: &[ArtistCredit]) -> bool {
-    credits.iter().any(|c| {
-        c.joinphrase.as_deref().is_some_and(|j| {
-            let l = j.to_ascii_lowercase();
-            l.contains("feat") || l.contains("ft.") || l.contains("ft ") || l.contains("featuring")
-        })
+/// This credit's join phrase introduces a featured guest.
+fn has_featuring_join(credit: &ArtistCredit) -> bool {
+    credit.joinphrase.as_deref().is_some_and(|j| {
+        let l = j.to_ascii_lowercase();
+        l.contains("feat") || l.contains("ft.") || l.contains("ft ")
     })
 }
 
@@ -1029,6 +1032,25 @@ mod tests {
         assert_eq!(
             canonical_album_artist(&credits),
             "Robert Plant & Alison Krauss"
+        );
+    }
+
+    #[test]
+    fn canonical_album_artist_keeps_collaborators_before_feat() {
+        let credit = |name: &str, join: Option<&str>| ArtistCredit {
+            name: name.into(),
+            joinphrase: join.map(str::to_string),
+            artist: None,
+        };
+        let credits = vec![
+            credit("Robert Plant", Some(" & ")),
+            credit("Alison Krauss", Some(" feat. ")),
+            credit("T Bone Burnett", None),
+        ];
+        assert_eq!(
+            canonical_album_artist(&credits),
+            "Robert Plant & Alison Krauss",
+            "only the featured guest is dropped, not the co-billed artist"
         );
     }
 
