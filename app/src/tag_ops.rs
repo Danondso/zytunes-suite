@@ -755,6 +755,33 @@ pub struct ApplyOutcome {
     pub dir_renames: Vec<(PathBuf, PathBuf)>,
 }
 
+impl ApplyOutcome {
+    /// Paths the library cache must re-read after this apply: every new
+    /// location, plus every source (retagged in place, or vacated so its
+    /// stale entry drops).
+    ///
+    /// A source still sitting in the inbox is left out. It was not filed
+    /// (rename failed, Filename row off, no MusicBrainz pairing), and the
+    /// inbox is outside `library_root`, so re-reading it would add a
+    /// non-library file to the library.
+    pub fn reread_paths(&self, diff: &ReleaseTagDiff, library_root: &Path) -> Vec<PathBuf> {
+        let inbox = crate::library_layout::default_inbox_dir(library_root);
+        let left_in_inbox = |src: &PathBuf| {
+            !self.rename_map.contains_key(src)
+                && inbox.as_deref().is_some_and(|root| src.starts_with(root))
+        };
+        let mut paths: Vec<PathBuf> = diff
+            .tracks
+            .iter()
+            .map(|t| &t.src_path)
+            .filter(|src| !left_in_inbox(src))
+            .cloned()
+            .collect();
+        paths.extend(self.rename_map.values().cloned());
+        paths
+    }
+}
+
 /// Apply an approved `ReleaseTagDiff` to disk.
 ///
 /// Three phases:
@@ -2926,6 +2953,37 @@ mod tests {
             remap_through_dir_renames(Path::new("/m/alicex/dirt/01.wav"), &renames),
             PathBuf::from("/m/alicex/dirt/01.wav"),
             "a name that merely shares the prefix string is not under the folder"
+        );
+    }
+
+    #[test]
+    fn reread_paths_skip_sources_left_in_the_inbox() {
+        let music = PathBuf::from("/data/Music");
+        let inbox = crate::library_layout::default_inbox_dir(&music).unwrap();
+        let filed = (inbox.join("a.mp3"), music.join("A").join("B").join("a.mp3"));
+        let stuck = inbox.join("b.mp3");
+        let retag = music.join("A").join("B").join("c.mp3");
+        let mut diff = rename_only_diff(&filed.0, &filed.1);
+        for src in [&stuck, &retag] {
+            let mut t = rename_only_diff(src, src).tracks.remove(0);
+            t.dest_path = None;
+            diff.tracks.push(t);
+        }
+        let outcome = ApplyOutcome {
+            results: vec![Ok(()), Ok(()), Ok(())],
+            rename_map: HashMap::from([filed.clone()]),
+            dir_renames: Vec::new(),
+        };
+        let paths = outcome.reread_paths(&diff, &music);
+        assert!(paths.contains(&filed.1), "new location is read");
+        assert!(paths.contains(&retag), "in-library retag is re-read");
+        assert!(
+            paths.contains(&filed.0),
+            "a vacated source is listed so its cache entry drops"
+        );
+        assert!(
+            !paths.contains(&stuck),
+            "a file still sitting in the inbox is outside the library"
         );
     }
 

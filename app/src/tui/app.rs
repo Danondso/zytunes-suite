@@ -2712,20 +2712,30 @@ impl App {
         let Some(overlay) = self.tag_manager.take() else {
             return;
         };
-        let filing = overlay.filing;
-        let applied = matches!(overlay.phase, TagManagerPhase::Done);
-        if filing && !applied {
-            if let Some(tracks) = overlay.source_tracks.as_ref() {
-                for t in tracks {
-                    if let Some(loc) = t.location.as_ref() {
-                        self.inbox.dismissed.insert(loc.clone());
-                    }
-                }
-            }
-            self.inbox.queue.clear();
+        if !overlay.filing {
+            return;
         }
-        if filing && applied {
+        let applied = matches!(overlay.phase, TagManagerPhase::Done);
+        // Snooze every source that is still where it was: all of them on a
+        // dismiss, and after an apply the ones that were not filed (rename
+        // failed, Filename row off, no MusicBrainz pairing). Without this
+        // the next 5 s poll reopens the overlay for the same file forever.
+        let still_there = overlay
+            .source_tracks
+            .iter()
+            .flatten()
+            .filter_map(|t| t.location.as_ref())
+            .filter(|loc| {
+                !(applied
+                    && overlay
+                        .last_rename_map
+                        .contains_key(std::path::Path::new(loc.as_str())))
+            });
+        self.inbox.dismissed.extend(still_there.cloned());
+        if applied {
             self.open_next_file_cluster(None);
+        } else {
+            self.inbox.queue.clear();
         }
     }
 
@@ -14352,6 +14362,41 @@ mod tests {
         assert!(
             app.tag_manager.is_none(),
             "dismissed inbox path must not reopen"
+        );
+    }
+
+    #[test]
+    fn filing_done_dismisses_sources_left_in_inbox() {
+        let mut app = make_app_with_library_for_tagmgr();
+        let track = |n: &str| zytunes::library::Track {
+            name: n.into(),
+            artist: "A".into(),
+            album: "B".into(),
+            location: Some(format!("/inbox/{n}.mp3")),
+            ..Default::default()
+        };
+        let (moved, stuck) = (track("moved"), track("stuck"));
+        app.on_inbox_scanned(vec![moved.clone(), stuck.clone()]);
+        // Apply finished, but only one file was actually filed; the other
+        // (rename failed / Filename row off / no MB pairing) is still there.
+        let overlay = app.tag_manager.as_mut().unwrap();
+        overlay.phase = TagManagerPhase::Done;
+        overlay.last_rename_map.insert(
+            PathBuf::from("/inbox/moved.mp3"),
+            PathBuf::from("/m/A/B/moved.mp3"),
+        );
+        app.close_tag_manager();
+        assert!(app.tag_manager.is_none());
+
+        app.on_inbox_scanned(vec![stuck]);
+        assert!(
+            app.tag_manager.is_none(),
+            "a file left in the inbox after apply must not reopen the overlay every poll"
+        );
+        app.on_inbox_scanned(vec![moved]);
+        assert!(
+            app.tag_manager.is_some(),
+            "a filed path is not dismissed: a new drop with that name still opens"
         );
     }
 

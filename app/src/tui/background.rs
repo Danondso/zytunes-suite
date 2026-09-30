@@ -2322,30 +2322,18 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                     fingerprint,
                     replace_existing,
                 } => {
-                    let zytunes::tag_ops::ApplyOutcome {
-                        results,
-                        rename_map,
-                        dir_renames,
-                    } = zytunes::tag_ops::apply_release_diff_with(
+                    let outcome = zytunes::tag_ops::apply_release_diff_with(
                         &diff,
                         replace_existing,
                         std::path::Path::new(&music_dir),
                     );
-                    // Collect every src/dest path so the surgical re-read
-                    // covers both the original locations (now stale) and the
-                    // post-rename locations (now fresh).
-                    let mut paths: Vec<std::path::PathBuf> = Vec::new();
-                    for track in &diff.tracks {
-                        paths.push(track.src_path.clone());
-                    }
-                    for new in rename_map.values() {
-                        paths.push(new.clone());
-                    }
+                    let paths = outcome.reread_paths(&diff, std::path::Path::new(&music_dir));
+                    let dir_renames = outcome.dir_renames.clone();
                     let _ = event_tx.send(BgEvent::TagsApplied {
                         token,
-                        results,
-                        rename_map,
-                        dir_renames: dir_renames.clone(),
+                        results: outcome.results,
+                        rename_map: outcome.rename_map,
+                        dir_renames: outcome.dir_renames,
                     });
 
                     let log_tx = event_tx.clone();
