@@ -827,13 +827,10 @@ pub fn apply_release_diff_with(
             continue;
         }
         if !source_set.contains(dest) && dest_needs_replace(src, dest) {
-            if replace_existing {
-                if let Err(e) = std::fs::remove_file(dest) {
-                    results[idx] = Err(format!("replace {}: {e}", dest.display()));
-                    skipped.insert(idx);
-                    continue;
-                }
-            } else {
+            // With `replace_existing` the old copy is NOT removed here:
+            // the phase-2 rename lands on top of it, so a move that fails
+            // leaves the canonical file in place.
+            if !replace_existing {
                 results[idx] = Err(format!(
                     "rename collision: {} already exists",
                     dest.display()
@@ -1152,13 +1149,21 @@ fn perform_rename(src: &Path, dest: &Path) -> Result<(), String> {
             #[cfg(not(unix))]
             let is_exdev = false;
             if is_exdev {
-                std::fs::copy(src, dest).map_err(|e| {
-                    format!(
-                        "rename {} -> {}: cross-device copy failed: {e}",
-                        src.display(),
-                        dest.display()
-                    )
-                })?;
+                // Copy beside `dest`, then rename over it: a copy that
+                // dies halfway must not have truncated an existing dest.
+                let mut staged = dest.as_os_str().to_owned();
+                staged.push(".zytunes-part");
+                let staged = PathBuf::from(staged);
+                std::fs::copy(src, &staged)
+                    .and_then(|_| std::fs::rename(&staged, dest))
+                    .map_err(|e| {
+                        let _ = std::fs::remove_file(&staged);
+                        format!(
+                            "rename {} -> {}: cross-device copy failed: {e}",
+                            src.display(),
+                            dest.display()
+                        )
+                    })?;
                 std::fs::remove_file(src)
                     .map_err(|e| format!("rename cleanup of {}: {e}", src.display()))?;
                 Ok(())
@@ -2635,6 +2640,30 @@ mod tests {
         assert!(rename_only_diff(&src, &dest)
             .replacing_existing_dests()
             .is_empty());
+    }
+
+    #[test]
+    fn replace_keeps_existing_dest_when_the_move_fails() {
+        let dir = fresh_dir("replace-failed-move");
+        let src = dir.join("feat").join("01 - Track.wav");
+        let dest = dir.join("2Pac").join("01 - Track.wav");
+        std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        write_sine_wav(&src, 2);
+        write_sine_wav(&dest, 1);
+        let canonical = std::fs::read(&dest).unwrap();
+        let diff = rename_only_diff(&src, &dest);
+        // The source vanishes between the diff and the apply, so the move
+        // cannot succeed.
+        std::fs::remove_file(&src).unwrap();
+
+        let (results, map) = apply_release_diff_with(&diff, true, &dir);
+        assert!(results[0].is_err());
+        assert!(map.is_empty());
+        assert!(
+            std::fs::read(&dest).ok() == Some(canonical),
+            "a failed move must leave the canonical copy untouched"
+        );
     }
 
     #[test]
