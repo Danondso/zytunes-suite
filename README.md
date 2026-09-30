@@ -217,7 +217,7 @@ Inside the import overlay:
 | `q` | Close (blocked while an apply is in flight). Filing: skip the rest of the queue |
 | `Esc` | Back one phase, or close from search. Filing close without apply skips that album for the session |
 | `Tab` | Toggle artist/album search fields |
-| `Enter` | Search / pick a release / apply the diff (tags + rename into `{AlbumArtist}/{Album}`). Filing: if the dest already exists, confirm replace (`Enter`/`y`) or back to the diff (`Esc`/`n`) |
+| `Enter` | Search / pick a release / apply the diff (tags + rename into `{AlbumArtist}/{Album}`). Filing: if the dest already exists, confirm replace (`Enter`/`y`) or back to the diff (`Esc`/`n`). When no field would change, the diff header says the tags already match MusicBrainz and `Enter` just closes |
 | `s` | Return to search |
 | `Space` / `a` / `n` | Toggle focused field / enable all / enable none (diff preview) |
 | `c` / `C` / `X`/`E` | Collapse focused track / collapse all / expand all |

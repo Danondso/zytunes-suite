@@ -3882,9 +3882,7 @@ fn draw_tag_manager_overlay(f: &mut Frame, app: &App) {
             format!(" {noun} — ↑↓ select · Enter pick · s edit query · Esc back ")
         }
         TagManagerPhase::LoadingRelease => format!(" {noun} — loading release… "),
-        TagManagerPhase::DiffPreview => {
-            format!(" {noun} — j/k · Space · a/n · c fold · Enter apply · s search · Esc ")
-        }
+        TagManagerPhase::DiffPreview => format!(" {noun} — {} ", overlay.diff_preview_hint()),
         TagManagerPhase::ConfirmReplace => {
             format!(" {noun} — replace existing files? Enter/y yes · Esc/n back ")
         }
@@ -4191,6 +4189,14 @@ fn draw_tag_manager_diff(
             } else {
                 t.success_text
             }),
+        ),
+        Span::styled(
+            if overlay.tags_already_match() {
+                " · tags already match MusicBrainz"
+            } else {
+                ""
+            },
+            Style::default().fg(t.success_text),
         ),
         Span::raw(" · "),
         Span::styled(

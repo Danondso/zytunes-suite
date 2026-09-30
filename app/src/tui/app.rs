@@ -3416,8 +3416,11 @@ impl App {
     ) {
         enum Outcome {
             Stay,
-            Close,
-            Apply { replace_existing: bool },
+            /// Nothing enabled: close and tell the user why.
+            NothingToApply,
+            Apply {
+                replace_existing: bool,
+            },
         }
         let outcome = {
             let Some(overlay) = self.tag_manager.as_mut() else {
@@ -3489,7 +3492,7 @@ impl App {
                         return;
                     };
                     if !diff.has_any_enabled() {
-                        Outcome::Close
+                        Outcome::NothingToApply
                     } else if overlay.filing && !diff.replacing_existing_dests().is_empty() {
                         overlay.phase = TagManagerPhase::ConfirmReplace;
                         Outcome::Stay
@@ -3504,7 +3507,10 @@ impl App {
         };
         match outcome {
             Outcome::Stay => {}
-            Outcome::Close => self.close_tag_manager(),
+            Outcome::NothingToApply => {
+                self.close_tag_manager();
+                self.set_toast("Tags already match MusicBrainz".into(), false);
+            }
             Outcome::Apply { replace_existing } => {
                 self.dispatch_tag_diff_apply(cmd_tx, replace_existing);
             }
@@ -14684,6 +14690,38 @@ mod tests {
         overlay.rebuild_flattened_paths();
         app.tag_manager = Some(overlay);
         app
+    }
+
+    #[test]
+    fn enter_on_a_matching_diff_closes_and_says_so() {
+        let dir = std::env::temp_dir().join("zytunes-enter-nothing-to-apply");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("a.wav");
+        std::fs::write(&src, b"src").unwrap();
+        let (tx, rx) = mpsc::channel::<BgCommand>();
+        let mut app = filing_overlay_with_rename(&src, &src);
+        let overlay = app.tag_manager.as_mut().unwrap();
+        overlay.filing = false;
+        for f in &mut overlay.diff.as_mut().unwrap().tracks[0].fields {
+            f.enabled = false;
+        }
+        app.handle_tag_manager_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        assert!(
+            app.tag_manager.is_none(),
+            "nothing to apply: overlay closes"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing is dispatched to the worker"
+        );
+        assert!(
+            app.toast_message
+                .as_ref()
+                .is_some_and(|(m, _, err)| m.contains("already match MusicBrainz") && !err),
+            "the user is told the tags already match, got {:?}",
+            app.toast_message
+        );
     }
 
     #[test]

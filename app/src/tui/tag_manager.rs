@@ -183,6 +183,22 @@ impl TagManagerOverlay {
     /// drop stale events from previous opens. The counter is process-wide
     /// so a re-opened overlay starts ahead of every previous overlay's
     /// in-flight request.
+    /// A diff is loaded and no field would change anything: the file
+    /// already carries what MusicBrainz says. Rendered as a status line
+    /// in the diff view; Enter closes instead of applying.
+    pub fn tags_already_match(&self) -> bool {
+        self.diff.as_ref().is_some_and(|d| !d.has_any_enabled())
+    }
+
+    /// Key hint for the diff-preview title bar.
+    pub fn diff_preview_hint(&self) -> &'static str {
+        if self.tags_already_match() {
+            "j/k · c fold · Enter close · s search · Esc"
+        } else {
+            "j/k · Space · a/n · c fold · Enter apply · s search · Esc"
+        }
+    }
+
     pub fn next_request_token(&mut self) -> u64 {
         self.pending_request_token = REQUEST_TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed);
         self.pending_request_token
@@ -348,6 +364,51 @@ mod tests {
             .chain((0..n).map(|i| FocusRow::Field(0, i)))
             .collect();
         overlay
+    }
+
+    fn overlay_with_diff(enabled: bool) -> TagManagerOverlay {
+        use zytunes::tag_ops::{FieldDiff, FieldKind, ReleaseTagDiff, TrackTagDiff};
+        let mut overlay = overlay_with_field_count(0);
+        overlay.phase = TagManagerPhase::DiffPreview;
+        overlay.diff = Some(ReleaseTagDiff {
+            release_mbid: "rel-1".into(),
+            summary: "Dirt — Alice In Chains".into(),
+            tracks: vec![TrackTagDiff {
+                src_path: "/m/a.mp3".into(),
+                dest_path: None,
+                library_id: 1,
+                fields: vec![FieldDiff {
+                    kind: FieldKind::Identity,
+                    name: "Title",
+                    current: Some("Them Bones".into()),
+                    proposed: Some(if enabled { "Them Bones!" } else { "Them Bones" }.into()),
+                    enabled,
+                }],
+            }],
+        });
+        overlay
+    }
+
+    #[test]
+    fn tags_already_match_when_no_field_is_enabled() {
+        assert!(overlay_with_diff(false).tags_already_match());
+        assert!(!overlay_with_diff(true).tags_already_match());
+        let mut no_diff = overlay_with_field_count(0);
+        no_diff.phase = TagManagerPhase::DiffPreview;
+        assert!(
+            !no_diff.tags_already_match(),
+            "no diff loaded yet is not a match"
+        );
+    }
+
+    #[test]
+    fn diff_preview_hint_says_close_when_nothing_to_apply() {
+        assert!(overlay_with_diff(false)
+            .diff_preview_hint()
+            .contains("Enter close"));
+        assert!(overlay_with_diff(true)
+            .diff_preview_hint()
+            .contains("Enter apply"));
     }
 
     #[test]
