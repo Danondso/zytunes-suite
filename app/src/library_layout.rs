@@ -155,6 +155,7 @@ fn untagged_track(path: &Path, id: u64) -> Track {
         name,
         artist: "Unknown".into(),
         album: "Unknown".into(),
+        total_time_ms: crate::dirlib::audio_duration_ms(path),
         location: Some(path.to_string_lossy().into_owned()),
         ..Default::default()
     }
@@ -324,6 +325,35 @@ mod tests {
         let names: Vec<_> = tracks.iter().filter_map(|t| t.location.clone()).collect();
         assert_eq!(names.len(), 1, "{names:?}");
         assert!(names[0].ends_with("keep.wav"));
+    }
+
+    #[test]
+    fn scan_inbox_untagged_file_still_has_a_duration() {
+        use std::time::{Duration, SystemTime};
+
+        let dir =
+            std::env::temp_dir().join(format!("zytunes-inbox-untagged-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("01 - Mystery.wav");
+        crate::test_audio::write_sine_wav(&wav, 2);
+        let f = std::fs::File::options().write(true).open(&wav).unwrap();
+        f.set_modified(SystemTime::now() - Duration::from_secs(10))
+            .unwrap();
+
+        let tracks = scan_inbox(&dir, &HashSet::new(), false);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(tracks.len(), 1);
+        let t = &tracks[0];
+        assert_eq!(t.artist, "Unknown", "no tag: identity stays unknown");
+        // AcoustID needs the duration alongside the fingerprint; an
+        // untagged drop is exactly the file it exists to identify.
+        assert!(
+            t.total_time_ms
+                .is_some_and(|ms| (1500..=2500).contains(&ms)),
+            "duration read from the audio stream, got {:?}",
+            t.total_time_ms
+        );
     }
 
     #[test]

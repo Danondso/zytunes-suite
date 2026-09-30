@@ -888,6 +888,32 @@ pub(crate) fn track_from_lofty(path: &Path, id: u64) -> Option<Track> {
 }
 
 /// Infer metadata from directory structure: Artist/Album/Track.ext
+/// Duration of the audio stream, without reading any tag.
+///
+/// The fallback for untagged files: identity comes from the path, but
+/// AcoustID needs the duration next to the fingerprint, and an untagged
+/// file is the one it exists to identify.
+pub(crate) fn audio_duration_ms(path: &Path) -> Option<u64> {
+    use lofty::config::ParseOptions;
+    use lofty::file::AudioFile;
+    use lofty::probe::Probe;
+
+    let tagged = Probe::open(path)
+        .ok()?
+        .options(
+            ParseOptions::new()
+                .read_tags(false)
+                .read_cover_art(false)
+                .read_properties(true),
+        )
+        .guess_file_type()
+        .ok()?
+        .read()
+        .ok()?;
+    let dur = tagged.properties().duration();
+    (!dur.is_zero()).then_some(dur.as_millis() as u64)
+}
+
 fn track_from_path(path: &Path, id: u64) -> Track {
     let raw_stem = stem(path);
     let name = crate::strip_track_number(&raw_stem).to_string();
@@ -897,6 +923,7 @@ fn track_from_path(path: &Path, id: u64) -> Track {
         name,
         artist: parent_name(path, 2),
         album: parent_name(path, 1),
+        total_time_ms: audio_duration_ms(path),
         location: Some(path.to_string_lossy().to_string()),
         kind: Some(format!(
             "{} audio file",
@@ -1487,6 +1514,26 @@ mod tests {
     }
 
     use crate::test_audio::write_sine_wav;
+
+    #[test]
+    fn track_from_path_reads_the_duration_of_untagged_audio() {
+        let dir = std::env::temp_dir().join("zytunes-dirlib-untagged-duration");
+        let _ = fs::remove_dir_all(&dir);
+        let album_dir = dir.join("Artist").join("Album");
+        fs::create_dir_all(&album_dir).unwrap();
+        let path = album_dir.join("01 Untagged.wav");
+        write_sine_wav(&path, 2);
+        let track = track_from_path(&path, 1);
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(track.artist, "Artist");
+        assert!(
+            track
+                .total_time_ms
+                .is_some_and(|ms| (1500..=2500).contains(&ms)),
+            "got {:?}",
+            track.total_time_ms
+        );
+    }
 
     #[test]
     fn scan_populates_acoustic_id_for_real_audio() {
