@@ -5,6 +5,7 @@
 //! the tag-manager overlay (MusicBrainz diff + rename); this module only
 //! finds settled audio files and groups them by album.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -61,12 +62,16 @@ pub struct AlbumCluster {
 /// Pass `fingerprint = false` from the shared worker. Chromaprint belongs
 /// on [`fingerprint_missing`], which the TUI runs on its own thread so a
 /// pile of untagged drops does not stall connect, sync, or CD detection.
-pub fn scan_inbox(inbox: &Path, fingerprint: bool) -> Vec<Track> {
+///
+/// `skip` holds locations the user already dismissed. They are dropped
+/// before the tag read, so a dismissed drop costs nothing per poll and is
+/// never handed to the fingerprint thread.
+pub fn scan_inbox(inbox: &Path, skip: &HashSet<String>, fingerprint: bool) -> Vec<Track> {
     let mut files = Vec::new();
     collect_audio(inbox, &mut files);
     let mut tracks = Vec::new();
     for path in files {
-        if still_settling(&path) {
+        if skip.contains(path.to_string_lossy().as_ref()) || still_settling(&path) {
             continue;
         }
         let id = crate::dirlib::hash_path(&path);
@@ -283,12 +288,41 @@ mod tests {
             .unwrap();
         std::fs::write(dir.join("partial.wav.part"), b"nope").unwrap();
 
-        let tracks = scan_inbox(&dir, false);
+        let tracks = scan_inbox(&dir, &HashSet::new(), false);
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(tracks.len(), 1);
         assert!(tracks[0]
             .location
             .as_ref()
             .is_some_and(|p| p.ends_with("drop.wav")));
+    }
+
+    #[test]
+    fn scan_inbox_skips_dismissed_paths() {
+        use std::time::{Duration, SystemTime};
+
+        let dir = std::env::temp_dir().join(format!("zytunes-inbox-skip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let past = SystemTime::now() - Duration::from_secs(10);
+        for name in ["keep.wav", "dismissed.wav"] {
+            let wav = dir.join(name);
+            crate::test_audio::write_sine_wav(&wav, 1);
+            let f = std::fs::File::options().write(true).open(&wav).unwrap();
+            f.set_modified(past).unwrap();
+        }
+        // The key is whatever a previous scan reported as `location`.
+        let skip: HashSet<String> = scan_inbox(&dir, &HashSet::new(), false)
+            .into_iter()
+            .filter_map(|t| t.location)
+            .filter(|l| l.ends_with("dismissed.wav"))
+            .collect();
+        assert_eq!(skip.len(), 1);
+
+        let tracks = scan_inbox(&dir, &skip, false);
+        let _ = std::fs::remove_dir_all(&dir);
+        let names: Vec<_> = tracks.iter().filter_map(|t| t.location.clone()).collect();
+        assert_eq!(names.len(), 1, "{names:?}");
+        assert!(names[0].ends_with("keep.wav"));
     }
 }

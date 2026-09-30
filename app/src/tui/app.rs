@@ -6035,8 +6035,11 @@ impl App {
         self.inbox.last_request = Some(Instant::now());
         self.inbox.scan_in_flight = true;
         let fingerprint = self.scan_fingerprint && self.acoustid_app_key.is_some();
-        self.pending_bg_commands
-            .push(BgCommand::ScanInbox { inbox, fingerprint });
+        self.pending_bg_commands.push(BgCommand::ScanInbox {
+            inbox,
+            dismissed: self.inbox.dismissed.clone(),
+            fingerprint,
+        });
     }
 
     pub fn on_inbox_scanned(&mut self, tracks: Vec<Track>) {
@@ -14492,6 +14495,24 @@ mod tests {
     }
 
     #[test]
+    fn inbox_scan_command_carries_dismissed_paths() {
+        let mut app = App::new();
+        app.library = Some(make_minimal_library());
+        app.music_dir_cache = Some(std::path::PathBuf::from("/tmp/zytunes-music"));
+        app.inbox.last_request = None;
+        app.inbox.dismissed.insert("/inbox/skip.mp3".into());
+        app.maybe_request_inbox_scan();
+        let sent = app.pending_bg_commands.iter().find_map(|c| match c {
+            BgCommand::ScanInbox { dismissed, .. } => Some(dismissed),
+            _ => None,
+        });
+        assert!(
+            sent.is_some_and(|d| d.contains("/inbox/skip.mp3")),
+            "the worker must know what to skip before it reads or fingerprints"
+        );
+    }
+
+    #[test]
     fn inbox_scan_does_not_fire_on_first_tick() {
         let mut app = App::new();
         app.library = Some(make_minimal_library());
@@ -14513,7 +14534,9 @@ mod tests {
         app.inbox.last_request = None;
         app.maybe_request_inbox_scan();
         match app.pending_bg_commands.first() {
-            Some(BgCommand::ScanInbox { inbox, fingerprint }) => {
+            Some(BgCommand::ScanInbox {
+                inbox, fingerprint, ..
+            }) => {
                 assert!(inbox.ends_with("Automatically Add to Music"));
                 assert!(!*fingerprint, "no acoustid key → skip fingerprint");
             }

@@ -431,6 +431,9 @@ pub enum BgCommand {
     /// worker itself only reads tags.
     ScanInbox {
         inbox: PathBuf,
+        /// Locations dismissed this session. Dropped before the tag read
+        /// and the fingerprint decode, not after the scan returns.
+        dismissed: std::collections::HashSet<String>,
         fingerprint: bool,
     },
 }
@@ -2433,7 +2436,11 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                     }
                     let _ = event_tx.send(BgEvent::MbRecordingReleases { token, result });
                 }
-                BgCommand::ScanInbox { inbox, fingerprint } => {
+                BgCommand::ScanInbox {
+                    inbox,
+                    dismissed,
+                    fingerprint,
+                } => {
                     if let Err(e) = std::fs::create_dir_all(&inbox) {
                         let _ = event_tx.send(BgEvent::SyncMessage(format!(
                             "inbox: mkdir {}: {e}",
@@ -2442,7 +2449,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                     }
                     // Tag read only. Chromaprint stays off this thread — the
                     // worker also serves Connect, sync, and CD detection.
-                    let tracks = zytunes::library_layout::scan_inbox(&inbox, false);
+                    let tracks = zytunes::library_layout::scan_inbox(&inbox, &dismissed, false);
                     let needs_fp = fingerprint
                         && tracks
                             .iter()
