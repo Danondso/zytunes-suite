@@ -485,12 +485,29 @@ impl DirectoryLibrary {
             );
         }
 
-        // Surgical updates only touch `paths`, but a rename in a previous
-        // apply (or an external move) can leave other cache keys pointing
-        // at files that no longer exist. Those ghosts show up as a second
-        // sidebar artist when the remaining tags use different casing.
+        // Surgical updates only touch `paths`, but the apply can leave
+        // other cache keys pointing at files that no longer exist (a folder
+        // emptied by the move and removed, a sibling renamed along). Those
+        // ghosts show up as a second sidebar artist when the remaining
+        // tags use different casing. Only the folders the apply touched
+        // are checked: a stat of every cached file per apply is too much
+        // for a large library, and anything elsewhere is the full scan's
+        // business.
+        let touched: Vec<PathBuf> = paths
+            .iter()
+            .chain(vacated)
+            .filter_map(|p| p.parent().map(Path::to_path_buf))
+            .chain(
+                dir_renames
+                    .iter()
+                    .flat_map(|(old, new)| [old.clone(), new.clone()]),
+            )
+            .collect();
         let before = cached.len();
-        cached.retain(|path, _| Path::new(path).is_file());
+        cached.retain(|path, _| {
+            let path = Path::new(path);
+            !touched.iter().any(|dir| path.starts_with(dir)) || path.is_file()
+        });
         let pruned = before - cached.len();
         if pruned > 0 {
             log(&format!(
@@ -2287,6 +2304,95 @@ mod tests {
         .unwrap();
         assert_eq!(lib.track_count(), 0);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reread_paths_only_prunes_under_the_folders_the_apply_touched() {
+        let dir = std::env::temp_dir().join("zytunes-dirlib-reread-prune-scope");
+        let _ = fs::remove_dir_all(&dir);
+        let touched = dir.join("ArtistT").join("AlbumT");
+        let elsewhere = dir.join("ArtistE").join("AlbumE");
+        fs::create_dir_all(&touched).unwrap();
+        fs::create_dir_all(&elsewhere).unwrap();
+        let retagged = touched.join("01 Retagged.mp3");
+        let ghost_here = touched.join("02 Ghost.mp3");
+        let ghost_elsewhere = elsewhere.join("01 Ghost.mp3");
+        for p in [&retagged, &ghost_here, &ghost_elsewhere] {
+            fs::write(p, b"fake").unwrap();
+        }
+        let _ = DirectoryLibrary::scan_with_options(
+            dir.to_str().unwrap(),
+            ScanOptions::default(),
+            |_| {},
+        )
+        .unwrap();
+        fs::remove_file(&ghost_here).unwrap();
+        fs::remove_file(&ghost_elsewhere).unwrap();
+        let log = crate::cache::default_logger();
+        let lib = DirectoryLibrary::reread_paths(
+            dir.to_str().unwrap(),
+            std::slice::from_ref(&retagged),
+            false,
+            &log,
+        )
+        .unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        let paths: Vec<String> = lib
+            .all_tracks()
+            .filter_map(|t| t.location.clone())
+            .collect();
+        assert!(!paths.iter().any(|p| p == ghost_here.to_str().unwrap()));
+        // A surgical reread does not sweep the whole library: an entry in a
+        // folder the apply never touched is the full scan's business, and
+        // checking it would cost one stat per cached file per apply.
+        assert!(
+            paths.iter().any(|p| p == ghost_elsewhere.to_str().unwrap()),
+            "untouched folders are not stat-swept on every apply"
+        );
+    }
+
+    #[test]
+    fn reread_paths_prunes_the_folder_a_move_vacated() {
+        let dir = std::env::temp_dir().join("zytunes-dirlib-reread-prune-vacated");
+        let _ = fs::remove_dir_all(&dir);
+        let feat = dir.join("2Pac feat. Biggie").join("Album");
+        let canon = dir.join("2Pac").join("Album");
+        fs::create_dir_all(&feat).unwrap();
+        let moved_src = feat.join("01 A.mp3");
+        let ghost = feat.join("02 B.mp3");
+        fs::write(&moved_src, b"fake").unwrap();
+        fs::write(&ghost, b"fake").unwrap();
+        let _ = DirectoryLibrary::scan_with_options(
+            dir.to_str().unwrap(),
+            ScanOptions::default(),
+            |_| {},
+        )
+        .unwrap();
+        // The apply moved one file and something else removed the other.
+        fs::create_dir_all(&canon).unwrap();
+        let moved_dest = canon.join("01 A.mp3");
+        fs::rename(&moved_src, &moved_dest).unwrap();
+        fs::remove_file(&ghost).unwrap();
+        let log = crate::cache::default_logger();
+        let lib = DirectoryLibrary::reread_paths_after(
+            dir.to_str().unwrap(),
+            std::slice::from_ref(&moved_dest),
+            std::slice::from_ref(&moved_src),
+            &[],
+            false,
+            &log,
+        )
+        .unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        let paths: Vec<String> = lib
+            .all_tracks()
+            .filter_map(|t| t.location.clone())
+            .collect();
+        assert!(paths.iter().any(|p| p == moved_dest.to_str().unwrap()));
+        assert!(
+            !paths.iter().any(|p| p == ghost.to_str().unwrap()),
+            "the folder the move left is checked for ghosts"
+        );
     }
 
     #[test]
