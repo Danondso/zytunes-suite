@@ -30,8 +30,6 @@ use symphonia::core::probe::Hint;
 /// ID3 `TXXX:Acoustid Fingerprint` and Vorbis `ACOUSTID_FINGERPRINT` surface
 /// as `ItemKey::Unknown(name)` in lofty 0.22 — there's no dedicated variant —
 /// so we match on the stored name case-insensitively.
-const ACOUSTID_TAG_KEYS: &[&str] = &["Acoustid Fingerprint", "ACOUSTID_FINGERPRINT"];
-
 /// Seconds of audio to feed the fingerprinter. Chromaprint's AcoustID-default
 /// (Test2) configuration summarises the first ~2 minutes of a track; decoding
 /// further is wasted I/O that doesn't change the fingerprint.
@@ -40,8 +38,9 @@ const FINGERPRINT_SECONDS: u64 = 120;
 /// Read a pre-computed acoustic fingerprint from the file's tags, if any.
 ///
 /// Matches the tag name MusicBrainz Picard / fpcalc write:
-///   - Vorbis Comment / MP4: `ACOUSTID_FINGERPRINT`
+///   - Vorbis Comment: `ACOUSTID_FINGERPRINT`
 ///   - ID3v2: `TXXX:Acoustid Fingerprint`
+///   - MP4: `----:com.apple.iTunes:Acoustid Fingerprint`
 ///
 /// Returns the stored string verbatim — it's opaque to callers.
 pub fn read_embedded_fingerprint(path: &Path) -> Option<String> {
@@ -58,14 +57,17 @@ pub fn read_embedded_fingerprint(path: &Path) -> Option<String> {
         .ok()?;
     let tag = tagged.primary_tag().or_else(|| tagged.first_tag())?;
 
+    fingerprint_from_tag(tag)
+}
+
+/// The stored fingerprint under any spelling Picard uses (see
+/// [`crate::picard_keys`]).
+pub fn fingerprint_from_tag(tag: &lofty::tag::Tag) -> Option<String> {
     for item in tag.items() {
         let ItemKey::Unknown(name) = item.key() else {
             continue;
         };
-        if !ACOUSTID_TAG_KEYS
-            .iter()
-            .any(|k| name.eq_ignore_ascii_case(k))
-        {
+        if !crate::picard_keys::PicardField::AcoustidFingerprint.matches(name) {
             continue;
         }
         if let ItemValue::Text(v) = item.value() {
@@ -380,5 +382,16 @@ mod tests {
             "fingerprint_for must short-circuit on the embedded tag"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fingerprint_is_found_under_the_mp4_freeform_key() {
+        use lofty::tag::{ItemKey, ItemValue, Tag, TagItem, TagType};
+        let mut tag = Tag::new(TagType::Mp4Ilst);
+        tag.insert_unchecked(TagItem::new(
+            ItemKey::Unknown("----:com.apple.iTunes:Acoustid Fingerprint".into()),
+            ItemValue::Text("AQADtHJ0".into()),
+        ));
+        assert_eq!(fingerprint_from_tag(&tag).as_deref(), Some("AQADtHJ0"));
     }
 }

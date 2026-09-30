@@ -283,15 +283,17 @@ fn write_release_identifiers(
     // it impossible to write Picard's `TXXX:ASIN` via this path — Picard
     // reaches `Id3v2Tag::insert_user_text` directly. We skip ASIN; our
     // library scanner doesn't read it, and Picard can re-fetch from MB.
+    // Picard stores status and type lowercase ("official", "single");
+    // matching it keeps the tag-manager diff quiet on ripped files.
     if let Some(status) = release.status.as_deref() {
-        set_unknown_string(tag, "MUSICBRAINZ_ALBUMSTATUS", status);
+        set_unknown_string(tag, "MUSICBRAINZ_ALBUMSTATUS", &status.to_lowercase());
     }
     if let Some(album_type) = release
         .release_group
         .as_ref()
         .and_then(|rg| rg.primary_type.as_deref())
     {
-        set_unknown_string(tag, "MUSICBRAINZ_ALBUMTYPE", album_type);
+        set_unknown_string(tag, "MUSICBRAINZ_ALBUMTYPE", &album_type.to_lowercase());
     }
     if let Some(country) = release.country.as_deref() {
         set_unknown_string(tag, "RELEASECOUNTRY", country);
@@ -318,17 +320,49 @@ pub(crate) fn set_string(tag: &mut Tag, key: ItemKey, value: &str) {
     }
 }
 
+/// Write one of the Picard-style fields that lofty has no key for.
+///
+/// `name` is the canonical (Vorbis) spelling; the key actually written
+/// follows the container (see [`crate::picard_keys`]), and every other
+/// spelling of the same field is removed first so a Picard-tagged MP3
+/// does not end up with two differently named copies. `SCRIPT` has a
+/// lofty key in every container and goes through that.
+///
+/// `Tag::insert` verifies a static ItemKey↔TagType mapping exists and
+/// silently drops `ItemKey::Unknown`; `insert_unchecked` skips the check
+/// and lofty's per-format writer routes the item through TXXX (ID3v2) /
+/// the named comment (Vorbis) / the freeform atom (MP4).
 pub(crate) fn set_unknown_string(tag: &mut Tag, name: &str, value: &str) {
+    use crate::picard_keys::{strip_freeform_prefix, PicardField};
     if value.is_empty() {
         return;
     }
-    // `Tag::insert` verifies a static ItemKey↔TagType mapping exists and
-    // silently drops `ItemKey::Unknown`. `insert_unchecked` skips the
-    // check; lofty's per-format writer then routes the Unknown item
-    // through TXXX (ID3v2) / generic user-defined keys (Vorbis Comments,
-    // MP4 freeform) by description. See lofty::tag::Tag::insert docs.
+    if name.eq_ignore_ascii_case("SCRIPT") {
+        tag.retain(|i| {
+            !matches!(i.key(), ItemKey::Unknown(k) if strip_freeform_prefix(k).eq_ignore_ascii_case("SCRIPT"))
+        });
+        // lofty maps SCRIPT in Vorbis and MP4 but has no ID3v2 mapping;
+        // there it is Picard's `TXXX:SCRIPT`.
+        if tag.tag_type() == TagType::Id3v2 {
+            tag.insert_unchecked(TagItem::new(
+                ItemKey::Unknown("SCRIPT".into()),
+                ItemValue::Text(value.to_string()),
+            ));
+        } else {
+            set_string(tag, ItemKey::Script, value);
+        }
+        return;
+    }
+    let Some(field) = PicardField::from_canonical(name) else {
+        tag.insert_unchecked(TagItem::new(
+            ItemKey::Unknown(name.to_string()),
+            ItemValue::Text(value.to_string()),
+        ));
+        return;
+    };
+    tag.retain(|i| !matches!(i.key(), ItemKey::Unknown(k) if field.matches(k)));
     tag.insert_unchecked(TagItem::new(
-        ItemKey::Unknown(name.to_string()),
+        ItemKey::Unknown(field.key_for(tag.tag_type())),
         ItemValue::Text(value.to_string()),
     ));
 }
@@ -767,8 +801,9 @@ mod tests {
         tag_ripped_file(&path, &rel, &mb_track("T", 1), 1, Some(1), None, None).unwrap();
 
         assert_eq!(
-            read_unknown(&path, "MUSICBRAINZ_ALBUMSTATUS").as_deref(),
-            Some("Official")
+            read_unknown(&path, "MusicBrainz Album Status").as_deref(),
+            Some("official"),
+            "Picard's ID3 spelling and lowercase value"
         );
     }
 
@@ -779,7 +814,10 @@ mod tests {
         rel.country = Some("GB".into());
         tag_ripped_file(&path, &rel, &mb_track("T", 1), 1, Some(1), None, None).unwrap();
 
-        assert_eq!(read_unknown(&path, "RELEASECOUNTRY").as_deref(), Some("GB"));
+        assert_eq!(
+            read_unknown(&path, "MusicBrainz Album Release Country").as_deref(),
+            Some("GB")
+        );
     }
 
     #[test]
@@ -797,11 +835,11 @@ mod tests {
         tag_ripped_file(&path, &rel, &mb_track("T", 1), 1, Some(1), None, None).unwrap();
 
         assert_eq!(
-            read_unknown(&path, "MUSICBRAINZ_ALBUMTYPE").as_deref(),
-            Some("Album")
+            read_unknown(&path, "MusicBrainz Album Type").as_deref(),
+            Some("album")
         );
         assert_eq!(
-            read_unknown(&path, "MUSICBRAINZ_ALBUMPACKAGING").as_deref(),
+            read_unknown(&path, "MusicBrainz Album Packaging").as_deref(),
             Some("Gatefold Cover")
         );
     }
@@ -950,7 +988,7 @@ mod tests {
         tag_ripped_fingerprint(&path, "AQADtIqYRYmS_AeOJUuOK0d6_FcOpcePZkePI8eRJD8q5FdyZP9hHB-OH_2P_DhxJEdy_DhyHEdy_NCPI9eR/zhxnEcePOmRH8mPHzmS_ChyHEdy_PiP/8jx48iRHTny47i").unwrap();
 
         assert!(
-            read_unknown(&path, "ACOUSTID_FINGERPRINT").is_some_and(|v| v.starts_with("AQAD")),
+            read_unknown(&path, "Acoustid Fingerprint").is_some_and(|v| v.starts_with("AQAD")),
             "ACOUSTID_FINGERPRINT tag should be present and carry the written value"
         );
         // Pre-existing MB tags must still be there — the fingerprint write
@@ -983,7 +1021,7 @@ mod tests {
         // the caller from accidentally clearing a previously-written tag.
         let path = write_test_wav("acoustid-fp-empty");
         tag_ripped_fingerprint(&path, "").unwrap();
-        assert!(read_unknown(&path, "ACOUSTID_FINGERPRINT").is_none());
+        assert!(read_unknown(&path, "Acoustid Fingerprint").is_none());
     }
 
     #[test]

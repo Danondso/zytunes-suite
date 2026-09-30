@@ -75,18 +75,23 @@ fn read_on_disk_extras(path: &Path) -> OnDiskExtras {
     let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) else {
         return OnDiskExtras::default();
     };
+    extras_from_tag(tag)
+}
+
+/// Pull the Picard-style fields out of one tag, whatever the container
+/// spelled them as (see [`crate::picard_keys`]).
+fn extras_from_tag(tag: &Tag) -> OnDiskExtras {
+    use crate::picard_keys::PicardField;
     let media = tag
         .get_string(&ItemKey::OriginalMediaType)
         .map(|s| s.to_string());
-    // Picard TXXX fields are stored as `ItemKey::Unknown(description)`.
-    // Match case-insensitively because some legacy taggers used title-cased
-    // descriptions ("MusicBrainz Album Type" vs "MUSICBRAINZ_ALBUMTYPE")
-    // and lofty surfaces both verbatim.
+    // lofty knows SCRIPT in every container; older files may still carry
+    // it under an unknown key.
+    let mut script = tag.get_string(&ItemKey::Script).map(|s| s.to_string());
     let mut musicbrainz_album_type = None;
     let mut musicbrainz_album_status = None;
     let mut musicbrainz_album_packaging = None;
     let mut release_country = None;
-    let mut script = None;
     let mut acoustid_fingerprint = None;
     for item in tag.items() {
         let ItemKey::Unknown(name) = item.key() else {
@@ -98,27 +103,17 @@ fn read_on_disk_extras(path: &Path) -> OnDiskExtras {
         if value.is_empty() {
             continue;
         }
-        let slot = if name.eq_ignore_ascii_case("MUSICBRAINZ_ALBUMTYPE")
-            || name.eq_ignore_ascii_case("MusicBrainz Album Type")
-        {
+        let slot = if PicardField::AlbumType.matches(name) {
             &mut musicbrainz_album_type
-        } else if name.eq_ignore_ascii_case("MUSICBRAINZ_ALBUMSTATUS")
-            || name.eq_ignore_ascii_case("MusicBrainz Album Status")
-        {
+        } else if PicardField::AlbumStatus.matches(name) {
             &mut musicbrainz_album_status
-        } else if name.eq_ignore_ascii_case("MUSICBRAINZ_ALBUMPACKAGING")
-            || name.eq_ignore_ascii_case("MusicBrainz Album Packaging")
-        {
+        } else if PicardField::AlbumPackaging.matches(name) {
             &mut musicbrainz_album_packaging
-        } else if name.eq_ignore_ascii_case("RELEASECOUNTRY")
-            || name.eq_ignore_ascii_case("MusicBrainz Album Release Country")
-        {
+        } else if PicardField::ReleaseCountry.matches(name) {
             &mut release_country
-        } else if name.eq_ignore_ascii_case("SCRIPT") {
+        } else if crate::picard_keys::strip_freeform_prefix(name).eq_ignore_ascii_case("SCRIPT") {
             &mut script
-        } else if name.eq_ignore_ascii_case("ACOUSTID_FINGERPRINT")
-            || name.eq_ignore_ascii_case("Acoustid Fingerprint")
-        {
+        } else if PicardField::AcoustidFingerprint.matches(name) {
             &mut acoustid_fingerprint
         } else {
             continue;
@@ -551,11 +546,14 @@ fn build_track_fields(
     let mb_genre = pick_top_genre(release);
     push(FieldKind::Identity, "Genre", lib.genre.clone(), mb_genre);
 
-    // Album Type (Picard MUSICBRAINZ_ALBUMTYPE): "Album" / "Single" / "EP" / ...
+    // Album Type (Picard MUSICBRAINZ_ALBUMTYPE): "album" / "single" / "ep".
+    // MusicBrainz capitalises these; Picard stores them lowercase, and a
+    // Picard-tagged file must not show "single" → "Single" as a change.
     let album_type = release
         .release_group
         .as_ref()
-        .and_then(|rg| rg.primary_type.clone());
+        .and_then(|rg| rg.primary_type.as_deref())
+        .map(str::to_lowercase);
     push(
         FieldKind::Picard,
         "MUSICBRAINZ_ALBUMTYPE",
@@ -573,7 +571,7 @@ fn build_track_fields(
         FieldKind::Picard,
         "MUSICBRAINZ_ALBUMSTATUS",
         extras.musicbrainz_album_status.clone(),
-        release.status.clone(),
+        release.status.as_deref().map(str::to_lowercase),
     );
     push(
         FieldKind::Picard,
@@ -1761,6 +1759,168 @@ mod tests {
     }
 
     #[test]
+    fn extras_read_picard_spellings_from_every_container() {
+        use lofty::tag::{ItemKey, ItemValue, Tag, TagItem, TagType};
+        let unknown = |tag: &mut Tag, key: &str, value: &str| {
+            tag.insert_unchecked(TagItem::new(
+                ItemKey::Unknown(key.into()),
+                ItemValue::Text(value.into()),
+            ));
+        };
+        // MP4: freeform atoms come back with the full prefixed key.
+        let mut mp4 = Tag::new(TagType::Mp4Ilst);
+        unknown(
+            &mut mp4,
+            "----:com.apple.iTunes:MusicBrainz Album Type",
+            "single",
+        );
+        unknown(
+            &mut mp4,
+            "----:com.apple.iTunes:MusicBrainz Album Status",
+            "official",
+        );
+        unknown(
+            &mut mp4,
+            "----:com.apple.iTunes:MusicBrainz Album Release Country",
+            "XW",
+        );
+        unknown(
+            &mut mp4,
+            "----:com.apple.iTunes:Acoustid Fingerprint",
+            "AQAD...",
+        );
+        let ex = extras_from_tag(&mp4);
+        assert_eq!(ex.musicbrainz_album_type.as_deref(), Some("single"));
+        assert_eq!(ex.musicbrainz_album_status.as_deref(), Some("official"));
+        assert_eq!(ex.release_country.as_deref(), Some("XW"));
+        assert_eq!(ex.acoustid_fingerprint.as_deref(), Some("AQAD..."));
+
+        // Vorbis: lofty maps SCRIPT to its own key.
+        let mut vorbis = Tag::new(TagType::VorbisComments);
+        vorbis.insert(TagItem::new(
+            ItemKey::Script,
+            ItemValue::Text("Latn".into()),
+        ));
+        assert_eq!(extras_from_tag(&vorbis).script.as_deref(), Some("Latn"));
+    }
+
+    #[test]
+    fn picard_album_type_and_status_compare_lowercase() {
+        let dir = fresh_dir("picard-lowercase");
+        let path = dir.join("song.wav");
+        write_sine_wav(&path, 1);
+        let lib = make_lib_track(&path, "First", 1);
+        let mut rel = make_release("Album", "Artist");
+        rel.status = Some("Official".into());
+        rel.release_group = Some(crate::musicbrainz::ReleaseGroup {
+            id: "rg-1".into(),
+            title: "Album".into(),
+            primary_type: Some("Single".into()),
+            first_release_date: None,
+            genres: vec![],
+        });
+        let diff = build_release_diff(&[lib], &rel, &dir, DiffScope::Track, None);
+        let proposed = |name: &str| {
+            diff.tracks[0]
+                .fields
+                .iter()
+                .find(|f| f.name == name)
+                .and_then(|f| f.proposed.clone())
+        };
+        assert_eq!(proposed("MUSICBRAINZ_ALBUMTYPE").as_deref(), Some("single"));
+        assert_eq!(
+            proposed("MUSICBRAINZ_ALBUMSTATUS").as_deref(),
+            Some("official")
+        );
+    }
+
+    /// Apply a full release to a real file of each container ffmpeg can
+    /// produce here, re-read it, and check nothing is left to change.
+    /// Skipped when ffmpeg is not installed.
+    #[test]
+    fn apply_round_trips_in_every_container() {
+        if std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            eprintln!("ffmpeg not installed; skipping container round trip");
+            return;
+        }
+        let dir = fresh_dir("container-round-trip");
+        let seed = dir.join("seed.wav");
+        write_sine_wav(&seed, 2);
+        let mut rel = make_release("Album", "Artist");
+        rel.country = Some("US".into());
+        rel.status = Some("Official".into());
+        rel.packaging = Some("Jewel Case".into());
+        rel.barcode = Some("074645147529".into());
+        rel.genres = vec![crate::musicbrainz::MbGenre {
+            name: "grunge".into(),
+            count: 5,
+        }];
+        rel.text_representation = Some(crate::musicbrainz::TextRepresentation {
+            language: Some("eng".into()),
+            script: Some("Latn".into()),
+        });
+        rel.release_group = Some(crate::musicbrainz::ReleaseGroup {
+            id: "rg-1".into(),
+            title: "Album".into(),
+            primary_type: Some("Single".into()),
+            first_release_date: Some("1969".into()),
+            genres: vec![],
+        });
+        for (ext, codec) in [
+            ("mp3", "libmp3lame"),
+            ("flac", "flac"),
+            ("m4a", "alac"),
+            ("ogg", "libvorbis"),
+        ] {
+            let root = dir.join(ext);
+            let path = root
+                .join("Artist")
+                .join("Album")
+                .join(format!("01 - First.{ext}"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let status = std::process::Command::new("ffmpeg")
+                .args(["-y", "-loglevel", "error", "-i"])
+                .arg(&seed)
+                .args([
+                    "-c:a",
+                    codec,
+                    "-metadata",
+                    "title=First",
+                    "-metadata",
+                    "artist=Artist",
+                ])
+                .arg(&path)
+                .status()
+                .unwrap();
+            if !status.success() {
+                eprintln!("ffmpeg cannot encode {ext} here; skipping");
+                continue;
+            }
+            let read = || crate::dirlib::track_from_lofty(&path, 1).expect("tagged file");
+            let mut diff = build_release_diff(&[read()], &rel, &root, DiffScope::Track, None);
+            for f in &mut diff.tracks[0].fields {
+                if f.kind == FieldKind::Filename {
+                    f.enabled = false;
+                }
+            }
+            let out = apply_release_diff(&diff, &root);
+            assert!(out.results[0].is_ok(), "{ext}: {:?}", out.results[0]);
+            let again = build_release_diff(&[read()], &rel, &root, DiffScope::Track, None);
+            let left: Vec<String> = again.tracks[0]
+                .fields
+                .iter()
+                .filter(|f| f.enabled && f.kind != FieldKind::Filename)
+                .map(|f| format!("{}: {:?} -> {:?}", f.name, f.current, f.proposed))
+                .collect();
+            assert!(left.is_empty(), "{ext} still proposes {left:#?}");
+        }
+    }
+
+    #[test]
     fn apply_release_diff_writes_year_field() {
         // Regression: `build_track_fields` pushes the date row with name
         // "Year", but `apply_field` previously matched only "Release Date" —
@@ -2404,8 +2564,9 @@ mod tests {
                 .and_then(|i| i.value().text().map(str::to_string))
         };
         assert_eq!(
-            find("ACOUSTID_FINGERPRINT").as_deref(),
-            Some("AQADtBR=writeMe")
+            find("Acoustid Fingerprint").as_deref(),
+            Some("AQADtBR=writeMe"),
+            "ID3v2 uses Picard's TXXX description"
         );
         assert_eq!(find("ACOUSTID_ID").as_deref(), Some("uuid-to-write"));
     }
