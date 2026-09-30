@@ -1103,9 +1103,12 @@ fn retitle_case_along(src: &Path, dest: &Path) -> Result<(), String> {
                     })?;
                     let renamed = parent.join(want);
                     std::fs::rename(&tmp, &renamed).map_err(|e| {
+                        // Put the old name back: a folder left under the
+                        // hidden temp name drops out of the library.
+                        let _ = std::fs::rename(&tmp, &built);
                         format!(
                             "case retitle {} -> {}: {e}",
-                            tmp.display(),
+                            built.display(),
                             renamed.display()
                         )
                     })?;
@@ -1120,20 +1123,36 @@ fn retitle_case_along(src: &Path, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn perform_rename(src: &Path, dest: &Path) -> Result<(), String> {
-    if is_case_only_rename(src, dest) {
-        let distinct_target = match (src.parent(), dest.parent()) {
-            (Some(src_parent), Some(dest_parent)) => {
-                dest_parent.exists() && !same_inode(src_parent, dest_parent)
+/// Some component's new spelling already names a DIFFERENT entry (a
+/// case-sensitive volume holding both `alice in chains/` and
+/// `Alice In Chains/`). Retitling would rename one folder onto the other;
+/// the file has to be moved into the existing folder instead.
+fn retitle_target_taken(src: &Path, dest: &Path) -> bool {
+    let mut have_path = PathBuf::new();
+    for (have_c, want_c) in src.components().zip(dest.components()) {
+        match (have_c, want_c) {
+            (std::path::Component::Normal(have), std::path::Component::Normal(want)) => {
+                let target = have_path.join(want);
+                have_path.push(have);
+                if have != want
+                    && target.symlink_metadata().is_ok()
+                    && !same_inode(&have_path, &target)
+                {
+                    return true;
+                }
             }
-            _ => false,
-        };
-        // Same directory inode (or the target name does not exist yet):
-        // change the stored spelling in place. A separate target folder
-        // still takes the normal move below.
-        if !distinct_target {
-            return retitle_case_along(src, dest);
+            (other, _) => have_path.push(other),
         }
+    }
+    false
+}
+
+fn perform_rename(src: &Path, dest: &Path) -> Result<(), String> {
+    // Every new spelling is free (or is this same entry on a case-folding
+    // volume): change the stored names in place. Otherwise the canonical
+    // folder already exists separately and takes the normal move below.
+    if is_case_only_rename(src, dest) && !retitle_target_taken(src, dest) {
+        return retitle_case_along(src, dest);
     }
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
@@ -2664,6 +2683,75 @@ mod tests {
             std::fs::read(&dest).ok() == Some(canonical),
             "a failed move must leave the canonical copy untouched"
         );
+    }
+
+    fn temp_case_entries(root: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".zytunes-case-"))
+            .collect()
+    }
+
+    /// Wrong-case artist folder next to a populated canonical one. Only a
+    /// case-sensitive volume can hold both, so `None` elsewhere.
+    fn wrong_case_beside_canonical(
+        name: &str,
+    ) -> Option<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
+        let dir = fresh_dir(name);
+        if volume_folds_ascii_case(&dir) {
+            return None;
+        }
+        let src = dir
+            .join("alice in chains")
+            .join("Dirt")
+            .join("01 - Them Bones.wav");
+        let facelift = dir
+            .join("Alice In Chains")
+            .join("Facelift")
+            .join("01 - We Die Young.wav");
+        std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(facelift.parent().unwrap()).unwrap();
+        write_sine_wav(&src, 1);
+        write_sine_wav(&facelift, 1);
+        Some((dir, src, facelift))
+    }
+
+    #[test]
+    fn case_retitle_merges_into_existing_canonical_folder() {
+        let Some((dir, src, facelift)) = wrong_case_beside_canonical("case-merge") else {
+            return;
+        };
+        let dest = dir
+            .join("Alice In Chains")
+            .join("Dirt")
+            .join("01 - Them Bones.wav");
+
+        let (results, map) = apply_release_diff(&rename_only_diff(&src, &dest), &dir);
+        assert!(results[0].is_ok(), "{:?}", results[0]);
+        assert_eq!(map.get(&src), Some(&dest));
+        assert!(dest.exists(), "track must land in the canonical folder");
+        assert!(facelift.exists(), "the album already there is untouched");
+        assert!(
+            !dir.join("alice in chains").exists(),
+            "emptied wrong-case folder should be pruned"
+        );
+        assert_eq!(temp_case_entries(&dir), Vec::<String>::new());
+    }
+
+    #[test]
+    fn retitle_case_along_rolls_back_when_the_target_name_is_taken() {
+        let Some((dir, src, _)) = wrong_case_beside_canonical("case-rollback") else {
+            return;
+        };
+        let dest = dir
+            .join("Alice In Chains")
+            .join("Dirt")
+            .join("01 - Them Bones.wav");
+
+        assert!(retitle_case_along(&src, &dest).is_err());
+        assert!(src.exists(), "a failed retitle must restore the old name");
+        assert_eq!(temp_case_entries(&dir), Vec::<String>::new());
     }
 
     #[test]
