@@ -3092,6 +3092,19 @@ impl App {
                 self.sync.log.push(format!("tag-manager: {path}: {e}"));
             }
         }
+        // The overlay still reaches Done (the reread is real), so say it
+        // here: a write that only reached the log looked like the diff
+        // silently refusing to refresh.
+        let failed = results.iter().filter(|r| r.is_err()).count();
+        if failed > 0 {
+            self.set_toast(
+                format!(
+                    "{failed} track{} failed to write, see log (L)",
+                    if failed == 1 { "" } else { "s" }
+                ),
+                true,
+            );
+        }
         if let Some(overlay) = self.tag_manager.as_mut() {
             if overlay.accepts_token(token) {
                 overlay.last_rename_map = rename_map;
@@ -14450,6 +14463,32 @@ mod tests {
         assert!(overlay.filing);
         assert_eq!(overlay.source_album, "Album Two");
         assert!(app.inbox.queue.is_empty());
+    }
+
+    #[test]
+    fn failed_tag_writes_are_surfaced_not_just_logged() {
+        let mut app = make_app_with_library_for_tagmgr();
+        app.handle_tags_applied(
+            0,
+            vec![
+                Ok(()),
+                Err("lofty save failed: Invalid frame language".into()),
+            ],
+            std::collections::HashMap::new(),
+            &[],
+        );
+        assert!(
+            app.toast_message
+                .as_ref()
+                .is_some_and(|(m, _, err)| *err && m.contains("1 track") && m.contains("log")),
+            "the user must see that a write failed, got {:?}",
+            app.toast_message
+        );
+        assert!(app
+            .sync
+            .log
+            .iter()
+            .any(|l| l.contains("Invalid frame language")));
     }
 
     #[test]
