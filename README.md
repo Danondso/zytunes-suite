@@ -117,7 +117,7 @@ Bindings are context-sensitive. An open modal (search, help, CD import, tag mana
 
 | Key | Action |
 |-----|--------|
-| `/` | Search sidebar (live filter, `Esc` to cancel) |
+| `/` | Search sidebar (live filter, `Esc` to cancel). Matching folds Unicode compatibility forms, so `gore` finds an artist credited as `𝐺𝑂𝑅𝐸` |
 | `s` | Cycle sort column (TrackList panel) |
 | `I` | Track-info popup (TrackList panel, any browse mode) — `j`/`k` or arrows scroll, `g`/`G` top/end, `PageUp`/`PageDown` page, `Esc`/`q`/`I` close |
 | `a` | Add current selection to the sync queue |

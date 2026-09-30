@@ -121,16 +121,26 @@ impl SidebarEntry {
     /// `rebuild_sidebar_source` so `/` keystrokes never re-lowercase.
     pub fn lowercase_key(&self) -> String {
         match self {
-            SidebarEntry::Artist(a) => a.to_lowercase(),
+            SidebarEntry::Artist(a) => search_key(a),
             SidebarEntry::Album { artist, album } => {
-                let mut out = artist.to_lowercase();
+                let mut out = search_key(artist);
                 out.push('\n');
-                out.push_str(&album.to_lowercase());
+                out.push_str(&search_key(album));
                 out
             }
-            SidebarEntry::Playlist { name, .. } => name.to_lowercase(),
+            SidebarEntry::Playlist { name, .. } => search_key(name),
         }
     }
+}
+
+/// Fold a name for `/` matching: compatibility-normalised (NFKC), then
+/// lowercased. NFKC maps stylised letters onto their plain forms, so an
+/// artist MusicBrainz credits as `𝐺𝑂𝑅𝐸` (Mathematical Alphanumerics)
+/// or in fullwidth letters is found by typing `gore`. The stored name is
+/// never changed; only the comparison key is.
+pub fn search_key(s: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    s.nfkc().collect::<String>().to_lowercase()
 }
 
 impl std::fmt::Display for SidebarEntry {
@@ -4944,7 +4954,7 @@ impl App {
     /// and clones matching entries — no new `to_lowercase` allocations.
     pub fn apply_sidebar_filter(&mut self) {
         if self.search_active && !self.search_query.is_empty() {
-            let q = self.search_query.to_lowercase();
+            let q = search_key(&self.search_query);
             self.sidebar_items = self
                 .sidebar_items_full
                 .iter()
@@ -9523,6 +9533,36 @@ mod tests {
                 "Disc2 Track2",
                 "No Number",
             ]
+        );
+    }
+
+    #[test]
+    fn search_matches_stylised_unicode_artist_names() {
+        // MusicBrainz credits some artists in Mathematical Alphanumeric
+        // letters (`𝐺𝑂𝑅𝐸`). The name is kept as-is; typing `gore` must
+        // still find it.
+        let mut app = App::new();
+        app.browse_mode = BrowseMode::Device;
+        app.sidebar_mode = SidebarMode::Artists;
+        app.device.artists = vec![
+            "\u{1D43A}\u{1D442}\u{1D445}\u{1D438}".into(),
+            "Beatles".into(),
+        ];
+        app.search_active = true;
+        app.search_query = "gore".into();
+        app.refresh_sidebar();
+        assert_eq!(
+            app.sidebar_items,
+            vec![SidebarEntry::Artist(
+                "\u{1D43A}\u{1D442}\u{1D445}\u{1D438}".into()
+            )]
+        );
+        // And a fullwidth query still matches a plain name.
+        app.search_query = "\u{FF22}eat".into();
+        app.apply_sidebar_filter();
+        assert_eq!(
+            app.sidebar_items,
+            vec![SidebarEntry::Artist("Beatles".into())]
         );
     }
 
