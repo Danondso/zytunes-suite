@@ -91,7 +91,10 @@ pub fn tag_ripped_file(
         &render_artist_credit(&track.artist_credit),
     );
 
-    let album_artist = render_artist_credit(&release.artist_credit);
+    // Same spelling as the `{AlbumArtist}/` folder the rip lands in, so
+    // the sidebar groups the rip where the file is and a later `m` has
+    // nothing to propose. Featuring credits stay on the track artist.
+    let album_artist = canonical_album_artist(&release.artist_credit);
     if !album_artist.is_empty() {
         set_string(tag, ItemKey::AlbumArtist, &album_artist);
     }
@@ -639,6 +642,39 @@ mod tests {
 
         assert_eq!(read_text(&path, &ItemKey::DiscNumber).as_deref(), Some("1"));
         assert_eq!(read_text(&path, &ItemKey::DiscTotal).as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn tags_album_artist_with_the_same_canonical_name_as_the_folder() {
+        let path = write_test_wav("feat-album-artist");
+        let mut rel = release("All Eyez On Me", "2Pac", None);
+        rel.artist_credit = vec![
+            ArtistCredit {
+                name: "2Pac".into(),
+                joinphrase: Some(" featuring ".into()),
+                artist: None,
+            },
+            ArtistCredit {
+                name: "The Notorious B.I.G.".into(),
+                joinphrase: None,
+                artist: None,
+            },
+        ];
+        let mut track = mb_track("T", 1);
+        track.artist_credit = rel.artist_credit.clone();
+        tag_ripped_file(&path, &rel, &track, 1, Some(1), None, None).unwrap();
+        // The file lands under 2Pac/; the sidebar groups by ALBUMARTIST,
+        // so the tag has to agree or the rip shows up under the feat name
+        // and m immediately proposes the canonical one.
+        assert_eq!(
+            read_text(&path, &ItemKey::AlbumArtist).as_deref(),
+            Some("2Pac")
+        );
+        assert_eq!(
+            read_text(&path, &ItemKey::TrackArtist).as_deref(),
+            Some("2Pac featuring The Notorious B.I.G."),
+            "the featuring credit stays on the track artist"
+        );
     }
 
     #[test]
