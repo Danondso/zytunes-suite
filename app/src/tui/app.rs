@@ -1079,7 +1079,7 @@ impl Default for CdState {
 /// sibling of `music_dir` — see `library_layout::default_inbox_dir`.
 pub struct InboxState {
     /// When the most recent `ScanInbox` was sent. Seeded to `now` at
-    /// startup so the first tick doesn't mkdir-scan before the library
+    /// startup so the first tick doesn't scan before the library
     /// has loaded.
     pub last_request: Option<Instant>,
     pub scan_in_flight: bool,
@@ -1088,6 +1088,10 @@ pub struct InboxState {
     /// Inbox locations the user dismissed this session. Filtered out of
     /// later scans until the TUI restarts.
     pub dismissed: HashSet<String>,
+    /// The first scan of the session asked the worker to create the inbox
+    /// folder. Later scans only read it, so an unwritable parent logs one
+    /// line instead of one every poll.
+    pub dir_requested: bool,
 }
 
 impl Default for InboxState {
@@ -1097,6 +1101,7 @@ impl Default for InboxState {
             scan_in_flight: false,
             queue: VecDeque::new(),
             dismissed: HashSet::new(),
+            dir_requested: false,
         }
     }
 }
@@ -6045,6 +6050,7 @@ impl App {
             inbox,
             dismissed: self.inbox.dismissed.clone(),
             fingerprint,
+            create_dir: !std::mem::replace(&mut self.inbox.dir_requested, true),
         });
     }
 
@@ -14572,6 +14578,28 @@ mod tests {
                 "{name}: the drop is picked up by the next poll once the modal closes"
             );
         }
+    }
+
+    #[test]
+    fn inbox_folder_is_created_by_the_first_scan_only() {
+        let mut app = App::new();
+        app.library = Some(make_minimal_library());
+        app.music_dir_cache = Some(std::path::PathBuf::from("/tmp/zytunes-music"));
+        let mut flags = Vec::new();
+        for _ in 0..3 {
+            app.inbox.last_request = None;
+            app.inbox.scan_in_flight = false;
+            app.maybe_request_inbox_scan();
+            flags.extend(app.pending_bg_commands.drain(..).filter_map(|c| match c {
+                BgCommand::ScanInbox { create_dir, .. } => Some(create_dir),
+                _ => None,
+            }));
+        }
+        assert_eq!(
+            flags,
+            vec![true, false, false],
+            "one mkdir (and at most one failure log line) per session, not one per poll"
+        );
     }
 
     #[test]

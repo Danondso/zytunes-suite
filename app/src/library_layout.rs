@@ -325,4 +325,12 @@ mod tests {
         assert_eq!(names.len(), 1, "{names:?}");
         assert!(names[0].ends_with("keep.wav"));
     }
+
+    #[test]
+    fn scan_inbox_missing_dir_is_empty_and_not_created() {
+        let dir = std::env::temp_dir().join(format!("zytunes-inbox-absent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(scan_inbox(&dir, &HashSet::new(), false).is_empty());
+        assert!(!dir.exists(), "scanning must not create the folder");
+    }
 }

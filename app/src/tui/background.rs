@@ -435,6 +435,10 @@ pub enum BgCommand {
         /// and the fingerprint decode, not after the scan returns.
         dismissed: std::collections::HashSet<String>,
         fingerprint: bool,
+        /// Create the inbox folder before scanning. Set on the first scan
+        /// of a session only: the folder exists by default, but a parent
+        /// that refuses the mkdir must not log every poll.
+        create_dir: bool,
     },
 }
 
@@ -2440,12 +2444,15 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                     inbox,
                     dismissed,
                     fingerprint,
+                    create_dir,
                 } => {
-                    if let Err(e) = std::fs::create_dir_all(&inbox) {
-                        let _ = event_tx.send(BgEvent::SyncMessage(format!(
-                            "inbox: mkdir {}: {e}",
-                            inbox.display()
-                        )));
+                    if create_dir {
+                        if let Err(e) = std::fs::create_dir_all(&inbox) {
+                            let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                                "inbox: could not create {} ({e}); create it by hand to drop music there",
+                                inbox.display()
+                            )));
+                        }
                     }
                     // Tag read only. Chromaprint stays off this thread — the
                     // worker also serves Connect, sync, and CD detection.
