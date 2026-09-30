@@ -2759,10 +2759,11 @@ impl App {
                         .contains_key(std::path::Path::new(loc.as_str())))
             });
         self.inbox.dismissed.extend(still_there.cloned());
+        // A dismiss keeps the rest of the queue: those clusters were
+        // already tag-read and fingerprinted, and the next poll opens the
+        // next one from the queue instead of rescanning the inbox.
         if applied || advance {
             self.open_next_file_cluster(cmd_tx);
-        } else {
-            self.inbox.queue.clear();
         }
     }
 
@@ -6121,7 +6122,19 @@ impl App {
         if self.modal_open() {
             return;
         }
+        let due = match self.inbox.last_request {
+            None => true,
+            Some(t) => t.elapsed() >= POLL_INTERVAL,
+        };
+        if !due {
+            return;
+        }
+        // Clusters left from an earlier scan (a dismissed run, or a result
+        // that arrived under a modal) open from the queue: no rescan, no
+        // second fingerprint pass.
         if !self.inbox.queue.is_empty() {
+            self.inbox.last_request = Some(Instant::now());
+            self.open_next_file_cluster(None);
             return;
         }
         if self.library.is_none() {
@@ -6133,13 +6146,6 @@ impl App {
         let Some(inbox) = zytunes::library_layout::default_inbox_dir(music_dir) else {
             return;
         };
-        let due = match self.inbox.last_request {
-            None => true,
-            Some(t) => t.elapsed() >= POLL_INTERVAL,
-        };
-        if !due {
-            return;
-        }
         self.inbox.last_request = Some(Instant::now());
         self.inbox.scan_in_flight = true;
         let fingerprint = self.scan_fingerprint && self.acoustid_app_key.is_some();
@@ -6153,11 +6159,6 @@ impl App {
 
     pub fn on_inbox_scanned(&mut self, tracks: Vec<Track>) {
         self.inbox.scan_in_flight = false;
-        // A modal opened while the scan was in flight. Drop this result;
-        // the next poll after it closes finds the same files.
-        if self.modal_open() {
-            return;
-        }
         let tracks: Vec<Track> = tracks
             .into_iter()
             .filter(|t| {
@@ -6169,7 +6170,15 @@ impl App {
         if tracks.is_empty() {
             return;
         }
-        self.enqueue_file_clusters(zytunes::library_layout::cluster_by_album(tracks), None);
+        let clusters = zytunes::library_layout::cluster_by_album(tracks);
+        // A modal opened while the scan was in flight. Keep the result
+        // (it carries fingerprints that took seconds per file) and let the
+        // next poll open it once the modal closes.
+        if self.modal_open() {
+            self.inbox.queue.extend(clusters);
+            return;
+        }
+        self.enqueue_file_clusters(clusters, None);
     }
 
     pub fn set_toast(&mut self, msg: String, is_error: bool) {
@@ -14783,13 +14792,82 @@ mod tests {
                 app.tag_manager.is_none(),
                 "{name}: the filing overlay must not steal keys from an open modal"
             );
+            assert_eq!(
+                app.inbox.queue.len(),
+                1,
+                "{name}: the scanned (and fingerprinted) cluster is kept, not thrown away"
+            );
             set(&mut app, false);
-            app.on_inbox_scanned(vec![drop.clone()]);
+            app.inbox.last_request = None;
+            app.maybe_request_inbox_scan();
             assert!(
                 app.tag_manager.is_some(),
-                "{name}: the drop is picked up by the next poll once the modal closes"
+                "{name}: the next poll opens the queued cluster once the modal closes"
+            );
+            assert!(
+                !app.pending_bg_commands
+                    .iter()
+                    .any(|c| matches!(c, BgCommand::ScanInbox { .. })),
+                "{name}: no rescan while a queued cluster is waiting"
             );
         }
+    }
+
+    #[test]
+    fn dismissing_a_filing_cluster_keeps_the_rest_queued_for_the_next_poll() {
+        let dir = std::env::temp_dir().join("zytunes-dismiss-keeps-queue");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("a.wav");
+        std::fs::write(&src, b"src").unwrap();
+        let mut app = filing_overlay_with_rename(&src, &dir.join("b.wav"));
+        app.tag_manager.as_mut().unwrap().source_tracks = Some(vec![Track {
+            id: 1,
+            name: "a".into(),
+            artist: "2Pac".into(),
+            album: "Album".into(),
+            location: Some(src.display().to_string()),
+            ..Default::default()
+        }]);
+        app.inbox
+            .queue
+            .push_back(zytunes::library_layout::AlbumCluster {
+                artist: "Alice In Chains".into(),
+                album: "Facelift".into(),
+                tracks: vec![Track {
+                    id: 2,
+                    name: "We Die Young".into(),
+                    artist: "Alice In Chains".into(),
+                    album: "Facelift".into(),
+                    location: Some(dir.join("c.wav").display().to_string()),
+                    acoustic_id: Some("FP".into()),
+                    ..Default::default()
+                }],
+            });
+        app.close_tag_manager();
+        assert!(app.tag_manager.is_none());
+        assert!(
+            app.inbox.dismissed.contains(&src.display().to_string()),
+            "the dismissed cluster is snoozed"
+        );
+        assert_eq!(
+            app.inbox.queue.len(),
+            1,
+            "the other clusters keep their scan and fingerprints"
+        );
+        app.inbox.last_request = None;
+        app.maybe_request_inbox_scan();
+        let overlay = app
+            .tag_manager
+            .as_ref()
+            .expect("next cluster opens from the queue");
+        assert_eq!(overlay.source_album, "Facelift");
+        assert!(
+            !app.pending_bg_commands
+                .iter()
+                .any(|c| matches!(c, BgCommand::ScanInbox { .. })),
+            "no rescan and no re-fingerprint was requested"
+        );
     }
 
     #[test]
