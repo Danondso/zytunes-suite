@@ -2499,12 +2499,18 @@ impl App {
                 let Some(t) = self.track_list.get(self.track_selected) else {
                     return;
                 };
-                let artist = t.artist.clone();
-                let album = t.album.clone();
-                self.library
-                    .as_ref()
-                    .unwrap()
-                    .album_tracks_by_artist(&artist, &album)
+                // The row carries the TRACK artist, but albums are keyed
+                // by the grouping (album) artist. Resolve the library track
+                // so a feat or compilation row finds its own album.
+                let lib = self.library.as_ref().unwrap();
+                let resolved = t.library_id.and_then(|id| lib.track_by_id(id)).or_else(|| {
+                    lib.tracks_by_name(&t.name).find(|lt| {
+                        lt.artist.eq_ignore_ascii_case(&t.artist)
+                            && lt.album.eq_ignore_ascii_case(&t.album)
+                    })
+                });
+                let artist = resolved.map_or(t.artist.as_str(), |lt| lt.grouping_artist());
+                lib.album_tracks_by_artist(artist, &t.album)
                     .cloned()
                     .collect()
             }
@@ -8590,7 +8596,7 @@ mod tests {
             Box::new(
                 self.tracks
                     .iter()
-                    .filter(move |t| t.artist == a && t.album == b),
+                    .filter(move |t| t.grouping_artist() == a && t.album == b),
             )
         }
         fn tracks_by_name<'a>(
@@ -14492,6 +14498,46 @@ mod tests {
         assert_eq!(overlay.source_album, "Album A");
         assert_eq!(app.inbox.queue.len(), 1);
         assert_eq!(app.inbox.queue[0].album, "Album B");
+    }
+
+    #[test]
+    fn file_and_enrich_from_track_list_uses_album_artist() {
+        let (tx, _rx) = mpsc::channel::<BgCommand>();
+        let mut app = make_app_with_library_for_tagmgr();
+        let track = |name: &str, artist: &str| zytunes::library::Track {
+            name: name.into(),
+            artist: artist.into(),
+            album: "All Eyez on Me".into(),
+            album_artist: Some("2Pac".into()),
+            ..Default::default()
+        };
+        app.library = Some(Box::new(VecLibrary {
+            tracks: vec![
+                track("California Love", "2Pac feat. Dr. Dre"),
+                track("Ambitionz az a Ridah", "2Pac"),
+            ],
+        }));
+        // The row shows the TRACK artist; the album lives under the album
+        // artist. A feat row is exactly what `F` exists to reshelve.
+        app.active_panel = Panel::TrackList;
+        app.track_list = vec![TrackInfo::new(
+            "California Love".into(),
+            "2Pac feat. Dr. Dre".into(),
+            "All Eyez on Me".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )];
+        app.track_selected = 0;
+
+        app.start_file_and_enrich(&tx);
+        let overlay = app.tag_manager.as_ref().expect("overlay should open");
+        assert!(overlay.filing);
+        assert_eq!(overlay.source_tracks.as_ref().map(Vec::len), Some(2));
     }
 
     #[test]
