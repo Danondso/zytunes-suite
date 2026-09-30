@@ -1201,6 +1201,32 @@ fn retitle_case_along(
 }
 
 /// Follow `path` through directory renames, applied in order.
+/// Old → new library track ID for every file an apply moved.
+///
+/// Track IDs hash the file path (`dirlib::hash_path`), so a move changes
+/// the ID and everything keyed on it (playlists, play counts, the listen
+/// log) would point at nothing. `locations` are the library's files before
+/// the apply; `rename_map` the exact moves; `dir_renames` the directory
+/// retitles that carried siblings along.
+pub fn track_id_remap<'a>(
+    locations: impl IntoIterator<Item = &'a Path>,
+    rename_map: &HashMap<PathBuf, PathBuf>,
+    dir_renames: &[(PathBuf, PathBuf)],
+) -> HashMap<u64, u64> {
+    use crate::dirlib::hash_path;
+    let mut map = HashMap::new();
+    for old in locations {
+        let new = match rename_map.get(old) {
+            Some(dest) => dest.clone(),
+            None => remap_through_dir_renames(old, dir_renames),
+        };
+        if new != old {
+            map.insert(hash_path(old), hash_path(&new));
+        }
+    }
+    map
+}
+
 pub fn remap_through_dir_renames(path: &Path, renames: &[(PathBuf, PathBuf)]) -> PathBuf {
     let mut path = path.to_path_buf();
     for (old, new) in renames {
@@ -3277,6 +3303,34 @@ mod tests {
                 .join("01 - We Die Young.wav")
         );
         assert!(moved.exists());
+    }
+
+    #[test]
+    fn track_id_remap_covers_moved_files_and_siblings_of_renamed_dirs() {
+        use crate::dirlib::hash_path;
+        let root = Path::new("/m");
+        let moved_src = root.join("feat").join("01 - A.mp3");
+        let moved_dest = root.join("2Pac").join("Album").join("01 - A.mp3");
+        let sibling = root
+            .join("alice in chains")
+            .join("Facelift")
+            .join("01 - B.mp3");
+        let sibling_new = root
+            .join("Alice In Chains")
+            .join("Facelift")
+            .join("01 - B.mp3");
+        let untouched = root.join("Other").join("X").join("01 - C.mp3");
+        let rename_map = HashMap::from([(moved_src.clone(), moved_dest.clone())]);
+        let dir_renames = vec![(root.join("alice in chains"), root.join("Alice In Chains"))];
+        let map = track_id_remap(
+            [moved_src.as_path(), sibling.as_path(), untouched.as_path()],
+            &rename_map,
+            &dir_renames,
+        );
+        assert_eq!(map.len(), 2, "{map:?}");
+        assert_eq!(map[&hash_path(&moved_src)], hash_path(&moved_dest));
+        assert_eq!(map[&hash_path(&sibling)], hash_path(&sibling_new));
+        assert!(!map.contains_key(&hash_path(&untouched)));
     }
 
     #[test]

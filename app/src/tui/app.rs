@@ -3079,6 +3079,39 @@ impl App {
         overlay.phase = TagManagerPhase::DiffPreview;
     }
 
+    /// Track IDs hash the file path, so every file an apply moved has a
+    /// new ID. Re-key playlists, play stats and the listen log before the
+    /// library reread lands, while the old locations are still known.
+    fn follow_moved_track_ids(
+        &mut self,
+        rename_map: &std::collections::HashMap<PathBuf, PathBuf>,
+        dir_renames: &[(PathBuf, PathBuf)],
+    ) {
+        let Some(lib) = self.library.as_ref() else {
+            return;
+        };
+        let locations: Vec<PathBuf> = lib
+            .all_tracks()
+            .filter_map(|t| t.location.as_deref().map(PathBuf::from))
+            .collect();
+        let map = zytunes::tag_ops::track_id_remap(
+            locations.iter().map(PathBuf::as_path),
+            rename_map,
+            dir_renames,
+        );
+        if map.is_empty() {
+            return;
+        }
+        if self.playlists.remap_track_ids(&map) {
+            self.persist_playlists();
+        }
+        if self.local_plays.remap_track_ids(&map) {
+            self.persist_local_plays();
+        }
+        // The listen log rewrites its own file.
+        self.listen_log.remap_track_ids(&map);
+    }
+
     fn handle_tags_applied(
         &mut self,
         token: u64,
@@ -3101,6 +3134,9 @@ impl App {
                 );
                 *loc = moved.to_string_lossy().into_owned();
             }
+        }
+        if !rename_map.is_empty() || !dir_renames.is_empty() {
+            self.follow_moved_track_ids(&rename_map, dir_renames);
         }
         // Per-track failures are surfaced via the sync log so the user sees
         // *which* tracks failed without sifting through the diff view. We log
@@ -14535,6 +14571,65 @@ mod tests {
         assert!(overlay.filing);
         assert_eq!(overlay.source_album, "Album Two");
         assert!(app.inbox.queue.is_empty());
+    }
+
+    #[test]
+    fn playlists_and_play_stats_follow_a_track_through_a_move() {
+        use zytunes::dirlib::hash_path;
+        let old = PathBuf::from("/m/alice in chains/Dirt/01 - Them Bones.mp3");
+        let sibling = PathBuf::from("/m/alice in chains/Facelift/01 - We Die Young.mp3");
+        let mut app = App::new();
+        app.library = Some(Box::new(VecLibrary {
+            tracks: [&old, &sibling]
+                .iter()
+                .map(|p| Track {
+                    id: hash_path(p),
+                    name: "x".into(),
+                    artist: "alice in chains".into(),
+                    album: "a".into(),
+                    location: Some(p.display().to_string()),
+                    ..Default::default()
+                })
+                .collect(),
+        }));
+        let pl = app
+            .playlists
+            .add(zytunes::playlist::Playlist::new_manual("Faves"));
+        app.playlists.add_track(pl, hash_path(&old));
+        app.playlists.add_track(pl, hash_path(&sibling));
+        app.local_plays.record_play(hash_path(&sibling), 5);
+        app.listen_log.append(ListenEvent {
+            ts: 1,
+            id: hash_path(&old),
+            completed: true,
+        });
+
+        // The apply retitled the artist folder (carrying Facelift along)
+        // and renamed the Dirt track.
+        let new = PathBuf::from("/m/Alice In Chains/Dirt/01 - Them Bones.mp3");
+        let sibling_new = PathBuf::from("/m/Alice In Chains/Facelift/01 - We Die Young.mp3");
+        let rename_map = std::collections::HashMap::from([(old.clone(), new.clone())]);
+        let dir_renames = vec![(
+            PathBuf::from("/m/alice in chains"),
+            PathBuf::from("/m/Alice In Chains"),
+        )];
+        app.handle_tags_applied(0, vec![Ok(())], rename_map, &dir_renames);
+
+        assert_eq!(
+            app.playlists.get(pl).unwrap().track_ids,
+            vec![hash_path(&new), hash_path(&sibling_new)],
+            "playlist entries point at the moved files"
+        );
+        assert!(app.local_plays.get(hash_path(&sibling)).is_none());
+        assert_eq!(
+            app.local_plays
+                .get(hash_path(&sibling_new))
+                .unwrap()
+                .play_count,
+            1,
+            "play stats for the sibling album survived the folder retitle"
+        );
+        assert_eq!(app.listen_log.events()[0].id, hash_path(&new));
     }
 
     #[test]

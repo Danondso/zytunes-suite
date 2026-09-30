@@ -165,6 +165,25 @@ impl PlaylistStore {
         }
     }
 
+    /// Point playlists at tracks whose library ID changed (a file move
+    /// re-hashes the path). Returns `true` if any playlist changed.
+    pub fn remap_track_ids(&mut self, map: &std::collections::HashMap<u64, u64>) -> bool {
+        let mut changed = false;
+        for p in &mut self.playlists {
+            for id in p
+                .track_ids
+                .iter_mut()
+                .chain(p.previously_recommended.iter_mut())
+            {
+                if let Some(new) = map.get(id) {
+                    *id = *new;
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
     /// Reorder a track within a playlist. Returns `true` on success.
     pub fn move_track(&mut self, playlist_id: u64, from: usize, to: usize) -> bool {
         match self.get_mut(playlist_id) {
@@ -337,6 +356,7 @@ fn derive_id(created_at_ms: u64, name: &str) -> u64 {
 mod tests {
     use super::*;
     use crate::playlist::{GenerationParams, Playlist};
+    use std::collections::HashMap;
 
     fn temp_path(stem: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -407,6 +427,19 @@ mod tests {
         assert_eq!(s.get(id).unwrap().name, "Roadtrip");
         assert!(s.rename(id, "\tTabbed\n").is_ok());
         assert_eq!(s.get(id).unwrap().name, "Tabbed");
+    }
+
+    #[test]
+    fn remap_track_ids_follows_renamed_tracks() {
+        let mut s = PlaylistStore::new();
+        let id = s.add(Playlist::new_manual("Faves"));
+        s.add_track(id, 1);
+        s.add_track(id, 2);
+        s.add_track(id, 3);
+        let map = HashMap::from([(2u64, 20u64)]);
+        assert!(s.remap_track_ids(&map), "something changed");
+        assert_eq!(s.get(id).unwrap().track_ids, vec![1, 20, 3]);
+        assert!(!s.remap_track_ids(&map), "nothing left to remap");
     }
 
     #[test]

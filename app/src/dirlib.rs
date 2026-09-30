@@ -714,7 +714,7 @@ pub(crate) fn is_audio_file(path: &Path) -> bool {
         .is_some_and(|ext| AUDIO_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
 }
 
-pub(crate) fn hash_path(path: &Path) -> u64 {
+pub fn hash_path(path: &Path) -> u64 {
     let mut hasher = DefaultHasher::new();
     path.to_string_lossy().hash(&mut hasher);
     hasher.finish()

@@ -147,6 +147,27 @@ impl LocalPlays {
         entry.last_played_at_ms = now_ms;
     }
 
+    /// Move play stats to tracks whose library ID changed (a file move
+    /// re-hashes the path). Stats already under the new ID are merged:
+    /// counts add, the latest play wins. Returns `true` if anything moved.
+    pub fn remap_track_ids(&mut self, map: &HashMap<u64, u64>) -> bool {
+        let mut changed = false;
+        for (old, new) in map {
+            let Some(moved) = self.tracks.remove(old) else {
+                continue;
+            };
+            changed = true;
+            let entry = self.tracks.entry(*new).or_default();
+            entry.play_count = entry.play_count.saturating_add(moved.play_count);
+            entry.skip_count = entry.skip_count.saturating_add(moved.skip_count);
+            entry.last_played_at_ms = entry.last_played_at_ms.max(moved.last_played_at_ms);
+            for (k, v) in moved.device_baselines {
+                entry.device_baselines.entry(k).or_insert(v);
+            }
+        }
+        changed
+    }
+
     /// Record a TUI skip: pre-threshold abandonment via next/prev/stop.
     /// Does not touch `last_played_at_ms` — a skip isn't a "play."
     pub fn record_skip(&mut self, track_id: u64) {
@@ -323,6 +344,34 @@ pub fn now_unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remap_track_ids_carries_plays_to_the_new_id() {
+        let mut p = LocalPlays::new();
+        p.record_play(1, 100);
+        p.record_play(1, 200);
+        p.record_skip(1);
+        let map = HashMap::from([(1u64, 10u64)]);
+        assert!(p.remap_track_ids(&map));
+        assert!(p.get(1).is_none(), "old id is gone");
+        let moved = p.get(10).unwrap();
+        assert_eq!(
+            (moved.play_count, moved.skip_count, moved.last_played_at_ms),
+            (2, 1, 200)
+        );
+        assert!(!p.remap_track_ids(&map));
+    }
+
+    #[test]
+    fn remap_track_ids_merges_into_an_existing_entry() {
+        let mut p = LocalPlays::new();
+        p.record_play(1, 100);
+        p.record_play(10, 300);
+        assert!(p.remap_track_ids(&HashMap::from([(1u64, 10u64)])));
+        let merged = p.get(10).unwrap();
+        assert_eq!(merged.play_count, 2);
+        assert_eq!(merged.last_played_at_ms, 300, "latest play wins");
+    }
 
     // -- play_threshold_ms --
 
