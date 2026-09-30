@@ -757,8 +757,8 @@ pub struct ApplyOutcome {
 
 impl ApplyOutcome {
     /// Paths the library cache must re-read after this apply: every new
-    /// location, plus every source (retagged in place, or vacated so its
-    /// stale entry drops).
+    /// location, plus every source that was retagged in place. Moved
+    /// sources are not listed; see [`Self::vacated`].
     ///
     /// A source still sitting in the inbox is left out. It was not filed
     /// (rename failed, Filename row off, no MusicBrainz pairing), and the
@@ -766,19 +766,23 @@ impl ApplyOutcome {
     /// non-library file to the library.
     pub fn reread_paths(&self, diff: &ReleaseTagDiff, library_root: &Path) -> Vec<PathBuf> {
         let inbox = crate::library_layout::default_inbox_dir(library_root);
-        let left_in_inbox = |src: &PathBuf| {
-            !self.rename_map.contains_key(src)
-                && inbox.as_deref().is_some_and(|root| src.starts_with(root))
-        };
+        let in_inbox = |src: &PathBuf| inbox.as_deref().is_some_and(|root| src.starts_with(root));
         let mut paths: Vec<PathBuf> = diff
             .tracks
             .iter()
             .map(|t| &t.src_path)
-            .filter(|src| !left_in_inbox(src))
+            .filter(|src| !self.rename_map.contains_key(*src) && !in_inbox(src))
             .cloned()
             .collect();
         paths.extend(self.rename_map.values().cloned());
         paths
+    }
+
+    /// Old paths of the files that moved. The cache drops these by key: a
+    /// case-folding volume still resolves the old spelling, so "does the
+    /// file exist" cannot tell a vacated path from a live one.
+    pub fn vacated(&self) -> Vec<PathBuf> {
+        self.rename_map.keys().cloned().collect()
     }
 }
 
@@ -2978,9 +2982,10 @@ mod tests {
         assert!(paths.contains(&filed.1), "new location is read");
         assert!(paths.contains(&retag), "in-library retag is re-read");
         assert!(
-            paths.contains(&filed.0),
-            "a vacated source is listed so its cache entry drops"
+            !paths.contains(&filed.0),
+            "a moved source is never re-read; on a folding volume it still resolves"
         );
+        assert_eq!(outcome.vacated(), vec![filed.0.clone()]);
         assert!(
             !paths.contains(&stuck),
             "a file still sitting in the inbox is outside the library"

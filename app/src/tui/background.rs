@@ -2335,6 +2335,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                         std::path::Path::new(&music_dir),
                     );
                     let paths = outcome.reread_paths(&diff, std::path::Path::new(&music_dir));
+                    let vacated = outcome.vacated();
                     let dir_renames = outcome.dir_renames.clone();
                     let _ = event_tx.send(BgEvent::TagsApplied {
                         token,
@@ -2350,6 +2351,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                     let lib_result = zytunes::dirlib::DirectoryLibrary::reread_paths_after(
                         &music_dir,
                         &paths,
+                        &vacated,
                         &dir_renames,
                         fingerprint,
                         &scan_log,

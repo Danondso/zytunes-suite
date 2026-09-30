@@ -389,10 +389,12 @@ impl DirectoryLibrary {
         fingerprint: bool,
         log: &crate::cache::Logger,
     ) -> Result<Self, String> {
-        Self::reread_paths_after(root, paths, &[], fingerprint, log)
+        Self::reread_paths_after(root, paths, &[], &[], fingerprint, log)
     }
 
-    /// [`Self::reread_paths`], plus whole-directory renames to follow.
+    /// [`Self::reread_paths`], plus the renames an apply performed.
+    ///
+    /// `vacated` are old paths of moved files; their entries are dropped.
     ///
     /// A case retitle (`Alice in Chains/` → `Alice In Chains/`) moves every
     /// album under the folder, not only the files in `paths`. Each cached
@@ -402,6 +404,7 @@ impl DirectoryLibrary {
     pub fn reread_paths_after(
         root: &str,
         paths: &[PathBuf],
+        vacated: &[PathBuf],
         dir_renames: &[(PathBuf, PathBuf)],
         fingerprint: bool,
         log: &crate::cache::Logger,
@@ -410,6 +413,13 @@ impl DirectoryLibrary {
             return Err(format!("Not a directory: {root}"));
         }
         let mut cached = crate::cache::load_dirlib_cache(root, log);
+
+        // Sources a rename moved away. Dropped by key, not by an existence
+        // check: on a case-folding volume the old spelling still opens, and
+        // re-reading it would list the file twice.
+        for old in vacated {
+            cached.remove(old.to_string_lossy().as_ref());
+        }
 
         // Re-key entries carried along by a directory rename. The old key
         // is always dropped: on a case-folding volume it still resolves,
@@ -2178,7 +2188,8 @@ mod tests {
         let log = crate::cache::default_logger();
         let lib = DirectoryLibrary::reread_paths_after(
             dir.to_str().unwrap(),
-            &[filed.clone(), filed_new.clone()],
+            std::slice::from_ref(&filed_new),
+            std::slice::from_ref(&filed),
             &[(old_artist.clone(), new_artist.clone())],
             false,
             &log,
@@ -2197,6 +2208,37 @@ mod tests {
             ],
             "the sibling album must follow the folder, under its new path only"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reread_paths_drops_vacated_source_that_still_resolves() {
+        // On a case-folding volume the old spelling of a retitled file
+        // still opens. A file left in place stands in for that here: a
+        // vacated path must leave the library even though it "exists".
+        let dir = std::env::temp_dir().join("zytunes-dirlib-reread-vacated");
+        let _ = fs::remove_dir_all(&dir);
+        let album = dir.join("ArtistV").join("AlbumV");
+        fs::create_dir_all(&album).unwrap();
+        let old = album.join("01 old spelling.mp3");
+        fs::write(&old, b"fake").unwrap();
+        let _ = DirectoryLibrary::scan_with_options(
+            dir.to_str().unwrap(),
+            ScanOptions::default(),
+            |_| {},
+        )
+        .unwrap();
+        let log = crate::cache::default_logger();
+        let lib = DirectoryLibrary::reread_paths_after(
+            dir.to_str().unwrap(),
+            &[],
+            std::slice::from_ref(&old),
+            &[],
+            false,
+            &log,
+        )
+        .unwrap();
+        assert_eq!(lib.track_count(), 0);
         let _ = fs::remove_dir_all(&dir);
     }
 
