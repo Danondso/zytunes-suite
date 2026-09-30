@@ -168,14 +168,22 @@ pub fn tag_ripped_file(
 /// ID3v2 goes through the concrete `Id3v2Tag`: lofty's generic-tag writer
 /// has no frame for the MusicBrainz recording ID and drops it, while the
 /// owned conversion emits the `UFID` frame Picard writes (and its reader
-/// maps back). Only that tag is rewritten; the file's other tags were not
-/// edited and stay as they are on disk.
+/// maps back). A file that also carries an ID3v1 tag gets that tag rebuilt
+/// from the edited ID3v2 so a reader that falls back to it does not see
+/// the pre-edit title; no ID3v1 is added where there was none.
 pub(crate) fn save_tag(tagged: &TaggedFile, tag_type: TagType, path: &Path) -> Result<(), String> {
     let saved = match tagged.tag(tag_type) {
         Some(tag) if tag_type == TagType::Id3v2 => {
             let mut id3 = Id3v2Tag::from(tag.clone());
             repair_frame_languages(&mut id3);
             id3.save_to_path(path, WriteOptions::default())
+                .and_then(|()| {
+                    if !tagged.contains_tag_type(TagType::Id3v1) {
+                        return Ok(());
+                    }
+                    lofty::id3::v1::Id3v1Tag::from(tag.clone())
+                        .save_to_path(path, WriteOptions::default())
+                })
         }
         _ => tagged.save_to_path(path, WriteOptions::default()),
     };
@@ -758,6 +766,57 @@ mod tests {
             read_text(&path, &ItemKey::MusicBrainzRecordingId).as_deref(),
             Some("b1a9c0de-0000-4000-8000-000000000001")
         );
+    }
+
+    #[test]
+    fn save_tag_keeps_an_existing_id3v1_in_step_with_id3v2() {
+        use lofty::tag::Accessor;
+        let Some(path) = crate::test_audio::ffmpeg_mp3("id3v1-in-step") else {
+            return;
+        };
+        // An older rip carrying both tags, as many do.
+        let mut tf = lofty::read_from_path(&path).unwrap();
+        for tt in [TagType::Id3v2, TagType::Id3v1] {
+            let mut t = Tag::new(tt);
+            t.set_title("Old Title".into());
+            t.set_artist("Old Artist".into());
+            tf.insert_tag(t);
+        }
+        tf.save_to_path(&path, WriteOptions::default()).unwrap();
+
+        let mut tf = lofty::read_from_path(&path).unwrap();
+        tf.tag_mut(TagType::Id3v2)
+            .unwrap()
+            .set_title("New Title".into());
+        save_tag(&tf, TagType::Id3v2, &path).unwrap();
+
+        let back = lofty::read_from_path(&path).unwrap();
+        assert_eq!(
+            back.tag(TagType::Id3v1).and_then(|t| t.title()).as_deref(),
+            Some("New Title"),
+            "a player reading ID3v1 must not see the pre-edit title"
+        );
+        assert_eq!(
+            back.tag(TagType::Id3v1).and_then(|t| t.artist()).as_deref(),
+            Some("Old Artist")
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_tag_does_not_add_an_id3v1_where_there_was_none() {
+        use lofty::tag::Accessor;
+        let Some(path) = crate::test_audio::ffmpeg_mp3("no-id3v1") else {
+            return;
+        };
+        let mut tf = lofty::read_from_path(&path).unwrap();
+        let mut t = Tag::new(TagType::Id3v2);
+        t.set_title("Title".into());
+        tf.insert_tag(t);
+        save_tag(&tf, TagType::Id3v2, &path).unwrap();
+        let back = lofty::read_from_path(&path).unwrap();
+        assert!(back.tag(TagType::Id3v1).is_none());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
