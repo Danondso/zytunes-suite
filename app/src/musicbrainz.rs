@@ -650,16 +650,30 @@ pub fn render_artist_credit(credits: &[ArtistCredit]) -> String {
 /// under `2Pac`, and `A & B feat. C` under `A & B`. Collaborations joined
 /// with `&` / `and` / `,` keep the full credit.
 pub fn canonical_album_artist(credits: &[ArtistCredit]) -> String {
-    let Some(feat_at) = credits.iter().position(has_featuring_join) else {
-        return render_artist_credit(credits);
+    let kept = match credits.iter().position(has_featuring_join) {
+        // No featuring join: the whole credit is the album artist.
+        None => credits,
+        // The join sits on the first credit: that artist, without the guest.
+        Some(0) => &credits[..1],
+        // `A & B feat. C`: keep every credit up to and including the one
+        // whose join phrase introduces the guest.
+        Some(feat_at) => &credits[..=feat_at],
     };
-    // A lone billed artist uses the artist entity's own name, which drops
-    // any "credited as" styling on this one release.
-    if feat_at == 0 {
-        return primary_credit_name(&credits[0]).to_string();
+    join_entity_names(kept)
+}
+
+/// Join credits on each artist entity's own name, not the per-release
+/// "credited as" spelling, so one artist does not land in two folders.
+fn join_entity_names(credits: &[ArtistCredit]) -> String {
+    let mut out = String::new();
+    for (i, ac) in credits.iter().enumerate() {
+        out.push_str(primary_credit_name(ac));
+        if i + 1 < credits.len() {
+            if let Some(jp) = &ac.joinphrase {
+                out.push_str(jp);
+            }
+        }
     }
-    let mut out = render_artist_credit(&credits[..feat_at]);
-    out.push_str(&credits[feat_at].name);
     out.trim().to_string()
 }
 
@@ -1062,6 +1076,34 @@ mod tests {
             canonical_album_artist(&credits),
             "Robert Plant & Alison Krauss",
             "only the featured guest is dropped, not the co-billed artist"
+        );
+    }
+
+    #[test]
+    fn canonical_album_artist_uses_the_entity_name_on_every_path() {
+        // A credited-as spelling and the artist entity's own name must
+        // not land the same person in two folders. The entity name is the
+        // MusicBrainz spelling, whether or not a featuring join is present.
+        let entity = |credit: &str, canon: &str, join: Option<&str>| ArtistCredit {
+            name: credit.into(),
+            joinphrase: join.map(str::to_string),
+            artist: Some(Artist {
+                id: "id".into(),
+                name: canon.into(),
+                sort_name: None,
+            }),
+        };
+        assert_eq!(
+            canonical_album_artist(&[entity("Alice in Chains", "Alice In Chains", None)]),
+            "Alice In Chains"
+        );
+        assert_eq!(
+            canonical_album_artist(&[
+                entity("alice in chains", "Alice In Chains", Some(" & ")),
+                entity("jerry", "Jerry Cantrell", Some(" feat. ")),
+                entity("Guest", "Guest", None),
+            ]),
+            "Alice In Chains & Jerry Cantrell"
         );
     }
 

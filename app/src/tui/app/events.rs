@@ -139,6 +139,9 @@ impl App {
             BgEvent::MbSearchResults { token, result } => {
                 self.handle_mb_search_results(token, result);
             }
+            BgEvent::ReplaceConflictsProbed { token, conflicts } => {
+                self.on_replace_conflicts_probed(token, conflicts);
+            }
             BgEvent::MbReleaseLoaded { token, result } => {
                 self.handle_mb_release_loaded(token, result);
             }

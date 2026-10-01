@@ -3884,32 +3884,36 @@ fn draw_tag_manager_overlay(f: &mut Frame, app: &App) {
     } else {
         "Tag manager"
     };
-    let title = match overlay.phase {
-        TagManagerPhase::SearchInput => {
-            format!(" {noun} — edit query (Enter to search, Esc to close) ")
-        }
-        TagManagerPhase::SearchPending => format!(" {noun} — searching MusicBrainz… "),
-        TagManagerPhase::SearchResults => {
-            format!(" {noun} — ↑↓ select · Enter pick · s edit query · Esc back ")
-        }
-        TagManagerPhase::LoadingRelease => format!(" {noun} — loading release… "),
-        TagManagerPhase::DiffPreview => format!(" {noun} — {} ", overlay.diff_preview_hint()),
-        TagManagerPhase::ConfirmReplace => {
-            format!(
+    let title = if overlay.probing_conflicts {
+        format!(" {noun} — checking existing copies… ")
+    } else {
+        match overlay.phase {
+            TagManagerPhase::SearchInput => {
+                format!(" {noun} — edit query (Enter to search, Esc to close) ")
+            }
+            TagManagerPhase::SearchPending => format!(" {noun} — searching MusicBrainz… "),
+            TagManagerPhase::SearchResults => {
+                format!(" {noun} — ↑↓ select · Enter pick · s edit query · Esc back ")
+            }
+            TagManagerPhase::LoadingRelease => format!(" {noun} — loading release… "),
+            TagManagerPhase::DiffPreview => format!(" {noun} — {} ", overlay.diff_preview_hint()),
+            TagManagerPhase::ConfirmReplace => {
+                format!(
                 " {noun} — choose the copy to keep · Space switch · Enter/y apply · Esc/n back "
             )
-        }
-        TagManagerPhase::Applying => format!(" {noun} — applying… "),
-        // `L` and, after a failed reread, Esc do not close this screen.
-        TagManagerPhase::Done if !overlay.apply_failures.is_empty() => {
-            if overlay.error.is_some() {
-                format!(" {noun} — done with errors · L log · Esc search · other keys close ")
-            } else {
-                format!(" {noun} — done with errors · L log · other keys close ")
             }
+            TagManagerPhase::Applying => format!(" {noun} — applying… "),
+            // `L` and, after a failed reread, Esc do not close this screen.
+            TagManagerPhase::Done if !overlay.apply_failures.is_empty() => {
+                if overlay.error.is_some() {
+                    format!(" {noun} — done with errors · L log · Esc search · other keys close ")
+                } else {
+                    format!(" {noun} — done with errors · L log · other keys close ")
+                }
+            }
+            TagManagerPhase::Done => format!(" {noun} — done (any key to close) "),
+            TagManagerPhase::Error => format!(" {noun} — error (any key to close) "),
         }
-        TagManagerPhase::Done => format!(" {noun} — done (any key to close) "),
-        TagManagerPhase::Error => format!(" {noun} — error (any key to close) "),
     };
     let block = t
         .block()

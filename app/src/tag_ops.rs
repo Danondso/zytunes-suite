@@ -275,6 +275,21 @@ impl ReleaseTagDiff {
             })
             .collect()
     }
+
+    /// A rename whose dest already holds another file. The caller probes
+    /// those pairs off the UI thread; this check is only `stat`.
+    pub fn needs_replace_probe(&self) -> bool {
+        let moving: Vec<&TrackTagDiff> = self.tracks.iter().filter(|t| t.wants_rename()).collect();
+        moving.iter().any(|t| {
+            let Some(dest) = t.dest_path.as_ref() else {
+                return false;
+            };
+            if moving.iter().any(|m| &m.src_path == dest) {
+                return false;
+            }
+            dest_needs_replace(&t.src_path, dest)
+        })
+    }
 }
 
 /// Which of two copies of one track survives a filing apply.
@@ -313,7 +328,7 @@ impl AudioQuality {
     pub fn read(path: &Path) -> Self {
         use lofty::file::{AudioFile, FileType};
         let size_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        let Ok(tagged) = probe_by_content(path) else {
+        let Ok(tagged) = probe_properties(path) else {
             return Self {
                 size_bytes,
                 ..Self::default()
@@ -1164,7 +1179,7 @@ pub fn apply_release_diff_keeping(
                 // library rather than overwritten, and put back if the
                 // incoming file then fails to arrive.
                 set_aside(dest, library_root).and_then(|kept| {
-                    match perform_rename(&live_src, dest, &mut dir_renames) {
+                    match perform_rename(&live_src, dest, library_root, &mut dir_renames) {
                         Ok(()) => {
                             aside.push(SetAside {
                                 copy: SetAsideCopy::Replaced,
@@ -1180,7 +1195,7 @@ pub fn apply_release_diff_keeping(
                     }
                 })
             } else {
-                perform_rename(&live_src, dest, &mut dir_renames)
+                perform_rename(&live_src, dest, library_root, &mut dir_renames)
             };
             progressed = true;
             match moved {
@@ -1231,7 +1246,7 @@ pub fn apply_release_diff_keeping(
         } else if live_src == *dest {
             Ok(())
         } else {
-            perform_rename(&live_src, dest, &mut dir_renames)
+            perform_rename(&live_src, dest, library_root, &mut dir_renames)
         };
         let track = &diff.tracks[idx];
         // Only a source that left its path is recorded as moved: a failed
@@ -1505,7 +1520,7 @@ fn is_duplicate_audio(a: &Path, b: &Path) -> bool {
     use lofty::file::AudioFile;
     const DUPLICATE_SLACK: std::time::Duration = std::time::Duration::from_secs(2);
     let duration = |p: &Path| {
-        probe_by_content(p)
+        probe_properties(p)
             .ok()
             .map(|t| t.properties().duration())
             .filter(|d| !d.is_zero())
@@ -1674,6 +1689,7 @@ fn retitle_target_taken(src: &Path, dest: &Path) -> bool {
 fn perform_rename(
     src: &Path,
     dest: &Path,
+    library_root: &Path,
     dir_renames: &mut Vec<(PathBuf, PathBuf)>,
 ) -> Result<(), String> {
     // Every new spelling is free (or is this same entry on a case-folding
@@ -1682,7 +1698,92 @@ fn perform_rename(
     if is_case_only_rename(src, dest) && !retitle_target_taken(src, dest) {
         return retitle_case_along(src, dest, dir_renames);
     }
-    move_file(src, dest)
+    // The leaf name changed, or the file comes from somewhere else (the
+    // inbox), so the path is not a case-only rename. A folder on the way
+    // to `dest` that is stored under another case still has to be
+    // retitled first: on a case-folding volume `create_dir_all` keeps the
+    // old spelling, and the rename map would name a path the next scan
+    // does not see.
+    let retitled_from = dir_renames.len();
+    let src = retitle_dest_folders(src, dest, library_root, dir_renames)?;
+    // On a case-sensitive volume the retitled folder can turn out to hold
+    // a file at `dest` that nothing saw before the retitle, so nobody was
+    // asked which copy to keep. Leave both where they are.
+    if dir_renames.len() > retitled_from && dest_needs_replace(&src, dest) {
+        return Err(format!(
+            "rename collision: {} already exists in the retitled folder; file the track again to choose which copy to keep",
+            dest.display()
+        ));
+    }
+    move_file(&src, dest)
+}
+
+/// Give each existing folder between `library_root` and `dest` the
+/// spelling `dest` uses, and return where `src` lives afterwards (a
+/// retitled folder carries everything under it along).
+///
+/// Nothing above `library_root` is touched, and a `dest` outside it is
+/// left alone.
+fn retitle_dest_folders(
+    src: &Path,
+    dest: &Path,
+    library_root: &Path,
+    dir_renames: &mut Vec<(PathBuf, PathBuf)>,
+) -> Result<PathBuf, String> {
+    let Some(folders) = dest
+        .parent()
+        .and_then(|p| p.strip_prefix(library_root).ok())
+    else {
+        return Ok(src.to_path_buf());
+    };
+    let retitled_from = dir_renames.len();
+    let mut built = library_root.to_path_buf();
+    for component in folders.components() {
+        if let std::path::Component::Normal(want) = component {
+            if let Some(have) = sole_case_variant(&built, want) {
+                retitle_case_along(&built.join(have), &built.join(want), dir_renames)?;
+            }
+        }
+        built.push(component);
+    }
+    Ok(remap_through_dir_renames(
+        src,
+        &dir_renames[retitled_from..],
+    ))
+}
+
+/// The one folder in `dir` whose name is `want` in another ASCII case.
+/// `None` when `want` itself is there (the folders are separate entries
+/// and the file is moved into the canonical one), when nothing matches,
+/// or when several spellings do and none is the obvious one to retitle.
+fn sole_case_variant(dir: &Path, want: &std::ffi::OsStr) -> Option<std::ffi::OsString> {
+    let want_text = want.to_string_lossy();
+    let mut variant = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let name = entry.file_name();
+        if name == want {
+            return None;
+        }
+        if name.to_string_lossy().eq_ignore_ascii_case(&want_text) {
+            if variant.is_some() || !entry.path().is_dir() {
+                return None;
+            }
+            variant = Some(name);
+        }
+    }
+    variant
+}
+
+/// Properties only. Conflict ranking needs duration and bitrate, not tags
+/// or cover art, and the default lofty parse reads both.
+fn probe_properties(path: &Path) -> Result<lofty::file::TaggedFile, String> {
+    Probe::open(path)
+        .map_err(|e| format!("lofty open failed on {}: {e}", path.display()))?
+        .options(ParseOptions::new().read_tags(false).read_cover_art(false))
+        .guess_file_type()
+        .map_err(|e| format!("lofty content sniff failed on {}: {e}", path.display()))?
+        .read()
+        .map_err(|e| format!("lofty read failed on {}: {e}", path.display()))
 }
 
 /// Move one file, creating the dest folder and falling back to copy +
@@ -3550,6 +3651,145 @@ mod tests {
             );
         }
         assert!(dir.join("Alice In Chains").join("Dirt").exists());
+    }
+
+    #[test]
+    fn a_filename_change_still_retitles_the_parent_folder() {
+        // The leaf name changes, so this is not a case-only rename. The
+        // parent folders still differ only by case. They have to be
+        // retitled, or a case-folding volume keeps the old spelling while
+        // the rename map records the canonical one and siblings are left
+        // behind.
+        let dir = fresh_dir("case-and-filename");
+        let src_album = dir.join("Alice in Chains").join("Dirt");
+        std::fs::create_dir_all(&src_album).unwrap();
+        let src = src_album.join("01 Song.wav");
+        let sibling = src_album.join("02 Other.wav");
+        write_sine_wav(&src, 1);
+        write_sine_wav(&sibling, 1);
+        let dest = dir
+            .join("Alice In Chains")
+            .join("Dirt")
+            .join("01 - Song.wav");
+
+        let diff = ReleaseTagDiff {
+            release_mbid: "rel-1".into(),
+            summary: "test".into(),
+            tracks: vec![TrackTagDiff {
+                src_path: src.clone(),
+                dest_path: Some(dest.clone()),
+                library_id: 1,
+                fields: vec![FieldDiff {
+                    kind: FieldKind::Filename,
+                    name: "Filename",
+                    current: Some(src.display().to_string()),
+                    proposed: Some(dest.display().to_string()),
+                    enabled: true,
+                    from_release: true,
+                }],
+            }],
+        };
+
+        let ApplyOutcome {
+            results,
+            rename_map,
+            dir_renames,
+            ..
+        } = apply_release_diff(&diff, &dir);
+        assert!(results[0].is_ok(), "{:?}", results[0]);
+        let followed = moved_path(&sibling, &rename_map, &dir_renames);
+        let canonical_sibling = dir
+            .join("Alice In Chains")
+            .join("Dirt")
+            .join("02 Other.wav");
+        assert_eq!(followed, canonical_sibling);
+        assert!(
+            canonical_sibling.exists(),
+            "the sibling moved with the retitled folder"
+        );
+        assert!(dest.exists());
+    }
+
+    #[test]
+    fn filing_into_a_wrong_case_folder_retitles_it() {
+        // The file comes from outside the library, so no part of its path
+        // is a case variant of the dest. The artist folder already in the
+        // library is, and it has to take the canonical spelling: on a
+        // case-folding volume `create_dir_all` would leave it as it is
+        // while the rename map names the canonical path.
+        let parent = fresh_dir("case-from-inbox");
+        let music = parent.join("Music");
+        let inbox = parent.join("Automatically Add to Music");
+        let facelift = music
+            .join("alice in chains")
+            .join("Facelift")
+            .join("01 - We Die Young.wav");
+        std::fs::create_dir_all(facelift.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&inbox).unwrap();
+        write_sine_wav(&facelift, 1);
+        let src = inbox.join("01 them bones.wav");
+        write_sine_wav(&src, 1);
+        let dest = music
+            .join("Alice In Chains")
+            .join("Dirt")
+            .join("01 - Them Bones.wav");
+
+        let ApplyOutcome {
+            results,
+            rename_map,
+            dir_renames,
+            ..
+        } = apply_release_diff(&rename_only_diff(&src, &dest), &music);
+        assert!(results[0].is_ok(), "{:?}", results[0]);
+        assert!(dest.exists());
+        let stored: Vec<String> = std::fs::read_dir(&music)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(stored, vec!["Alice In Chains".to_string()]);
+        let followed = moved_path(&facelift, &rename_map, &dir_renames);
+        assert_eq!(
+            followed,
+            music
+                .join("Alice In Chains")
+                .join("Facelift")
+                .join("01 - We Die Young.wav")
+        );
+        assert!(followed.exists(), "the album already there came along");
+    }
+
+    #[test]
+    fn a_folder_retitle_never_lands_a_file_on_one_it_uncovers() {
+        // Only a case-sensitive volume hides the file: `dest` does not
+        // exist until its folder takes the canonical spelling, so the
+        // replace check before the rename saw nothing to ask about.
+        let dir = fresh_dir("case-uncovers-dest");
+        if volume_folds_ascii_case(&dir) {
+            return;
+        }
+        let album = dir.join("alice in chains").join("Dirt");
+        std::fs::create_dir_all(&album).unwrap();
+        let src = album.join("01 them bones.wav");
+        let hidden = album.join("01 - Them Bones.wav");
+        write_sine_wav(&src, 1);
+        std::fs::write(&hidden, b"the copy already filed").unwrap();
+        let canonical = dir.join("Alice In Chains").join("Dirt");
+        let dest = canonical.join("01 - Them Bones.wav");
+
+        let outcome = apply_release_diff_with(&rename_only_diff(&src, &dest), true, &dir);
+        let err = outcome.results[0].as_ref().unwrap_err();
+        assert!(err.contains("rename collision"), "{err}");
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"the copy already filed",
+            "the file the retitle uncovered is untouched"
+        );
+        assert!(
+            canonical.join("01 them bones.wav").exists(),
+            "the incoming file stays beside it"
+        );
+        assert!(!outcome.rename_map.contains_key(&src));
     }
 
     fn volume_folds_ascii_case(dir: &std::path::Path) -> bool {

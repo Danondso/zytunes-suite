@@ -152,6 +152,11 @@ pub struct TagManagerOverlay {
     /// Inbox / `F` filing: titles say "File into library", dismiss snoozes
     /// the cluster, and close continues the album queue.
     pub filing: bool,
+    /// An overlay the poll opened does not act on the first Enter. The
+    /// user may still be pressing Enter to play tracks.
+    pub enter_armed: bool,
+    /// A replace-conflict probe is in flight on the worker. Keys wait.
+    pub probing_conflicts: bool,
 }
 
 /// What became of a track whose apply reported an error.
@@ -211,6 +216,8 @@ impl TagManagerOverlay {
             acoustid_uuid: None,
             source_tracks: None,
             filing: false,
+            enter_armed: true,
+            probing_conflicts: false,
         }
     }
 

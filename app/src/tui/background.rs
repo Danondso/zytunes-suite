@@ -290,6 +290,13 @@ pub enum BgCommand {
         mb_base_url: Option<String>,
         mb_user_agent: Option<String>,
     },
+    /// Read the two copies of each filing conflict off the UI thread.
+    /// `replace_conflicts` parses audio (properties, and by default cover
+    /// art); doing that in the key handler freezes the TUI on a slow disk.
+    ProbeReplaceConflicts {
+        token: u64,
+        diff: Box<zytunes::tag_ops::ReleaseTagDiff>,
+    },
     /// Apply an approved tag diff to disk, then surgically re-read the
     /// affected files into the library. Emits [`BgEvent::TagsApplied`]
     /// followed by [`BgEvent::LibraryRereadComplete`].
@@ -590,6 +597,11 @@ pub enum BgEvent {
     MbSearchResults {
         token: u64,
         result: Result<Vec<zytunes::musicbrainz::ReleaseSearchHit>, String>,
+    },
+    /// Outcome of [`BgCommand::ProbeReplaceConflicts`].
+    ReplaceConflictsProbed {
+        token: u64,
+        conflicts: Vec<zytunes::tag_ops::ReplaceConflict>,
     },
     /// Outcome of [`BgCommand::MbReleaseDetails`]. Boxed because the
     /// `Release` payload is comparable in size to the cd `Identified`
@@ -2339,6 +2351,10 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                         )));
                     }
                     let _ = event_tx.send(BgEvent::MbReleaseLoaded { token, result });
+                }
+                BgCommand::ProbeReplaceConflicts { token, diff } => {
+                    let conflicts = diff.replace_conflicts();
+                    let _ = event_tx.send(BgEvent::ReplaceConflictsProbed { token, conflicts });
                 }
                 BgCommand::ApplyTagDiff {
                     token,

@@ -80,7 +80,10 @@ pub struct CachedFile {
 ///   v2 entries hold "311                           " which would still
 ///   poison MB searches and sidebar grouping until re-tagged — force a
 ///   re-scan instead.
-const CACHE_SCHEMA_VERSION: u32 = 3;
+///   3 → 4: untagged files gained a duration read from the audio stream.
+///   A v3 entry with `total_time_ms: None` is dropped so the next scan
+///   re-reads it; an entry that already has a duration stays.
+const CACHE_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Serialize, Deserialize, Default)]
 struct CachedLibrary {
@@ -339,6 +342,20 @@ fn migrate_cache(
         current = 3;
     }
 
+    // Step 3 → 4: drop entries that never recorded a duration. Filling
+    // one in means reading the audio file, which this function does not
+    // do. A missing entry is re-read on the next scan; one that already
+    // has a duration is left alone.
+    if current == 3 {
+        let before = files.len();
+        files.retain(|_, entry| entry.track.total_time_ms.is_some());
+        log(&format!(
+            "zytunes: cache: v3→v4 dropped {} entries with no duration so they are re-read",
+            before - files.len()
+        ));
+        current = 4;
+    }
+
     if current == CACHE_SCHEMA_VERSION {
         Some(files)
     } else {
@@ -579,6 +596,7 @@ mod tests {
                         album_artist: Some("  311  ".into()),
                         isrc: Some("   USRC11111111   ".into()),
                         comment: Some("  intentional padding  ".into()),
+                        total_time_ms: Some(180_000),
                         ..Default::default()
                     },
                 },
@@ -661,6 +679,56 @@ mod tests {
         let raw = load_raw(dir_path, &log).expect("just wrote a cache");
         assert_eq!(raw.schema_version, CACHE_SCHEMA_VERSION);
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_v3_cache_drops_entries_that_never_recorded_a_duration() {
+        // Untagged files cached before the scan read their duration keep
+        // total_time_ms: None, and filing then skips AcoustID. Those
+        // entries have to leave the cache so the next scan re-reads them.
+        // An entry that already has a duration stays.
+        let dir_path = "/tmp/zytunes-cache-v3-duration-test";
+        let cache_name = dirlib_cache_name(dir_path);
+        let Some(path) = cache_path(&cache_name) else {
+            return;
+        };
+        let file = |name: &str, duration: Option<u64>| {
+            (
+                format!("{dir_path}/{name}"),
+                CachedFile {
+                    fingerprint: FileFingerprint {
+                        mtime_secs: 1,
+                        size: 1,
+                    },
+                    fingerprint_failed: false,
+                    track: crate::library::Track {
+                        id: 1,
+                        name: name.into(),
+                        artist: "A".into(),
+                        album: "B".into(),
+                        total_time_ms: duration,
+                        ..Default::default()
+                    },
+                },
+            )
+        };
+        let stale = CachedLibrary {
+            root: dir_path.to_string(),
+            schema_version: 3,
+            files: HashMap::from([file("untagged.wav", None), file("tagged.mp3", Some(1_000))]),
+        };
+        let log = default_logger();
+        save_raw(dir_path, &stale, &log);
+        let loaded = load_dirlib_cache(dir_path, &log);
+        assert!(
+            !loaded.contains_key(&format!("{dir_path}/untagged.wav")),
+            "a cached track with no duration must be re-read"
+        );
+        assert!(
+            loaded.contains_key(&format!("{dir_path}/tagged.mp3")),
+            "a track that already has a duration stays"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
