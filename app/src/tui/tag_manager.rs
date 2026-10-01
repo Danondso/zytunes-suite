@@ -122,10 +122,13 @@ pub struct TagManagerOverlay {
     /// follow-up (library reread, anchor restore) needs both this and the
     /// list of source paths.
     pub last_rename_map: std::collections::HashMap<PathBuf, PathBuf>,
-    /// Destinations the pending apply would overwrite, computed once on
-    /// entering `ConfirmReplace`. The prompt renders from this every
-    /// frame; recomputing would stat the library at the 50 ms tick.
-    pub replacing_dests: Vec<PathBuf>,
+    /// Renames whose dest already holds another copy, computed once on
+    /// entering `ConfirmReplace` with the better copy preselected. The
+    /// prompt renders from this every frame (recomputing would probe the
+    /// files at the 50 ms tick) and the user's choices are edited in place.
+    pub replace_conflicts: Vec<zytunes::tag_ops::ReplaceConflict>,
+    /// Which conflict the `ConfirmReplace` cursor is on.
+    pub replace_focus: usize,
     /// Token stamped onto every outgoing MB worker request so we can drop
     /// stale responses. Incremented on each request; the worker echoes
     /// it back on the matching response, and `accepts_token` is the
@@ -175,7 +178,8 @@ impl TagManagerOverlay {
             flattened_rows: Vec::new(),
             collapsed_tracks: HashSet::new(),
             last_rename_map: std::collections::HashMap::new(),
-            replacing_dests: Vec::new(),
+            replace_conflicts: Vec::new(),
+            replace_focus: 0,
             pending_request_token: 0,
             acoustid_uuid: None,
             source_tracks: None,

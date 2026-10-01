@@ -2733,8 +2733,23 @@ impl App {
         self.close_tag_manager_with(None, false);
     }
 
+    /// `q` on a filing overlay ends the whole run, not just this album:
+    /// every queued cluster is snoozed with it, so neither the queue nor
+    /// the next inbox scan reopens the overlay this session.
+    fn abort_filing_run(&mut self) {
+        let queued = self
+            .inbox
+            .queue
+            .drain(..)
+            .flat_map(|c| c.tracks)
+            .filter_map(|t| t.location);
+        self.inbox.dismissed.extend(queued);
+        self.close_tag_manager();
+    }
+
     /// Close the overlay. `advance` opens the next queued filing cluster
-    /// as an apply would; a plain close (Esc, error) drops the queue.
+    /// as an apply would; a plain close (Esc, error) leaves the queue for
+    /// the next poll, and [`Self::abort_filing_run`] is what drops it.
     fn close_tag_manager_with(&mut self, cmd_tx: Option<&mpsc::Sender<BgCommand>>, advance: bool) {
         let Some(overlay) = self.tag_manager.take() else {
             return;
@@ -3353,12 +3368,13 @@ impl App {
             return;
         };
         // Phase-independent: q always closes (matches the help/track-info
-        // overlays). Esc handling is per-phase.
+        // overlays), and on a filing run skips the queued albums too. Esc
+        // handling is per-phase.
         if matches!(key.code, KeyCode::Char('q')) {
             // Don't allow closing mid-Apply — the worker is still mutating
             // disk state. Wait for the finishing event.
             if !matches!(overlay.phase, TagManagerPhase::Applying) {
-                self.close_tag_manager();
+                self.abort_filing_run();
             }
             return;
         }
@@ -3580,13 +3596,14 @@ impl App {
                     } else if !diff.has_any_enabled() {
                         Outcome::NothingEnabled
                     } else if overlay.filing {
-                        let replacing = diff.replacing_existing_dests();
-                        if replacing.is_empty() {
+                        let conflicts = diff.replace_conflicts();
+                        if conflicts.is_empty() {
                             Outcome::Apply {
                                 replace_existing: true,
                             }
                         } else {
-                            overlay.replacing_dests = replacing;
+                            overlay.replace_conflicts = conflicts;
+                            overlay.replace_focus = 0;
                             overlay.phase = TagManagerPhase::ConfirmReplace;
                             Outcome::Stay
                         }
@@ -3622,13 +3639,41 @@ impl App {
         key: KeyEvent,
         cmd_tx: &mpsc::Sender<BgCommand>,
     ) {
+        use zytunes::tag_ops::KeepCopy;
+        let Some(overlay) = self.tag_manager.as_mut() else {
+            return;
+        };
+        let last = overlay.replace_conflicts.len().saturating_sub(1);
         match key.code {
             KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
                 self.dispatch_tag_diff_apply(cmd_tx, true);
             }
             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
-                if let Some(overlay) = self.tag_manager.as_mut() {
-                    overlay.phase = TagManagerPhase::DiffPreview;
+                overlay.replace_conflicts.clear();
+                overlay.phase = TagManagerPhase::DiffPreview;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                overlay.replace_focus = (overlay.replace_focus + 1).min(last);
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                overlay.replace_focus = overlay.replace_focus.saturating_sub(1);
+            }
+            KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right => {
+                if let Some(c) = overlay.replace_conflicts.get_mut(overlay.replace_focus) {
+                    c.keep = match c.keep {
+                        KeepCopy::Incoming => KeepCopy::Existing,
+                        KeepCopy::Existing => KeepCopy::Incoming,
+                    };
+                }
+            }
+            KeyCode::Char('i') => {
+                for c in &mut overlay.replace_conflicts {
+                    c.keep = KeepCopy::Incoming;
+                }
+            }
+            KeyCode::Char('e') => {
+                for c in &mut overlay.replace_conflicts {
+                    c.keep = KeepCopy::Existing;
                 }
             }
             _ => {}
@@ -3662,6 +3707,12 @@ impl App {
         };
         overlay.phase = TagManagerPhase::Applying;
         let token = overlay.next_request_token();
+        // Empty unless the apply came through `ConfirmReplace`.
+        let keep_existing = std::mem::take(&mut overlay.replace_conflicts)
+            .into_iter()
+            .filter(|c| c.keep == zytunes::tag_ops::KeepCopy::Existing)
+            .map(|c| c.src)
+            .collect();
         let fingerprint = self.scan_fingerprint;
         let _ = cmd_tx.send(BgCommand::ApplyTagDiff {
             token,
@@ -3669,6 +3720,7 @@ impl App {
             music_dir,
             fingerprint,
             replace_existing,
+            keep_existing,
         });
     }
 
@@ -14879,6 +14931,49 @@ mod tests {
     }
 
     #[test]
+    fn q_aborts_the_whole_filing_run() {
+        // From the diff, and from Done (where any other key would advance
+        // to the next queued album).
+        for phase in [TagManagerPhase::DiffPreview, TagManagerPhase::Done] {
+            let src = PathBuf::from("/inbox/a.wav");
+            let queued = "/inbox/c.wav".to_string();
+            let mut app = filing_overlay_with_rename(&src, std::path::Path::new("/m/b.wav"));
+            app.tag_manager.as_mut().unwrap().phase = phase;
+            app.inbox
+                .queue
+                .push_back(zytunes::library_layout::AlbumCluster {
+                    artist: "Alice In Chains".into(),
+                    album: "Facelift".into(),
+                    tracks: vec![Track {
+                        id: 2,
+                        name: "We Die Young".into(),
+                        artist: "Alice In Chains".into(),
+                        album: "Facelift".into(),
+                        location: Some(queued.clone()),
+                        ..Default::default()
+                    }],
+                });
+            let (tx, _rx) = mpsc::channel::<BgCommand>();
+            app.handle_tag_manager_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), &tx);
+            assert!(app.tag_manager.is_none(), "{phase:?}: q closes");
+            assert!(
+                app.inbox.queue.is_empty(),
+                "{phase:?}: the queue is dropped"
+            );
+            assert!(
+                app.inbox.dismissed.contains(&queued),
+                "{phase:?}: queued albums are snoozed so a rescan does not reopen them"
+            );
+            app.inbox.last_request = None;
+            app.maybe_request_inbox_scan();
+            assert!(
+                app.tag_manager.is_none(),
+                "{phase:?}: the next poll must not reopen the run"
+            );
+        }
+    }
+
+    #[test]
     fn inbox_folder_is_created_by_the_first_scan_only() {
         let mut app = App::new();
         app.library = Some(make_minimal_library());
@@ -15162,10 +15257,9 @@ mod tests {
         assert!(rx.try_recv().is_err(), "apply must wait for confirm");
         // The list the prompt shows is computed once on entry: the
         // renderer runs every 50 ms and must not stat the library per frame.
-        assert_eq!(
-            app.tag_manager.as_ref().unwrap().replacing_dests,
-            vec![dest.clone()]
-        );
+        let conflicts = &app.tag_manager.as_ref().unwrap().replace_conflicts;
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].dest, dest);
 
         app.handle_tag_manager_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
         assert_eq!(
@@ -15177,8 +15271,31 @@ mod tests {
         app.handle_tag_manager_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE), &tx);
         match rx.try_recv().expect("apply after yes") {
             BgCommand::ApplyTagDiff {
-                replace_existing, ..
-            } => assert!(replace_existing),
+                replace_existing,
+                keep_existing,
+                ..
+            } => {
+                assert!(replace_existing);
+                assert!(keep_existing.is_empty(), "the incoming copy was kept");
+            }
+            _ => panic!("expected ApplyTagDiff"),
+        }
+
+        // Space flips the focused conflict to the copy already in place;
+        // the apply then carries that source as one to remove.
+        let mut app = filing_overlay_with_rename(&src, &dest);
+        let key = |c| KeyEvent::new(c, KeyModifiers::NONE);
+        app.handle_tag_manager_key(key(KeyCode::Enter), &tx);
+        app.handle_tag_manager_key(key(KeyCode::Char(' ')), &tx);
+        assert_eq!(
+            app.tag_manager.as_ref().unwrap().replace_conflicts[0].keep,
+            zytunes::tag_ops::KeepCopy::Existing
+        );
+        app.handle_tag_manager_key(key(KeyCode::Enter), &tx);
+        match rx.try_recv().expect("apply after choosing") {
+            BgCommand::ApplyTagDiff { keep_existing, .. } => {
+                assert!(keep_existing.contains(&src));
+            }
             _ => panic!("expected ApplyTagDiff"),
         }
         let _ = std::fs::remove_dir_all(&dir);

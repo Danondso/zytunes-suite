@@ -21,6 +21,7 @@ pub enum PicardField {
     AlbumPackaging,
     ReleaseCountry,
     AcoustidFingerprint,
+    AcoustidId,
 }
 
 /// MP4 freeform atoms are keyed `----:<mean>:<name>`; the name is the
@@ -33,12 +34,13 @@ pub fn strip_freeform_prefix(key: &str) -> &str {
 }
 
 impl PicardField {
-    pub const ALL: [PicardField; 5] = [
+    pub const ALL: [PicardField; 6] = [
         PicardField::AlbumType,
         PicardField::AlbumStatus,
         PicardField::AlbumPackaging,
         PicardField::ReleaseCountry,
         PicardField::AcoustidFingerprint,
+        PicardField::AcoustidId,
     ];
 
     /// The Vorbis spelling, also our internal name.
@@ -49,6 +51,7 @@ impl PicardField {
             PicardField::AlbumPackaging => "MUSICBRAINZ_ALBUMPACKAGING",
             PicardField::ReleaseCountry => "RELEASECOUNTRY",
             PicardField::AcoustidFingerprint => "ACOUSTID_FINGERPRINT",
+            PicardField::AcoustidId => "ACOUSTID_ID",
         }
     }
 
@@ -60,6 +63,7 @@ impl PicardField {
             PicardField::AlbumPackaging => "MusicBrainz Album Packaging",
             PicardField::ReleaseCountry => "MusicBrainz Album Release Country",
             PicardField::AcoustidFingerprint => "Acoustid Fingerprint",
+            PicardField::AcoustidId => "Acoustid Id",
         }
     }
 
@@ -107,6 +111,18 @@ mod tests {
         assert_eq!(
             PicardField::AcoustidFingerprint.key_for(TagType::Mp4Ilst),
             "----:com.apple.iTunes:Acoustid Fingerprint"
+        );
+        assert_eq!(
+            PicardField::AcoustidId.key_for(TagType::VorbisComments),
+            "ACOUSTID_ID"
+        );
+        assert_eq!(
+            PicardField::AcoustidId.key_for(TagType::Id3v2),
+            "Acoustid Id"
+        );
+        assert_eq!(
+            PicardField::AcoustidId.key_for(TagType::Mp4Ilst),
+            "----:com.apple.iTunes:Acoustid Id"
         );
     }
 

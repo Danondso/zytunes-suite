@@ -168,26 +168,61 @@ pub fn tag_ripped_file(
 /// ID3v2 goes through the concrete `Id3v2Tag`: lofty's generic-tag writer
 /// has no frame for the MusicBrainz recording ID and drops it, while the
 /// owned conversion emits the `UFID` frame Picard writes (and its reader
-/// maps back). A file that also carries an ID3v1 tag gets that tag rebuilt
-/// from the edited ID3v2 so a reader that falls back to it does not see
-/// the pre-edit title; no ID3v1 is added where there was none.
+/// maps back). A file that also carries an ID3v1 tag gets that tag brought
+/// up to date with the edited ID3v2 (see [`merged_id3v1`]) so a reader that
+/// falls back to it does not see the pre-edit title; no ID3v1 is added
+/// where there was none.
 pub(crate) fn save_tag(tagged: &TaggedFile, tag_type: TagType, path: &Path) -> Result<(), String> {
     let saved = match tagged.tag(tag_type) {
         Some(tag) if tag_type == TagType::Id3v2 => {
             let mut id3 = Id3v2Tag::from(tag.clone());
             repair_frame_languages(&mut id3);
             id3.save_to_path(path, WriteOptions::default())
-                .and_then(|()| {
-                    if !tagged.contains_tag_type(TagType::Id3v1) {
-                        return Ok(());
-                    }
-                    lofty::id3::v1::Id3v1Tag::from(tag.clone())
-                        .save_to_path(path, WriteOptions::default())
+                .and_then(|()| match tagged.tag(TagType::Id3v1) {
+                    Some(v1) => merged_id3v1(v1, tag).save_to_path(path, WriteOptions::default()),
+                    None => Ok(()),
                 })
         }
         _ => tagged.save_to_path(path, WriteOptions::default()),
     };
     saved.map_err(|e| format!("lofty save failed on {}: {e}", path.display()))
+}
+
+/// The file's ID3v1 tag with the edited ID3v2's values laid over it.
+///
+/// Only a field the ID3v2 carries is overwritten. Rebuilding the ID3v1
+/// from the ID3v2 alone erased whatever the ID3v2 lacked: a comment or
+/// genre held only in ID3v1, or every field of an ID3v1-only file whose
+/// new ID3v2 held just the rows the edit touched.
+fn merged_id3v1(existing: &Tag, edited: &Tag) -> lofty::id3::v1::Id3v1Tag {
+    use lofty::id3::v1::Id3v1Tag;
+    // ID3v1 stores genre as an index into a fixed list. An ID3v2 genre
+    // outside that list clears the slot instead of leaving a stale one.
+    let edited_has_genre = edited.get_string(&ItemKey::Genre).is_some();
+    let edited = Id3v1Tag::from(edited.clone());
+    let mut v1 = Id3v1Tag::from(existing.clone());
+    if edited.title.is_some() {
+        v1.title = edited.title;
+    }
+    if edited.artist.is_some() {
+        v1.artist = edited.artist;
+    }
+    if edited.album.is_some() {
+        v1.album = edited.album;
+    }
+    if edited.year.is_some() {
+        v1.year = edited.year;
+    }
+    if edited.comment.is_some() {
+        v1.comment = edited.comment;
+    }
+    if edited.track_number.is_some() {
+        v1.track_number = edited.track_number;
+    }
+    if edited_has_genre {
+        v1.genre = edited.genre;
+    }
+    v1
 }
 
 /// Give comment and lyrics frames a writable language code.
@@ -800,6 +835,39 @@ mod tests {
             back.tag(TagType::Id3v1).and_then(|t| t.artist()).as_deref(),
             Some("Old Artist")
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_tag_keeps_id3v1_fields_the_id3v2_does_not_carry() {
+        use lofty::tag::Accessor;
+        let Some(path) = crate::test_audio::ffmpeg_mp3("id3v1-extra-fields") else {
+            return;
+        };
+        let mut tf = lofty::read_from_path(&path).unwrap();
+        let mut v2 = Tag::new(TagType::Id3v2);
+        v2.set_title("Old Title".into());
+        tf.insert_tag(v2);
+        let mut v1 = Tag::new(TagType::Id3v1);
+        v1.set_title("Old Title".into());
+        v1.set_album("Old Album".into());
+        v1.set_genre("Rock".into());
+        v1.set_comment("ripped 2003".into());
+        tf.insert_tag(v1);
+        tf.save_to_path(&path, WriteOptions::default()).unwrap();
+
+        let mut tf = lofty::read_from_path(&path).unwrap();
+        tf.tag_mut(TagType::Id3v2)
+            .unwrap()
+            .set_title("New Title".into());
+        save_tag(&tf, TagType::Id3v2, &path).unwrap();
+
+        let back = lofty::read_from_path(&path).unwrap();
+        let v1 = back.tag(TagType::Id3v1).expect("ID3v1 survives");
+        assert_eq!(v1.title().as_deref(), Some("New Title"));
+        assert_eq!(v1.album().as_deref(), Some("Old Album"));
+        assert_eq!(v1.genre().as_deref(), Some("Rock"));
+        assert_eq!(v1.comment().as_deref(), Some("ripped 2003"));
         let _ = std::fs::remove_file(&path);
     }
 

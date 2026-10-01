@@ -3884,7 +3884,9 @@ fn draw_tag_manager_overlay(f: &mut Frame, app: &App) {
         TagManagerPhase::LoadingRelease => format!(" {noun} — loading release… "),
         TagManagerPhase::DiffPreview => format!(" {noun} — {} ", overlay.diff_preview_hint()),
         TagManagerPhase::ConfirmReplace => {
-            format!(" {noun} — replace existing files? Enter/y yes · Esc/n back ")
+            format!(
+                " {noun} — choose the copy to keep · Space switch · Enter/y apply · Esc/n back "
+            )
         }
         TagManagerPhase::Applying => format!(" {noun} — applying… "),
         TagManagerPhase::Done => format!(" {noun} — done (any key to close) "),
@@ -4078,44 +4080,114 @@ fn draw_tag_manager_confirm_replace(
     overlay: &crate::app::TagManagerOverlay,
     inner: Rect,
 ) {
+    use zytunes::tag_ops::KeepCopy;
     let t = app.theme();
-    let dests = &overlay.replacing_dests;
-    let n = dests.len();
+    let conflicts = &overlay.replace_conflicts;
+    let n = conflicts.len();
+    let file_name = |p: &std::path::Path| {
+        p.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
     let mut lines = vec![
         Line::from(""),
         Line::from(Span::styled(
             format!(
-                " {n} file{} already exist at the destination.",
-                if n == 1 { "" } else { "s" }
+                " {n} track{} already at the destination. Choose the copy to keep;",
+                if n == 1 { " is" } else { "s are" }
             ),
             t.header(),
         )),
         Line::from(Span::styled(
-            " Replace them with the incoming copies?",
+            " the other moves to \"Removed from Music\". The better copy is preselected.",
             t.header(),
         )),
         Line::from(""),
     ];
-    let shown = dests.iter().take(6);
-    for p in shown {
-        let label = p.file_name().and_then(|n| n.to_str()).unwrap_or("file");
-        let parent = p
+    // Each conflict is a title, two copies and a spacer. Show the window
+    // of conflicts that holds the focused one.
+    const ROWS_PER_CONFLICT: usize = 4;
+    let room = (inner.height as usize).saturating_sub(lines.len() + 2);
+    let visible = (room / ROWS_PER_CONFLICT).max(1);
+    let focus = overlay.replace_focus.min(n.saturating_sub(1));
+    let first = (focus + 1).saturating_sub(visible);
+    for (i, c) in conflicts.iter().enumerate().skip(first).take(visible) {
+        let parent = c
+            .dest
             .parent()
             .and_then(|d| d.file_name())
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
-        lines.push(Line::from(format!("   {parent}/{label}")));
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let focused = i == focus;
+        lines.push(Line::from(Span::styled(
+            format!(
+                " {} {parent}/{}",
+                if focused { "▸" } else { " " },
+                file_name(&c.dest)
+            ),
+            if focused { t.header() } else { t.dim() },
+        )));
+        let copies = [
+            (
+                KeepCopy::Incoming,
+                "incoming",
+                &c.incoming,
+                file_name(&c.src),
+            ),
+            (KeepCopy::Existing, "existing", &c.existing, String::new()),
+        ];
+        for (which, label, quality, name) in copies {
+            let kept = c.keep == which;
+            let mut text = format!(
+                "     {} {label}  {}",
+                if kept { "(●) keep  " } else { "( ) remove" },
+                describe_audio_quality(quality)
+            );
+            if !name.is_empty() {
+                text.push_str(&format!("  ← {name}"));
+            }
+            let style = if kept {
+                Style::default().fg(t.success_text)
+            } else {
+                t.dim()
+            };
+            lines.push(Line::from(Span::styled(text, style)));
+        }
+        lines.push(Line::from(""));
     }
-    if n > 6 {
-        lines.push(Line::from(format!("   …and {} more", n - 6)));
+    if n > visible {
+        lines.push(Line::from(Span::styled(
+            format!(" {} of {n}", focus + 1),
+            t.dim(),
+        )));
     }
-    lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        " Enter/y: replace    Esc/n: back to diff",
+        " j/k: move   Space: switch copy   i/e: keep all incoming/existing   Enter/y: apply   Esc/n: back",
         t.dim(),
     )));
-    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
-    f.render_widget(para, inner);
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// One copy of a track in the replace prompt: `FLAC 16-bit 44.1 kHz` or
+/// `320 kbps 44.1 kHz`, then length and size.
+fn describe_audio_quality(q: &zytunes::tag_ops::AudioQuality) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if q.lossless {
+        parts.push(match q.bit_depth {
+            Some(bits) => format!("lossless {bits}-bit"),
+            None => "lossless".into(),
+        });
+    } else if let Some(kbps) = q.bitrate_kbps {
+        parts.push(format!("{kbps} kbps"));
+    }
+    if let Some(hz) = q.sample_rate {
+        parts.push(format!("{:.1} kHz", f64::from(hz) / 1000.0));
+    }
+    if q.duration_ms > 0 {
+        parts.push(format_duration_ms(q.duration_ms).trim().to_string());
+    }
+    parts.push(metadata::format_bytes(q.size_bytes));
+    parts.join(" · ")
 }
 
 fn draw_tag_manager_diff(
@@ -4542,6 +4614,65 @@ mod tests {
         let track = header_track(vec![filename]);
         let label = render_track_header(&track);
         assert!(!label.contains("rename"));
+    }
+
+    #[test]
+    fn confirm_replace_shows_both_copies_and_the_choice() {
+        use zytunes::tag_ops::{AudioQuality, KeepCopy, ReplaceConflict};
+        let mut overlay = crate::app::TagManagerOverlay::new(
+            zytunes::tag_ops::DiffScope::Album,
+            "2Pac".into(),
+            "Album".into(),
+            None,
+            crate::app::SelectionAnchor::default(),
+        );
+        overlay.filing = true;
+        overlay.replace_conflicts = vec![ReplaceConflict {
+            src: "/inbox/01 Song.mp3".into(),
+            dest: "/m/2Pac/Album/01 - Song.mp3".into(),
+            incoming: AudioQuality {
+                bitrate_kbps: Some(128),
+                sample_rate: Some(44_100),
+                duration_ms: 222_000,
+                size_bytes: 3_600_000,
+                ..Default::default()
+            },
+            existing: AudioQuality {
+                lossless: true,
+                bit_depth: Some(16),
+                sample_rate: Some(44_100),
+                duration_ms: 222_000,
+                size_bytes: 28_000_000,
+                ..Default::default()
+            },
+            keep: KeepCopy::Existing,
+        }];
+        let app = App::new();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 14)).unwrap();
+        term.draw(|f| draw_tag_manager_confirm_replace(f, &app, &overlay, f.area()))
+            .unwrap();
+        let buf = term.backend().buffer().clone();
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        let screen = rows.join("\n");
+        assert!(screen.contains("▸ Album/01 - Song.mp3"), "{screen}");
+        assert!(
+            screen.contains(
+                "( ) remove incoming  128 kbps · 44.1 kHz · 3:42 · 3.43 MB  ← 01 Song.mp3"
+            ),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("(●) keep   existing  lossless 16-bit · 44.1 kHz · 3:42 · 26.70 MB"),
+            "{screen}"
+        );
     }
 
     #[test]

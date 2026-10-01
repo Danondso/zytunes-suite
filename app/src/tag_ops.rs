@@ -50,6 +50,9 @@ struct OnDiskExtras {
     /// `Probe::open` + `read()`, and on a 20-track release that doubled
     /// the file-open count for no benefit.
     acoustid_fingerprint: Option<String>,
+    /// The AcoustID track UUID (Picard's `ACOUSTID_ID`), so a file that
+    /// already carries it does not show the row as a change on every open.
+    acoustid_id: Option<String>,
 }
 
 fn read_on_disk_extras(path: &Path) -> OnDiskExtras {
@@ -93,6 +96,7 @@ fn extras_from_tag(tag: &Tag) -> OnDiskExtras {
     let mut musicbrainz_album_packaging = None;
     let mut release_country = None;
     let mut acoustid_fingerprint = None;
+    let mut acoustid_id = None;
     for item in tag.items() {
         let ItemKey::Unknown(name) = item.key() else {
             continue;
@@ -115,6 +119,8 @@ fn extras_from_tag(tag: &Tag) -> OnDiskExtras {
             &mut script
         } else if PicardField::AcoustidFingerprint.matches(name) {
             &mut acoustid_fingerprint
+        } else if PicardField::AcoustidId.matches(name) {
+            &mut acoustid_id
         } else {
             continue;
         };
@@ -130,6 +136,7 @@ fn extras_from_tag(tag: &Tag) -> OnDiskExtras {
         release_country,
         script,
         acoustid_fingerprint,
+        acoustid_id,
     }
 }
 
@@ -205,28 +212,134 @@ impl ReleaseTagDiff {
             .any(|t| t.fields.iter().any(|f| f.current != f.proposed))
     }
 
-    /// Dest paths that an enabled Filename rename would overwrite.
-    /// Used by the filing overlay to confirm before replace.
-    pub fn replacing_existing_dests(&self) -> Vec<PathBuf> {
-        let sources: std::collections::HashSet<&PathBuf> =
-            self.tracks.iter().map(|t| &t.src_path).collect();
-        self.tracks
+    /// Every enabled rename whose dest already holds another copy of the
+    /// track, with both copies described and the better one preselected.
+    /// The filing overlay shows these so the user picks which copy stays.
+    ///
+    /// A dest held by another track of this diff is listed only when that
+    /// track is staying put and holds the same recording (a duplicate the
+    /// apply folds into one file). One that moves out first is not
+    /// replaced at all, and one holding different audio is refused by the
+    /// apply as a collision.
+    pub fn replace_conflicts(&self) -> Vec<ReplaceConflict> {
+        let renames = |t: &TrackTagDiff| {
+            t.dest_path.is_some()
+                && t.fields
+                    .iter()
+                    .any(|f| f.kind == FieldKind::Filename && f.enabled)
+        };
+        let (moving, staying): (Vec<&TrackTagDiff>, Vec<&TrackTagDiff>) =
+            self.tracks.iter().partition(|t| renames(t));
+        moving
             .iter()
             .filter_map(|t| {
                 let dest = t.dest_path.as_ref()?;
-                if dest == &t.src_path || sources.contains(dest) {
-                    return None;
-                }
-                if !t
-                    .fields
-                    .iter()
-                    .any(|f| f.kind == FieldKind::Filename && f.enabled)
+                if moving.iter().any(|m| &m.src_path == dest)
+                    || !dest_needs_replace(&t.src_path, dest)
                 {
                     return None;
                 }
-                dest_needs_replace(&t.src_path, dest).then(|| dest.clone())
+                let held_by_batch = staying.iter().any(|s| &s.src_path == dest);
+                if held_by_batch && !is_duplicate_audio(&t.src_path, dest) {
+                    return None;
+                }
+                let incoming = AudioQuality::read(&t.src_path);
+                let existing = AudioQuality::read(dest);
+                // A tie goes to the incoming copy: it is the one about to
+                // receive the tags this apply writes.
+                let keep = if existing.rank() > incoming.rank() {
+                    KeepCopy::Existing
+                } else {
+                    KeepCopy::Incoming
+                };
+                Some(ReplaceConflict {
+                    src: t.src_path.clone(),
+                    dest: dest.clone(),
+                    incoming,
+                    existing,
+                    keep,
+                })
             })
             .collect()
+    }
+}
+
+/// Which of two copies of one track survives a filing apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeepCopy {
+    /// The file being filed lands on top of the one at the dest.
+    Incoming,
+    /// The file at the dest stays; the one being filed is removed.
+    Existing,
+}
+
+/// A rename whose dest already holds another copy of the track.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplaceConflict {
+    pub src: PathBuf,
+    pub dest: PathBuf,
+    pub incoming: AudioQuality,
+    pub existing: AudioQuality,
+    /// Preselected to the better copy; the overlay lets the user flip it.
+    pub keep: KeepCopy,
+}
+
+/// What separates two copies of one track: enough to rank them and to
+/// show the user why. All `None`/zero when the file cannot be read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AudioQuality {
+    pub lossless: bool,
+    pub bit_depth: Option<u8>,
+    pub sample_rate: Option<u32>,
+    pub bitrate_kbps: Option<u32>,
+    pub duration_ms: u64,
+    pub size_bytes: u64,
+}
+
+impl AudioQuality {
+    pub fn read(path: &Path) -> Self {
+        use lofty::file::{AudioFile, FileType};
+        let size_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let Ok(tagged) = probe_by_content(path) else {
+            return Self {
+                size_bytes,
+                ..Self::default()
+            };
+        };
+        let props = tagged.properties();
+        let bit_depth = props.bit_depth();
+        // MP4 holds either AAC or ALAC; only the lossless codec reports a
+        // bit depth.
+        let lossless = match tagged.file_type() {
+            FileType::Flac | FileType::Wav | FileType::Aiff | FileType::Ape | FileType::WavPack => {
+                true
+            }
+            FileType::Mp4 => bit_depth.is_some(),
+            _ => false,
+        };
+        Self {
+            lossless,
+            bit_depth,
+            sample_rate: props.sample_rate(),
+            bitrate_kbps: props.audio_bitrate(),
+            duration_ms: props.duration().as_millis() as u64,
+            size_bytes,
+        }
+    }
+
+    /// Orders copies of one track: lossless over lossy, then resolution
+    /// for lossless and bitrate for lossy. Bitrate says nothing between
+    /// two lossless files (it follows the compression level), and sample
+    /// rate is only a tie-break between lossy ones.
+    fn rank(&self) -> (bool, u8, u32, u32) {
+        let depth = self.bit_depth.unwrap_or(0);
+        let rate = self.sample_rate.unwrap_or(0);
+        let bitrate = self.bitrate_kbps.unwrap_or(0);
+        if self.lossless {
+            (true, depth, rate, 0)
+        } else {
+            (false, 0, bitrate, rate)
+        }
     }
 }
 
@@ -363,7 +476,8 @@ fn release_summary(release: &Release) -> String {
 ///   1. `mb_track_id` equality (when both sides carry one).
 ///   2. `disc_number` + `track_number` equality.
 ///   3. `track_number` equality on any medium (fallback when the library
-///      track doesn't carry a disc number).
+///      track doesn't carry a disc number). When more than one medium has
+///      that track number, a title match (step 4) is preferred.
 ///   4. Title equality, case-insensitive — across every medium.
 fn pair_to_mb_track_across_media<'a>(
     lib: &Track,
@@ -387,26 +501,37 @@ fn pair_to_mb_track_across_media<'a>(
             }
         }
     }
-    // 3. Track-number fallback, any medium. Ambiguous on multi-disc releases
-    // when the lib side has no disc — accept the first hit and move on.
+    let by_title = || {
+        media.iter().find_map(|medium| {
+            medium
+                .tracks
+                .iter()
+                .find(|m| m.title.eq_ignore_ascii_case(&lib.name))
+                .map(|m| (medium, m))
+        })
+    };
+    // 3. Track-number fallback, any medium. On a multi-disc release every
+    // disc has a track N, so without a disc number the title decides
+    // first: taking the first disc's track N filed disc 2 track 1 as (and
+    // on top of) disc 1 track 1. The first hit stands only when no title
+    // matches either.
     if let Some(n) = lib.track_number {
-        for medium in media {
-            if let Some(m) = medium.tracks.iter().find(|m| m.position == Some(n)) {
-                return Some((medium, m));
+        let mut hits = media.iter().filter_map(|medium| {
+            medium
+                .tracks
+                .iter()
+                .find(|m| m.position == Some(n))
+                .map(|m| (medium, m))
+        });
+        if let Some(first) = hits.next() {
+            if hits.next().is_none() {
+                return Some(first);
             }
+            return by_title().or(Some(first));
         }
     }
     // 4. Title fallback.
-    for medium in media {
-        if let Some(m) = medium
-            .tracks
-            .iter()
-            .find(|m| m.title.eq_ignore_ascii_case(&lib.name))
-        {
-            return Some((medium, m));
-        }
-    }
-    None
+    by_title()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -704,7 +829,7 @@ fn build_track_fields(
         push(
             FieldKind::Picard,
             "ACOUSTID_ID",
-            None,
+            extras.acoustid_id.clone(),
             Some(uuid.to_string()),
         );
     }
@@ -766,6 +891,11 @@ pub struct ApplyOutcome {
     /// including albums that were not part of the diff — so callers must
     /// remap any path they still hold under `old`.
     pub dir_renames: Vec<(PathBuf, PathBuf)>,
+    /// Copies taken out of the library, `(where it was, where it is now)`.
+    /// Filing never deletes a file: the copy that lost a replace is moved
+    /// to the removed-files folder (see [`set_aside`]) so it can be put
+    /// back by hand.
+    pub set_aside: Vec<(PathBuf, PathBuf)>,
 }
 
 impl ApplyOutcome {
@@ -818,6 +948,15 @@ impl ApplyOutcome {
 /// iteration order would be arbitrary and lossy — better to surface the
 /// conflict so the user disables one in the overlay.
 ///
+/// A dest held by another track of the batch that is staying where it is:
+/// with `replace_existing`, and when both files hold the same recording
+/// ([`is_duplicate_audio`]), the two are folded into one — the incoming
+/// file lands on top like any other replace, unless the caller chose the
+/// copy in place ([`apply_release_diff_keeping`]). Otherwise the rename is a
+/// collision: the track in place keeps its file and still gets its tags.
+/// A dest held by a batch track that is moving is never overwritten; the
+/// rename waits until that track has moved, and fails if it never does.
+///
 /// Callers feed the [`ApplyOutcome`] into
 /// [`crate::dirlib::DirectoryLibrary::reread_paths`] so the cache picks up
 /// new tags AND new locations.
@@ -838,6 +977,26 @@ pub fn apply_release_diff(diff: &ReleaseTagDiff, library_root: &Path) -> ApplyOu
 pub fn apply_release_diff_with(
     diff: &ReleaseTagDiff,
     replace_existing: bool,
+    library_root: &Path,
+) -> ApplyOutcome {
+    apply_release_diff_keeping(
+        diff,
+        replace_existing,
+        &std::collections::HashSet::new(),
+        library_root,
+    )
+}
+
+/// [`apply_release_diff_with`], plus the user's choice for each
+/// [`ReplaceConflict`]: a source in `keep_existing` is not renamed onto
+/// its dest. The copy already there stays and the source file is removed,
+/// so the two are still folded into one. `rename_map` records it like a
+/// move, which is what makes playlists and play counts follow the copy
+/// that survived. Sources that turn out not to conflict are filed as usual.
+pub fn apply_release_diff_keeping(
+    diff: &ReleaseTagDiff,
+    replace_existing: bool,
+    keep_existing: &std::collections::HashSet<PathBuf>,
     library_root: &Path,
 ) -> ApplyOutcome {
     let mut results: Vec<Result<(), String>> = vec![Ok(()); diff.tracks.len()];
@@ -867,14 +1026,37 @@ pub fn apply_release_diff_with(
     }
     let source_set: std::collections::HashSet<&PathBuf> =
         renaming.iter().map(|(_, s, _)| *s).collect();
+    // Tracks of this batch that are not moving (already canonical, or
+    // their Filename row is off).
+    let staying: std::collections::HashSet<&PathBuf> = diff
+        .tracks
+        .iter()
+        .map(|t| &t.src_path)
+        .filter(|s| !source_set.contains(s))
+        .collect();
 
     // Phase 0: mark all colliders as Err and remove them from the work set.
     let mut skipped: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut to_rename: Vec<(usize, &PathBuf, &PathBuf)> = Vec::new();
+    let mut to_discard: Vec<(usize, &PathBuf, &PathBuf)> = Vec::new();
     for &(idx, src, dest) in &renaming {
         if dest_count.get(dest).copied().unwrap_or(0) > 1 {
             results[idx] = Err(format!(
                 "rename collision: two tracks would land at {}",
+                dest.display()
+            ));
+            skipped.insert(idx);
+            continue;
+        }
+        if staying.contains(dest)
+            && dest_needs_replace(src, dest)
+            && !(replace_existing && is_duplicate_audio(src, dest))
+        {
+            // Two files of one album claim the same track. A duplicate is
+            // folded into one by the replace below; this is a mispairing
+            // that would put a different song on top of the one in place.
+            results[idx] = Err(format!(
+                "rename collision: {} is a different track of this album and is staying in place",
                 dest.display()
             ));
             skipped.insert(idx);
@@ -892,14 +1074,19 @@ pub fn apply_release_diff_with(
                 skipped.insert(idx);
                 continue;
             }
+            if keep_existing.contains(src) {
+                to_discard.push((idx, src, dest));
+                continue;
+            }
         }
         to_rename.push((idx, src, dest));
     }
 
     // Phase 1: tag writes. Skip tracks marked as collided in phase 0 so we
-    // don't leave new tags at an old path that we'll never rename.
+    // don't leave new tags at an old path that we'll never rename, and
+    // the copies about to be removed.
     for (i, track) in diff.tracks.iter().enumerate() {
-        if skipped.contains(&i) {
+        if skipped.contains(&i) || to_discard.iter().any(|(idx, _, _)| *idx == i) {
             continue;
         }
         if let Err(e) = write_track_tags(track) {
@@ -911,29 +1098,98 @@ pub fn apply_release_diff_with(
     // still moves with whatever tags it has. The reverse direction (skip
     // rename on tag-write failure) would leave the file in the wrong
     // canonical location AND with old tags, which is the worse failure mode.
+    //
+    // A dest that is another batch track's source is free only once that
+    // track has moved out, so such a rename is deferred and retried after
+    // the others. Whatever is still blocked when a pass moves nothing (the
+    // occupant's own rename failed or was skipped, or two tracks trade
+    // places) fails instead of overwriting the file that is there.
     let mut dir_renames: Vec<(PathBuf, PathBuf)> = Vec::new();
-    for (idx, src, dest) in to_rename {
-        // A case retitle renames whole folders, so an earlier track in
-        // this batch may already have carried this one along. Work from
-        // where the file is now, not where the diff last saw it.
+    let mut aside: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut pending = to_rename;
+    loop {
+        let mut blocked: Vec<(usize, &PathBuf, &PathBuf)> = Vec::new();
+        let mut progressed = false;
+        for (idx, src, dest) in pending {
+            // A case retitle renames whole folders, so an earlier track in
+            // this batch may already have carried this one along. Work from
+            // where the file is now, not where the diff last saw it.
+            let live_src = remap_through_dir_renames(src, &dir_renames);
+            if source_set.contains(dest) && dest_needs_replace(&live_src, dest) {
+                blocked.push((idx, src, dest));
+                continue;
+            }
+            let moved = if live_src == *dest {
+                Ok(())
+            } else if dest_needs_replace(&live_src, dest) {
+                // A replace. The copy at `dest` is moved out of the
+                // library rather than overwritten, and put back if the
+                // incoming file then fails to arrive.
+                set_aside(dest, library_root).and_then(|kept| {
+                    match perform_rename(&live_src, dest, &mut dir_renames) {
+                        Ok(()) => {
+                            aside.push((dest.clone(), kept));
+                            Ok(())
+                        }
+                        Err(e) => {
+                            let _ = move_file(&kept, dest);
+                            Err(e)
+                        }
+                    }
+                })
+            } else {
+                perform_rename(&live_src, dest, &mut dir_renames)
+            };
+            progressed = true;
+            match moved {
+                Ok(()) => {
+                    rename_map.insert(src.clone(), dest.clone());
+                    for parent in [src.parent(), live_src.parent()].into_iter().flatten() {
+                        prune_empty_parents(parent, library_root);
+                    }
+                }
+                Err(e) => {
+                    if results[idx].is_ok() {
+                        results[idx] = Err(e);
+                    }
+                }
+            }
+        }
+        pending = blocked;
+        if pending.is_empty() || !progressed {
+            break;
+        }
+    }
+    for (idx, _, dest) in pending {
+        if results[idx].is_ok() {
+            results[idx] = Err(format!(
+                "rename collision: {} is still held by another track of this album",
+                dest.display()
+            ));
+        }
+    }
+
+    // The user kept the copy already at the dest: the incoming file goes
+    // to the removed-files folder. Checked again here because the renames
+    // above may have changed what sits at `dest`; if nothing does any
+    // more, the file is filed there.
+    for (idx, src, dest) in to_discard {
         let live_src = remap_through_dir_renames(src, &dir_renames);
-        let moved = if live_src == *dest {
+        let done = if dest_needs_replace(&live_src, dest) {
+            set_aside(&live_src, library_root).map(|kept| aside.push((live_src.clone(), kept)))
+        } else if live_src == *dest {
             Ok(())
         } else {
             perform_rename(&live_src, dest, &mut dir_renames)
         };
-        match moved {
+        match done {
             Ok(()) => {
                 rename_map.insert(src.clone(), dest.clone());
                 for parent in [src.parent(), live_src.parent()].into_iter().flatten() {
                     prune_empty_parents(parent, library_root);
                 }
             }
-            Err(e) => {
-                if results[idx].is_ok() {
-                    results[idx] = Err(e);
-                }
-            }
+            Err(e) => results[idx] = Err(e),
         }
     }
 
@@ -941,6 +1197,7 @@ pub fn apply_release_diff_with(
         results,
         rename_map,
         dir_renames,
+        set_aside: aside,
     }
 }
 
@@ -983,7 +1240,17 @@ fn write_then_swap(tmp: &Path, src: &Path, to_apply: &[&FieldDiff]) -> Result<()
         other => other,
     };
     if tagged.tag(tag_type).is_none() {
-        tagged.insert_tag(Tag::new(tag_type));
+        let mut fresh = Tag::new(tag_type);
+        // An ID3v1-only MP3. The new ID3v2 becomes the tag every reader
+        // prefers (the scanner included), so it starts from what the file
+        // already says: holding only the edited rows, it hid the title
+        // and artist that were never part of the edit.
+        if let Some(v1) = tagged.tag(TagType::Id3v1) {
+            for item in v1.items() {
+                fresh.insert(item.clone());
+            }
+        }
+        tagged.insert_tag(fresh);
     }
     let tag = tagged
         .tag_mut(tag_type)
@@ -1115,6 +1382,28 @@ fn is_strict_child(path: &Path, root: &Path) -> bool {
 /// and removing `dest` there would delete the source.
 fn dest_needs_replace(src: &Path, dest: &Path) -> bool {
     dest != src && dest.exists() && !same_inode(src, dest)
+}
+
+/// Two files hold the same recording, as far as filing can tell: both
+/// have a readable duration and the two are within [`DUPLICATE_SLACK`].
+///
+/// Only asked about two files of one album that were paired to the same
+/// MusicBrainz track, so this is the check that separates a second copy
+/// of the song from a different song paired there by mistake (disc 2
+/// track 1 beside disc 1 track 1). Unreadable audio is never a duplicate.
+fn is_duplicate_audio(a: &Path, b: &Path) -> bool {
+    use lofty::file::AudioFile;
+    const DUPLICATE_SLACK: std::time::Duration = std::time::Duration::from_secs(2);
+    let duration = |p: &Path| {
+        probe_by_content(p)
+            .ok()
+            .map(|t| t.properties().duration())
+            .filter(|d| !d.is_zero())
+    };
+    match (duration(a), duration(b)) {
+        (Some(a), Some(b)) => a.abs_diff(b) <= DUPLICATE_SLACK,
+        _ => false,
+    }
 }
 
 /// Full paths differ only by ASCII case of one or more components.
@@ -1272,6 +1561,12 @@ fn perform_rename(
     if is_case_only_rename(src, dest) && !retitle_target_taken(src, dest) {
         return retitle_case_along(src, dest, dir_renames);
     }
+    move_file(src, dest)
+}
+
+/// Move one file, creating the dest folder and falling back to copy +
+/// remove across filesystems.
+fn move_file(src: &Path, dest: &Path) -> Result<(), String> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
     }
@@ -1313,6 +1608,53 @@ fn perform_rename(
             }
         }
     }
+}
+
+/// Take `path` out of the library without deleting it: move it into the
+/// removed-files folder beside the library
+/// ([`crate::library_layout::default_removed_dir`]) and return where it
+/// went.
+///
+/// Filing is the only thing that removes a user's audio (the copy that
+/// lost a replace), and a wrong pairing or a wrong choice there must be
+/// recoverable. The file keeps its path relative to the library's parent
+/// (`Music/Artist/Album/01 - Song.mp3`, or `Automatically Add to
+/// Music/…` for an inbox drop), so it is obvious where it came from; a
+/// name already taken there gets a ` (2)`, ` (3)`… suffix. With nowhere to
+/// put it (a library at the filesystem root) this fails, and the caller
+/// leaves both copies where they are.
+fn set_aside(path: &Path, library_root: &Path) -> Result<PathBuf, String> {
+    let removed = crate::library_layout::default_removed_dir(library_root).ok_or_else(|| {
+        format!(
+            "no folder beside {} to keep the removed copy of {}",
+            library_root.display(),
+            path.display()
+        )
+    })?;
+    let relative = library_root
+        .parent()
+        .and_then(|parent| path.strip_prefix(parent).ok())
+        .map(Path::to_path_buf)
+        .or_else(|| path.file_name().map(PathBuf::from))
+        .ok_or_else(|| format!("cannot name a removed copy of {}", path.display()))?;
+    let wanted = removed.join(relative);
+    let stem = wanted
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let ext = wanted
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    let target = (1u32..)
+        .map(|n| match n {
+            1 => wanted.clone(),
+            n => wanted.with_file_name(format!("{stem} ({n}){ext}")),
+        })
+        .find(|p| p.symlink_metadata().is_err())
+        .expect("an unbounded range always yields a free name");
+    move_file(path, &target)?;
+    Ok(target)
 }
 
 #[cfg(test)]
@@ -1942,7 +2284,8 @@ mod tests {
                 continue;
             }
             let read = || crate::dirlib::track_from_lofty(&path, 1).expect("tagged file");
-            let mut diff = build_release_diff(&[read()], &rel, &root, DiffScope::Track, None);
+            let uuid = Some("9ff43b6a-4f16-427c-93c2-92307ca505e0");
+            let mut diff = build_release_diff(&[read()], &rel, &root, DiffScope::Track, uuid);
             for f in &mut diff.tracks[0].fields {
                 if f.kind == FieldKind::Filename {
                     f.enabled = false;
@@ -1950,7 +2293,27 @@ mod tests {
             }
             let out = apply_release_diff(&diff, &root);
             assert!(out.results[0].is_ok(), "{ext}: {:?}", out.results[0]);
-            let again = build_release_diff(&[read()], &rel, &root, DiffScope::Track, None);
+
+            // The AcoustID UUID sits under the key Picard uses in this
+            // container, and nowhere else.
+            let tagged = lofty::read_from_path(&path).unwrap();
+            let tag = tagged.primary_tag().expect("tag after apply");
+            let acoustid_keys: Vec<&str> = tag
+                .items()
+                .filter(|i| i.value().text() == uuid)
+                .filter_map(|i| match i.key() {
+                    ItemKey::Unknown(k) => Some(k.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let want = match ext {
+                "mp3" => "Acoustid Id",
+                "m4a" => "----:com.apple.iTunes:Acoustid Id",
+                _ => "ACOUSTID_ID",
+            };
+            assert_eq!(acoustid_keys, vec![want], "{ext}");
+
+            let again = build_release_diff(&[read()], &rel, &root, DiffScope::Track, uuid);
             let left: Vec<String> = again.tracks[0]
                 .fields
                 .iter()
@@ -2636,7 +2999,92 @@ mod tests {
             Some("AQADtBR=writeMe"),
             "ID3v2 uses Picard's TXXX description"
         );
-        assert_eq!(find("ACOUSTID_ID").as_deref(), Some("uuid-to-write"));
+        assert_eq!(
+            find("Acoustid Id").as_deref(),
+            Some("uuid-to-write"),
+            "ID3v2 uses Picard's TXXX description"
+        );
+        assert_eq!(
+            find("ACOUSTID_ID"),
+            None,
+            "no second copy under the Vorbis name"
+        );
+    }
+
+    #[test]
+    fn tagging_an_id3v1_only_mp3_keeps_what_it_already_said() {
+        use lofty::config::WriteOptions;
+        use lofty::file::AudioFile;
+        let Some(path) = crate::test_audio::ffmpeg_mp3("id3v1-only-apply") else {
+            return;
+        };
+        // ffmpeg writes an ID3v2 of its own; this file must have none.
+        TagType::Id3v2.remove_from_path(&path).unwrap();
+        let mut tf = lofty::read_from_path(&path).unwrap();
+        let mut v1 = Tag::new(TagType::Id3v1);
+        v1.set_title("Old Title".into());
+        v1.set_artist("Old Artist".into());
+        v1.set_album("Old Album".into());
+        v1.set_genre("Rock".into());
+        v1.set_comment("ripped 2003".into());
+        tf.insert_tag(v1);
+        tf.save_to_path(&path, WriteOptions::default()).unwrap();
+
+        // An edit that touches none of those fields.
+        write_track_tags(&TrackTagDiff {
+            src_path: path.clone(),
+            dest_path: None,
+            library_id: 1,
+            fields: vec![FieldDiff {
+                kind: FieldKind::MbId,
+                name: "MB Release ID",
+                current: None,
+                proposed: Some("rel-1".into()),
+                enabled: true,
+            }],
+        })
+        .unwrap();
+
+        let back = lofty::read_from_path(&path).unwrap();
+        let v1 = back.tag(TagType::Id3v1).expect("ID3v1 survives");
+        assert_eq!(v1.title().as_deref(), Some("Old Title"));
+        assert_eq!(v1.artist().as_deref(), Some("Old Artist"));
+        assert_eq!(v1.album().as_deref(), Some("Old Album"));
+        assert_eq!(v1.genre().as_deref(), Some("Rock"));
+        assert_eq!(v1.comment().as_deref(), Some("ripped 2003"));
+        let v2 = back.tag(TagType::Id3v2).expect("ID3v2 was added");
+        assert_eq!(v2.get_string(&ItemKey::MusicBrainzReleaseId), Some("rel-1"));
+        let scanned = crate::dirlib::track_from_lofty(&path, 1).expect("still tagged");
+        assert_eq!(scanned.name, "Old Title");
+        assert_eq!(scanned.artist, "Old Artist");
+        assert_eq!(scanned.album, "Old Album");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn apply_replaces_a_legacy_acoustid_id_spelling() {
+        // Earlier builds wrote `TXXX:ACOUSTID_ID` into ID3v2. The row reads
+        // it as the current value, and a rewrite leaves one Picard-spelled
+        // copy rather than two.
+        let mut tag = Tag::new(TagType::Id3v2);
+        tag.insert_unchecked(lofty::tag::TagItem::new(
+            ItemKey::Unknown("ACOUSTID_ID".into()),
+            ItemValue::Text("old-uuid".into()),
+        ));
+        assert_eq!(
+            extras_from_tag(&tag).acoustid_id.as_deref(),
+            Some("old-uuid")
+        );
+
+        set_unknown_string(&mut tag, "ACOUSTID_ID", "new-uuid");
+        let copies: Vec<(&str, Option<&str>)> = tag
+            .items()
+            .filter_map(|i| match i.key() {
+                ItemKey::Unknown(k) => Some((k.as_str(), i.value().text())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(copies, vec![("Acoustid Id", Some("new-uuid"))]);
     }
 
     #[test]
@@ -3125,11 +3573,308 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn replacing_existing_dests_ignores_same_inode_dest() {
+    fn replace_conflicts_ignore_same_inode_dest() {
         let (src, dest) = same_file_two_unicode_spellings("same-inode-confirm");
-        assert!(rename_only_diff(&src, &dest)
-            .replacing_existing_dests()
-            .is_empty());
+        assert!(rename_only_diff(&src, &dest).replace_conflicts().is_empty());
+    }
+
+    /// `Artist/Album` holding `01 Song.wav` (`extra_secs` long) beside the
+    /// already-canonical `01 - Song.wav` (one second), and a diff that
+    /// lists both: the first renamed onto the second, the second staying.
+    fn second_file_beside_canonical(
+        name: &str,
+        extra_secs: u32,
+    ) -> (PathBuf, PathBuf, PathBuf, ReleaseTagDiff) {
+        let dir = fresh_dir(name);
+        let album = dir.join("Artist").join("Album");
+        std::fs::create_dir_all(&album).unwrap();
+        let extra = album.join("01 Song.wav");
+        let in_place = album.join("01 - Song.wav");
+        write_sine_wav(&extra, extra_secs);
+        write_sine_wav(&in_place, 1);
+        let mut diff = rename_only_diff(&extra, &in_place);
+        diff.tracks.push(TrackTagDiff {
+            src_path: in_place.clone(),
+            dest_path: None,
+            library_id: 2,
+            fields: vec![FieldDiff {
+                kind: FieldKind::Identity,
+                name: "Title",
+                current: None,
+                proposed: Some("Song".into()),
+                enabled: true,
+            }],
+        });
+        (dir, extra, in_place, diff)
+    }
+
+    #[test]
+    fn filing_folds_a_duplicate_into_the_track_already_in_place() {
+        let (dir, extra, in_place, diff) = second_file_beside_canonical("stay-dedupe", 1);
+        let incoming = std::fs::read(&extra).unwrap();
+        let conflicts = diff.replace_conflicts();
+        assert_eq!(conflicts.len(), 1, "the user is asked first");
+        assert_eq!((&conflicts[0].src, &conflicts[0].dest), (&extra, &in_place));
+        assert_eq!(
+            conflicts[0].keep,
+            KeepCopy::Incoming,
+            "equal quality: the copy that gets the new tags"
+        );
+        let out = apply_release_diff_with(&diff, true, &dir);
+        assert!(out.results.iter().all(Result::is_ok), "{:?}", out.results);
+        assert!(!extra.exists(), "one file is left, at the canonical path");
+        assert_eq!(std::fs::read(&in_place).unwrap(), incoming);
+        assert_eq!(out.rename_map.get(&extra), Some(&in_place));
+
+        // The replaced copy was moved beside the library, not deleted.
+        let [(was, kept)] = out.set_aside.as_slice() else {
+            panic!("one copy set aside, got {:?}", out.set_aside);
+        };
+        assert_eq!(was, &in_place);
+        assert!(
+            kept.starts_with(crate::library_layout::default_removed_dir(&dir).unwrap()),
+            "{}",
+            kept.display()
+        );
+        assert!(
+            kept.ends_with("stay-dedupe/Artist/Album/01 - Song.wav"),
+            "the path says where it came from: {}",
+            kept.display()
+        );
+        let tagged = lofty::read_from_path(kept).unwrap();
+        assert_eq!(
+            tagged.primary_tag().and_then(|t| t.title()).as_deref(),
+            Some("Song"),
+            "it is the copy that was in place"
+        );
+    }
+
+    #[test]
+    fn a_set_aside_copy_never_overwrites_an_earlier_one() {
+        let dir = fresh_dir("set-aside-twice");
+        let removed = crate::library_layout::default_removed_dir(&dir).unwrap();
+        let _ = std::fs::remove_dir_all(removed.join("set-aside-twice"));
+        let song = dir.join("Artist").join("01 - Song.wav");
+        std::fs::create_dir_all(song.parent().unwrap()).unwrap();
+        let mut kept = Vec::new();
+        for secs in [1, 2] {
+            write_sine_wav(&song, secs);
+            kept.push((set_aside(&song, &dir).unwrap(), secs));
+            assert!(!song.exists());
+        }
+        assert!(kept[0].0.ends_with("Artist/01 - Song.wav"));
+        assert!(kept[1].0.ends_with("Artist/01 - Song (2).wav"));
+        for (path, secs) in kept {
+            let probe = dir.join("probe.wav");
+            write_sine_wav(&probe, secs);
+            assert_eq!(
+                path.metadata().unwrap().len(),
+                probe.metadata().unwrap().len()
+            );
+        }
+    }
+
+    #[test]
+    fn keeping_the_existing_copy_removes_the_incoming_one() {
+        let (dir, extra, in_place, diff) = second_file_beside_canonical("stay-keep-existing", 1);
+        let keep: std::collections::HashSet<PathBuf> = [extra.clone()].into();
+        let out = apply_release_diff_keeping(&diff, true, &keep, &dir);
+        assert!(out.results.iter().all(Result::is_ok), "{:?}", out.results);
+        assert!(!extra.exists(), "the duplicate is gone from the library");
+        let [(was, kept)] = out.set_aside.as_slice() else {
+            panic!("one copy set aside, got {:?}", out.set_aside);
+        };
+        assert_eq!(was, &extra);
+        assert!(kept.is_file(), "moved beside the library, not deleted");
+        let tagged = lofty::read_from_path(&in_place).unwrap();
+        assert_eq!(
+            tagged.primary_tag().and_then(|t| t.title()).as_deref(),
+            Some("Song"),
+            "the copy in place is the one that was tagged, so it was not replaced"
+        );
+        assert_eq!(
+            out.rename_map.get(&extra),
+            Some(&in_place),
+            "playlists follow the surviving copy"
+        );
+    }
+
+    #[test]
+    fn keep_existing_is_ignored_without_replace_or_without_a_conflict() {
+        // No replace allowed (`m`): still a collision, nothing removed.
+        let (dir, extra, in_place, diff) = second_file_beside_canonical("keep-no-replace", 1);
+        let keep: std::collections::HashSet<PathBuf> = [extra.clone()].into();
+        let out = apply_release_diff_keeping(&diff, false, &keep, &dir);
+        assert!(out.results[0].is_err());
+        assert!(extra.exists() && in_place.exists());
+
+        // Nothing at the dest: the file is simply filed.
+        let dir = fresh_dir("keep-no-conflict");
+        let (src, dest) = (dir.join("a.wav"), dir.join("b.wav"));
+        write_sine_wav(&src, 1);
+        let keep: std::collections::HashSet<PathBuf> = [src.clone()].into();
+        let out = apply_release_diff_keeping(&rename_only_diff(&src, &dest), true, &keep, &dir);
+        assert!(out.results[0].is_ok(), "{:?}", out.results[0]);
+        assert!(dest.exists() && !src.exists());
+    }
+
+    #[test]
+    fn replace_conflicts_preselect_the_better_copy() {
+        if std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            eprintln!("ffmpeg not installed; skipping quality ranking");
+            return;
+        }
+        let dir = fresh_dir("conflict-quality");
+        let encode = |path: &Path, bitrate: &str| {
+            std::process::Command::new("ffmpeg")
+                .args(["-y", "-loglevel", "error", "-f", "lavfi", "-i"])
+                .arg("sine=frequency=440:duration=2")
+                .args(["-c:a", "libmp3lame", "-b:a", bitrate])
+                .arg(path)
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        let (low, high) = (dir.join("low.mp3"), dir.join("high.mp3"));
+        if !encode(&low, "64k") || !encode(&high, "192k") {
+            eprintln!("ffmpeg cannot encode mp3 here; skipping");
+            return;
+        }
+        // A worse copy arriving on a better one keeps the one in place...
+        let c = rename_only_diff(&low, &high).replace_conflicts();
+        assert_eq!(c[0].keep, KeepCopy::Existing, "{:?}", c[0]);
+        assert!(c[0].existing.bitrate_kbps > c[0].incoming.bitrate_kbps);
+        // ...and a better one replaces it.
+        let c = rename_only_diff(&high, &low).replace_conflicts();
+        assert_eq!(c[0].keep, KeepCopy::Incoming, "{:?}", c[0]);
+
+        // Lossless beats any lossy bitrate.
+        let lossy = AudioQuality {
+            bitrate_kbps: Some(320),
+            sample_rate: Some(48_000),
+            ..Default::default()
+        };
+        let lossless = AudioQuality {
+            lossless: true,
+            bit_depth: Some(16),
+            sample_rate: Some(44_100),
+            bitrate_kbps: Some(700),
+            ..Default::default()
+        };
+        assert!(lossless.rank() > lossy.rank());
+    }
+
+    #[test]
+    fn a_duplicate_is_not_folded_without_replace() {
+        // The tag manager (`m`) never replaces: both copies stay.
+        let (dir, extra, in_place, diff) = second_file_beside_canonical("stay-no-replace", 1);
+        let out = apply_release_diff(&diff, &dir);
+        assert!(out.results[0].is_err());
+        assert!(extra.exists() && in_place.exists());
+    }
+
+    #[test]
+    fn rename_onto_a_different_batch_track_that_stays_is_a_collision() {
+        for replace_existing in [true, false] {
+            let (dir, extra, in_place, diff) = second_file_beside_canonical("stay-collision", 4);
+            let kept = std::fs::metadata(&in_place).unwrap().len();
+            assert!(
+                diff.replace_conflicts().is_empty(),
+                "nothing to choose: the apply refuses this rename"
+            );
+            let out = apply_release_diff_with(&diff, replace_existing, &dir);
+            let err = out.results[0]
+                .as_ref()
+                .expect_err("a different song is refused");
+            assert!(err.contains("collision"), "{err}");
+            assert!(extra.exists(), "the refused file stays where it was");
+            assert!(out.rename_map.is_empty());
+            assert!(out.results[1].is_ok(), "{:?}", out.results[1]);
+            let tagged = lofty::read_from_path(&in_place).unwrap();
+            assert_eq!(
+                tagged.primary_tag().and_then(|t| t.title()).as_deref(),
+                Some("Song"),
+                "the track in place still gets its tags"
+            );
+            // The tag write grew the file; the two-second copy is twice it.
+            let now = std::fs::metadata(&in_place).unwrap().len();
+            assert!(
+                now < std::fs::metadata(&extra).unwrap().len() && now >= kept,
+                "the track in place keeps its own audio"
+            );
+        }
+    }
+
+    #[test]
+    fn rename_waits_for_the_batch_track_holding_its_dest_to_move_out() {
+        // `a` is listed first but lands on `b`'s current path; `b` has to
+        // move on to `c` before `a` may take its place.
+        let dir = fresh_dir("rename-chain");
+        let (a, b, c) = (dir.join("a.wav"), dir.join("b.wav"), dir.join("c.wav"));
+        write_sine_wav(&a, 1);
+        write_sine_wav(&b, 2);
+        let (a_len, b_len) = (a.metadata().unwrap().len(), b.metadata().unwrap().len());
+        let mut diff = rename_only_diff(&a, &b);
+        diff.tracks.push(rename_only_diff(&b, &c).tracks.remove(0));
+
+        let out = apply_release_diff(&diff, &dir);
+        assert!(out.results.iter().all(Result::is_ok), "{:?}", out.results);
+        assert!(!a.exists());
+        assert_eq!(b.metadata().unwrap().len(), a_len, "a's audio is now at b");
+        assert_eq!(c.metadata().unwrap().len(), b_len, "b's audio is now at c");
+    }
+
+    #[test]
+    fn rename_never_lands_on_a_batch_track_that_failed_to_move_out() {
+        // `b` cannot move (its dest collides with a file outside the
+        // batch), so `a` must not be renamed over it.
+        let dir = fresh_dir("rename-chain-blocked");
+        let (a, b, c) = (dir.join("a.wav"), dir.join("b.wav"), dir.join("c.wav"));
+        write_sine_wav(&a, 1);
+        write_sine_wav(&b, 2);
+        write_sine_wav(&c, 3);
+        let b_len = b.metadata().unwrap().len();
+        let mut diff = rename_only_diff(&a, &b);
+        diff.tracks.push(rename_only_diff(&b, &c).tracks.remove(0));
+
+        let out = apply_release_diff(&diff, &dir);
+        assert!(out.results[1].is_err(), "b's dest already exists");
+        let err = out.results[0].as_ref().expect_err("a has nowhere to go");
+        assert!(err.contains("collision"), "{err}");
+        assert!(a.exists());
+        assert_eq!(b.metadata().unwrap().len(), b_len, "b keeps its audio");
+        assert!(out.rename_map.is_empty());
+    }
+
+    #[test]
+    fn multi_disc_pairing_without_disc_numbers_prefers_the_title() {
+        let mut rel = make_release("Album", "Artist");
+        let mut disc2 = rel.media[0].clone();
+        disc2.position = Some(2);
+        disc2.tracks[0].id = "trk-d2-1".into();
+        disc2.tracks[0].title = "Third".into();
+        disc2.tracks[1].id = "trk-d2-2".into();
+        disc2.tracks[1].title = "Fourth".into();
+        rel.media.push(disc2);
+
+        // Disc 2 track 1, tagged with a track number but no disc number.
+        let lib = make_lib_track(Path::new("/m/x.wav"), "Third", 1);
+        let (medium, track) = pair_to_mb_track_across_media(&lib, &rel.media).unwrap();
+        assert_eq!((medium.position, track.title.as_str()), (Some(2), "Third"));
+
+        // No title to go on: the first disc's track N, as before.
+        let lib = make_lib_track(Path::new("/m/y.wav"), "Untitled", 1);
+        let (medium, track) = pair_to_mb_track_across_media(&lib, &rel.media).unwrap();
+        assert_eq!((medium.position, track.title.as_str()), (Some(1), "First"));
+
+        // A single-disc release still pairs by number over title.
+        let single = make_release("Album", "Artist");
+        let lib = make_lib_track(Path::new("/m/z.wav"), "Second", 1);
+        let (_, track) = pair_to_mb_track_across_media(&lib, &single.media).unwrap();
+        assert_eq!(track.title, "First");
     }
 
     #[test]
@@ -3369,7 +4114,7 @@ mod tests {
         let outcome = ApplyOutcome {
             results: vec![Ok(()), Ok(()), Ok(())],
             rename_map: HashMap::from([filed.clone()]),
-            dir_renames: Vec::new(),
+            ..Default::default()
         };
         let paths = outcome.reread_paths(&diff, &music);
         assert!(paths.contains(&filed.1), "new location is read");
@@ -3386,7 +4131,7 @@ mod tests {
     }
 
     #[test]
-    fn replacing_existing_dests_lists_on_disk_targets() {
+    fn replace_conflicts_list_on_disk_targets() {
         let dir = fresh_dir("replacing-dests");
         let src = dir.join("src.wav");
         let dest = dir.join("dest.wav");
@@ -3408,6 +4153,8 @@ mod tests {
                 }],
             }],
         };
-        assert_eq!(diff.replacing_existing_dests(), vec![dest]);
+        let conflicts = diff.replace_conflicts();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!((&conflicts[0].src, &conflicts[0].dest), (&src, &dest));
     }
 }

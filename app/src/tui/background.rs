@@ -310,6 +310,9 @@ pub enum BgCommand {
         /// Filing (`F` / inbox): overwrite a dest that already exists so
         /// a feat-folder copy does not sit beside the canonical file.
         replace_existing: bool,
+        /// Sources whose dest already holds the copy the user chose to
+        /// keep: the source is removed instead of replacing it.
+        keep_existing: std::collections::HashSet<std::path::PathBuf>,
     },
     /// Look up a Chromaprint fingerprint against the AcoustID web service.
     /// Result is delivered as [`BgEvent::AcoustIdResolved`]. The tag-manager
@@ -2328,12 +2331,21 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                     music_dir,
                     fingerprint,
                     replace_existing,
+                    keep_existing,
                 } => {
-                    let outcome = zytunes::tag_ops::apply_release_diff_with(
+                    let outcome = zytunes::tag_ops::apply_release_diff_keeping(
                         &diff,
                         replace_existing,
+                        &keep_existing,
                         std::path::Path::new(&music_dir),
                     );
+                    for (was, kept) in &outcome.set_aside {
+                        let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                            "tag-manager: moved {} out of the library to {}",
+                            was.display(),
+                            kept.display()
+                        )));
+                    }
                     let paths = outcome.reread_paths(&diff, std::path::Path::new(&music_dir));
                     let vacated = outcome.vacated();
                     let dir_renames = outcome.dir_renames.clone();
