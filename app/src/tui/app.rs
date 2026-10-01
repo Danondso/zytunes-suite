@@ -2772,12 +2772,9 @@ impl App {
         }
         // `Done` with an error is an apply whose library reread failed:
         // the failure list is on screen, but the library was not swapped,
-        // so the next cluster must not open against it. The poll would
-        // open the queue within 5 s, so hold it until a library lands.
+        // so the next cluster must not open against it. The reread
+        // failure also holds the queue against the poll.
         let applied = matches!(overlay.phase, TagManagerPhase::Done) && overlay.error.is_none();
-        if matches!(overlay.phase, TagManagerPhase::Done) && overlay.error.is_some() {
-            self.inbox.hold_until_library = true;
-        }
         // Snooze every source that is still where it was: all of them on a
         // dismiss, and after an apply (including a failed reread) the ones
         // that were not filed. A path that did move is not snoozed, so a
@@ -2798,7 +2795,7 @@ impl App {
         // A dismiss keeps the rest of the queue: those clusters were
         // already tag-read and fingerprinted, and the next poll opens the
         // next one from the queue instead of rescanning the inbox.
-        if applied || advance {
+        if (applied || advance) && !self.inbox.hold_until_library {
             self.open_next_file_cluster(cmd_tx);
         }
     }
@@ -3403,6 +3400,11 @@ impl App {
                 }
             }
             Err(e) => {
+                // The files moved but the library still shows them where
+                // they were. Queued clusters wait for a library that
+                // loads, however this overlay is left: closed from Done or
+                // Error, or by way of Esc back to search.
+                self.inbox.hold_until_library = true;
                 if overlay_matches {
                     if let Some(overlay) = self.tag_manager.as_mut() {
                         overlay.error = Some(e);
@@ -15475,47 +15477,99 @@ mod tests {
         );
     }
 
-    #[test]
-    fn q_aborts_the_whole_filing_run() {
-        // From the diff, and from Done (where any other key would advance
-        // to the next queued album).
-        for phase in [TagManagerPhase::DiffPreview, TagManagerPhase::Done] {
-            let src = PathBuf::from("/inbox/a.wav");
-            let queued = "/inbox/c.wav".to_string();
-            let mut app = filing_overlay_with_rename(&src, std::path::Path::new("/m/b.wav"));
-            app.tag_manager.as_mut().unwrap().phase = phase;
-            app.inbox
-                .queue
-                .push_back(zytunes::library_layout::AlbumCluster {
+    /// A filing overlay in `phase` with one more album waiting in the
+    /// queue, whose only track is at the returned inbox path.
+    fn filing_overlay_with_a_queued_album(phase: TagManagerPhase) -> (App, String) {
+        let src = PathBuf::from("/inbox/a.wav");
+        let queued = "/inbox/c.wav".to_string();
+        let mut app = filing_overlay_with_rename(&src, std::path::Path::new("/m/b.wav"));
+        app.tag_manager.as_mut().unwrap().phase = phase;
+        app.inbox
+            .queue
+            .push_back(zytunes::library_layout::AlbumCluster {
+                artist: "Alice In Chains".into(),
+                album: "Facelift".into(),
+                tracks: vec![Track {
+                    id: 2,
+                    name: "We Die Young".into(),
                     artist: "Alice In Chains".into(),
                     album: "Facelift".into(),
-                    tracks: vec![Track {
-                        id: 2,
-                        name: "We Die Young".into(),
-                        artist: "Alice In Chains".into(),
-                        album: "Facelift".into(),
-                        location: Some(queued.clone()),
-                        ..Default::default()
-                    }],
-                });
-            let (tx, _rx) = mpsc::channel::<BgCommand>();
-            app.handle_tag_manager_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), &tx);
-            assert!(app.tag_manager.is_none(), "{phase:?}: q closes");
-            assert!(
-                app.inbox.queue.is_empty(),
-                "{phase:?}: the queue is dropped"
-            );
-            assert!(
-                app.inbox.dismissed.contains(&queued),
-                "{phase:?}: queued albums are snoozed so a rescan does not reopen them"
-            );
+                    location: Some(queued.clone()),
+                    ..Default::default()
+                }],
+            });
+        (app, queued)
+    }
+
+    #[test]
+    fn q_aborts_the_whole_filing_run() {
+        let (mut app, queued) = filing_overlay_with_a_queued_album(TagManagerPhase::DiffPreview);
+        let (tx, _rx) = mpsc::channel::<BgCommand>();
+        app.handle_tag_manager_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), &tx);
+        assert!(app.tag_manager.is_none(), "q closes");
+        assert!(app.inbox.queue.is_empty(), "the queue is dropped");
+        assert!(
+            app.inbox.dismissed.contains(&queued),
+            "queued albums are snoozed so a rescan does not reopen them"
+        );
+        app.inbox.last_request = None;
+        app.maybe_request_inbox_scan();
+        assert!(
+            app.tag_manager.is_none(),
+            "the next poll must not reopen the run"
+        );
+    }
+
+    #[test]
+    fn q_on_the_done_screen_closes_like_any_other_key() {
+        // The apply is over, so there is no run left to abort: the next
+        // queued album opens, and nothing in the queue is snoozed.
+        let (mut app, queued) = filing_overlay_with_a_queued_album(TagManagerPhase::Done);
+        let (tx, _rx) = mpsc::channel::<BgCommand>();
+        app.handle_tag_manager_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), &tx);
+        let overlay = app.tag_manager.as_ref().expect("the next album opens");
+        assert_eq!(overlay.source_album, "Facelift");
+        assert!(!app.inbox.dismissed.contains(&queued));
+    }
+
+    #[test]
+    fn a_failed_reread_holds_the_queue_however_the_overlay_is_left() {
+        let (tx, _rx) = mpsc::channel::<BgCommand>();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let poll_leaves_the_queue = |app: &mut App, case: &str| {
+            assert!(app.tag_manager.is_none(), "{case}: overlay closed");
             app.inbox.last_request = None;
             app.maybe_request_inbox_scan();
             assert!(
                 app.tag_manager.is_none(),
-                "{phase:?}: the next poll must not reopen the run"
+                "{case}: the poll must not open the next album against the stale library"
             );
-        }
+            assert_eq!(app.inbox.queue.len(), 1, "{case}");
+        };
+
+        // Every track applied, so the failed reread lands on Error.
+        let (mut app, _) = filing_overlay_with_a_queued_album(TagManagerPhase::Applying);
+        app.handle_library_reread_complete(0, Err("disk".into()));
+        assert_eq!(
+            app.tag_manager.as_ref().unwrap().phase,
+            TagManagerPhase::Error
+        );
+        app.handle_tag_manager_key(key(KeyCode::Enter), &tx);
+        poll_leaves_the_queue(&mut app, "closed from Error");
+
+        // Esc from the failure list goes to search; Esc there closes.
+        let mut app = done_with_a_failure_and_a_queued_cluster(Err("disk"));
+        app.handle_tag_manager_key(key(KeyCode::Esc), &tx);
+        app.handle_tag_manager_key(key(KeyCode::Esc), &tx);
+        poll_leaves_the_queue(&mut app, "closed from search");
+
+        app.handle_library_reread_complete(0, Ok(Box::new(VecLibrary { tracks: vec![] })));
+        app.inbox.last_request = None;
+        app.maybe_request_inbox_scan();
+        assert!(
+            app.tag_manager.is_some(),
+            "a fresh library lets the held cluster open"
+        );
     }
 
     #[test]
