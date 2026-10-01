@@ -49,6 +49,17 @@ pub enum AudioCommand {
     Scrub {
         delta_ms: i64,
     },
+    /// A filing apply renamed the open file, or re-keyed the stem cache
+    /// under it. The decoder keeps the inode; this only updates the paths
+    /// the next scrub or stem-exit reopens.
+    Retarget {
+        /// `(old, new)` of the playing source file. Applied only when the
+        /// path the thread has stored is `old` (a transcoded temp is left
+        /// alone).
+        file: Option<(String, String)>,
+        /// Stem-cache directories renamed by a rekey, `(old, new)`.
+        stem_dirs: Vec<(std::path::PathBuf, std::path::PathBuf)>,
+    },
 }
 
 /// What [`AudioCommand::SwapSource`] swaps to. `Stems` carries the shared
@@ -161,6 +172,37 @@ fn resolve_playback_path(path: &str) -> Result<String, String> {
         transcode_for_playback(path)
     } else {
         Ok(path.to_string())
+    }
+}
+
+/// Point the open source at where a filing apply moved it. The decoder
+/// keeps the inode; only the path a later scrub or stem-exit reopens
+/// changes. A stored path that is not `old` (a transcoded temp) is left
+/// alone.
+fn apply_retarget(
+    current: Option<&mut NowSource>,
+    file: Option<(String, String)>,
+    stem_dirs: &[(std::path::PathBuf, std::path::PathBuf)],
+) {
+    match current {
+        Some(NowSource::File(path)) => {
+            if let Some((old, new)) = file {
+                if *path == old {
+                    *path = new;
+                }
+            }
+        }
+        Some(NowSource::Stems(stems, _)) => {
+            for stem_path in &mut stems.paths {
+                for (old, new) in stem_dirs {
+                    if let Ok(rest) = stem_path.strip_prefix(old) {
+                        *stem_path = new.join(rest);
+                        break;
+                    }
+                }
+            }
+        }
+        None => {}
     }
 }
 
@@ -430,6 +472,9 @@ pub fn spawn(
                         elapsed_ms: elapsed.as_millis() as u64,
                     });
                 }
+                Ok(AudioCommand::Retarget { file, stem_dirs }) => {
+                    apply_retarget(current.as_mut(), file, &stem_dirs);
+                }
                 Ok(AudioCommand::Scrub { delta_ms }) => {
                     // Compute new position
                     let elapsed_now = if playing {
@@ -678,5 +723,45 @@ mod tests {
         assert_eq!(sought.next(), Some(25.0), "eager fallback hit the mark");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retarget_rewrites_the_stored_file_and_leaves_a_transcode_temp() {
+        let mut file = Some(NowSource::File("/m/old.flac".into()));
+        apply_retarget(
+            file.as_mut(),
+            Some(("/m/old.flac".into(), "/m/new.flac".into())),
+            &[],
+        );
+        assert!(matches!(file, Some(NowSource::File(p)) if p == "/m/new.flac"));
+
+        let mut temp = Some(NowSource::File("/tmp/zytunes-play.wav".into()));
+        apply_retarget(
+            temp.as_mut(),
+            Some(("/m/old.flac".into(), "/m/new.flac".into())),
+            &[],
+        );
+        assert!(
+            matches!(temp, Some(NowSource::File(p)) if p == "/tmp/zytunes-play.wav"),
+            "a transcoded temp is not the file that was renamed"
+        );
+    }
+
+    #[test]
+    fn retarget_rewrites_open_stem_paths_under_a_renamed_cache_dir() {
+        use std::path::PathBuf;
+        use zytunes::stems::{new_stem_gains, StemSet, SIX_STEM_LAYOUT};
+        let old = PathBuf::from("/cache/old-key");
+        let new = PathBuf::from("/cache/new-key");
+        let mut stems = Some(NowSource::Stems(
+            Box::new(StemSet::from_layout(&old, "flac", SIX_STEM_LAYOUT)),
+            new_stem_gains(&[]),
+        ));
+        apply_retarget(stems.as_mut(), None, &[(old, new.clone())]);
+        let Some(NowSource::Stems(set, _)) = stems else {
+            panic!("stem source replaced");
+        };
+        assert!(set.paths.iter().all(|p| p.starts_with(&new)));
+        assert!(set.paths[0].ends_with("vocals.flac"));
     }
 }

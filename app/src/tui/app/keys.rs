@@ -847,7 +847,7 @@ impl App {
 
     /// `L` — dump the sync log to `/tmp/zytunes-log.txt` and copy the
     /// path to the system clipboard.
-    fn dump_log_to_file(&mut self) {
+    pub(crate) fn dump_log_to_file(&mut self) {
         let path = std::path::PathBuf::from("/tmp/zytunes-log.txt");
         let content = self.sync.log.join("\n");
         match std::fs::write(&path, &content) {

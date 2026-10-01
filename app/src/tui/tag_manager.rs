@@ -122,6 +122,8 @@ pub struct TagManagerOverlay {
     /// follow-up (library reread, anchor restore) needs both this and the
     /// list of source paths.
     pub last_rename_map: std::collections::HashMap<PathBuf, PathBuf>,
+    /// Tracks the last apply failed on, in diff order. Empty on success.
+    pub apply_failures: Vec<ApplyFailure>,
     /// Renames whose dest already holds another copy, computed once on
     /// entering `ConfirmReplace` with the better copy preselected. The
     /// prompt renders from this every frame (recomputing would probe the
@@ -152,6 +154,30 @@ pub struct TagManagerOverlay {
     pub filing: bool,
 }
 
+/// What became of a track whose apply reported an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailedTrack {
+    /// It was to be renamed or filed and is still where it was.
+    NotMoved,
+    /// It reached its new path, but its tags were not written.
+    MovedUntagged,
+    /// No move was asked for; its tags were not written.
+    Untagged,
+    /// Its tags were not written, and an incoming copy then took its
+    /// place: the file is in the removed-files folder. The file now at its
+    /// old path is the incoming one, which is not the one that failed.
+    SetAsideUntagged,
+}
+
+/// One failed track of the last apply, kept on the overlay so the Done
+/// screen can name it instead of pointing at the log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplyFailure {
+    pub file: PathBuf,
+    pub outcome: FailedTrack,
+    pub error: String,
+}
+
 impl TagManagerOverlay {
     pub fn new(
         scope: DiffScope,
@@ -178,6 +204,7 @@ impl TagManagerOverlay {
             flattened_rows: Vec::new(),
             collapsed_tracks: HashSet::new(),
             last_rename_map: std::collections::HashMap::new(),
+            apply_failures: Vec::new(),
             replace_conflicts: Vec::new(),
             replace_focus: 0,
             pending_request_token: 0,
@@ -187,11 +214,6 @@ impl TagManagerOverlay {
         }
     }
 
-    /// Bump the request token and return the new value. Callers stamp this
-    /// onto outgoing `BgCommand::Mb*` requests so the response handler can
-    /// drop stale events from previous opens. The counter is process-wide
-    /// so a re-opened overlay starts ahead of every previous overlay's
-    /// in-flight request.
     /// A diff is loaded and no field would change anything: the file
     /// already carries what MusicBrainz says. Rendered as a status line
     /// in the diff view; Enter closes instead of applying.
@@ -208,6 +230,11 @@ impl TagManagerOverlay {
         }
     }
 
+    /// Bump the request token and return the new value. Callers stamp this
+    /// onto outgoing `BgCommand::Mb*` requests so the response handler can
+    /// drop stale events from previous opens. The counter is process-wide
+    /// so a re-opened overlay starts ahead of every previous overlay's
+    /// in-flight request.
     pub fn next_request_token(&mut self) -> u64 {
         self.pending_request_token = REQUEST_TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed);
         self.pending_request_token
@@ -392,6 +419,7 @@ mod tests {
                     current: Some("Them Bones".into()),
                     proposed: Some(if enabled { "Them Bones!" } else { "Them Bones" }.into()),
                     enabled,
+                    from_release: true,
                 }],
             }],
         });
@@ -493,6 +521,7 @@ mod tests {
                         current: Some("Same".into()),
                         proposed: Some("Same".into()),
                         enabled: false,
+                        from_release: true,
                     },
                     FieldDiff {
                         kind: FieldKind::Identity,
@@ -500,6 +529,7 @@ mod tests {
                         current: Some("Old".into()),
                         proposed: Some("New".into()),
                         enabled: true,
+                        from_release: true,
                     },
                 ],
             }],
@@ -547,6 +577,7 @@ mod tests {
                         current: Some("Same".into()),
                         proposed: Some("Same".into()),
                         enabled: false,
+                        from_release: true,
                     },
                     FieldDiff {
                         kind: FieldKind::Identity,
@@ -554,6 +585,7 @@ mod tests {
                         current: Some("Old".into()),
                         proposed: Some("New".into()),
                         enabled: false,
+                        from_release: true,
                     },
                 ],
             }],
@@ -591,6 +623,7 @@ mod tests {
                     current: Some("Old".into()),
                     proposed: Some("New".into()),
                     enabled: true,
+                    from_release: true,
                 },
                 FieldDiff {
                     kind: FieldKind::Identity,
@@ -598,6 +631,7 @@ mod tests {
                     current: Some("Same".into()),
                     proposed: Some("Same".into()),
                     enabled: false,
+                    from_release: true,
                 },
             ],
         };

@@ -4,6 +4,7 @@ mod util;
 pub use metadata::{format_metadata_pairs, MetadataRow};
 use util::{
     center_pad, char_disp_width, compute_scroll, disp_width, marquee, pad_right_to_width, truncate,
+    wrap_hard,
 };
 
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -266,9 +267,11 @@ pub fn draw(f: &mut Frame, app: &App) {
         draw_stem_bulk_confirm(f, app, confirm);
     }
 
-    // Toast overlay.
-    if let Some((ref msg, _, is_error)) = app.toast_message {
-        draw_toast(f, app, msg, is_error);
+    // Toast overlay. While the tag manager is open the toast is drawn
+    // after it instead (see below).
+    let toast = app.toast_message.as_ref();
+    if let (Some((msg, _, is_error)), None) = (toast, &app.tag_manager) {
+        draw_toast(f, app, msg, *is_error);
     }
 
     // Help overlay.
@@ -289,8 +292,16 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     // Tag-manager overlay. Drawn on top of the track-info popup because the
     // `m` key dispatcher routes around the track-info guard.
+    //
+    // The toast goes on top of it. An apply reports failed tracks through
+    // a toast while the overlay stays open, and both are centered rects:
+    // drawn first, the toast was fully covered and the failure reached
+    // only the log.
     if app.tag_manager.is_some() {
         draw_tag_manager_overlay(f, app);
+        if let Some((msg, _, is_error)) = toast {
+            draw_toast(f, app, msg, *is_error);
+        }
     }
 
     // CD import overlay — drawn last so it sits on top of everything.
@@ -3889,6 +3900,14 @@ fn draw_tag_manager_overlay(f: &mut Frame, app: &App) {
             )
         }
         TagManagerPhase::Applying => format!(" {noun} — applying… "),
+        // `L` and, after a failed reread, Esc do not close this screen.
+        TagManagerPhase::Done if !overlay.apply_failures.is_empty() => {
+            if overlay.error.is_some() {
+                format!(" {noun} — done with errors · L log · Esc search · other keys close ")
+            } else {
+                format!(" {noun} — done with errors · L log · other keys close ")
+            }
+        }
         TagManagerPhase::Done => format!(" {noun} — done (any key to close) "),
         TagManagerPhase::Error => format!(" {noun} — error (any key to close) "),
     };
@@ -3919,6 +3938,9 @@ fn draw_tag_manager_overlay(f: &mut Frame, app: &App) {
         TagManagerPhase::ConfirmReplace => {
             draw_tag_manager_confirm_replace(f, app, overlay, inner);
         }
+        TagManagerPhase::Done if !overlay.apply_failures.is_empty() => {
+            draw_tag_manager_failures(f, app, overlay, inner);
+        }
         TagManagerPhase::Done => {
             draw_centered_line(f, inner, "Done. Press any key to close.", t.success_text);
         }
@@ -3930,6 +3952,94 @@ fn draw_tag_manager_overlay(f: &mut Frame, app: &App) {
             draw_centered_line(f, inner, &msg, t.error_text);
         }
     }
+}
+
+/// Done screen of an apply that failed on some tracks: each one by file
+/// name, with what became of it and the reason. The log has the same
+/// lines, but the user is looking here, and "see log" does not say which
+/// files are still sitting where they were.
+fn draw_tag_manager_failures(
+    f: &mut Frame,
+    app: &App,
+    overlay: &crate::app::TagManagerOverlay,
+    inner: Rect,
+) {
+    use crate::app::tag_manager::FailedTrack;
+    let t = app.theme();
+    let failures = &overlay.apply_failures;
+    let n = failures.len();
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!(
+                "{n} track{} failed. Everything else was applied.",
+                if n == 1 { "" } else { "s" }
+            ),
+            Style::default().fg(t.error_text),
+        )),
+        Line::default(),
+    ];
+    // Reasons are hard-wrapped here rather than left to the widget, so
+    // the row count is known: errors carry full paths and their point
+    // ("already exists") is often at the end, past the right edge. Wrapped
+    // by display width: a CJK path is twice as wide as its char count.
+    let width = usize::from(inner.width);
+    let reason_width = width.saturating_sub(4).max(1);
+    if let Some(err) = overlay.error.as_deref() {
+        let mut reread: Vec<Line> = wrap_hard(err, width.max(1))
+            .into_iter()
+            .map(|row| Line::from(Span::styled(row, Style::default().fg(t.error_text))))
+            .collect();
+        reread.push(Line::default());
+        lines.splice(0..0, reread);
+    }
+    // Rows left for tracks: below the header rows, above the footer.
+    let mut room = usize::from(inner.height).saturating_sub(lines.len() + 1);
+    let mut shown = 0;
+    for failure in failures {
+        let reason_rows = wrap_hard(&failure.error, reason_width);
+        let rows = 1 + reason_rows.len();
+        // Always show the first track, even in a window too short for it.
+        if rows > room && shown > 0 {
+            break;
+        }
+        room = room.saturating_sub(rows);
+        shown += 1;
+        let name = failure
+            .file
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| failure.file.display().to_string());
+        let outcome = match failure.outcome {
+            FailedTrack::NotMoved => "not moved",
+            FailedTrack::MovedUntagged => "moved, tags not written",
+            FailedTrack::Untagged => "tags not written",
+            FailedTrack::SetAsideUntagged => "set aside, tags not written",
+        };
+        // A long file name gives way, not the outcome: what became of the
+        // file is the point of the row.
+        let name_width = width.saturating_sub(disp_width("✗  — ") + disp_width(outcome));
+        let name = truncate(&name, name_width);
+        lines.push(Line::from(Span::styled(
+            format!("✗ {name} — {outcome}"),
+            Style::default().fg(t.error_text),
+        )));
+        for row in reason_rows {
+            lines.push(Line::from(Span::styled(
+                format!("    {row}"),
+                Style::default().fg(t.dim_text),
+            )));
+        }
+    }
+    let more = if n > shown {
+        format!("+{} more. Full list in the log (L).", n - shown)
+    } else {
+        "Also in the log (L).".to_string()
+    };
+    lines.push(Line::from(Span::styled(
+        more,
+        Style::default().fg(t.dim_text),
+    )));
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_centered_line(f: &mut Frame, area: Rect, msg: &str, color: Color) {
@@ -4514,6 +4624,22 @@ mod tests {
     use super::*;
     use zytunes::tag_ops::{FieldDiff, FieldKind, TrackTagDiff};
 
+    /// What the test terminal shows: one line per row, trailing blanks
+    /// trimmed.
+    fn screen_text(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
+        let buf = term.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn header_track(fields: Vec<FieldDiff>) -> TrackTagDiff {
         TrackTagDiff {
             src_path: std::path::PathBuf::from("/m/A/B/01.mp3"),
@@ -4530,6 +4656,7 @@ mod tests {
             current: Some(cur.into()),
             proposed: Some(prop.into()),
             enabled: true,
+            from_release: true,
         }
     }
 
@@ -4569,6 +4696,7 @@ mod tests {
                 current: Some("Dreams".into()),
                 proposed: Some("Dreams".into()),
                 enabled: false,
+                from_release: true,
             },
             field(FieldKind::Numbering, "Track #", "1", "1"),
         ]);
@@ -4595,6 +4723,7 @@ mod tests {
                 current: Some("/m/A/B/01 old.mp3".into()),
                 proposed: Some("/m/A/B/01 new.mp3".into()),
                 enabled: true,
+                from_release: true,
             },
         ]);
         let label = render_track_header(&track);
@@ -4609,11 +4738,188 @@ mod tests {
             current: Some("/m/A/B/01 old.mp3".into()),
             proposed: Some("/m/A/B/01 new.mp3".into()),
             enabled: false,
+            from_release: true,
         };
         let _ = &mut filename;
         let track = header_track(vec![filename]);
         let label = render_track_header(&track);
         assert!(!label.contains("rename"));
+    }
+
+    #[test]
+    fn a_write_failure_toast_shows_over_the_tag_overlay() {
+        // The apply reports failed tracks through a toast while the
+        // overlay is still open (it goes on to Done). Both are centered,
+        // so the overlay drawn second hid the only on-screen notice.
+        let mut app = App::new();
+        app.tag_manager = Some(crate::app::TagManagerOverlay::new(
+            zytunes::tag_ops::DiffScope::Album,
+            "2Pac".into(),
+            "Album".into(),
+            None,
+            crate::app::SelectionAnchor::default(),
+        ));
+        let msg = "1 track failed to write, see log (L)";
+        app.set_toast(msg.into(), true);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| draw(f, &app)).unwrap();
+        let screen = screen_text(&term);
+        assert!(screen.contains("Tag manager") || screen.contains("File into library"));
+        assert!(screen.contains(msg), "{screen}");
+    }
+
+    #[test]
+    fn done_screen_lists_the_tracks_that_failed() {
+        use crate::app::tag_manager::{ApplyFailure, FailedTrack};
+        let mut app = App::new();
+        let mut overlay = crate::app::TagManagerOverlay::new(
+            zytunes::tag_ops::DiffScope::Album,
+            "2Pac".into(),
+            "Album".into(),
+            None,
+            crate::app::SelectionAnchor::default(),
+        );
+        overlay.filing = true;
+        overlay.phase = crate::app::TagManagerPhase::Done;
+        overlay.apply_failures = vec![
+            ApplyFailure {
+                file: "/inbox/01 Song.wav".into(),
+                outcome: FailedTrack::NotMoved,
+                error: "rename collision: /m/01 - Song.wav already exists".into(),
+            },
+            ApplyFailure {
+                file: "/inbox/02 Other.wav".into(),
+                outcome: FailedTrack::MovedUntagged,
+                error: "lofty save failed: Invalid frame language".into(),
+            },
+        ];
+        app.tag_manager = Some(overlay);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| draw(f, &app)).unwrap();
+        let screen = screen_text(&term);
+        assert!(screen.contains("done with errors"), "{screen}");
+        assert!(screen.contains("2 tracks failed"), "{screen}");
+        assert!(screen.contains("✗ 01 Song.wav — not moved"), "{screen}");
+        assert!(
+            screen.contains("rename collision: /m/01 - Song.wav already exists"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("✗ 02 Other.wav — moved, tags not written"),
+            "{screen}"
+        );
+        assert!(!screen.contains("Done. Press any key"), "{screen}");
+    }
+
+    #[test]
+    fn done_screen_shows_a_reread_error_above_the_track_failures() {
+        use crate::app::tag_manager::{ApplyFailure, FailedTrack};
+        let mut app = App::new();
+        let mut overlay = crate::app::TagManagerOverlay::new(
+            zytunes::tag_ops::DiffScope::Album,
+            "2Pac".into(),
+            "Album".into(),
+            None,
+            crate::app::SelectionAnchor::default(),
+        );
+        overlay.phase = crate::app::TagManagerPhase::Done;
+        // Longer than the overlay is wide; its last character must still
+        // be on screen.
+        overlay.error = Some(format!(
+            "library reread failed: disk {}終",
+            "/a/long/path".repeat(12)
+        ));
+        overlay.apply_failures = vec![ApplyFailure {
+            file: "/inbox/01 Song.wav".into(),
+            outcome: FailedTrack::NotMoved,
+            error: "rename collision".into(),
+        }];
+        app.tag_manager = Some(overlay);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| draw(f, &app)).unwrap();
+        let screen = screen_text(&term);
+        assert!(screen.contains("library reread failed: disk"), "{screen}");
+        assert!(screen.contains('終'), "the error is wrapped: {screen}");
+        assert!(screen.contains("01 Song.wav — not moved"), "{screen}");
+        assert!(
+            screen.contains("L log · Esc search · other keys close"),
+            "the title names the keys that do not close: {screen}"
+        );
+    }
+
+    #[test]
+    fn done_screen_wraps_a_long_reason_and_counts_what_does_not_fit() {
+        use crate::app::tag_manager::{ApplyFailure, FailedTrack};
+        let mut app = App::new();
+        let mut overlay = crate::app::TagManagerOverlay::new(
+            zytunes::tag_ops::DiffScope::Album,
+            "2Pac".into(),
+            "Album".into(),
+            None,
+            crate::app::SelectionAnchor::default(),
+        );
+        overlay.phase = crate::app::TagManagerPhase::Done;
+        // The point of a collision error is at its end, after the path.
+        let long = format!(
+            "rename collision: /m/{}/01 - Song.wav already exists",
+            "x".repeat(90)
+        );
+        overlay.apply_failures = (1..=9)
+            .map(|i| ApplyFailure {
+                file: format!("/inbox/{i:02} Song.wav").into(),
+                outcome: FailedTrack::NotMoved,
+                error: long.clone(),
+            })
+            .collect();
+        app.tag_manager = Some(overlay);
+        // 60x16 terminal: overlay 42 wide, 9 rows of body.
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 16)).unwrap();
+        term.draw(|f| draw(f, &app)).unwrap();
+        let screen = screen_text(&term);
+        assert!(screen.contains("9 tracks failed"), "{screen}");
+        assert!(screen.contains("✗ 01 Song.wav — not moved"), "{screen}");
+        assert!(
+            screen.contains("already exists"),
+            "the end of the reason: {screen}"
+        );
+        assert!(!screen.contains("09 Song.wav"), "{screen}");
+        let more = screen
+            .lines()
+            .find(|l| l.contains("more. Full list in the log (L)."))
+            .unwrap_or_else(|| panic!("the footer survives: {screen}"));
+        let shown = screen.matches("— not moved").count();
+        assert!(more.contains(&format!("+{} more", 9 - shown)), "{screen}");
+    }
+
+    #[test]
+    fn done_screen_keeps_wide_reasons_and_long_names_inside_the_overlay() {
+        use crate::app::tag_manager::{ApplyFailure, FailedTrack};
+        let mut app = App::new();
+        let mut overlay = crate::app::TagManagerOverlay::new(
+            zytunes::tag_ops::DiffScope::Album,
+            "坂本龍一".into(),
+            "Album".into(),
+            None,
+            crate::app::SelectionAnchor::default(),
+        );
+        overlay.phase = crate::app::TagManagerPhase::Done;
+        // Wide glyphs: counted by chars, a row of these ran to twice the
+        // overlay's width and the end of the reason was clipped.
+        overlay.apply_failures = vec![ApplyFailure {
+            file: format!("/inbox/01 {}.flac", "曲".repeat(40)).into(),
+            outcome: FailedTrack::MovedUntagged,
+            // One wide char closes the reason, so no wrap can split it.
+            error: format!("{}終", "坂".repeat(60)),
+        }];
+        app.tag_manager = Some(overlay);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 20)).unwrap();
+        term.draw(|f| draw(f, &app)).unwrap();
+        let screen = screen_text(&term);
+        assert!(screen.contains('終'), "the end of the reason: {screen}");
+        assert!(
+            screen.contains("— moved, tags not written"),
+            "the outcome survives a long name: {screen}"
+        );
     }
 
     #[test]
@@ -4651,17 +4957,7 @@ mod tests {
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 14)).unwrap();
         term.draw(|f| draw_tag_manager_confirm_replace(f, &app, &overlay, f.area()))
             .unwrap();
-        let buf = term.backend().buffer().clone();
-        let rows: Vec<String> = (0..buf.area.height)
-            .map(|y| {
-                (0..buf.area.width)
-                    .map(|x| buf[(x, y)].symbol())
-                    .collect::<String>()
-                    .trim_end()
-                    .to_string()
-            })
-            .collect();
-        let screen = rows.join("\n");
+        let screen = screen_text(&term);
         assert!(screen.contains("▸ Album/01 - Song.mp3"), "{screen}");
         assert!(
             screen.contains(

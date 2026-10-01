@@ -150,14 +150,19 @@ impl LocalPlays {
     /// Move play stats to tracks whose library ID changed (a file move
     /// re-hashes the path). Stats already under the new ID are merged:
     /// counts add, the latest play wins. Returns `true` if anything moved.
+    ///
+    /// Every old entry is lifted out before any is put back. One apply can
+    /// yield `a -> b` and `b -> c` together (a file renamed into the path
+    /// another file just left); moving them one at a time, in map order,
+    /// could land `a`'s stats on `b` and then carry them on to `c`.
     pub fn remap_track_ids(&mut self, map: &HashMap<u64, u64>) -> bool {
-        let mut changed = false;
-        for (old, new) in map {
-            let Some(moved) = self.tracks.remove(old) else {
-                continue;
-            };
-            changed = true;
-            let entry = self.tracks.entry(*new).or_default();
+        let lifted: Vec<(u64, TrackPlays)> = map
+            .iter()
+            .filter_map(|(old, new)| Some((*new, self.tracks.remove(old)?)))
+            .collect();
+        let changed = !lifted.is_empty();
+        for (new, moved) in lifted {
+            let entry = self.tracks.entry(new).or_default();
             entry.play_count = entry.play_count.saturating_add(moved.play_count);
             entry.skip_count = entry.skip_count.saturating_add(moved.skip_count);
             entry.last_played_at_ms = entry.last_played_at_ms.max(moved.last_played_at_ms);
@@ -371,6 +376,32 @@ mod tests {
         let merged = p.get(10).unwrap();
         assert_eq!(merged.play_count, 2);
         assert_eq!(merged.last_played_at_ms, 300, "latest play wins");
+    }
+
+    #[test]
+    fn remap_track_ids_keeps_a_rename_chain_apart() {
+        // An apply can move track 1 into the path track 2 just left, and
+        // so on down the album: id n -> n+1 for every track. Each track's
+        // plays must follow that track, not pile up at the end of the
+        // chain. Eight links so a lucky map order cannot pass by accident.
+        let mut p = LocalPlays::new();
+        for id in 1..=8u64 {
+            for _ in 0..id {
+                p.record_play(id, id * 100);
+            }
+        }
+        let map: HashMap<u64, u64> = (1..=8u64).map(|id| (id, id + 1)).collect();
+        assert!(p.remap_track_ids(&map));
+        assert!(p.get(1).is_none(), "nothing moved into the first id");
+        for id in 1..=8u64 {
+            let moved = p.get(id + 1).unwrap();
+            assert_eq!(
+                (u64::from(moved.play_count), moved.last_played_at_ms),
+                (id, id * 100),
+                "track {id}'s plays are under {}",
+                id + 1
+            );
+        }
     }
 
     // -- play_threshold_ms --

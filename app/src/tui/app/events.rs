@@ -147,8 +147,17 @@ impl App {
                 results,
                 rename_map,
                 dir_renames,
+                set_aside,
+                stem_dir_renames,
             } => {
-                self.handle_tags_applied(token, results, rename_map, &dir_renames);
+                self.handle_tags_applied(
+                    token,
+                    results,
+                    rename_map,
+                    &dir_renames,
+                    &set_aside,
+                    &stem_dir_renames,
+                );
             }
             BgEvent::LibraryRereadComplete { token, result } => {
                 self.handle_library_reread_complete(token, result);
@@ -515,6 +524,7 @@ impl App {
         match result {
             Ok(lib) => {
                 self.library = Some(lib);
+                self.inbox.hold_until_library = false;
                 // Re-resolve the popup's cached lib `Track` against
                 // the new library *before* `refresh_sidebar` clears
                 // `track_list` — closed popups drop the cache, open

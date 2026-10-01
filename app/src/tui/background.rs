@@ -313,6 +313,14 @@ pub enum BgCommand {
         /// Sources whose dest already holds the copy the user chose to
         /// keep: the source is removed instead of replacing it.
         keep_existing: std::collections::HashSet<std::path::PathBuf>,
+        /// Resolved stem-cache root. Entries whose source moved are re-keyed
+        /// when the file's fingerprint still matches, and removed when it
+        /// does not. `None` leaves the cache alone.
+        stem_cache_dir: Option<PathBuf>,
+        /// Source path of the track whose stem split the mixer has open,
+        /// if stem playback is live. That entry is not deleted out from
+        /// under the mixer when a rewrite makes the fingerprint stale.
+        stems_in_use: Option<PathBuf>,
     },
     /// Look up a Chromaprint fingerprint against the AcoustID web service.
     /// Result is delivered as [`BgEvent::AcoustIdResolved`]. The tag-manager
@@ -601,6 +609,13 @@ pub enum BgEvent {
         /// Albums outside the diff moved with them, so the app remaps any
         /// queued filing cluster that still points under `old`.
         dir_renames: Vec<(std::path::PathBuf, std::path::PathBuf)>,
+        /// The copies this apply moved out of the library. A tag error on
+        /// a track whose file is here needs telling apart: for a dropped
+        /// incoming file it is about the copy that stayed, for a replaced
+        /// one about the file that is now in the removed-files folder.
+        set_aside: Vec<zytunes::tag_ops::SetAside>,
+        /// Stem-cache directories renamed onto a moved file's new key.
+        stem_dir_renames: Vec<(std::path::PathBuf, std::path::PathBuf)>,
     },
     /// Phase 2 of `ApplyTagDiff`: surgical re-scan complete. Replaces
     /// `App.library` and (when the token still matches the open overlay)
@@ -2332,6 +2347,8 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                     fingerprint,
                     replace_existing,
                     keep_existing,
+                    stem_cache_dir,
+                    stems_in_use,
                 } => {
                     let outcome = zytunes::tag_ops::apply_release_diff_keeping(
                         &diff,
@@ -2339,21 +2356,57 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                         &keep_existing,
                         std::path::Path::new(&music_dir),
                     );
-                    for (was, kept) in &outcome.set_aside {
+                    for aside in &outcome.set_aside {
                         let _ = event_tx.send(BgEvent::SyncMessage(format!(
                             "tag-manager: moved {} out of the library to {}",
-                            was.display(),
-                            kept.display()
+                            aside.was.display(),
+                            aside.now.display()
                         )));
                     }
                     let paths = outcome.reread_paths(&diff, std::path::Path::new(&music_dir));
                     let vacated = outcome.vacated();
                     let dir_renames = outcome.dir_renames.clone();
+                    // Re-key stem entries onto the new path when the audio
+                    // is unchanged. A rewritten file no longer matches the
+                    // sidecar and is dropped, except the one a mixer has open.
+                    let moved_anything = !outcome.rename_map.is_empty() || !dir_renames.is_empty();
+                    let stem_dir_renames = match (moved_anything, stem_cache_dir) {
+                        (true, Some(cache_dir)) => {
+                            let log_tx = event_tx.clone();
+                            let log: zytunes::cache::Logger =
+                                std::sync::Arc::new(move |msg: &str| {
+                                    let _ = log_tx.send(BgEvent::SyncMessage(msg.to_string()));
+                                });
+                            let report = zytunes::stems::rekey_moved_stem_entries(
+                                &cache_dir,
+                                |old| {
+                                    zytunes::tag_ops::moved_path(
+                                        old,
+                                        &outcome.rename_map,
+                                        &dir_renames,
+                                    )
+                                },
+                                stems_in_use.as_deref(),
+                                &log,
+                            );
+                            let rekeyed = report.dir_renames.len();
+                            if rekeyed > 0 || report.removed > 0 {
+                                log(&format!(
+                                    "stem cache: re-keyed {rekeyed} moved split(s), removed {}",
+                                    report.removed
+                                ));
+                            }
+                            report.dir_renames
+                        }
+                        _ => Vec::new(),
+                    };
                     let _ = event_tx.send(BgEvent::TagsApplied {
                         token,
                         results: outcome.results,
                         rename_map: outcome.rename_map,
                         dir_renames: outcome.dir_renames,
+                        set_aside: outcome.set_aside,
+                        stem_dir_renames,
                     });
 
                     let log_tx = event_tx.clone();
@@ -2533,23 +2586,14 @@ fn run_mb_search_releases_with_log(
         bytes_hex(album)
     )));
     let _ = log.send(BgEvent::SyncMessage(format!("tag-manager: URL={}", url)));
-    let first = client
-        .search_releases_exact(artist, album, 12)
-        .map_err(|e| e.to_string())?;
-    if first.releases.is_empty()
-        && zytunes::musicbrainz::should_retry_various_artists(artist, album)
-    {
-        let fallback = client.search_releases_url("Various Artists", album, 12);
-        let _ = log.send(BgEvent::SyncMessage(format!(
-            "tag-manager: 0 hits, retrying as Various Artists: {fallback}"
-        )));
-        client
-            .search_releases_exact("Various Artists", album, 12)
-            .map(|r| r.releases)
-            .map_err(|e| e.to_string())
-    } else {
-        Ok(first.releases)
-    }
+    client
+        .search_releases(artist, album, 12, |fallback| {
+            let _ = log.send(BgEvent::SyncMessage(format!(
+                "tag-manager: 0 hits, retrying as Various Artists: {fallback}"
+            )));
+        })
+        .map(|r| r.releases)
+        .map_err(|e| e.to_string())
 }
 
 fn bytes_hex(s: &str) -> String {

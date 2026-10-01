@@ -169,6 +169,13 @@ pub struct FieldDiff {
     pub current: Option<String>,
     pub proposed: Option<String>,
     pub enabled: bool,
+    /// The proposed value is the release's own (MusicBrainz said so).
+    /// False where it was carried from the diffed file instead: the
+    /// release has nothing for the field so the file's value is kept, or
+    /// the value is derived from that file's audio (the fingerprint, and
+    /// the AcoustID looked up from it).
+    /// Such a row says nothing about any other copy of the track.
+    pub from_release: bool,
 }
 
 /// Per-track diff, scoped to one library file.
@@ -193,6 +200,18 @@ pub struct ReleaseTagDiff {
     /// e.g. `"Abbey Road — The Beatles (1969 GB)"`.
     pub summary: String,
     pub tracks: Vec<TrackTagDiff>,
+}
+
+impl TrackTagDiff {
+    /// The apply will try to move this file: a rename is proposed and its
+    /// Filename row is still on.
+    pub fn wants_rename(&self) -> bool {
+        self.dest_path.is_some()
+            && self
+                .fields
+                .iter()
+                .any(|f| f.kind == FieldKind::Filename && f.enabled)
+    }
 }
 
 impl ReleaseTagDiff {
@@ -222,14 +241,8 @@ impl ReleaseTagDiff {
     /// replaced at all, and one holding different audio is refused by the
     /// apply as a collision.
     pub fn replace_conflicts(&self) -> Vec<ReplaceConflict> {
-        let renames = |t: &TrackTagDiff| {
-            t.dest_path.is_some()
-                && t.fields
-                    .iter()
-                    .any(|f| f.kind == FieldKind::Filename && f.enabled)
-        };
         let (moving, staying): (Vec<&TrackTagDiff>, Vec<&TrackTagDiff>) =
-            self.tracks.iter().partition(|t| renames(t));
+            self.tracks.iter().partition(|t| t.wants_rename());
         moving
             .iter()
             .filter_map(|t| {
@@ -582,6 +595,7 @@ fn build_track_fields(
             // proposes blanking this tag". If a future caller needs that,
             // it must push the `FieldDiff` directly rather than route
             // through `push`.
+            let from_release = prop.is_some();
             let prop = if prop.is_none() && cur.is_some() {
                 cur.clone()
             } else {
@@ -594,6 +608,7 @@ fn build_track_fields(
                 current: cur,
                 proposed: prop,
                 enabled,
+                from_release,
             });
         };
 
@@ -820,18 +835,25 @@ fn build_track_fields(
 
     // -- AcoustID tags --
     //
+    // Both are pushed directly, not through `push`, which would mark them
+    // as release values: they come from this file's audio, and must not
+    // be written to another copy kept in its place.
+    //
     // ACOUSTID_ID is the parent AcoustID UUID — only available when
     // we resolved via the AcoustID fingerprint path. Skipped when the
-    // overlay reached this point through MBID-direct or MB-search.
-    // (Closure-based push first so the &mut fields borrow it captures
-    // ends before the direct fields.push below.)
+    // overlay reached this point through MBID-direct or MB-search. It was
+    // looked up from this file's fingerprint.
     if let Some(uuid) = acoustid_uuid.filter(|s| !s.is_empty()) {
-        push(
-            FieldKind::Picard,
-            "ACOUSTID_ID",
-            extras.acoustid_id.clone(),
-            Some(uuid.to_string()),
-        );
+        let on_disk = extras.acoustid_id.clone().filter(|s| !s.is_empty());
+        let enabled = on_disk.as_deref() != Some(uuid);
+        fields.push(FieldDiff {
+            kind: FieldKind::Picard,
+            name: "ACOUSTID_ID",
+            current: on_disk,
+            proposed: Some(uuid.to_string()),
+            enabled,
+            from_release: false,
+        });
     }
 
     // ACOUSTID_FINGERPRINT is sourced entirely from the library track's
@@ -851,6 +873,7 @@ fn build_track_fields(
             current: on_disk,
             proposed: Some(fp.to_string()),
             enabled,
+            from_release: false,
         });
     }
 
@@ -863,6 +886,7 @@ fn build_track_fields(
                 current: Some(src_path.display().to_string()),
                 proposed: Some(dest.display().to_string()),
                 enabled: true,
+                from_release: true,
             });
         }
     }
@@ -891,11 +915,33 @@ pub struct ApplyOutcome {
     /// including albums that were not part of the diff — so callers must
     /// remap any path they still hold under `old`.
     pub dir_renames: Vec<(PathBuf, PathBuf)>,
-    /// Copies taken out of the library, `(where it was, where it is now)`.
-    /// Filing never deletes a file: the copy that lost a replace is moved
-    /// to the removed-files folder (see [`set_aside`]) so it can be put
-    /// back by hand.
-    pub set_aside: Vec<(PathBuf, PathBuf)>,
+    /// Copies taken out of the library. Filing never deletes a file: the
+    /// copy that lost a replace is moved to the removed-files folder (see
+    /// [`set_aside`]) so it can be put back by hand.
+    pub set_aside: Vec<SetAside>,
+}
+
+/// One copy an apply moved out of the library.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetAside {
+    /// Which of the two copies lost; it decides what `was` names.
+    pub copy: SetAsideCopy,
+    /// Where the copy was. For [`SetAsideCopy::Replaced`] the dest path it
+    /// held; for [`SetAsideCopy::Incoming`] the diff's `src_path` (the
+    /// path the diff knows it by, even if a folder retitle moved it before
+    /// it was set aside).
+    pub was: PathBuf,
+    /// Where it is now, under the removed-files folder.
+    pub now: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetAsideCopy {
+    /// The copy that held the dest path; the incoming file took its place.
+    Replaced,
+    /// The incoming file, dropped in favour of the copy already at its
+    /// dest.
+    Incoming,
 }
 
 impl ApplyOutcome {
@@ -1008,16 +1054,8 @@ pub fn apply_release_diff_keeping(
         .tracks
         .iter()
         .enumerate()
-        .filter_map(|(i, t)| match &t.dest_path {
-            Some(dest)
-                if t.fields
-                    .iter()
-                    .any(|f| f.kind == FieldKind::Filename && f.enabled) =>
-            {
-                Some((i, &t.src_path, dest))
-            }
-            _ => None,
-        })
+        .filter(|(_, t)| t.wants_rename())
+        .filter_map(|(i, t)| Some((i, &t.src_path, t.dest_path.as_ref()?)))
         .collect();
 
     let mut dest_count: HashMap<&PathBuf, usize> = HashMap::new();
@@ -1105,7 +1143,7 @@ pub fn apply_release_diff_keeping(
     // occupant's own rename failed or was skipped, or two tracks trade
     // places) fails instead of overwriting the file that is there.
     let mut dir_renames: Vec<(PathBuf, PathBuf)> = Vec::new();
-    let mut aside: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut aside: Vec<SetAside> = Vec::new();
     let mut pending = to_rename;
     loop {
         let mut blocked: Vec<(usize, &PathBuf, &PathBuf)> = Vec::new();
@@ -1128,7 +1166,11 @@ pub fn apply_release_diff_keeping(
                 set_aside(dest, library_root).and_then(|kept| {
                     match perform_rename(&live_src, dest, &mut dir_renames) {
                         Ok(()) => {
-                            aside.push((dest.clone(), kept));
+                            aside.push(SetAside {
+                                copy: SetAsideCopy::Replaced,
+                                was: dest.clone(),
+                                now: kept,
+                            });
                             Ok(())
                         }
                         Err(e) => {
@@ -1148,11 +1190,7 @@ pub fn apply_release_diff_keeping(
                         prune_empty_parents(parent, library_root);
                     }
                 }
-                Err(e) => {
-                    if results[idx].is_ok() {
-                        results[idx] = Err(e);
-                    }
-                }
+                Err(e) => record_move_error(&mut results[idx], e),
             }
         }
         pending = blocked;
@@ -1161,35 +1199,66 @@ pub fn apply_release_diff_keeping(
         }
     }
     for (idx, _, dest) in pending {
-        if results[idx].is_ok() {
-            results[idx] = Err(format!(
+        record_move_error(
+            &mut results[idx],
+            format!(
                 "rename collision: {} is still held by another track of this album",
                 dest.display()
-            ));
-        }
+            ),
+        );
     }
 
     // The user kept the copy already at the dest: the incoming file goes
     // to the removed-files folder. Checked again here because the renames
     // above may have changed what sits at `dest`; if nothing does any
     // more, the file is filed there.
+    //
+    // Phase 1 skipped these tracks, so the approved tags are written here,
+    // to whichever file ends up at `dest`. Otherwise the track reports
+    // success while the surviving copy keeps the tags the user was shown
+    // being replaced.
     for (idx, src, dest) in to_discard {
         let live_src = remap_through_dir_renames(src, &dir_renames);
-        let done = if dest_needs_replace(&live_src, dest) {
-            set_aside(&live_src, library_root).map(|kept| aside.push((live_src.clone(), kept)))
+        let existing_survives = dest_needs_replace(&live_src, dest);
+        let done = if existing_survives {
+            set_aside(&live_src, library_root).map(|kept| {
+                aside.push(SetAside {
+                    copy: SetAsideCopy::Incoming,
+                    was: src.clone(),
+                    now: kept,
+                })
+            })
         } else if live_src == *dest {
             Ok(())
         } else {
             perform_rename(&live_src, dest, &mut dir_renames)
         };
-        match done {
-            Ok(()) => {
-                rename_map.insert(src.clone(), dest.clone());
-                for parent in [src.parent(), live_src.parent()].into_iter().flatten() {
-                    prune_empty_parents(parent, library_root);
-                }
+        let track = &diff.tracks[idx];
+        // Only a source that left its path is recorded as moved: a failed
+        // set-aside or rename leaves it where it was, and everything
+        // keyed on `rename_map` (cache, play counts, inbox snooze) must
+        // keep seeing it there.
+        let moved = done.is_ok();
+        let tagged = done.and_then(|()| {
+            if !existing_survives {
+                // The incoming file was filed after all.
+                write_tags_at(dest, &enabled_tag_rows(track))
+            } else if staying.contains(dest) {
+                // A track of this diff: phase 1 wrote its own rows.
+                Ok(())
+            } else {
+                write_tags_at(dest, &rows_for_kept_copy(track))
             }
-            Err(e) => results[idx] = Err(e),
+        });
+        // The file move stands whether or not the tag write did.
+        if moved {
+            rename_map.insert(src.clone(), dest.clone());
+            for parent in [src.parent(), live_src.parent()].into_iter().flatten() {
+                prune_empty_parents(parent, library_root);
+            }
+        }
+        if let Err(e) = tagged {
+            results[idx] = Err(e);
         }
     }
 
@@ -1201,12 +1270,54 @@ pub fn apply_release_diff_keeping(
     }
 }
 
+/// Record why a track did not move. The move error leads: the file is
+/// reported as "not moved", and that is the reason for it. A tag-write
+/// error from phase 1 is kept after it rather than replaced, since the
+/// file is also still untagged.
+fn record_move_error(result: &mut Result<(), String>, move_error: String) {
+    let combined = match result {
+        Ok(()) => move_error,
+        Err(tag_error) => format!("{move_error}; its tags were not written either: {tag_error}"),
+    };
+    *result = Err(combined);
+}
+
 fn write_track_tags(track: &TrackTagDiff) -> Result<(), String> {
-    let to_apply: Vec<&FieldDiff> = track
+    write_tags_at(&track.src_path, &enabled_tag_rows(track))
+}
+
+/// The tag rows the user left switched on.
+fn enabled_tag_rows(track: &TrackTagDiff) -> Vec<&FieldDiff> {
+    track
         .fields
         .iter()
         .filter(|f| f.enabled && f.kind != FieldKind::Filename)
-        .collect();
+        .collect()
+}
+
+/// The rows to write to a copy that was kept in place of the diffed file.
+///
+/// The diff was computed against the incoming file. A row that is off
+/// stays off, including one that looks unchanged because the incoming
+/// file already matched the release: that row does not show the kept
+/// copy's own value, so writing it would replace a curated tag and
+/// rewrite the file. Only rows the user left on are written. An empty
+/// set leaves the file untouched, so its mtime and stem cache stay.
+///
+/// Only the release's own values cross over. A row carried from the
+/// incoming file (its genre where MusicBrainz has none, its audio
+/// fingerprint) describes the copy being set aside, and the kept copy
+/// keeps what it has.
+fn rows_for_kept_copy(track: &TrackTagDiff) -> Vec<&FieldDiff> {
+    track
+        .fields
+        .iter()
+        .filter(|f| f.kind != FieldKind::Filename && f.from_release && f.enabled)
+        .collect()
+}
+
+/// Write `to_apply` to the audio file at `src`.
+fn write_tags_at(src: &Path, to_apply: &[&FieldDiff]) -> Result<(), String> {
     if to_apply.is_empty() {
         return Ok(());
     }
@@ -1218,14 +1329,13 @@ fn write_track_tags(track: &TrackTagDiff) -> Result<(), String> {
     // The temp lives in the same directory so the rename is a same-FS swap
     // (atomic on POSIX); any failure path removes the temp so the original
     // is never touched.
-    let src = &track.src_path;
     let tmp = tagtmp_path(src);
     // Clean up a leftover from a prior crash before copying.
     let _ = std::fs::remove_file(&tmp);
     std::fs::copy(src, &tmp)
         .map_err(|e| format!("tag-save: copy {} -> {}: {e}", src.display(), tmp.display()))?;
 
-    let result = write_then_swap(&tmp, src, &to_apply);
+    let result = write_then_swap(&tmp, src, to_apply);
     if result.is_err() {
         // Leave the original untouched; clean up the temp.
         let _ = std::fs::remove_file(&tmp);
@@ -1489,7 +1599,6 @@ fn retitle_case_along(
     Ok(())
 }
 
-/// Follow `path` through directory renames, applied in order.
 /// Old → new library track ID for every file an apply moved.
 ///
 /// Track IDs hash the file path (`dirlib::hash_path`), so a move changes
@@ -1505,10 +1614,7 @@ pub fn track_id_remap<'a>(
     use crate::dirlib::hash_path;
     let mut map = HashMap::new();
     for old in locations {
-        let new = match rename_map.get(old) {
-            Some(dest) => dest.clone(),
-            None => remap_through_dir_renames(old, dir_renames),
-        };
+        let new = moved_path(old, rename_map, dir_renames);
         if new != old {
             map.insert(hash_path(old), hash_path(&new));
         }
@@ -1516,6 +1622,21 @@ pub fn track_id_remap<'a>(
     map
 }
 
+/// Where the file that was at `old` before an apply is now: its own
+/// rename if it had one, otherwise wherever a directory retitle carried
+/// it. Unchanged when the apply did not touch it.
+pub fn moved_path(
+    old: &Path,
+    rename_map: &HashMap<PathBuf, PathBuf>,
+    dir_renames: &[(PathBuf, PathBuf)],
+) -> PathBuf {
+    match rename_map.get(old) {
+        Some(dest) => dest.clone(),
+        None => remap_through_dir_renames(old, dir_renames),
+    }
+}
+
+/// Follow `path` through directory renames, applied in order.
 pub fn remap_through_dir_renames(path: &Path, renames: &[(PathBuf, PathBuf)]) -> PathBuf {
     let mut path = path.to_path_buf();
     for (old, new) in renames {
@@ -1669,6 +1790,12 @@ mod tests {
     fn fresh_dir(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join("zytunes-tag-ops").join(name);
         let _ = std::fs::remove_dir_all(&dir);
+        // Copies set aside by an earlier run of the same test live beside
+        // `dir`, not in it, and would turn `01 - Song.wav` into
+        // `01 - Song (2).wav` on the next run.
+        if let Some(removed) = crate::library_layout::default_removed_dir(&dir) {
+            let _ = std::fs::remove_dir_all(removed.join(name));
+        }
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -2407,6 +2534,7 @@ mod tests {
                     current: None,
                     proposed: Some("Forced Write".into()),
                     enabled: true,
+                    from_release: true,
                 }],
             }],
         };
@@ -2534,6 +2662,7 @@ mod tests {
                         current: Some(src1.display().to_string()),
                         proposed: Some(dest.display().to_string()),
                         enabled: true,
+                        from_release: true,
                     }],
                 },
                 TrackTagDiff {
@@ -2546,6 +2675,7 @@ mod tests {
                         current: Some(src2.display().to_string()),
                         proposed: Some(dest.display().to_string()),
                         enabled: true,
+                        from_release: true,
                     }],
                 },
             ],
@@ -2602,6 +2732,7 @@ mod tests {
                             current: Some("Old".into()),
                             proposed: Some("New Album From MB".into()),
                             enabled: true,
+                            from_release: true,
                         },
                         FieldDiff {
                             kind: FieldKind::Filename,
@@ -2609,6 +2740,7 @@ mod tests {
                             current: Some(src1.display().to_string()),
                             proposed: Some(dest.display().to_string()),
                             enabled: true,
+                            from_release: true,
                         },
                     ],
                 },
@@ -2622,6 +2754,7 @@ mod tests {
                         current: Some(src2.display().to_string()),
                         proposed: Some(dest.display().to_string()),
                         enabled: true,
+                        from_release: true,
                     }],
                 },
             ],
@@ -2941,6 +3074,11 @@ mod tests {
         assert_eq!(id_field.kind, FieldKind::Picard);
         assert_eq!(id_field.proposed.as_deref(), Some("ac-uuid-42"));
         assert!(id_field.current.is_none());
+        assert!(id_field.enabled);
+        assert!(
+            !id_field.from_release,
+            "looked up from this file's audio: not for a copy kept in its place"
+        );
     }
 
     #[test]
@@ -3041,6 +3179,7 @@ mod tests {
                 current: None,
                 proposed: Some("rel-1".into()),
                 enabled: true,
+                from_release: true,
             }],
         })
         .unwrap();
@@ -3323,6 +3462,7 @@ mod tests {
                     current: Some(src.display().to_string()),
                     proposed: Some(dest.display().to_string()),
                     enabled: true,
+                    from_release: true,
                 }],
             }],
         };
@@ -3376,6 +3516,7 @@ mod tests {
                     current: Some(src.display().to_string()),
                     proposed: Some(dest.display().to_string()),
                     enabled: true,
+                    from_release: true,
                 }],
             }],
         };
@@ -3444,6 +3585,7 @@ mod tests {
                     current: Some(src.display().to_string()),
                     proposed: Some(dest.display().to_string()),
                     enabled: true,
+                    from_release: true,
                 }],
             }],
         };
@@ -3480,6 +3622,7 @@ mod tests {
                     current: Some(src.display().to_string()),
                     proposed: Some(dest.display().to_string()),
                     enabled: true,
+                    from_release: true,
                 }],
             }],
         };
@@ -3513,6 +3656,7 @@ mod tests {
                     current: Some(src.display().to_string()),
                     proposed: Some(dest.display().to_string()),
                     enabled: true,
+                    from_release: true,
                 }],
             }],
         }
@@ -3603,6 +3747,7 @@ mod tests {
                 current: None,
                 proposed: Some("Song".into()),
                 enabled: true,
+                from_release: true,
             }],
         });
         (dir, extra, in_place, diff)
@@ -3627,10 +3772,15 @@ mod tests {
         assert_eq!(out.rename_map.get(&extra), Some(&in_place));
 
         // The replaced copy was moved beside the library, not deleted.
-        let [(was, kept)] = out.set_aside.as_slice() else {
+        let [SetAside {
+            copy,
+            was,
+            now: kept,
+        }] = out.set_aside.as_slice()
+        else {
             panic!("one copy set aside, got {:?}", out.set_aside);
         };
-        assert_eq!(was, &in_place);
+        assert_eq!((*copy, was), (SetAsideCopy::Replaced, &in_place));
         assert!(
             kept.starts_with(crate::library_layout::default_removed_dir(&dir).unwrap()),
             "{}",
@@ -3652,8 +3802,6 @@ mod tests {
     #[test]
     fn a_set_aside_copy_never_overwrites_an_earlier_one() {
         let dir = fresh_dir("set-aside-twice");
-        let removed = crate::library_layout::default_removed_dir(&dir).unwrap();
-        let _ = std::fs::remove_dir_all(removed.join("set-aside-twice"));
         let song = dir.join("Artist").join("01 - Song.wav");
         std::fs::create_dir_all(song.parent().unwrap()).unwrap();
         let mut kept = Vec::new();
@@ -3681,10 +3829,15 @@ mod tests {
         let out = apply_release_diff_keeping(&diff, true, &keep, &dir);
         assert!(out.results.iter().all(Result::is_ok), "{:?}", out.results);
         assert!(!extra.exists(), "the duplicate is gone from the library");
-        let [(was, kept)] = out.set_aside.as_slice() else {
+        let [SetAside {
+            copy,
+            was,
+            now: kept,
+        }] = out.set_aside.as_slice()
+        else {
             panic!("one copy set aside, got {:?}", out.set_aside);
         };
-        assert_eq!(was, &extra);
+        assert_eq!((*copy, was), (SetAsideCopy::Incoming, &extra));
         assert!(kept.is_file(), "moved beside the library, not deleted");
         let tagged = lofty::read_from_path(&in_place).unwrap();
         assert_eq!(
@@ -3697,6 +3850,232 @@ mod tests {
             Some(&in_place),
             "playlists follow the surviving copy"
         );
+    }
+
+    #[test]
+    fn keeping_an_existing_copy_from_outside_the_album_still_tags_it() {
+        // The copy at the dest is not one of the diff's tracks (a drop
+        // filed onto an album already in the library), so no other row
+        // writes its tags. The approved changes must land on the file
+        // that survives, not vanish with the one set aside.
+        let dir = fresh_dir("keep-existing-tags");
+        let incoming = dir.join("Drop").join("01 Song.wav");
+        let existing = dir.join("Artist").join("Album").join("01 - Song.wav");
+        for p in [&incoming, &existing] {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            write_sine_wav(p, 1);
+        }
+        let row = |name, current: Option<&str>, proposed: &str, enabled| FieldDiff {
+            kind: FieldKind::Identity,
+            name,
+            current: current.map(String::from),
+            proposed: Some(proposed.into()),
+            enabled,
+            from_release: true,
+        };
+        let mut diff = rename_only_diff(&incoming, &existing);
+        // The kept copy already has an album the diff never showed.
+        write_tags_at(
+            &existing,
+            &[&FieldDiff {
+                kind: FieldKind::Identity,
+                name: "Album",
+                current: None,
+                proposed: Some("Live Album".into()),
+                enabled: true,
+                from_release: true,
+            }],
+        )
+        .unwrap();
+        diff.tracks[0].fields.extend([
+            // A change the user approved.
+            row("Title", None, "Song", true),
+            // Unchanged on the incoming file, so the row is off. The kept
+            // copy's own album must survive: the row does not show it.
+            row("Album", Some("Album"), "Album", false),
+            // Turned off by the user: stays unwritten.
+            row("Artist", Some("Old"), "New", false),
+        ]);
+        let keep: std::collections::HashSet<PathBuf> = [incoming.clone()].into();
+        let out = apply_release_diff_keeping(&diff, true, &keep, &dir);
+        assert!(out.results.iter().all(Result::is_ok), "{:?}", out.results);
+        assert!(!incoming.exists(), "the incoming copy was set aside");
+
+        let tagged = lofty::read_from_path(&existing).unwrap();
+        let tag = tagged.primary_tag().expect("the kept copy was tagged");
+        assert_eq!(tag.title().as_deref(), Some("Song"));
+        assert_eq!(
+            tag.album().as_deref(),
+            Some("Live Album"),
+            "an unchanged row is not written onto the kept copy"
+        );
+        assert_eq!(tag.artist(), None, "a row the user turned off");
+
+        // The copy that left the library is as it arrived.
+        let [SetAside { now: aside, .. }] = out.set_aside.as_slice() else {
+            panic!("one copy set aside, got {:?}", out.set_aside);
+        };
+        let untouched = lofty::read_from_path(aside).unwrap();
+        assert!(untouched.primary_tag().is_none_or(|t| t.title().is_none()));
+    }
+
+    #[test]
+    fn keeping_the_existing_copy_does_not_rewrite_it_when_nothing_is_enabled() {
+        let dir = fresh_dir("keep-existing-mtime");
+        let incoming = dir.join("Drop").join("01 Song.wav");
+        let existing = dir.join("Artist").join("Album").join("01 - Song.wav");
+        for p in [&incoming, &existing] {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            write_sine_wav(p, 1);
+        }
+        let before = existing.metadata().unwrap().modified().unwrap();
+        let mut diff = rename_only_diff(&incoming, &existing);
+        diff.tracks[0].fields.push(FieldDiff {
+            kind: FieldKind::Identity,
+            name: "Album",
+            current: Some("Album".into()),
+            proposed: Some("Album".into()),
+            enabled: false,
+            from_release: true,
+        });
+        let keep: std::collections::HashSet<PathBuf> = [incoming.clone()].into();
+        let out = apply_release_diff_keeping(&diff, true, &keep, &dir);
+        assert!(out.results.iter().all(Result::is_ok), "{:?}", out.results);
+        assert_eq!(
+            existing.metadata().unwrap().modified().unwrap(),
+            before,
+            "no enabled row, so the kept file is not rewritten"
+        );
+    }
+
+    #[test]
+    fn a_kept_copy_keeps_what_the_release_has_no_say_on() {
+        // Rows carried from the incoming file (MusicBrainz has no genre;
+        // the fingerprint is that file's own audio) describe the copy
+        // being set aside. They must not land on the one that stays.
+        let dir = fresh_dir("keep-existing-curated");
+        let incoming = dir.join("Drop").join("01 Song.wav");
+        let existing = dir.join("Artist").join("Album").join("01 - Song.wav");
+        for p in [&incoming, &existing] {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            write_sine_wav(p, 1);
+        }
+        let row = |kind, name, current: Option<&str>, proposed: &str, from_release| FieldDiff {
+            kind,
+            name,
+            current: current.map(String::from),
+            proposed: Some(proposed.into()),
+            enabled: current != Some(proposed),
+            from_release,
+        };
+        let curated = [
+            row(FieldKind::Identity, "Genre", None, "Grunge", true),
+            row(
+                FieldKind::Picard,
+                "ACOUSTID_FINGERPRINT",
+                None,
+                "kept-fp",
+                true,
+            ),
+        ];
+        write_tags_at(&existing, &curated.iter().collect::<Vec<_>>()).unwrap();
+
+        let mut diff = rename_only_diff(&incoming, &existing);
+        diff.tracks[0].fields.extend([
+            row(FieldKind::Identity, "Genre", Some("Rock"), "Rock", false),
+            // Off (already embedded in the incoming file) and on (not yet
+            // embedded): neither is the kept copy's fingerprint.
+            row(
+                FieldKind::Picard,
+                "ACOUSTID_FINGERPRINT",
+                Some("drop-fp"),
+                "drop-fp",
+                false,
+            ),
+            row(
+                FieldKind::Picard,
+                "ACOUSTID_FINGERPRINT",
+                None,
+                "drop-fp",
+                false,
+            ),
+        ]);
+        let keep: std::collections::HashSet<PathBuf> = [incoming.clone()].into();
+        let out = apply_release_diff_keeping(&diff, true, &keep, &dir);
+        assert!(out.results.iter().all(Result::is_ok), "{:?}", out.results);
+
+        let tagged = lofty::read_from_path(&existing).unwrap();
+        assert_eq!(
+            tagged.primary_tag().unwrap().genre().as_deref(),
+            Some("Grunge")
+        );
+        assert_eq!(
+            read_on_disk_extras(&existing)
+                .acoustid_fingerprint
+                .as_deref(),
+            Some("kept-fp")
+        );
+    }
+
+    #[test]
+    fn a_failed_move_is_reported_even_when_the_tag_write_failed_first() {
+        let dir = fresh_dir("move-and-tags-fail");
+        // Not audio: the tag write fails. A regular file where the dest
+        // folder would go: the move fails too.
+        let src = dir.join("Drop").join("01 Song.wav");
+        std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+        std::fs::write(&src, b"not audio").unwrap();
+        let blocker = dir.join("Artist");
+        std::fs::write(&blocker, b"in the way").unwrap();
+        let dest = blocker.join("Album").join("01 - Song.wav");
+
+        let mut diff = rename_only_diff(&src, &dest);
+        diff.tracks[0].fields.push(FieldDiff {
+            kind: FieldKind::Identity,
+            name: "Title",
+            current: None,
+            proposed: Some("Song".into()),
+            enabled: true,
+            from_release: true,
+        });
+        let out = apply_release_diff_with(&diff, false, &dir);
+
+        assert!(src.exists() && out.rename_map.is_empty());
+        let error = out.results[0].as_ref().unwrap_err();
+        let tag_error = write_track_tags(&diff.tracks[0]).unwrap_err();
+        let move_error = error
+            .strip_suffix(&format!("; its tags were not written either: {tag_error}"))
+            .unwrap_or_else(|| panic!("the tag error is kept: {error}"));
+        assert!(
+            !move_error.is_empty() && move_error != tag_error,
+            "and the reason the file is still in place leads: {error}"
+        );
+    }
+
+    #[test]
+    fn a_copy_that_could_not_be_set_aside_is_not_recorded_as_moved() {
+        let base = fresh_dir("keep-existing-stuck");
+        let root = base.join("Music");
+        let incoming = root.join("Drop").join("01 Song.wav");
+        let existing = root.join("Artist").join("Album").join("01 - Song.wav");
+        for p in [&incoming, &existing] {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            write_sine_wav(p, 1);
+        }
+        // A regular file where the removed-files folder would go.
+        let removed = crate::library_layout::default_removed_dir(&root).unwrap();
+        std::fs::write(&removed, b"in the way").unwrap();
+
+        let diff = rename_only_diff(&incoming, &existing);
+        let keep: std::collections::HashSet<PathBuf> = [incoming.clone()].into();
+        let out = apply_release_diff_keeping(&diff, true, &keep, &root);
+
+        assert!(out.results[0].is_err(), "{:?}", out.results);
+        assert!(incoming.exists() && existing.exists());
+        // Still at its path: the cache must not drop it, nothing may be
+        // re-keyed onto the dest, and the inbox must snooze it.
+        assert!(out.rename_map.is_empty(), "{:?}", out.rename_map);
+        assert!(out.vacated().is_empty());
     }
 
     #[test]
@@ -4150,6 +4529,7 @@ mod tests {
                     current: Some(src.display().to_string()),
                     proposed: Some(dest.display().to_string()),
                     enabled: true,
+                    from_release: true,
                 }],
             }],
         };

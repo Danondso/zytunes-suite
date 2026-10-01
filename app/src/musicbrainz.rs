@@ -220,30 +220,23 @@ impl MusicBrainzClient {
     /// artist (`Jim Sturgess feat. T.V. Carpio` on *Across the Universe*).
     /// When the first query returns no hits and the album title is non-empty,
     /// a second query retries with artist `Various Artists`.
+    ///
+    /// `on_retry` is called with the retry's URL just before it is sent,
+    /// and not at all when the first query is the answer, so a caller can
+    /// log the fallback without owning a second copy of the rule.
     pub fn search_releases(
         &self,
         artist: &str,
         album: &str,
         limit: u32,
+        on_retry: impl FnOnce(&str),
     ) -> Result<ReleaseSearchResponse, MbError> {
-        let resp = self.search_releases_exact(artist, album, limit)?;
-        if resp.releases.is_empty() && should_retry_various_artists(artist, album) {
-            self.search_releases_exact(VARIOUS_ARTISTS, album, limit)
-        } else {
-            Ok(resp)
-        }
-    }
-
-    /// One Solr query, with no Various Artists retry. Callers that log the
-    /// fallback (the tag-manager worker) use this so the retry line is
-    /// emitted only after the first query actually returned nothing.
-    pub fn search_releases_exact(
-        &self,
-        artist: &str,
-        album: &str,
-        limit: u32,
-    ) -> Result<ReleaseSearchResponse, MbError> {
-        self.get_json(&self.search_releases_url(artist, album, limit))
+        search_with_various_artists_fallback(
+            artist,
+            album,
+            |artist| self.get_json(&self.search_releases_url(artist, album, limit)),
+            || on_retry(&self.search_releases_url(VARIOUS_ARTISTS, album, limit)),
+        )
     }
 
     /// The URL that [`Self::search_releases`] would request. Exposed so callers
@@ -304,10 +297,28 @@ impl MusicBrainzClient {
 
 const VARIOUS_ARTISTS: &str = "Various Artists";
 
+/// The Various Artists fallback, with the HTTP call abstracted to `query`
+/// (given the artist to search under) so the rule is testable offline and
+/// exists exactly once.
+fn search_with_various_artists_fallback<E>(
+    artist: &str,
+    album: &str,
+    mut query: impl FnMut(&str) -> Result<ReleaseSearchResponse, E>,
+    on_retry: impl FnOnce(),
+) -> Result<ReleaseSearchResponse, E> {
+    let first = query(artist)?;
+    if first.releases.is_empty() && should_retry_various_artists(artist, album) {
+        on_retry();
+        query(VARIOUS_ARTISTS)
+    } else {
+        Ok(first)
+    }
+}
+
 /// Soundtrack releases are filed under Various Artists. Retry that artist
 /// when `artist`+`album` produced no Solr hits — not when the album title is
 /// blank (that query would match every VA release) or the artist is already VA.
-pub fn should_retry_various_artists(artist: &str, album: &str) -> bool {
+fn should_retry_various_artists(artist: &str, album: &str) -> bool {
     !album.trim().is_empty() && !is_various_artists(artist)
 }
 
@@ -1093,6 +1104,78 @@ mod tests {
         ));
         assert!(!should_retry_various_artists("Jim Sturgess", "   "));
         assert!(!should_retry_various_artists("Jim Sturgess", ""));
+    }
+
+    /// A search response with `n` hits, built the way the wire gives it.
+    fn response_with_hits(n: usize) -> ReleaseSearchResponse {
+        let hits: Vec<String> = (0..n)
+            .map(|i| format!(r#"{{"id":"rel-{i}","title":"Album"}}"#))
+            .collect();
+        serde_json::from_str(&format!(r#"{{"releases":[{}]}}"#, hits.join(","))).unwrap()
+    }
+
+    #[test]
+    fn various_artists_retry_runs_once_and_only_after_an_empty_first_query() {
+        // (artist, album, hits of the first query) -> artists queried.
+        let cases: [(&str, &str, usize, &[&str]); 4] = [
+            ("Jim Sturgess", "Across the Universe", 2, &["Jim Sturgess"]),
+            (
+                "Jim Sturgess",
+                "Across the Universe",
+                0,
+                &["Jim Sturgess", "Various Artists"],
+            ),
+            // Already Various Artists, or no album to narrow the retry.
+            ("various", "Across the Universe", 0, &["various"]),
+            ("Jim Sturgess", "  ", 0, &["Jim Sturgess"]),
+        ];
+        for (artist, album, first_hits, want_queries) in cases {
+            let mut queried: Vec<String> = Vec::new();
+            let mut announced = 0;
+            let resp = search_with_various_artists_fallback(
+                artist,
+                album,
+                |a| -> Result<_, MbError> {
+                    queried.push(a.to_string());
+                    // The retry, when it runs, finds the soundtrack.
+                    Ok(response_with_hits(if queried.len() == 1 {
+                        first_hits
+                    } else {
+                        1
+                    }))
+                },
+                || announced += 1,
+            )
+            .unwrap();
+            assert_eq!(queried, want_queries, "{artist:?} / {album:?}");
+            assert_eq!(
+                announced,
+                want_queries.len() - 1,
+                "the retry is announced exactly when it happens"
+            );
+            let want_hits = if want_queries.len() == 2 {
+                1
+            } else {
+                first_hits
+            };
+            assert_eq!(resp.releases.len(), want_hits);
+        }
+    }
+
+    #[test]
+    fn a_failed_first_query_is_an_error_not_a_retry() {
+        let mut calls = 0;
+        let out = search_with_various_artists_fallback(
+            "Jim Sturgess",
+            "Across the Universe",
+            |_| -> Result<ReleaseSearchResponse, &str> {
+                calls += 1;
+                Err("timeout")
+            },
+            || panic!("no retry after an error"),
+        );
+        assert_eq!(out.unwrap_err(), "timeout");
+        assert_eq!(calls, 1);
     }
 
     #[test]

@@ -905,7 +905,6 @@ pub(crate) fn track_from_lofty(path: &Path, id: u64) -> Option<Track> {
     })
 }
 
-/// Infer metadata from directory structure: Artist/Album/Track.ext
 /// Duration of the audio stream, without reading any tag.
 ///
 /// The fallback for untagged files: identity comes from the path, but
@@ -932,6 +931,7 @@ pub(crate) fn audio_duration_ms(path: &Path) -> Option<u64> {
     (!dur.is_zero()).then_some(dur.as_millis() as u64)
 }
 
+/// Infer metadata from directory structure: Artist/Album/Track.ext
 fn track_from_path(path: &Path, id: u64) -> Track {
     let raw_stem = stem(path);
     let name = crate::strip_track_number(&raw_stem).to_string();
@@ -2312,6 +2312,7 @@ mod tests {
                     current: Some(filed.display().to_string()),
                     proposed: Some(filed_new.display().to_string()),
                     enabled: true,
+                    from_release: true,
                 }],
             }],
         };
