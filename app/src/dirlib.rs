@@ -424,37 +424,38 @@ impl DirectoryLibrary {
         // Re-key entries carried along by a directory rename. The old key
         // is always dropped: on a case-folding volume it still resolves,
         // so the ghost prune below would keep it as a duplicate.
-        for (old_dir, new_dir) in dir_renames {
-            let carried: Vec<String> = cached
-                .keys()
-                .filter(|k| Path::new(k).starts_with(old_dir))
-                .cloned()
-                .collect();
-            for key in carried {
-                let Some(entry) = cached.remove(&key) else {
-                    continue;
-                };
-                let moved = crate::tag_ops::remap_through_dir_renames(
-                    Path::new(&key),
-                    std::slice::from_ref(&(old_dir.clone(), new_dir.clone())),
-                );
-                let Some(fp) = crate::cache::FileFingerprint::from_path(&moved) else {
-                    continue;
-                };
-                let mut track = track_from_lofty(&moved, hash_path(&moved))
-                    .unwrap_or_else(|| track_from_path(&moved, hash_path(&moved)));
-                if track.acoustic_id.is_none() {
-                    track.acoustic_id = entry.track.acoustic_id;
-                }
-                cached.insert(
-                    moved.to_string_lossy().to_string(),
-                    crate::cache::CachedFile {
-                        fingerprint: fp,
-                        track,
-                        fingerprint_failed: entry.fingerprint_failed,
-                    },
-                );
+        //
+        // Each key goes through the WHOLE chain before the file is looked
+        // at. A retitle of two nested folders records the second rename
+        // under the first one's new name, so the path after only the first
+        // step never existed on disk and a stat there would drop the entry.
+        let carried: Vec<(String, PathBuf)> = cached
+            .keys()
+            .filter_map(|key| {
+                let moved = crate::tag_ops::remap_through_dir_renames(Path::new(key), dir_renames);
+                (moved != Path::new(key)).then(|| (key.clone(), moved))
+            })
+            .collect();
+        for (key, moved) in carried {
+            let Some(entry) = cached.remove(&key) else {
+                continue;
+            };
+            let Some(fp) = crate::cache::FileFingerprint::from_path(&moved) else {
+                continue;
+            };
+            let mut track = track_from_lofty(&moved, hash_path(&moved))
+                .unwrap_or_else(|| track_from_path(&moved, hash_path(&moved)));
+            if track.acoustic_id.is_none() {
+                track.acoustic_id = entry.track.acoustic_id;
             }
+            cached.insert(
+                moved.to_string_lossy().to_string(),
+                crate::cache::CachedFile {
+                    fingerprint: fp,
+                    track,
+                    fingerprint_failed: entry.fingerprint_failed,
+                },
+            );
         }
 
         for p in paths {
@@ -2270,6 +2271,86 @@ mod tests {
                 sibling_new.to_str().unwrap().to_string()
             ],
             "the sibling album must follow the folder, under its new path only"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reread_paths_follows_a_nested_directory_rename() {
+        // Retitling artist AND album records the album rename under the
+        // artist's new name. A track the diff did not list must still
+        // follow both, and keep the ID playlists were remapped to.
+        use crate::tag_ops::{FieldDiff, FieldKind, ReleaseTagDiff, TrackTagDiff};
+        let dir = std::env::temp_dir().join("zytunes-dirlib-reread-nested-rename");
+        let _ = fs::remove_dir_all(&dir);
+        let old_album = dir.join("alice in chains").join("dirt");
+        let new_album = dir.join("Alice In Chains").join("Dirt");
+        fs::create_dir_all(&old_album).unwrap();
+        let filed = old_album.join("01 - Them Bones.mp3");
+        let sibling = old_album.join("02 - Dam That River.mp3");
+        fs::write(&filed, b"fake").unwrap();
+        fs::write(&sibling, b"fake").unwrap();
+        let _ = DirectoryLibrary::scan_with_options(
+            dir.to_str().unwrap(),
+            ScanOptions::default(),
+            |_| {},
+        )
+        .unwrap();
+
+        let filed_new = new_album.join("01 - Them Bones.mp3");
+        let sibling_new = new_album.join("02 - Dam That River.mp3");
+        let diff = ReleaseTagDiff {
+            release_mbid: "rel-1".into(),
+            summary: "test".into(),
+            tracks: vec![TrackTagDiff {
+                src_path: filed.clone(),
+                dest_path: Some(filed_new.clone()),
+                library_id: 1,
+                fields: vec![FieldDiff {
+                    kind: FieldKind::Filename,
+                    name: "Filename",
+                    current: Some(filed.display().to_string()),
+                    proposed: Some(filed_new.display().to_string()),
+                    enabled: true,
+                }],
+            }],
+        };
+        let out = crate::tag_ops::apply_release_diff(&diff, &dir);
+        assert!(out.results[0].is_ok(), "{:?}", out.results[0]);
+        assert_eq!(out.dir_renames.len(), 2, "{:?}", out.dir_renames);
+
+        let log = crate::cache::default_logger();
+        let lib = DirectoryLibrary::reread_paths_after(
+            dir.to_str().unwrap(),
+            &out.reread_paths(&diff, &dir),
+            &out.vacated(),
+            &out.dir_renames,
+            false,
+            &log,
+        )
+        .unwrap();
+        let mut paths: Vec<String> = lib
+            .all_tracks()
+            .filter_map(|t| t.location.clone())
+            .collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![
+                filed_new.to_str().unwrap().to_string(),
+                sibling_new.to_str().unwrap().to_string()
+            ],
+            "the unlisted track must follow both folder renames"
+        );
+        let remap = crate::tag_ops::track_id_remap(
+            [filed.as_path(), sibling.as_path()],
+            &out.rename_map,
+            &out.dir_renames,
+        );
+        let sibling_id = remap[&hash_path(&sibling)];
+        assert!(
+            lib.all_tracks().any(|t| t.id == sibling_id),
+            "playlists are remapped to an ID the library holds"
         );
         let _ = fs::remove_dir_all(&dir);
     }
