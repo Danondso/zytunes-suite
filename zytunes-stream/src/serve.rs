@@ -454,7 +454,9 @@ async fn stream_stem(
     let path = stem_track_path(&state, id)?;
     let kind = zytunes::stems::StemKind::from_file_stem(&kind).ok_or(StatusCode::NOT_FOUND)?;
     let hub = state.stems.as_ref().ok_or(StatusCode::NOT_FOUND)?;
-    let stem_path = hub.stem_path(&path, kind).ok_or(StatusCode::NOT_FOUND)?;
+    let stem_path = hub
+        .stem_path(id, &path, kind)
+        .ok_or(StatusCode::NOT_FOUND)?;
     serve_path_bytes(&stem_path, req.headers(), FileMode::Stream).await
 }
 

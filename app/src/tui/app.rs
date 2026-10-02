@@ -386,7 +386,7 @@ pub struct StemPanel {
 pub struct StemBulkConfirm {
     pub artist: String,
     pub album: String,
-    pub track_paths: Vec<String>,
+    pub tracks: Vec<zytunes::stems::StemTrack>,
     /// Recipe parsed once when the modal opened — accept and dispatch
     /// reuse it instead of re-parsing (and re-logging) per call.
     pub recipe: zytunes::stems::RecipeKind,
@@ -408,7 +408,8 @@ pub struct StemBatchState {
     /// ignored (mirrors `StemState::job_gen`).
     pub gen: u64,
     pub album: String,
-    pub track_paths: Vec<String>,
+    /// Each track's ID (its cache key) and where its file is now.
+    pub tracks: Vec<zytunes::stems::StemTrack>,
     /// 1-indexed track the worker is on.
     pub current: usize,
     pub total: usize,
@@ -3187,12 +3188,12 @@ impl App {
     /// that is gone. The audio thread keeps the inode open across the
     /// rename; [`AudioCommand::Retarget`] tells it which path the next
     /// scrub should reopen, and stem exit follows `stems.for_path`. The
-    /// playing track's ID is untouched: a move does not change it.
+    /// playing track's ID is untouched: a move does not change it, and
+    /// neither does the stem cache entry keyed on it.
     fn follow_moved_now_playing(
         &mut self,
         rename_map: &std::collections::HashMap<PathBuf, PathBuf>,
         dir_renames: &[(PathBuf, PathBuf)],
-        stem_dir_renames: &[(PathBuf, PathBuf)],
     ) {
         let moved = |loc: &str| {
             let old = std::path::Path::new(loc);
@@ -3234,9 +3235,9 @@ impl App {
         }
         if let Some(mut batch) = self.stems_batch.take() {
             let mut retargeted = 0usize;
-            for path in &mut batch.track_paths {
-                if let Some(new) = moved(path) {
-                    *path = new.to_string_lossy().into_owned();
+            for track in &mut batch.tracks {
+                if let Some(new) = moved(&track.path) {
+                    track.path = new.to_string_lossy().into_owned();
                     retargeted += 1;
                 }
             }
@@ -3252,7 +3253,7 @@ impl App {
             if retargeted > 0 && !batch.suspended {
                 self.dispatch_stem_batch(
                     batch.album,
-                    batch.track_paths,
+                    batch.tracks,
                     batch.recipe,
                     batch.separated_so_far,
                 );
@@ -3260,12 +3261,9 @@ impl App {
                 self.stems_batch = Some(batch);
             }
         }
-        if playing_retarget.is_some() || !stem_dir_renames.is_empty() {
+        if let Some((old, new)) = playing_retarget {
             self.pending_audio_commands
-                .push(crate::audio::AudioCommand::Retarget {
-                    file: playing_retarget.clone(),
-                    stem_dirs: stem_dir_renames.to_vec(),
-                });
+                .push(crate::audio::AudioCommand::Retarget { old, new });
         }
         let Some(np) = self.now_playing.as_mut() else {
             return;
@@ -3290,7 +3288,6 @@ impl App {
         rename_map: std::collections::HashMap<PathBuf, PathBuf>,
         dir_renames: &[(PathBuf, PathBuf)],
         set_aside: &[zytunes::tag_ops::SetAside],
-        stem_dir_renames: &[(PathBuf, PathBuf)],
     ) {
         // The folders moved on disk whether or not this overlay is still
         // open, so queued clusters are remapped even for a stale token.
@@ -3309,8 +3306,8 @@ impl App {
             }
         }
         self.remap_queued_sync(&rename_map, dir_renames);
-        if !rename_map.is_empty() || !dir_renames.is_empty() || !stem_dir_renames.is_empty() {
-            self.follow_moved_now_playing(&rename_map, dir_renames, stem_dir_renames);
+        if !rename_map.is_empty() || !dir_renames.is_empty() {
+            self.follow_moved_now_playing(&rename_map, dir_renames);
         }
         // Per-track failures are surfaced via the sync log so the user sees
         // *which* tracks failed without sifting through the diff view. We log
@@ -4008,8 +4005,6 @@ impl App {
             .map(|c| c.src)
             .collect();
         let fingerprint = self.scan_fingerprint;
-        let stem_cache_dir = self.stems_cfg.stem_cache_dir();
-        let stems_in_use = self.stem_split_in_use();
         self.dispatch_bg(
             BgCommand::ApplyTagDiff {
                 token,
@@ -4018,28 +4013,9 @@ impl App {
                 fingerprint,
                 replace_existing,
                 keep_existing,
-                stem_cache_dir,
-                stems_in_use,
             },
             cmd_tx,
         );
-    }
-
-    /// Source path of a stem split the apply must not delete. Active is a
-    /// mixer that already has the files open. Separating is a split that
-    /// can open them before rekey runs. `None` in plain file playback.
-    fn stem_split_in_use(&self) -> Option<PathBuf> {
-        // Separating counts: the split can finish and the mixer can open
-        // the cache dir while this apply is still running. The snapshot
-        // is taken when the command is sent, so the path has to be the
-        // one already being separated, not only a mixer that is Active.
-        if !matches!(
-            self.stems.status,
-            StemStatus::Active | StemStatus::Separating { .. }
-        ) {
-            return None;
-        }
-        self.stems.for_path.clone().map(PathBuf::from)
     }
 
     // -- Playback controls --
@@ -4280,11 +4256,16 @@ impl App {
         let Some(lib) = &self.library else {
             return;
         };
-        let track_paths: Vec<String> = lib
+        let tracks: Vec<zytunes::stems::StemTrack> = lib
             .album_tracks_by_artist(&artist, &album)
-            .filter_map(|t| t.location.clone())
+            .filter_map(|t| {
+                Some(zytunes::stems::StemTrack {
+                    id: t.id,
+                    path: t.location.clone()?,
+                })
+            })
             .collect();
-        if track_paths.is_empty() {
+        if tracks.is_empty() {
             self.set_toast("No file paths for this album".into(), true);
             return;
         }
@@ -4295,12 +4276,13 @@ impl App {
         let cached = cache_dir
             .as_deref()
             .map(|d| {
-                track_paths
+                tracks
                     .iter()
-                    .filter(|p| {
+                    .filter(|t| {
                         zytunes::stems::stem_cache_contains(
                             d,
-                            std::path::Path::new(p.as_str()),
+                            t.id,
+                            std::path::Path::new(t.path.as_str()),
                             &cache_id,
                             layout,
                         )
@@ -4313,11 +4295,11 @@ impl App {
             .map(zytunes::stems::stem_cache_used_bytes)
             .unwrap_or(0);
         let projected_bytes =
-            zytunes::stems::EST_STEM_BYTES_PER_TRACK * (track_paths.len() - cached) as u64;
+            zytunes::stems::EST_STEM_BYTES_PER_TRACK * (tracks.len() - cached) as u64;
         self.stem_bulk_confirm = Some(StemBulkConfirm {
             artist,
             album,
-            track_paths,
+            tracks,
             recipe,
             cached,
             projected_bytes,
@@ -4346,8 +4328,8 @@ impl App {
             );
             return;
         }
-        let total = confirm.track_paths.len();
-        self.dispatch_stem_batch(confirm.album, confirm.track_paths, confirm.recipe, 0);
+        let total = confirm.tracks.len();
+        self.dispatch_stem_batch(confirm.album, confirm.tracks, confirm.recipe, 0);
         self.set_toast(
             format!("Separating {total} track(s) in the background…"),
             false,
@@ -4363,7 +4345,7 @@ impl App {
     fn dispatch_stem_batch(
         &mut self,
         album: String,
-        track_paths: Vec<String>,
+        tracks: Vec<zytunes::stems::StemTrack>,
         recipe: zytunes::stems::RecipeKind,
         separated_so_far: usize,
     ) {
@@ -4371,18 +4353,18 @@ impl App {
         self.pending_bg_commands
             .push(BgCommand::SeparateStemsBatch {
                 gen: self.stem_batch_gen,
-                track_paths: track_paths.clone(),
+                tracks: tracks.clone(),
                 engine_command: self.stems_cfg.command_path(),
                 recipe,
                 model: self.stems_cfg.model(),
                 cache_max_bytes: self.stems_cfg.cache_max_bytes(),
                 cache_dir: self.stems_cfg.stem_cache_dir(),
             });
-        let total = track_paths.len();
+        let total = tracks.len();
         self.stems_batch = Some(StemBatchState {
             gen: self.stem_batch_gen,
             album,
-            track_paths,
+            tracks,
             current: 0,
             total,
             pct: None,
@@ -4420,7 +4402,7 @@ impl App {
             .push(format!("[stems] resuming album batch: {}", batch.album));
         self.dispatch_stem_batch(
             batch.album,
-            batch.track_paths,
+            batch.tracks,
             batch.recipe,
             batch.separated_so_far,
         );
@@ -4485,6 +4467,7 @@ impl App {
         self.stems.for_path = Some(path.clone());
         self.pending_bg_commands.push(BgCommand::SeparateStems {
             gen: self.stems.job_gen,
+            track_id: self.stem_track_id(&path),
             track_path: path,
             engine_command: self.stems_cfg.command_path(),
             recipe,
@@ -4492,6 +4475,25 @@ impl App {
             cache_max_bytes: self.stems_cfg.cache_max_bytes(),
             cache_dir: self.stems_cfg.stem_cache_dir(),
         });
+    }
+
+    /// The ID a stem cache entry for the file at `path` is keyed on: the
+    /// library track's ID, which stays the same when the file moves. The
+    /// playing track's own ID is asked first, since right after a filing
+    /// apply the library can still list the track at its old path. A file
+    /// with no library track falls back to the hash of its path.
+    fn stem_track_id(&self, path: &str) -> u64 {
+        let playing = self
+            .now_playing
+            .as_ref()
+            .filter(|_| self.playing_track_path().as_deref() == Some(path))
+            .and_then(|np| np.track_id);
+        playing
+            .or_else(|| {
+                let lib = self.library.as_deref()?;
+                lib.track_by_location(path).map(|t| t.id)
+            })
+            .unwrap_or_else(|| zytunes::dirlib::hash_path(std::path::Path::new(path)))
     }
 
     // -- Stem settings panel (`o`) --
@@ -12871,6 +12873,13 @@ mod tests {
 
     /// App with one library track playing at 42 s — the baseline fixture
     /// for stem-mode tests.
+    fn stem_track(id: u64, path: &str) -> zytunes::stems::StemTrack {
+        zytunes::stems::StemTrack {
+            id,
+            path: path.into(),
+        }
+    }
+
     fn stem_playing_app(path: &str) -> App {
         let mut app = App::new();
         app.local_plays_save_path = None;
@@ -12950,6 +12959,7 @@ mod tests {
             [BgCommand::SeparateStems {
                 gen,
                 track_path,
+                track_id,
                 engine_command,
                 recipe,
                 model,
@@ -12958,6 +12968,11 @@ mod tests {
             }] => {
                 assert_eq!(*gen, app.stems.job_gen, "command carries the new gen");
                 assert_eq!(track_path, "/lib/song.mp3");
+                assert_eq!(
+                    *track_id,
+                    zytunes::dirlib::hash_path(std::path::Path::new("/lib/song.mp3")),
+                    "a playing file with no library track is keyed on the hash of its path"
+                );
                 assert!(engine_command.is_none(), "no [stems] command configured");
                 assert_eq!(*recipe, zytunes::stems::RecipeKind::Demucs);
                 assert_eq!(model, "htdemucs_6s");
@@ -13158,8 +13173,8 @@ mod tests {
     /// sidebar, and hermetic stem config/discovery.
     fn bulk_stem_app() -> App {
         let mut app = stem_playing_app("/lib/song.mp3");
-        let mk = |name: &str, loc: &str| zytunes::library::Track {
-            id: 1,
+        let mk = |id: u64, name: &str, loc: &str| zytunes::library::Track {
+            id,
             name: name.into(),
             artist: "Artist".into(),
             album: "Album".into(),
@@ -13167,7 +13182,7 @@ mod tests {
             ..Default::default()
         };
         app.library = Some(Box::new(VecLibrary {
-            tracks: vec![mk("One", "/lib/one.mp3"), mk("Two", "/lib/two.mp3")],
+            tracks: vec![mk(1, "One", "/lib/one.mp3"), mk(2, "Two", "/lib/two.mp3")],
         }));
         app.sidebar_items = vec![SidebarEntry::Album {
             artist: "Artist".into(),
@@ -13402,7 +13417,7 @@ mod tests {
         app.press_stem_mode_on_album();
         let confirm = app.stem_bulk_confirm.as_ref().expect("confirm modal opens");
         assert_eq!(confirm.album, "Album");
-        assert_eq!(confirm.track_paths.len(), 2);
+        assert_eq!(confirm.tracks.len(), 2);
         assert_eq!(confirm.cached, 0, "fake paths are never cached");
         assert!(confirm.projected_bytes > 0);
     }
@@ -13430,7 +13445,7 @@ mod tests {
         assert!(!batch.suspended);
         assert!(matches!(
             app.pending_bg_commands.as_slice(),
-            [BgCommand::SeparateStemsBatch { track_paths, .. }] if track_paths.len() == 2
+            [BgCommand::SeparateStemsBatch { tracks, .. }] if tracks.len() == 2
         ));
     }
 
@@ -15093,7 +15108,7 @@ mod tests {
             PathBuf::from("/m/alice in chains"),
             PathBuf::from("/m/Alice In Chains"),
         )];
-        app.handle_tags_applied(0, vec![Ok(())], rename_map, &dir_renames, &[], &[]);
+        app.handle_tags_applied(0, vec![Ok(())], rename_map, &dir_renames, &[]);
 
         // A track's ID does not change when its file moves, so nothing
         // keyed on it has anything to follow.
@@ -15189,7 +15204,6 @@ mod tests {
             std::collections::HashMap::new(),
             &[],
             &[],
-            &[],
         );
         assert!(
             app.toast_message
@@ -15235,7 +15249,6 @@ mod tests {
                 Ok(()),
             ],
             HashMap::from([(moved.clone(), moved_to)]),
-            &[],
             &[],
             &[],
         );
@@ -15301,7 +15314,6 @@ mod tests {
             HashMap::new(),
             &[],
             &[],
-            &[],
         );
         assert_eq!(
             app.tag_manager.as_ref().unwrap().apply_failures[0].outcome,
@@ -15319,7 +15331,6 @@ mod tests {
                 was: incoming.clone(),
                 now: PathBuf::from("/Removed from Music/inbox/01 Song.wav"),
             }],
-            &[],
         );
         assert_eq!(
             app.tag_manager.as_ref().unwrap().apply_failures,
@@ -15360,7 +15371,6 @@ mod tests {
                 was: in_place,
                 now: removed.clone(),
             }],
-            &[],
         );
         assert_eq!(
             app.tag_manager.as_ref().unwrap().apply_failures,
@@ -15380,7 +15390,6 @@ mod tests {
             0,
             vec![Err("rename collision".into())],
             HashMap::new(),
-            &[],
             &[],
             &[],
         );
@@ -15414,7 +15423,6 @@ mod tests {
             0,
             vec![Err("rename collision".into())],
             HashMap::new(),
-            &[],
             &[],
             &[],
         );
@@ -15501,7 +15509,6 @@ mod tests {
                 PathBuf::from("/m/Alice in Chains"),
                 PathBuf::from("/m/Alice In Chains"),
             )],
-            &[],
             &[],
         );
         assert_eq!(
@@ -15860,7 +15867,7 @@ mod tests {
             PathBuf::from("/m/alice in chains"),
             PathBuf::from("/m/Alice in Chains"),
         )];
-        app.handle_tags_applied(0, vec![Ok(())], rename_map, &dir_renames, &[], &[]);
+        app.handle_tags_applied(0, vec![Ok(())], rename_map, &dir_renames, &[]);
 
         let np = app.now_playing.as_ref().unwrap();
         assert_eq!(
@@ -15886,7 +15893,7 @@ mod tests {
         assert!(
             matches!(
                 app.pending_audio_commands.as_slice(),
-                [crate::audio::AudioCommand::Retarget { file: Some((old, _)), .. }]
+                [crate::audio::AudioCommand::Retarget { old, .. }]
                     if old == old1.to_str().unwrap()
             ),
             "scrub reopens the moved file"
@@ -15934,23 +15941,24 @@ mod tests {
         app.stems.pending_path = Some(moved.into());
         app.dispatch_stem_batch(
             "Mix".into(),
-            vec![moved.into(), stays.into()],
+            vec![stem_track(1, moved), stem_track(2, stays)],
             zytunes::stems::RecipeKind::Demucs,
             0,
         );
         app.pending_bg_commands.clear();
-        app.handle_tags_applied(0, vec![Ok(())], HashMap::new(), &dir_renames, &[], &[]);
+        app.handle_tags_applied(0, vec![Ok(())], HashMap::new(), &dir_renames, &[]);
         assert_eq!(app.stems.pending_path, None);
         let moved_to = "/m/Alice in Chains/Dirt/01 Them Bones.flac";
+        let followed = vec![stem_track(1, moved_to), stem_track(2, stays)];
         assert_eq!(
-            app.stems_batch.as_ref().unwrap().track_paths,
-            vec![moved_to.to_string(), stays.to_string()],
+            app.stems_batch.as_ref().unwrap().tracks,
+            followed,
+            "the path follows the move; the ID its split is cached under does not change"
         );
         assert!(
             app.pending_bg_commands.iter().any(|c| matches!(
                 c,
-                BgCommand::SeparateStemsBatch { track_paths, .. }
-                    if track_paths == &vec![moved_to.to_string(), stays.to_string()]
+                BgCommand::SeparateStemsBatch { tracks, .. } if tracks == &followed
             )),
             "the running worker is replaced with the new paths"
         );
@@ -15958,15 +15966,15 @@ mod tests {
         // A batch made up only of moved tracks is separated at the new paths.
         app.dispatch_stem_batch(
             "Dirt".into(),
-            vec![moved.into()],
+            vec![stem_track(1, moved)],
             zytunes::stems::RecipeKind::Demucs,
             0,
         );
         app.pending_bg_commands.clear();
-        app.handle_tags_applied(0, vec![Ok(())], HashMap::new(), &dir_renames, &[], &[]);
+        app.handle_tags_applied(0, vec![Ok(())], HashMap::new(), &dir_renames, &[]);
         assert_eq!(
-            app.stems_batch.as_ref().unwrap().track_paths,
-            vec![moved_to.to_string()]
+            app.stems_batch.as_ref().unwrap().tracks,
+            vec![stem_track(1, moved_to)]
         );
     }
 
@@ -16082,7 +16090,7 @@ mod tests {
         app.stems.status = StemStatus::Separating { pct: None };
         app.stems.for_path = Some(old.to_string_lossy().into_owned());
         app.stems.job_gen = 4;
-        app.handle_tags_applied(0, vec![Ok(())], HashMap::from([(old, new)]), &[], &[], &[]);
+        app.handle_tags_applied(0, vec![Ok(())], HashMap::from([(old, new)]), &[], &[]);
         assert_eq!(
             app.stems.job_gen, 5,
             "the late result is a stale generation"
@@ -16108,7 +16116,7 @@ mod tests {
         app.stems_batch = Some(StemBatchState {
             gen: 1,
             album: "Dirt".into(),
-            track_paths: vec![old.into(), stay.into()],
+            tracks: vec![stem_track(1, old), stem_track(2, stay)],
             current: 1,
             total: 2,
             pct: None,
@@ -16122,14 +16130,13 @@ mod tests {
             HashMap::from([(PathBuf::from(old), PathBuf::from(new))]),
             &[],
             &[],
-            &[],
         );
-        let paths = &app.stems_batch.as_ref().unwrap().track_paths;
-        assert_eq!(paths, &vec![new.to_string(), stay.to_string()]);
+        let tracks = &app.stems_batch.as_ref().unwrap().tracks;
+        assert_eq!(tracks, &vec![stem_track(1, new), stem_track(2, stay)]);
         assert!(
             app.pending_bg_commands.iter().any(|c| matches!(
                 c,
-                BgCommand::SeparateStemsBatch { track_paths, .. } if track_paths == paths
+                BgCommand::SeparateStemsBatch { tracks: sent, .. } if sent == tracks
             )),
             "the running worker is replaced with the new paths"
         );
@@ -16148,7 +16155,7 @@ mod tests {
         app.stems_batch = Some(StemBatchState {
             gen: 1,
             album: "Dirt".into(),
-            track_paths: vec![old.into()],
+            tracks: vec![stem_track(1, old)],
             current: 1,
             total: 1,
             pct: None,
@@ -16162,11 +16169,10 @@ mod tests {
             HashMap::from([(PathBuf::from(old), PathBuf::from(new))]),
             &[],
             &[],
-            &[],
         );
         assert_eq!(
-            app.stems_batch.as_ref().unwrap().track_paths,
-            vec![new.to_string()]
+            app.stems_batch.as_ref().unwrap().tracks,
+            vec![stem_track(1, new)]
         );
         assert!(
             app.stems_batch.as_ref().unwrap().suspended,
@@ -16208,7 +16214,6 @@ mod tests {
                 PathBuf::from("/m/Alice In Chains"),
             )],
             &[],
-            &[],
         );
         let locs: Vec<&str> = app.sync.queue[0]
             .tracks
@@ -16225,19 +16230,49 @@ mod tests {
     }
 
     #[test]
-    fn an_in_flight_split_is_protected_when_the_apply_starts() {
-        let src = PathBuf::from("/inbox/01 Song.wav");
-        let mut app = filing_overlay_with_rename(&src, std::path::Path::new("/m/01 - Song.wav"));
-        app.stems.status = StemStatus::Separating { pct: Some(40) };
-        app.stems.for_path = Some(src.to_string_lossy().into_owned());
-        let (tx, rx) = mpsc::channel();
-        app.dispatch_tag_diff_apply(Some(&tx), true);
-        match rx.try_recv() {
-            Ok(BgCommand::ApplyTagDiff { stems_in_use, .. }) => {
-                assert_eq!(stems_in_use.as_deref(), Some(src.as_path()));
-            }
-            Ok(_) => panic!("expected ApplyTagDiff"),
-            Err(_) => panic!("apply was not dispatched"),
+    fn a_split_requested_after_a_move_uses_the_playing_tracks_id() {
+        // The file was renamed by an apply and the library has not been
+        // re-read yet, so the new path is not in the index. The split
+        // must still be asked for under the track's ID, or it would be
+        // cached under a key nothing looks up again.
+        let old = "/lib/artist/song.mp3";
+        let new = "/lib/Artist/01 - Song.mp3";
+        let mut app = stem_playing_app(old);
+        app.now_playing.as_mut().unwrap().track_id = Some(77);
+        app.handle_tags_applied(
+            0,
+            vec![Ok(())],
+            HashMap::from([(PathBuf::from(old), PathBuf::from(new))]),
+            &[],
+            &[],
+        );
+        app.pending_bg_commands.clear();
+        app.dispatch_separation(new.into(), zytunes::stems::RecipeKind::Demucs);
+        assert!(
+            matches!(
+                app.pending_bg_commands.as_slice(),
+                [BgCommand::SeparateStems { track_id: 77, track_path, .. }] if track_path == new
+            ),
+            "split keyed on the track, read from where the file is now"
+        );
+    }
+
+    #[test]
+    fn an_album_batch_carries_each_tracks_library_id() {
+        let mut app = bulk_stem_app();
+        app.stem_engine_finder = |_, _| Some(std::path::PathBuf::from("/bin/engine"));
+        app.press_stem_mode_on_album();
+        app.stem_bulk_confirm_accept();
+        let lib = app.library.as_deref().unwrap();
+        let [BgCommand::SeparateStemsBatch { tracks, .. }] = app.pending_bg_commands.as_slice()
+        else {
+            panic!("expected one batch command");
+        };
+        for t in tracks {
+            assert_eq!(
+                lib.track_by_id(t.id).and_then(|l| l.location.as_deref()),
+                Some(t.path.as_str())
+            );
         }
     }
 
@@ -16270,7 +16305,6 @@ mod tests {
             0,
             vec![Err("rename collision".into())],
             HashMap::from([(moved.clone(), dest)]),
-            &[],
             &[],
             &[],
         );
@@ -16326,7 +16360,6 @@ mod tests {
             0,
             vec![Ok(())],
             HashMap::from([(moved.clone(), dest)]),
-            &[],
             &[],
             &[],
         );
@@ -16988,7 +17021,6 @@ mod tests {
             outcome.rename_map,
             &outcome.dir_renames,
             &outcome.set_aside,
-            &[],
         );
         app.handle_library_reread_complete(token, Ok(Box::new(lib)));
     }

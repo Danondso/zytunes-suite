@@ -2572,7 +2572,7 @@ fn draw_stem_bulk_confirm(f: &mut Frame, app: &App, confirm: &crate::app::StemBu
     let area = f.area();
     let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
 
-    let to_do = confirm.track_paths.len() - confirm.cached;
+    let to_do = confirm.tracks.len() - confirm.cached;
     let mut lines = vec![
         Line::from(""),
         Line::from(format!(
@@ -2582,7 +2582,7 @@ fn draw_stem_bulk_confirm(f: &mut Frame, app: &App, confirm: &crate::app::StemBu
         Line::from(""),
         Line::from(format!(
             " {} track(s): {} to separate, {} already cached",
-            confirm.track_paths.len(),
+            confirm.tracks.len(),
             to_do,
             confirm.cached
         )),

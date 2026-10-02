@@ -151,18 +151,10 @@ impl App {
                 rename_map,
                 dir_renames,
                 set_aside,
-                stem_dir_renames,
                 id_merges,
             } => {
                 self.fold_merged_track_ids(&id_merges);
-                self.handle_tags_applied(
-                    token,
-                    results,
-                    rename_map,
-                    &dir_renames,
-                    &set_aside,
-                    &stem_dir_renames,
-                );
+                self.handle_tags_applied(token, results, rename_map, &dir_renames, &set_aside);
             }
             BgEvent::LibraryRereadComplete { token, result } => {
                 self.handle_library_reread_complete(token, result);

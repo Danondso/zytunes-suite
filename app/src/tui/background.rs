@@ -320,14 +320,6 @@ pub enum BgCommand {
         /// Sources whose dest already holds the copy the user chose to
         /// keep: the source is removed instead of replacing it.
         keep_existing: std::collections::HashSet<std::path::PathBuf>,
-        /// Resolved stem-cache root. Entries whose source moved are re-keyed
-        /// when the file's fingerprint still matches, and removed when it
-        /// does not. `None` leaves the cache alone.
-        stem_cache_dir: Option<PathBuf>,
-        /// Source path of the track whose stem split the mixer has open,
-        /// if stem playback is live. That entry is not deleted out from
-        /// under the mixer when a rewrite makes the fingerprint stale.
-        stems_in_use: Option<PathBuf>,
     },
     /// Look up a Chromaprint fingerprint against the AcoustID web service.
     /// Result is delivered as [`BgEvent::AcoustIdResolved`]. The tag-manager
@@ -383,6 +375,9 @@ pub enum BgCommand {
         /// [`BgCommand::ProvisionStemEngine::gen`].
         gen: u64,
         track_path: String,
+        /// The track's library ID, which keys its cache entry (a file
+        /// with no library track passes the hash of its path).
+        track_id: u64,
         /// Explicit engine path from `[stems].command`; `None` falls back
         /// to PATH and the managed bin dir.
         engine_command: Option<PathBuf>,
@@ -434,7 +429,7 @@ pub enum BgCommand {
         /// Batch generation echoed on `StemBatch*` events (independent
         /// of the per-track job gen).
         gen: u64,
-        track_paths: Vec<String>,
+        tracks: Vec<zytunes::stems::StemTrack>,
         engine_command: Option<PathBuf>,
         recipe: zytunes::stems::RecipeKind,
         model: String,
@@ -626,8 +621,6 @@ pub enum BgEvent {
         /// incoming file it is about the copy that stayed, for a replaced
         /// one about the file that is now in the removed-files folder.
         set_aside: Vec<zytunes::tag_ops::SetAside>,
-        /// Stem-cache directories renamed onto a moved file's new key.
-        stem_dir_renames: Vec<(std::path::PathBuf, std::path::PathBuf)>,
         /// Tracks a replace folded into another, `loser → winner` library
         /// ID. Empty for plain moves: a moved track keeps its ID.
         id_merges: std::collections::HashMap<u64, u64>,
@@ -2025,6 +2018,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                 BgCommand::SeparateStems {
                     gen,
                     track_path,
+                    track_id,
                     engine_command,
                     recipe,
                     model,
@@ -2105,6 +2099,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                                     &SeparationJob {
                                         gen,
                                         track_path: &track_path,
+                                        track_id,
                                         layout: recipe.layout(),
                                         cache_id: &cache_id,
                                         cache_dir: &cache_dir,
@@ -2236,7 +2231,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                 }
                 BgCommand::SeparateStemsBatch {
                     gen,
-                    track_paths,
+                    tracks,
                     engine_command,
                     recipe,
                     model,
@@ -2248,7 +2243,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                     let tx = event_tx.clone();
                     thread::spawn(move || {
                         let _guard = jobs.acquire();
-                        let total = track_paths.len();
+                        let total = tracks.len();
                         let bail = |failed: usize, cancelled: bool| {
                             let _ = tx.send(BgEvent::StemBatchDone {
                                 gen,
@@ -2294,7 +2289,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                         run_stem_batch(
                             &StemBatchJob {
                                 gen,
-                                track_paths: &track_paths,
+                                tracks: &tracks,
                                 layout: recipe.layout(),
                                 cache_id: &recipe.cache_id(&model),
                                 cache_dir: &cache_dir,
@@ -2366,8 +2361,6 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                     fingerprint,
                     replace_existing,
                     keep_existing,
-                    stem_cache_dir,
-                    stems_in_use,
                 } => {
                     let outcome = zytunes::tag_ops::apply_release_diff_keeping(
                         &diff,
@@ -2385,47 +2378,15 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                     let paths = outcome.reread_paths(&diff, std::path::Path::new(&music_dir));
                     let vacated = outcome.vacated();
                     let dir_renames = outcome.dir_renames.clone();
-                    // Re-key stem entries onto the new path when the audio
-                    // is unchanged. A rewritten file no longer matches the
-                    // sidecar and is dropped, except the one a mixer has open.
                     let moved_anything = !outcome.rename_map.is_empty() || !dir_renames.is_empty();
-                    let stem_dir_renames = match (moved_anything, stem_cache_dir) {
-                        (true, Some(cache_dir)) => {
-                            let log_tx = event_tx.clone();
-                            let log: zytunes::cache::Logger =
-                                std::sync::Arc::new(move |msg: &str| {
-                                    let _ = log_tx.send(BgEvent::SyncMessage(msg.to_string()));
-                                });
-                            let report = zytunes::stems::rekey_moved_stem_entries(
-                                &cache_dir,
-                                |old| {
-                                    zytunes::tag_ops::moved_path(
-                                        old,
-                                        &outcome.rename_map,
-                                        &dir_renames,
-                                    )
-                                },
-                                stems_in_use.as_deref(),
-                                &log,
-                            );
-                            let rekeyed = report.dir_renames.len();
-                            if rekeyed > 0 || report.removed > 0 {
-                                log(&format!(
-                                    "stem cache: re-keyed {rekeyed} moved split(s), removed {}",
-                                    report.removed
-                                ));
-                            }
-                            report.dir_renames
-                        }
-                        _ => Vec::new(),
-                    };
                     let log_tx = event_tx.clone();
                     let scan_log: zytunes::cache::Logger = std::sync::Arc::new(move |msg: &str| {
                         let _ = log_tx.send(BgEvent::SyncMessage(msg.to_string()));
                     });
                     // Move each file's ID with it before anything reads the
                     // library at the new paths. This is what keeps
-                    // playlists and play stats attached without re-keying.
+                    // playlists, play stats and stem splits (all keyed on
+                    // the ID) attached without re-keying.
                     let id_merges = if moved_anything {
                         zytunes::track_ids::record_moves(&music_dir, &scan_log, |old| {
                             zytunes::tag_ops::moved_path(old, &outcome.rename_map, &dir_renames)
@@ -2439,7 +2400,6 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                         rename_map: outcome.rename_map,
                         dir_renames: outcome.dir_renames,
                         set_aside: outcome.set_aside,
-                        stem_dir_renames,
                         id_merges,
                     });
 
@@ -3231,7 +3191,7 @@ impl StemJobs {
 /// the app re-dispatches the remainder afterwards.
 struct StemBatchJob<'a> {
     gen: u64,
-    track_paths: &'a [String],
+    tracks: &'a [zytunes::stems::StemTrack],
     layout: &'static [zytunes::stems::StemKind],
     cache_id: &'a str,
     cache_dir: &'a std::path::Path,
@@ -3252,7 +3212,7 @@ fn run_stem_batch(
 ) {
     let StemBatchJob {
         gen,
-        track_paths,
+        tracks,
         layout,
         cache_id,
         cache_dir,
@@ -3262,10 +3222,11 @@ fn run_stem_batch(
     let log: zytunes::cache::Logger = Arc::new(move |msg: &str| {
         let _ = log_tx.send(BgEvent::SyncMessage(format!("[stems] {msg}")));
     });
-    let total = track_paths.len();
+    let total = tracks.len();
     let (mut separated, mut skipped, mut failed) = (0usize, 0usize, 0usize);
     let mut was_cancelled = false;
-    for (i, track) in track_paths.iter().enumerate() {
+    for (i, zytunes::stems::StemTrack { id, path: track }) in tracks.iter().enumerate() {
+        let id = *id;
         if cancelled() {
             was_cancelled = true;
             break;
@@ -3278,12 +3239,12 @@ fn run_stem_batch(
             pct: None,
         });
         let source = std::path::Path::new(track);
-        if cached_stems(cache_dir, source, cache_id, layout, &log).is_some() {
+        if cached_stems(cache_dir, id, source, cache_id, layout, &log).is_some() {
             skipped += 1;
             continue;
         }
         log(&format!("batch {current}/{total}: separating {track}"));
-        let work_dir = cache_dir.join("work").join(stem_cache_key(track, cache_id));
+        let work_dir = cache_dir.join("work").join(stem_cache_key(id, cache_id));
         let _ = std::fs::remove_dir_all(&work_dir);
         let progress_tx = event_tx.clone();
         let on_progress = move |pct: u8| {
@@ -3298,7 +3259,7 @@ fn run_stem_batch(
         let outcome = separator.separate(source, &work_dir, cancelled, &on_progress, &on_line);
         match outcome {
             Ok(produced) => {
-                match store_stems(cache_dir, source, cache_id, &produced, max_bytes, &log) {
+                match store_stems(cache_dir, id, source, cache_id, &produced, max_bytes, &log) {
                     Ok(_) => separated += 1,
                     Err(e) => {
                         failed += 1;
@@ -3333,6 +3294,8 @@ fn run_stem_batch(
 struct SeparationJob<'a> {
     gen: u64,
     track_path: &'a str,
+    /// Keys the cache entry; see [`zytunes::stems::StemTrack::id`].
+    track_id: u64,
     /// Ordered stems the recipe produces — cache lookups validate
     /// against this exact file set.
     layout: &'static [zytunes::stems::StemKind],
@@ -3428,6 +3391,7 @@ fn run_separation(
     let SeparationJob {
         gen,
         track_path,
+        track_id,
         layout,
         cache_id,
         cache_dir,
@@ -3444,7 +3408,7 @@ fn run_separation(
     // being a hit, never a re-separation. No-op after the first sweep.
     zytunes::stems::migrate_legacy_stem_entries(cache_dir, &log);
 
-    if let Some(stems) = cached_stems(cache_dir, source, cache_id, layout, &log) {
+    if let Some(stems) = cached_stems(cache_dir, track_id, source, cache_id, layout, &log) {
         let _ = event_tx.send(BgEvent::StemsReady {
             gen,
             track_path: track_path.to_string(),
@@ -3458,7 +3422,7 @@ fn run_separation(
     // output must never look like a cache).
     let work_dir = cache_dir
         .join("work")
-        .join(stem_cache_key(track_path, cache_id));
+        .join(stem_cache_key(track_id, cache_id));
     let _ = std::fs::remove_dir_all(&work_dir);
 
     let progress_tx = event_tx.clone();
@@ -3473,7 +3437,9 @@ fn run_separation(
     let outcome = separator.separate(source, &work_dir, cancelled, &on_progress, &on_line);
     let terminal = match outcome {
         Ok(produced) => {
-            match store_stems(cache_dir, source, cache_id, &produced, max_bytes, &log) {
+            match store_stems(
+                cache_dir, track_id, source, cache_id, &produced, max_bytes, &log,
+            ) {
                 Ok(stems) => BgEvent::StemsReady {
                     gen,
                     track_path: track_path.to_string(),
@@ -3783,18 +3749,24 @@ mod tests {
             std::fs::write(p, b"warm").unwrap();
         }
         let log = zytunes::cache::default_logger();
-        zytunes::stems::store_stems(&cache, &a, "m", &produced, u64::MAX, &log).unwrap();
+        zytunes::stems::store_stems(&cache, 1, &a, "m", &produced, u64::MAX, &log).unwrap();
 
         let (event_tx, event_rx) = mpsc::channel();
         let sep = FakeSeparator::ok();
         let tracks = vec![
-            a.to_string_lossy().into_owned(),
-            b.to_string_lossy().into_owned(),
+            zytunes::stems::StemTrack {
+                id: 1,
+                path: a.to_string_lossy().into_owned(),
+            },
+            zytunes::stems::StemTrack {
+                id: 2,
+                path: b.to_string_lossy().into_owned(),
+            },
         ];
         run_stem_batch(
             &StemBatchJob {
                 gen: 3,
-                track_paths: &tracks,
+                tracks: &tracks,
                 layout: zytunes::stems::SIX_STEM_LAYOUT,
                 cache_id: "m",
                 cache_dir: &cache,
@@ -3832,6 +3804,7 @@ mod tests {
         // Track B's stems landed in the cache.
         assert!(zytunes::stems::cached_stems(
             &cache,
+            2,
             &b,
             "m",
             zytunes::stems::SIX_STEM_LAYOUT,
@@ -3849,11 +3822,14 @@ mod tests {
         std::fs::write(&a, b"mp3").unwrap();
         let (event_tx, event_rx) = mpsc::channel();
         let sep = FakeSeparator::ok();
-        let tracks = vec![a.to_string_lossy().into_owned()];
+        let tracks = vec![zytunes::stems::StemTrack {
+            id: 1,
+            path: a.to_string_lossy().into_owned(),
+        }];
         run_stem_batch(
             &StemBatchJob {
                 gen: 4,
-                track_paths: &tracks,
+                tracks: &tracks,
                 layout: zytunes::stems::SIX_STEM_LAYOUT,
                 cache_id: "m",
                 cache_dir: &cache,
@@ -3892,6 +3868,7 @@ mod tests {
             &SeparationJob {
                 gen: 7,
                 track_path: &track,
+                track_id: 9,
                 layout: zytunes::stems::SIX_STEM_LAYOUT,
                 cache_id: "m",
                 cache_dir: &cache,
@@ -3926,6 +3903,7 @@ mod tests {
             &SeparationJob {
                 gen: 8,
                 track_path: &track,
+                track_id: 9,
                 layout: zytunes::stems::SIX_STEM_LAYOUT,
                 cache_id: "m",
                 cache_dir: &cache,
@@ -3958,6 +3936,7 @@ mod tests {
             &SeparationJob {
                 gen: 7,
                 track_path: &source.to_string_lossy(),
+                track_id: 9,
                 layout: zytunes::stems::SIX_STEM_LAYOUT,
                 cache_id: "m",
                 cache_dir: &dir.join("cache"),
@@ -3994,6 +3973,7 @@ mod tests {
             &SeparationJob {
                 gen: 7,
                 track_path: &source.to_string_lossy(),
+                track_id: 9,
                 layout: zytunes::stems::SIX_STEM_LAYOUT,
                 cache_id: "m",
                 cache_dir: &dir.join("cache"),
