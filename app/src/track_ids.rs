@@ -132,6 +132,23 @@ impl TrackIds {
         }
     }
 
+    /// Drop entries whose path `keep` rejects, freeing their IDs. Only for
+    /// files a scan has proved gone: an entry is the only record of a
+    /// moved track's ID.
+    pub fn retain(&mut self, keep: impl Fn(&str) -> bool) {
+        let before = self.by_path.len();
+        self.by_path.retain(|path, id| {
+            let kept = keep(path);
+            if !kept {
+                self.used.remove(id);
+            }
+            kept
+        });
+        if self.by_path.len() != before {
+            self.dirty = true;
+        }
+    }
+
     /// The registry in `file`. A missing file is an empty registry: IDs
     /// then fall back to path hashes, which is what they were before the
     /// registry existed.
@@ -421,6 +438,21 @@ mod tests {
             );
             assert_eq!(ids.get(&p("/m/Alice/02 - Song.mp3")), Some(live));
         }
+    }
+
+    #[test]
+    fn retain_frees_the_ids_of_files_that_are_gone() {
+        let mut ids = TrackIds::default();
+        ids.id_for(&p("/music/keep.mp3"));
+        let moved = ids.id_for(&p("/music/first.mp3"));
+        ids.apply_moves(renames(&[("/music/first.mp3", "/music/gone.mp3")]), none);
+        ids.dirty = false;
+        ids.retain(|path| path != "/music/gone.mp3");
+        assert!(ids.dirty);
+        assert_eq!(ids.get(&p("/music/gone.mp3")), None);
+        assert!(ids.get(&p("/music/keep.mp3")).is_some());
+        // Its ID is free: a new file at the first path gets the plain hash.
+        assert_eq!(ids.id_for(&p("/music/first.mp3")), moved);
     }
 
     #[test]

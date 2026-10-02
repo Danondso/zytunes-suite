@@ -6,7 +6,8 @@
 //! files bound for names that are free, held, numbered, in another case,
 //! held by a track of the same diff that is leaving or staying, two bound
 //! for one name, files arriving from the inbox, and folders that have been
-//! made read-only so renames fail halfway through an album.
+//! made read-only so renames fail halfway through an album. Some folders
+//! also hold a cover image, which has to follow the audio out.
 //!
 //! What must hold whatever the sequence:
 //!   - no file is lost, duplicated or truncated;
@@ -16,7 +17,9 @@
 //!   - a file keeps the track ID it was first given, however often and
 //!     however it moves, and no two files share one;
 //!   - `rename_map` says where each file really went;
-//!   - no folder is left empty.
+//!   - no folder is left empty, or holding only what sat beside the
+//!     audio (cover art): those files follow the audio and are never lost
+//!     or overwritten either.
 //!
 //! A file's identity here is its inode: a rename keeps it, and the diffs
 //! only rename (a tag write swaps in a rewritten copy).
@@ -97,6 +100,24 @@ fn files_under(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
+fn is_audio(path: &Path) -> bool {
+    path.extension().is_some_and(|e| e == "wav")
+}
+
+/// Any audio file anywhere under `dir`.
+fn holds_audio(dir: &Path) -> bool {
+    files_under(dir).iter().any(|f| is_audio(f))
+}
+
+/// Every non-audio file under `root`: inode → path.
+fn sidecars_under(root: &Path) -> HashMap<u64, PathBuf> {
+    files_under(root)
+        .into_iter()
+        .filter(|f| !is_audio(f))
+        .map(|f| (inode(&f), f))
+        .collect()
+}
+
 fn inode(path: &Path) -> u64 {
     std::fs::metadata(path)
         .unwrap_or_else(|e| panic!("stat {}: {e}", path.display()))
@@ -140,6 +161,7 @@ struct Reached {
     refused_as_wrong_pairing: usize,
     folders_retitled: usize,
     failed_on_a_locked_folder: usize,
+    sidecars_carried: usize,
 }
 
 fn library_view(lib: &DirectoryLibrary) -> BTreeMap<String, u64> {
@@ -165,6 +187,18 @@ impl Model {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         write_sine_wav(path, secs);
         let meta = std::fs::metadata(path).unwrap();
+        self.files.insert(meta.ino(), meta.len());
+    }
+
+    /// A cover image beside `audio`, unless its folder has one. Each has
+    /// its own contents, so none is ever a byte-identical copy of another.
+    fn create_cover(&mut self, audio: &Path) {
+        let cover = audio.with_file_name("cover.jpg");
+        if cover.exists() {
+            return;
+        }
+        std::fs::write(&cover, format!("cover {}", self.files.len())).unwrap();
+        let meta = std::fs::metadata(&cover).unwrap();
         self.files.insert(meta.ino(), meta.len());
     }
 
@@ -202,10 +236,11 @@ impl Model {
         }
         assert_eq!(seen.len(), self.files.len(), "{at}: a file is gone");
 
-        // The library lists exactly what is on disk under the root.
+        // The library lists exactly the audio on disk under the root.
         let listed = library_view(lib);
         let on_disk: BTreeSet<String> = in_root
             .iter()
+            .filter(|p| is_audio(p))
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
         assert_eq!(
@@ -234,8 +269,11 @@ impl Model {
 
         if !self.faulted {
             for dir in &dirs {
-                let empty = std::fs::read_dir(dir).unwrap().next().is_none();
-                assert!(!empty, "{at}: empty folder left: {}", dir.display());
+                assert!(
+                    holds_audio(dir),
+                    "{at}: folder left with no audio in it: {}",
+                    dir.display()
+                );
             }
         }
     }
@@ -272,6 +310,9 @@ fn run(seed: u64, reached: &mut Reached) {
         let path = random_path(&mut rng, &root);
         if !path.exists() {
             model.create(&path, *rng.pick(LENGTHS));
+            if rng.one_in(2) {
+                model.create_cover(&path);
+            }
         }
     }
     let lib = scan(&root_str);
@@ -280,6 +321,7 @@ fn run(seed: u64, reached: &mut Reached) {
     for step in 0..8 {
         let at = format!("seed {seed} step {step}");
         let mut sources = files_under(&root);
+        sources.retain(|f| is_audio(f));
         if rng.one_in(3) {
             let drop = inbox.join(format!("drop {step}.wav"));
             model.create(&drop, *rng.pick(LENGTHS));
@@ -321,6 +363,7 @@ fn run(seed: u64, reached: &mut Reached) {
             }
         }
 
+        let sidecars = sidecars_under(&root);
         let outcome = apply_and_record_moves(&diff, &root_str, &log);
 
         // The folder may have been carried along by a retitle of its
@@ -337,6 +380,14 @@ fn run(seed: u64, reached: &mut Reached) {
         assert_eq!(outcome.results.len(), diff.tracks.len(), "{detail}");
         reached.moved += outcome.rename_map.len();
         reached.folders_retitled += outcome.dir_renames.len();
+        let sidecars_now = sidecars_under(&root);
+        reached.sidecars_carried += sidecars
+            .iter()
+            .filter(|(ino, was)| {
+                let carried = crate::tag_ops::remap_through_dir_renames(was, &outcome.dir_renames);
+                sidecars_now.get(*ino).is_some_and(|now| *now != carried)
+            })
+            .count();
         for (track, result) in diff.tracks.iter().zip(&outcome.results) {
             let landed = outcome.rename_map.get(&track.src_path);
             if landed.is_some() && track.src_path.starts_with(&inbox) {
@@ -393,7 +444,8 @@ fn filing_keeps_every_file_and_its_identity_through_random_applies() {
             && reached.filed_from_inbox > 0
             && reached.landed_beside > 0
             && reached.refused_as_wrong_pairing > 0
-            && reached.folders_retitled > 0,
+            && reached.folders_retitled > 0
+            && reached.sidecars_carried > 0,
         "the generator no longer reaches every case: {reached:?}"
     );
     // Root ignores directory permissions, so nothing fails on a read-only

@@ -781,6 +781,10 @@ pub struct ApplyOutcome {
     /// including albums that were not part of the diff — so callers must
     /// remap any path they still hold under `old`.
     pub dir_renames: Vec<(PathBuf, PathBuf)>,
+    /// Sidecar files (cover art, cue sheets, scans) that could not follow
+    /// the audio out of a folder, one message each. The file is still
+    /// where it was, and so is its folder.
+    pub sidecar_errors: Vec<String>,
 }
 
 impl ApplyOutcome {
@@ -1013,11 +1017,152 @@ pub fn apply_release_diff(diff: &ReleaseTagDiff, library_root: &Path) -> ApplyOu
         *landed = remap_through_dir_renames(landed, &dir_renames[landed_after[src]..]);
     }
 
+    let sidecar_errors = carry_sidecars(&rename_map, &dir_renames, library_root);
+
     ApplyOutcome {
         results,
         rename_map,
         dir_renames,
+        sidecar_errors,
     }
+}
+
+/// Files the OS scatters into folders. Removed rather than carried: they
+/// describe the folder that is going away.
+const OS_JUNK: &[&str] = &[".DS_Store", "Thumbs.db", "desktop.ini"];
+
+/// Move what is left in each folder the audio moved out of (cover art,
+/// cue sheets, scans, a subfolder of them) to where the audio went, so
+/// the folder can be removed instead of staying behind with no music in
+/// it. Returns one message per file that could not be moved.
+///
+/// A folder is only cleared once no audio is left anywhere under it: a
+/// track that stayed (failed, not in the diff, a numbered copy) keeps its
+/// folder and everything in it. Files go to the folder most of the audio
+/// landed in. Nothing is overwritten: a name already taken there by a
+/// different file gets a numbered sibling, and a byte-identical one is
+/// not kept twice.
+///
+/// Folders above the one the audio left are cleared too, up to the
+/// library root or the inbox (neither is ever cleared itself), but only
+/// of loose files and only once they hold no folder at all: that carries
+/// the cover that sits above `CD1`/`CD2`, without hauling along a sibling
+/// folder that was never part of the album.
+fn carry_sidecars(
+    rename_map: &HashMap<PathBuf, PathBuf>,
+    dir_renames: &[(PathBuf, PathBuf)],
+    library_root: &Path,
+) -> Vec<String> {
+    use std::collections::BTreeMap;
+    let inbox = crate::library_layout::default_inbox_dir(library_root);
+    // Folder left (by the name it has now) → folders landed in, counted.
+    let mut left: BTreeMap<PathBuf, BTreeMap<PathBuf, usize>> = BTreeMap::new();
+    for (src, landed) in rename_map {
+        let from = remap_through_dir_renames(src, dir_renames);
+        let (Some(from), Some(to)) = (from.parent(), landed.parent()) else {
+            continue;
+        };
+        if from != to {
+            *left
+                .entry(from.to_path_buf())
+                .or_default()
+                .entry(to.to_path_buf())
+                .or_default() += 1;
+        }
+    }
+    let mut errors = Vec::new();
+    for (from, landings) in left {
+        let Some((to, _)) = landings
+            .iter()
+            .max_by_key(|(dir, count)| (**count, std::cmp::Reverse(*dir)))
+        else {
+            continue;
+        };
+        let mut dir = from.as_path();
+        let mut whole_tree = true;
+        while may_remove_empty_dir(dir, library_root, inbox.as_deref()) {
+            if dir.is_dir() {
+                if has_audio_beneath(dir) || (!whole_tree && has_subfolder(dir)) {
+                    break;
+                }
+                move_sidecars(dir, to, &mut errors);
+                prune_empty_parents(dir, library_root);
+                if dir.exists() {
+                    break;
+                }
+            }
+            whole_tree = false;
+            let Some(parent) = dir.parent() else {
+                break;
+            };
+            dir = parent;
+        }
+    }
+    errors
+}
+
+/// Any audio file anywhere under `dir`. A folder that cannot be read
+/// counts as holding some.
+fn has_audio_beneath(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return true;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        if path.is_dir() {
+            has_audio_beneath(&path)
+        } else {
+            crate::dirlib::is_audio_file(&path)
+        }
+    })
+}
+
+fn has_subfolder(dir: &Path) -> bool {
+    std::fs::read_dir(dir).map_or(true, |entries| entries.flatten().any(|e| e.path().is_dir()))
+}
+
+/// Move every file under `from` to the same place under `to`. Symlinks
+/// are left (a relative one would dangle), which keeps `from` in place.
+fn move_sidecars(from: &Path, to: &Path, errors: &mut Vec<String>) {
+    if same_inode(from, to) {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(from) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_symlink() {
+            continue;
+        }
+        if kind.is_dir() {
+            move_sidecars(&path, &to.join(&name), errors);
+            let _ = std::fs::remove_dir(&path);
+            continue;
+        }
+        let target = to.join(&name);
+        let moved = if OS_JUNK.iter().any(|junk| name == *junk)
+            || (target.is_file() && same_contents(&path, &target))
+        {
+            std::fs::remove_file(&path).map_err(|e| format!("remove {}: {e}", path.display()))
+        } else {
+            move_file(&path, &landing_path(&path, &target))
+        };
+        if let Err(e) = moved {
+            errors.push(e);
+        }
+    }
+}
+
+fn same_contents(a: &Path, b: &Path) -> bool {
+    let len = |p: &Path| std::fs::metadata(p).map(|m| m.len()).ok();
+    len(a).is_some()
+        && len(a) == len(b)
+        && matches!((std::fs::read(a), std::fs::read(b)), (Ok(x), Ok(y)) if x == y)
 }
 
 /// [`apply_release_diff`], then move each moved file's track ID with it
@@ -3519,6 +3664,161 @@ mod tests {
         }
     }
 
+    /// A rename-only diff of several `(src, dest)` pairs.
+    fn renames_diff(pairs: &[(&Path, &Path)]) -> ReleaseTagDiff {
+        let mut diff = rename_only_diff(pairs[0].0, pairs[0].1);
+        for (src, dest) in &pairs[1..] {
+            diff.tracks.extend(rename_only_diff(src, dest).tracks);
+        }
+        diff
+    }
+
+    /// One-second wav at `path`, parents created.
+    fn wav_at(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        write_sine_wav(path, 1);
+    }
+
+    fn file_at(path: &Path, contents: &[u8]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+
+    #[test]
+    fn sidecars_follow_the_audio_out_of_a_folder() {
+        // The cover and the scans belong to the album. Left behind they
+        // keep the old folder alive with no music in it.
+        let dir = fresh_dir("sidecars-follow");
+        let src = dir.join("loose").join("rip").join("a.wav");
+        let album = dir.join("Artist").join("Album");
+        wav_at(&src);
+        file_at(&src.with_file_name("cover.jpg"), b"cover");
+        file_at(&src.with_file_name("Scans").join("back.png"), b"back");
+        file_at(&src.with_file_name(".DS_Store"), b"junk");
+        let out = apply_release_diff(&rename_only_diff(&src, &album.join("01 - Song.wav")), &dir);
+        assert!(out.results[0].is_ok(), "{:?}", out.results[0]);
+        assert!(out.sidecar_errors.is_empty(), "{:?}", out.sidecar_errors);
+        assert_eq!(std::fs::read(album.join("cover.jpg")).unwrap(), b"cover");
+        assert_eq!(
+            std::fs::read(album.join("Scans").join("back.png")).unwrap(),
+            b"back"
+        );
+        assert!(!album.join(".DS_Store").exists(), "OS junk is not carried");
+        assert!(!dir.join("loose").exists(), "the old folders are gone");
+    }
+
+    #[test]
+    fn sidecars_stay_while_the_folder_still_holds_audio() {
+        let dir = fresh_dir("sidecars-stay");
+        let src = dir.join("loose").join("a.wav");
+        let staying = dir.join("loose").join("b.wav");
+        wav_at(&src);
+        wav_at(&staying);
+        file_at(&src.with_file_name("cover.jpg"), b"cover");
+        let dest = dir.join("Artist").join("Album").join("01 - Song.wav");
+        let out = apply_release_diff(&rename_only_diff(&src, &dest), &dir);
+        assert!(out.results[0].is_ok(), "{:?}", out.results[0]);
+        assert!(src.with_file_name("cover.jpg").exists());
+        assert!(!dest.with_file_name("cover.jpg").exists());
+    }
+
+    #[test]
+    fn a_sidecar_never_overwrites_one_already_there() {
+        let dir = fresh_dir("sidecars-held");
+        let src = dir.join("loose").join("a.wav");
+        let album = dir.join("Artist").join("Album");
+        wav_at(&src);
+        wav_at(&album.join("02 - Other.wav"));
+        file_at(&src.with_file_name("cover.jpg"), b"new cover");
+        file_at(&src.with_file_name("notes.txt"), b"same");
+        file_at(&album.join("cover.jpg"), b"old cover");
+        file_at(&album.join("notes.txt"), b"same");
+        let out = apply_release_diff(&rename_only_diff(&src, &album.join("01 - Song.wav")), &dir);
+        assert!(out.results[0].is_ok(), "{:?}", out.results[0]);
+        assert_eq!(
+            std::fs::read(album.join("cover.jpg")).unwrap(),
+            b"old cover"
+        );
+        assert_eq!(
+            std::fs::read(album.join("cover (2).jpg")).unwrap(),
+            b"new cover"
+        );
+        // A byte-identical copy is not kept twice.
+        assert!(!album.join("notes (2).txt").exists());
+        assert!(!dir.join("loose").exists());
+    }
+
+    #[test]
+    fn a_cover_above_disc_folders_follows_once_both_discs_left() {
+        let dir = fresh_dir("sidecars-discs");
+        let old = dir.join("artist").join("old album");
+        let one = old.join("CD1").join("a.wav");
+        let two = old.join("CD2").join("b.wav");
+        wav_at(&one);
+        wav_at(&two);
+        file_at(&old.join("cover.jpg"), b"cover");
+        file_at(&old.join("CD2").join("disc2.cue"), b"cue");
+        let album = dir.join("Artist").join("Album");
+        let diff = renames_diff(&[
+            (&one, &album.join("1-01 - A.wav")),
+            (&two, &album.join("2-01 - B.wav")),
+        ]);
+        let out = apply_release_diff(&diff, &dir);
+        assert!(out.results.iter().all(Result::is_ok), "{:?}", out.results);
+        assert!(album.join("cover.jpg").exists());
+        assert!(album.join("disc2.cue").exists());
+        assert!(!dir.join("artist").exists());
+    }
+
+    #[test]
+    fn a_folder_tree_above_the_album_is_not_hauled_along() {
+        // Only loose files of a folder above the album follow. A sibling
+        // folder with no audio in it (documents, artwork for something
+        // else) is not this album's.
+        let dir = fresh_dir("sidecars-above");
+        let src = dir.join("unsorted").join("rip").join("a.wav");
+        wav_at(&src);
+        file_at(&dir.join("unsorted").join("docs").join("readme.txt"), b"x");
+        file_at(&dir.join("unsorted").join("list.txt"), b"y");
+        let dest = dir.join("Artist").join("Album").join("01 - Song.wav");
+        let out = apply_release_diff(&rename_only_diff(&src, &dest), &dir);
+        assert!(out.results[0].is_ok(), "{:?}", out.results[0]);
+        assert!(dir
+            .join("unsorted")
+            .join("docs")
+            .join("readme.txt")
+            .exists());
+        assert!(dir.join("unsorted").join("list.txt").exists());
+        assert!(!dir.join("unsorted").join("rip").exists());
+    }
+
+    #[test]
+    fn sidecars_follow_an_album_out_of_the_inbox_but_the_inbox_itself_is_left() {
+        let base = fresh_dir("sidecars-inbox");
+        let music = base.join("Music");
+        std::fs::create_dir_all(&music).unwrap();
+        let inbox = crate::library_layout::default_inbox_dir(&music).unwrap();
+        let dropped = inbox.join("some rip").join("a.wav");
+        let loose = inbox.join("b.wav");
+        wav_at(&dropped);
+        wav_at(&loose);
+        file_at(&dropped.with_file_name("cover.jpg"), b"cover");
+        file_at(&inbox.join("notes.txt"), b"mine");
+        let album = music.join("Artist").join("Album");
+        let diff = renames_diff(&[
+            (&dropped, &album.join("01 - A.wav")),
+            (&loose, &album.join("02 - B.wav")),
+        ]);
+        let out = apply_release_diff(&diff, &music);
+        assert!(out.results.iter().all(Result::is_ok), "{:?}", out.results);
+        assert!(album.join("cover.jpg").exists());
+        assert!(!inbox.join("some rip").exists());
+        assert!(
+            inbox.join("notes.txt").exists(),
+            "a file loose in the inbox stays"
+        );
+    }
+
     /// `(src, dest)` that are two spellings of ONE file, differing by
     /// Unicode normalisation rather than ASCII case. APFS/HFS+ resolve
     /// both names to the same entry on their own; elsewhere a hard link
@@ -3978,6 +4278,7 @@ mod tests {
             results: vec![Ok(()), Ok(())],
             rename_map: HashMap::from([moved.clone()]),
             dir_renames: vec![(music.join("alice"), music.join("Alice"))],
+            ..Default::default()
         };
         let paths = outcome.reread_paths(&diff, &music);
         assert!(paths.contains(&music.join("Alice").join("Dirt").join("02.mp3")));

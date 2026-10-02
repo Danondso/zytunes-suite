@@ -135,7 +135,8 @@ impl DirectoryLibrary {
         let cached = crate::cache::load_dirlib_cache(path, &options.log);
 
         // Parallel directory walk.
-        let paths = collect_audio_paths(root);
+        let walk = Walk::of(root);
+        let paths = &walk.files;
         let total = paths.len() as u64;
         on_progress(ScanProgress {
             completed: 0,
@@ -188,14 +189,15 @@ impl DirectoryLibrary {
         // first seen under. Resolved here in one pass because assigning a
         // new ID has to see every ID already taken.
         //
-        // An entry whose file the walk did not find is kept. The walk
-        // cannot tell a deleted file from an unmounted volume or a folder
-        // it could not list, and the entry is the only record of a moved
-        // track's ID: dropping it on a bad day would detach that track's
-        // playlists and play stats for good. A stale entry costs nothing
-        // (a file that later lands on its path takes the path over).
+        // An entry is dropped only when the walk proved its file gone
+        // (`Walk::proves_gone`). The walk cannot tell a deleted file from
+        // an unmounted volume or a folder it could not list, and the entry
+        // is the only record of a moved track's ID: dropping it on a bad
+        // day would detach that track's playlists and play stats for good.
         let ids: HashMap<String, u64> =
             crate::track_ids::with_registry(path, &options.log, |registry| {
+                registry
+                    .retain(|p| extant_paths.contains(p) || !walk.proves_gone(Path::new(p), root));
                 paths
                     .iter()
                     .map(|p| (p.to_string_lossy().into_owned(), registry.id_for(p)))
@@ -743,21 +745,72 @@ fn log_fingerprint_stopped(
     ));
 }
 
+/// One walk of the library folder.
+struct Walk {
+    /// Every audio file found.
+    files: Vec<PathBuf>,
+    /// Folders that were read and had something in them. Only such a
+    /// folder is evidence about what is missing from it: one that could
+    /// not be read says nothing, and an empty one may be the mount point
+    /// of a volume that is not mounted.
+    listed: HashSet<PathBuf>,
+}
+
+impl Walk {
+    fn of(root: &Path) -> Self {
+        let listed = Mutex::new(HashSet::new());
+        let files = collect_audio_paths(root, &listed);
+        Walk {
+            files,
+            listed: listed.into_inner().unwrap_or_else(|e| e.into_inner()),
+        }
+    }
+
+    /// The walk did not find `path` (a file under `root`), and that is
+    /// because it is gone rather than out of reach: the nearest folder
+    /// above it that still exists was read, had entries, and the next
+    /// step towards `path` was not among them. A walk that found no files
+    /// at all proves nothing.
+    fn proves_gone(&self, path: &Path, root: &Path) -> bool {
+        if self.files.is_empty() {
+            return false;
+        }
+        for dir in path.ancestors().skip(1) {
+            if !dir.starts_with(root) {
+                return false;
+            }
+            if self.listed.contains(dir) {
+                return true;
+            }
+            if dir.exists() {
+                return false;
+            }
+        }
+        false
+    }
+}
+
 /// Recursively collect audio file paths, walking each subdirectory in parallel.
 ///
 /// For large libraries the serial `read_dir` walk alone can take several seconds;
 /// rayon's recursive parallelism turns it into a few hundred milliseconds on SSD.
-fn collect_audio_paths(dir: &Path) -> Vec<PathBuf> {
+fn collect_audio_paths(dir: &Path, listed: &Mutex<HashSet<PathBuf>>) -> Vec<PathBuf> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e.flatten().collect::<Vec<_>>(),
         Err(_) => return Vec::new(),
     };
+    if !entries.is_empty() {
+        listed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(dir.to_path_buf());
+    }
     entries
         .par_iter()
         .flat_map(|entry| {
             let path = entry.path();
             if path.is_dir() {
-                collect_audio_paths(&path)
+                collect_audio_paths(&path, listed)
             } else if is_audio_file(&path) {
                 vec![path]
             } else {
@@ -2468,6 +2521,93 @@ mod tests {
         crate::track_ids::forget(root);
         crate::cache::forget_dirlib_cache(root);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A library of two albums with one track each, scanned once.
+    /// Returns `(root dir, first track, second track)`.
+    fn two_album_library(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("zytunes-ids-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        crate::track_ids::forget(dir.to_str().unwrap());
+        let one = dir.join("Artist").join("One").join("01.mp3");
+        let two = dir.join("Artist").join("Two").join("01.mp3");
+        for f in [&one, &two] {
+            fs::create_dir_all(f.parent().unwrap()).unwrap();
+            fs::write(f, b"fake").unwrap();
+        }
+        DirectoryLibrary::scan(dir.to_str().unwrap()).unwrap();
+        (dir, one, two)
+    }
+
+    fn registered(root: &Path, path: &Path) -> bool {
+        let log = crate::cache::default_logger();
+        crate::track_ids::with_registry(root.to_str().unwrap(), &log, |r| r.get(path).is_some())
+    }
+
+    fn forget_library(dir: &Path) {
+        crate::track_ids::forget(dir.to_str().unwrap());
+        crate::cache::forget_dirlib_cache(dir.to_str().unwrap());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_file_deleted_by_hand_is_dropped_from_the_registry() {
+        let (dir, one, two) = two_album_library("deleted-file");
+        let extra = one.with_file_name("02.mp3");
+        fs::write(&extra, b"fake").unwrap();
+        DirectoryLibrary::scan(dir.to_str().unwrap()).unwrap();
+        assert!(registered(&dir, &extra));
+        fs::remove_file(&extra).unwrap();
+        DirectoryLibrary::scan(dir.to_str().unwrap()).unwrap();
+        assert!(!registered(&dir, &extra), "its folder was read without it");
+        assert!(registered(&dir, &one) && registered(&dir, &two));
+        forget_library(&dir);
+    }
+
+    #[test]
+    fn an_album_folder_deleted_by_hand_is_dropped_from_the_registry() {
+        let (dir, one, two) = two_album_library("deleted-album");
+        fs::remove_dir_all(one.parent().unwrap()).unwrap();
+        DirectoryLibrary::scan(dir.to_str().unwrap()).unwrap();
+        assert!(
+            !registered(&dir, &one),
+            "the artist folder no longer lists it"
+        );
+        assert!(registered(&dir, &two));
+        forget_library(&dir);
+    }
+
+    #[test]
+    fn a_folder_found_empty_keeps_its_registry_entries() {
+        // A volume mounted inside the library and not mounted today is an
+        // empty folder. Its tracks are out of reach, not gone.
+        let (dir, one, two) = two_album_library("empty-folder");
+        let away = std::env::temp_dir().join(format!("zytunes-ids-held-{}", std::process::id()));
+        let _ = fs::remove_file(&away);
+        fs::rename(&one, &away).unwrap();
+        DirectoryLibrary::scan(dir.to_str().unwrap()).unwrap();
+        assert!(registered(&dir, &one));
+        assert!(registered(&dir, &two));
+        let _ = fs::remove_file(&away);
+        forget_library(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_that_cannot_be_read_keeps_its_registry_entries() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, one, two) = two_album_library("unreadable-folder");
+        let album = one.parent().unwrap();
+        fs::set_permissions(album, fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = fs::read_dir(album).is_err();
+        DirectoryLibrary::scan(dir.to_str().unwrap()).unwrap();
+        fs::set_permissions(album, fs::Permissions::from_mode(0o755)).unwrap();
+        if unreadable {
+            // Not so when the tests run as root.
+            assert!(registered(&dir, &one));
+        }
+        assert!(registered(&dir, &two));
+        forget_library(&dir);
     }
 
     #[test]

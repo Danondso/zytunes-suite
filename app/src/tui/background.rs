@@ -3162,6 +3162,11 @@ pub(crate) fn run_tag_apply(
             }
         }
     }
+    for e in &outcome.sidecar_errors {
+        let _ = event_tx.send(BgEvent::SyncMessage(format!(
+            "tag-manager: a file beside the music was left behind: {e}"
+        )));
+    }
     let paths = outcome.reread_paths(diff, root);
     let vacated = outcome.vacated();
     let dir_renames = outcome.dir_renames.clone();
