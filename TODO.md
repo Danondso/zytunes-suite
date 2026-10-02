@@ -4,6 +4,8 @@
 
 - **Mobile: album view** — replace `_TrackList` with an album page: cover (`/tracks/{id}/art` of a representative track), title, artist (link to artist view), year/duration/track count when cheap, Play album (sets queue to the sorted track list). Track rows show number, title, duration; highlight the playing track; group by `disc_number` when present. Widget tests for play-album and now-playing highlight. Out of scope: shuffle/repeat (queue follow-up), lyrics, multi-artist “Various” special cases beyond `album_artist`.
 
+- **Filing: never replace a track, file duplicates side by side** — when a filed (or re-filed) file's dest is already held by another track, land it beside that track under a distinguishing name instead of prompting to replace. Duplicates are then managed as their own task, separate from filing. This removes the replace path end to end: `replace_existing` / `keep_existing` / `KeepCopy` / `ReplaceConflict` probing and the `ConfirmReplace` phase, `tag_ops::set_aside` and the `Removed from Music` folder for filing, and with them the only case where two track IDs merge — so `TagsApplied.id_merges`, `App::fold_merged_track_ids`, `TrackIds::apply_moves`' merge return, and `remap_track_ids` on playlists / local plays / the listen log can all go. Decide the side-by-side name (`01 - Title (2).flac`?) and what a same-batch collision does. A duplicate finder/manager is a separate follow-up.
+
 ## Future
 
 - **Theming (remaining)**
