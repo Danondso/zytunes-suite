@@ -4,6 +4,8 @@
 
 - **Mobile: album view** — replace `_TrackList` with an album page: cover (`/tracks/{id}/art` of a representative track), title, artist (link to artist view), year/duration/track count when cheap, Play album (sets queue to the sorted track list). Track rows show number, title, duration; highlight the playing track; group by `disc_number` when present. Widget tests for play-album and now-playing highlight. Out of scope: shuffle/repeat (queue follow-up), lyrics, multi-artist “Various” special cases beyond `album_artist`.
 
+- **Duplicate manager** — filing now lands a file beside a held dest as a numbered copy (`01 - Song (2).flac`) instead of replacing it. Add a way to find and resolve those: list numbered copies (and same-recording tracks generally) with each copy's quality (lossless/bitrate, sample rate, length, size), pick the one to keep, and move the rest out of the library. A resolved pair is the one case that would merge two track IDs, so that feature owns re-keying playlists, play stats and the listen log.
+
 ## Future
 
 - **Theming (remaining)**
@@ -72,10 +74,10 @@
 - **Dedupe menu** — richer UI than the Device-mode `U` keep-newest hotkey.
 - **CD TUI panel with graphic** — dedicated CD panel art, not just the import overlay.
 - **Trash on delete** — library-side deletes always go to the system trash, never unlink in place.
-- **Import from directory / auto sorting** — drop a folder of files and sort them into the library layout.
 
 ## Done
 
+- **Import from directory / auto sorting** — sibling inbox `{parent(music_dir)}/Automatically Add to Music` plus `F` on a Library artist/album. Identify on MusicBrainz (MBID → AcoustID → search), preview the tag-manager diff, apply tags and file into `{AlbumArtist}/{Album}/`. Inbox is polled from the TUI tick; dismissed clusters are skipped for the session.
 - **GoGear ViBE music sync** — Philips VID `0x0471` / ViBE PID `0x20b6` as USB mass storage. Detects the stick even when unmounted. Files copy to `MUSIC/{Artist}/{Album}/`; `_system/` is skipped. MP3/WMA/WAV pass through; everything else transcodes to MP3. No playlist/photo/video.
 - **Now-playing soundbar** — lock-free spectrum snapshot drawn centered in the now-playing panel. Each theme picks a layout, glyph alphabet, and colour mode; `W` overrides the layout until the next theme change. Quiet bands keep a floor mark; graphic-EQ Hz (`32` `64` `125` `1k` …) sits under each band (Pulse is a level mountain and has no Hz labels). Pause freezes the bars, Play/Stop clear them.
 - **Diagnostics: playlist/listen-log Logger** — `PlaylistStore` and `ListenLog` take a `Logger`; CLI uses stderr, TUI routes into `SyncMessage`. No `eprintln!` on those hot paths.

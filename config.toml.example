@@ -16,7 +16,8 @@
 # ---------------------------------------------------------------------------
 
 # Music library root. Recursively scanned for audio (lofty tags, then
-# Artist/Album/Track.ext for untagged files).
+# Artist/Album/Track.ext for untagged files). Inbox drops live in a
+# sibling folder: {parent(music_dir)}/Automatically Add to Music
 # Override: ZYTUNES_MUSIC_DIR
 # music_dir = "/Users/you/Music"
 

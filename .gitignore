@@ -39,3 +39,4 @@ findings.md
 *.swo
 *~
 references/
+.vscode/settings.json

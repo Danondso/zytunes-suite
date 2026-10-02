@@ -930,8 +930,9 @@ impl StemSeparator for CascadeSeparator {
 /// its own file mtime is the LRU clock for [`prune_stem_cache`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StemCacheMeta {
-    /// Absolute path of the source track (diagnostic only — the entry is
-    /// keyed by its hash, so collisions resolve via fingerprint mismatch).
+    /// Absolute path of the source track when it was separated
+    /// (diagnostic only — the entry is keyed by the track's ID and
+    /// validated by fingerprint, so the file may have moved since).
     pub source_path: String,
     pub fingerprint: FileFingerprint,
     pub model: String,
@@ -948,18 +949,29 @@ pub fn default_stem_cache_dir() -> Option<PathBuf> {
     Some(crate::paths::zytunes_cache_root()?.join("stems"))
 }
 
-/// Cache entry directory name for a `(source path, recipe cache id)`
-/// pair — the path hashed with the same `DefaultHasher` scheme the
-/// dirlib cache uses for scan roots, suffixed with the sanitised cache
-/// id. Keying on the pair (rather than the path alone) lets recipes
-/// coexist per-track: flipping `[stems] recipe` for an A/B comparison
-/// hits both ways instead of paying a full re-separation on every flip.
-pub fn stem_cache_key(source_path: &str, cache_id: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    source_path.hash(&mut hasher);
-    format!("{:016x}-{}", hasher.finish(), sanitize_cache_id(cache_id))
+/// A track to separate: where its file is, and the ID its cache entry is
+/// keyed on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StemTrack {
+    /// The library track ID (see [`crate::track_ids`]). A file with no
+    /// library track uses [`crate::dirlib::hash_path`] of its path.
+    pub id: u64,
+    pub path: String,
+}
+
+/// Cache entry directory name for a `(track ID, recipe cache id)` pair.
+///
+/// The ID, not the path: a track keeps its ID when its file moves, so a
+/// filed or retitled track still finds its split and the entry dir stays
+/// put under a mixer that has it open. A track's first ID is the hash of
+/// its first path, which is what entries were keyed on before, so older
+/// entries are found as they are.
+///
+/// Keying on the pair (rather than the track alone) lets recipes coexist
+/// per-track: flipping `[stems] recipe` for an A/B comparison hits both
+/// ways instead of paying a full re-separation on every flip.
+pub fn stem_cache_key(track_id: u64, cache_id: &str) -> String {
+    format!("{track_id:016x}-{}", sanitize_cache_id(cache_id))
 }
 
 /// Filesystem-safe form of a recipe cache id (`"hq/v1"` → `"hq-v1"`).
@@ -995,7 +1007,7 @@ fn is_legacy_key(name: &str) -> bool {
 }
 
 /// Lossless migration of pre-recipe-key cache entries to the
-/// `{path_hash}-{cache_id}` naming. A legacy entry's own meta sidecar
+/// `{track_id}-{cache_id}` naming. A legacy entry's own meta sidecar
 /// already records its cache id (`meta.model`), so migration is a
 /// rename — no re-separation. A legacy dir whose new-key twin already
 /// exists (the track was re-separated before migration ran) is dead
@@ -1049,11 +1061,12 @@ pub fn migrate_legacy_stem_entries(cache_dir: &Path, log: &Logger) {
 /// bulk-confirm estimate must not count as use.
 pub fn stem_cache_contains(
     cache_dir: &Path,
+    track_id: u64,
     source: &Path,
     model: &str,
     layout: &'static [StemKind],
 ) -> bool {
-    let entry_dir = cache_dir.join(stem_cache_key(&source.to_string_lossy(), model));
+    let entry_dir = cache_dir.join(stem_cache_key(track_id, model));
     let Some(meta) = read_meta(&entry_dir) else {
         return false;
     };
@@ -1129,7 +1142,8 @@ fn write_meta(entry_dir: &Path, meta: &StemCacheMeta) -> Result<(), String> {
     crate::paths::atomic_write_json(&entry_dir.join(META_NAME), &data)
 }
 
-/// Look up cached stems for `source` under `cache_dir`.
+/// Look up cached stems for the track `track_id`, whose file is at
+/// `source`, under `cache_dir`.
 ///
 /// A hit requires the meta sidecar to parse, its fingerprint to match the
 /// source file's current `(mtime, size)`, its model to match `model`
@@ -1139,12 +1153,13 @@ fn write_meta(entry_dir: &Path, meta: &StemCacheMeta) -> Result<(), String> {
 /// replaces the entry).
 pub fn cached_stems(
     cache_dir: &Path,
+    track_id: u64,
     source: &Path,
     model: &str,
     layout: &'static [StemKind],
     log: &Logger,
 ) -> Option<StemSet> {
-    let entry_dir = cache_dir.join(stem_cache_key(&source.to_string_lossy(), model));
+    let entry_dir = cache_dir.join(stem_cache_key(track_id, model));
     let meta = read_meta(&entry_dir)?;
     let current = FileFingerprint::from_path(source)?;
     if meta.fingerprint != current || meta.model != model {
@@ -1177,6 +1192,7 @@ pub fn cached_stems(
 /// smaller than one track still plays (it gets evicted by the next store).
 pub fn store_stems(
     cache_dir: &Path,
+    track_id: u64,
     source: &Path,
     model: &str,
     produced: &StemSet,
@@ -1185,7 +1201,7 @@ pub fn store_stems(
 ) -> Result<StemSet, String> {
     let fingerprint = FileFingerprint::from_path(source)
         .ok_or_else(|| format!("cannot stat source {}", source.display()))?;
-    let key = stem_cache_key(&source.to_string_lossy(), model);
+    let key = stem_cache_key(track_id, model);
     let entry_dir = cache_dir.join(&key);
     let stage_dir = cache_dir.join(format!("{key}.tmp"));
 
@@ -1442,12 +1458,12 @@ mod tests {
 
     #[test]
     fn cache_key_embeds_recipe_and_sanitizes_slashes() {
-        let a = stem_cache_key("/music/a.mp3", "htdemucs_6s");
-        assert_eq!(a, stem_cache_key("/music/a.mp3", "htdemucs_6s"));
-        assert_ne!(a, stem_cache_key("/music/b.mp3", "htdemucs_6s"));
+        let a = stem_cache_key(1, "htdemucs_6s");
+        assert_eq!(a, stem_cache_key(1, "htdemucs_6s"));
+        assert_ne!(a, stem_cache_key(2, "htdemucs_6s"));
         // Same track, different recipe → different entry, so recipe flips
         // don't evict each other.
-        let b = stem_cache_key("/music/a.mp3", "hq/v1");
+        let b = stem_cache_key(1, "hq/v1");
         assert_ne!(a, b);
         // Versioned cache ids carry a '/', which cannot appear in a
         // directory name.
@@ -1460,7 +1476,7 @@ mod tests {
         assert!(a.ends_with("htdemucs_6s"), "cache id readable in dirname");
         // Dots are mapped away: an entry name ending in `.tmp` would be
         // indistinguishable from a stage dir and swept by the prune.
-        let dotted = stem_cache_key("/music/a.mp3", "foo.tmp");
+        let dotted = stem_cache_key(1, "foo.tmp");
         assert!(!dotted.contains('.'), "no dots survive into the key");
         assert!(dotted.ends_with("foo-tmp"));
     }
@@ -1473,6 +1489,7 @@ mod tests {
         let (source, produced_demucs) = fake_separation(&root, b"mp3data");
         store_stems(
             &cache,
+            crate::dirlib::hash_path(&source),
             &source,
             "htdemucs_6s",
             &produced_demucs,
@@ -1490,17 +1507,111 @@ mod tests {
         for p in &produced_hq.paths {
             std::fs::write(p, b"hqflac").unwrap();
         }
-        store_stems(&cache, &source, "hq/v1", &produced_hq, u64::MAX, &log).unwrap();
+        store_stems(
+            &cache,
+            crate::dirlib::hash_path(&source),
+            &source,
+            "hq/v1",
+            &produced_hq,
+            u64::MAX,
+            &log,
+        )
+        .unwrap();
 
-        let demucs_hit = cached_stems(&cache, &source, "htdemucs_6s", SIX_STEM_LAYOUT, &log)
-            .expect("demucs entry survives the hq store");
-        let hq_hit =
-            cached_stems(&cache, &source, "hq/v1", SIX_STEM_LAYOUT, &log).expect("hq entry hits");
+        let demucs_hit = cached_stems(
+            &cache,
+            crate::dirlib::hash_path(&source),
+            &source,
+            "htdemucs_6s",
+            SIX_STEM_LAYOUT,
+            &log,
+        )
+        .expect("demucs entry survives the hq store");
+        let hq_hit = cached_stems(
+            &cache,
+            crate::dirlib::hash_path(&source),
+            &source,
+            "hq/v1",
+            SIX_STEM_LAYOUT,
+            &log,
+        )
+        .expect("hq entry hits");
         assert_ne!(demucs_hit.paths[0], hq_hit.paths[0]);
         assert_eq!(std::fs::read(&demucs_hit.paths[0]).unwrap(), b"flacdata");
         assert_eq!(std::fs::read(&hq_hit.paths[0]).unwrap(), b"hqflac");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Store a six-stem entry for `source` whose stem files all hold
+    /// `marker`, so a later hit can be told apart from another track's.
+    fn store_marked(cache: &Path, root: &Path, id: u64, source: &Path, model: &str, marker: &[u8]) {
+        let produced_dir = root.join("produced-marked");
+        std::fs::create_dir_all(&produced_dir).unwrap();
+        let produced = StemSet::from_layout(&produced_dir, STEM_EXT, SIX_STEM_LAYOUT);
+        for p in &produced.paths {
+            std::fs::write(p, marker).unwrap();
+        }
+        store_stems(
+            cache,
+            id,
+            source,
+            model,
+            &produced,
+            u64::MAX,
+            &default_logger(),
+        )
+        .unwrap();
+    }
+
+    fn hit_marker(cache: &Path, id: u64, source: &Path, model: &str) -> Option<Vec<u8>> {
+        let hit = cached_stems(cache, id, source, model, SIX_STEM_LAYOUT, &default_logger())?;
+        Some(std::fs::read(&hit.paths[0]).unwrap())
+    }
+
+    #[test]
+    fn a_split_is_still_a_hit_after_its_source_moves() {
+        // Entries are keyed on the track's ID, which a move does not
+        // change, so filing a track never touches the stem cache.
+        let root = temp_root("moved-source");
+        let cache = root.join("cache");
+        let (a, a_new) = (root.join("a.mp3"), root.join("Artist - a.mp3"));
+        std::fs::write(&a, b"track a").unwrap();
+        store_marked(&cache, &root, 7, &a, "htdemucs_6s", b"a-demucs");
+        store_marked(&cache, &root, 7, &a, "hq/v1", b"a-hq");
+        let entry = cache.join(stem_cache_key(7, "htdemucs_6s"));
+        assert!(entry.is_dir());
+
+        std::fs::rename(&a, &a_new).unwrap();
+
+        assert_eq!(
+            hit_marker(&cache, 7, &a_new, "htdemucs_6s").as_deref(),
+            Some(&b"a-demucs"[..])
+        );
+        assert_eq!(
+            hit_marker(&cache, 7, &a_new, "hq/v1").as_deref(),
+            Some(&b"a-hq"[..])
+        );
+        assert!(
+            entry.is_dir(),
+            "the entry stays where a live mixer has its files open"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_first_seen_id_finds_an_entry_keyed_before_ids_were_stable() {
+        // Entries used to be keyed on a hash of the path string. A track's
+        // first ID is `hash_path` of that same path, so every entry
+        // already on disk is found with no migration.
+        use std::hash::{Hash, Hasher};
+        let path = "/music/Artist/Album/01 - Song.flac";
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        path.hash(&mut hasher);
+        assert_eq!(
+            stem_cache_key(crate::dirlib::hash_path(Path::new(path)), "htdemucs_6s"),
+            format!("{:016x}-htdemucs_6s", hasher.finish())
+        );
     }
 
     #[test]
@@ -1512,7 +1623,7 @@ mod tests {
 
         // Simulate a pre-recipe-key entry: bare 16-hex dirname holding a
         // valid meta + full six-stem file set.
-        let new_key = stem_cache_key(&source.to_string_lossy(), "htdemucs_6s");
+        let new_key = stem_cache_key(crate::dirlib::hash_path(&source), "htdemucs_6s");
         let legacy_name = &new_key[..16];
         let legacy_dir = cache.join(legacy_name);
         std::fs::create_dir_all(&legacy_dir).unwrap();
@@ -1533,8 +1644,15 @@ mod tests {
         migrate_legacy_stem_entries(&cache, &log);
         assert!(!legacy_dir.exists(), "legacy dirname retired");
         assert!(cache.join(&new_key).exists(), "renamed, not re-separated");
-        let hit = cached_stems(&cache, &source, "htdemucs_6s", SIX_STEM_LAYOUT, &log)
-            .expect("migrated entry is a hit under the new key");
+        let hit = cached_stems(
+            &cache,
+            crate::dirlib::hash_path(&source),
+            &source,
+            "htdemucs_6s",
+            SIX_STEM_LAYOUT,
+            &log,
+        )
+        .expect("migrated entry is a hit under the new key");
         assert_eq!(std::fs::read(&hit.paths[0]).unwrap(), b"oldflac");
 
         let _ = std::fs::remove_dir_all(&root);
@@ -1554,8 +1672,17 @@ mod tests {
         // A legacy entry whose new-key twin already exists (the track was
         // re-separated before migration ran) is dead bytes — removed.
         let (source, produced) = fake_separation(&root, b"mp3data");
-        store_stems(&cache, &source, "m", &produced, u64::MAX, &log).unwrap();
-        let new_key = stem_cache_key(&source.to_string_lossy(), "m");
+        store_stems(
+            &cache,
+            crate::dirlib::hash_path(&source),
+            &source,
+            "m",
+            &produced,
+            u64::MAX,
+            &log,
+        )
+        .unwrap();
+        let new_key = stem_cache_key(crate::dirlib::hash_path(&source), "m");
         let superseded = cache.join(&new_key[..16]);
         std::fs::create_dir_all(&superseded).unwrap();
         write_meta(
@@ -1583,14 +1710,29 @@ mod tests {
         let (source, produced) = fake_separation(&root, b"mp3data");
         let log = default_logger();
 
-        let stored = store_stems(&cache, &source, "htdemucs_6s", &produced, u64::MAX, &log)
-            .expect("store succeeds");
+        let stored = store_stems(
+            &cache,
+            crate::dirlib::hash_path(&source),
+            &source,
+            "htdemucs_6s",
+            &produced,
+            u64::MAX,
+            &log,
+        )
+        .expect("store succeeds");
         assert!(stored.all_exist());
         // The produced files were moved, not copied.
         assert!(!produced.paths[0].exists());
 
-        let hit =
-            cached_stems(&cache, &source, "htdemucs_6s", SIX_STEM_LAYOUT, &log).expect("cache hit");
+        let hit = cached_stems(
+            &cache,
+            crate::dirlib::hash_path(&source),
+            &source,
+            "htdemucs_6s",
+            SIX_STEM_LAYOUT,
+            &log,
+        )
+        .expect("cache hit");
         assert_eq!(hit, stored);
 
         let _ = std::fs::remove_dir_all(&root);
@@ -1602,16 +1744,41 @@ mod tests {
         let cache = root.join("cache");
         let (source, produced) = fake_separation(&root, b"mp3data");
         let log = default_logger();
-        store_stems(&cache, &source, "htdemucs_6s", &produced, u64::MAX, &log).unwrap();
+        store_stems(
+            &cache,
+            crate::dirlib::hash_path(&source),
+            &source,
+            "htdemucs_6s",
+            &produced,
+            u64::MAX,
+            &log,
+        )
+        .unwrap();
 
         // Different model → miss. Under per-recipe keying this lookup
         // targets a different (nonexistent) entry dir, so it misses at
         // the key level before the meta comparison is reached.
-        assert!(cached_stems(&cache, &source, "htdemucs", SIX_STEM_LAYOUT, &log).is_none());
+        assert!(cached_stems(
+            &cache,
+            crate::dirlib::hash_path(&source),
+            &source,
+            "htdemucs",
+            SIX_STEM_LAYOUT,
+            &log
+        )
+        .is_none());
 
         // Re-written source with a different size → fingerprint miss.
         std::fs::write(&source, b"mp3data-but-longer").unwrap();
-        assert!(cached_stems(&cache, &source, "htdemucs_6s", SIX_STEM_LAYOUT, &log).is_none());
+        assert!(cached_stems(
+            &cache,
+            crate::dirlib::hash_path(&source),
+            &source,
+            "htdemucs_6s",
+            SIX_STEM_LAYOUT,
+            &log
+        )
+        .is_none());
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1625,19 +1792,44 @@ mod tests {
         let cache = root.join("cache");
         let (source, produced) = fake_separation(&root, b"mp3data");
         let log = default_logger();
-        store_stems(&cache, &source, "hq/v1", &produced, u64::MAX, &log).unwrap();
+        store_stems(
+            &cache,
+            crate::dirlib::hash_path(&source),
+            &source,
+            "hq/v1",
+            &produced,
+            u64::MAX,
+            &log,
+        )
+        .unwrap();
 
         assert_eq!(
-            stem_cache_key(&source.to_string_lossy(), "hq/v1"),
-            stem_cache_key(&source.to_string_lossy(), "hq-v1"),
+            stem_cache_key(crate::dirlib::hash_path(&source), "hq/v1"),
+            stem_cache_key(crate::dirlib::hash_path(&source), "hq-v1"),
             "precondition: the two ids collide on one dirname"
         );
         assert!(
-            cached_stems(&cache, &source, "hq-v1", SIX_STEM_LAYOUT, &log).is_none(),
+            cached_stems(
+                &cache,
+                crate::dirlib::hash_path(&source),
+                &source,
+                "hq-v1",
+                SIX_STEM_LAYOUT,
+                &log
+            )
+            .is_none(),
             "same dirname, different raw id must miss"
         );
         assert!(
-            cached_stems(&cache, &source, "hq/v1", SIX_STEM_LAYOUT, &log).is_some(),
+            cached_stems(
+                &cache,
+                crate::dirlib::hash_path(&source),
+                &source,
+                "hq/v1",
+                SIX_STEM_LAYOUT,
+                &log
+            )
+            .is_some(),
             "the id that stored the entry still hits"
         );
 
@@ -1650,11 +1842,27 @@ mod tests {
         let cache = root.join("cache");
         let (source, produced) = fake_separation(&root, b"mp3data");
         let log = default_logger();
-        let stored =
-            store_stems(&cache, &source, "htdemucs_6s", &produced, u64::MAX, &log).unwrap();
+        let stored = store_stems(
+            &cache,
+            crate::dirlib::hash_path(&source),
+            &source,
+            "htdemucs_6s",
+            &produced,
+            u64::MAX,
+            &log,
+        )
+        .unwrap();
 
         std::fs::remove_file(&stored.paths[3]).unwrap();
-        assert!(cached_stems(&cache, &source, "htdemucs_6s", SIX_STEM_LAYOUT, &log).is_none());
+        assert!(cached_stems(
+            &cache,
+            crate::dirlib::hash_path(&source),
+            &source,
+            "htdemucs_6s",
+            SIX_STEM_LAYOUT,
+            &log
+        )
+        .is_none());
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1674,8 +1882,17 @@ mod tests {
         let mut keys = Vec::new();
         for name in ["a.mp3", "b.mp3", "c.mp3"] {
             let (source, produced) = fake_separation(&temp_root(name), b"x");
-            store_stems(&cache, &source, "m", &produced, u64::MAX, &log).unwrap();
-            keys.push(stem_cache_key(&source.to_string_lossy(), "m"));
+            store_stems(
+                &cache,
+                crate::dirlib::hash_path(&source),
+                &source,
+                "m",
+                &produced,
+                u64::MAX,
+                &log,
+            )
+            .unwrap();
+            keys.push(stem_cache_key(crate::dirlib::hash_path(&source), "m"));
             std::thread::sleep(std::time::Duration::from_millis(1100));
         }
 
@@ -1845,7 +2062,16 @@ mod tests {
         let cache = root.join("cache");
         let log = default_logger();
         let (source, produced) = fake_separation(&root, b"v1");
-        store_stems(&cache, &source, "m", &produced, u64::MAX, &log).unwrap();
+        store_stems(
+            &cache,
+            crate::dirlib::hash_path(&source),
+            &source,
+            "m",
+            &produced,
+            u64::MAX,
+            &log,
+        )
+        .unwrap();
 
         // Source re-tagged → new fingerprint, fresh separation, re-store.
         std::fs::write(&source, b"v2-longer").unwrap();
@@ -1855,12 +2081,28 @@ mod tests {
         for p in &produced2.paths {
             std::fs::write(p, b"newflac").unwrap();
         }
-        let stored = store_stems(&cache, &source, "m", &produced2, u64::MAX, &log).unwrap();
+        let stored = store_stems(
+            &cache,
+            crate::dirlib::hash_path(&source),
+            &source,
+            "m",
+            &produced2,
+            u64::MAX,
+            &log,
+        )
+        .unwrap();
         assert!(stored.all_exist());
         assert_eq!(std::fs::read(&stored.paths[0]).unwrap(), b"newflac");
 
-        let hit =
-            cached_stems(&cache, &source, "m", SIX_STEM_LAYOUT, &log).expect("fresh entry hits");
+        let hit = cached_stems(
+            &cache,
+            crate::dirlib::hash_path(&source),
+            &source,
+            "m",
+            SIX_STEM_LAYOUT,
+            &log,
+        )
+        .expect("fresh entry hits");
         assert_eq!(hit, stored);
 
         let _ = std::fs::remove_dir_all(&root);
@@ -2008,18 +2250,41 @@ mod tests {
         }
         let log = default_logger();
 
-        let stored = store_stems(&cache, &source, "hq-harmony/v1", &produced, u64::MAX, &log)
-            .expect("store succeeds");
+        let stored = store_stems(
+            &cache,
+            crate::dirlib::hash_path(&source),
+            &source,
+            "hq-harmony/v1",
+            &produced,
+            u64::MAX,
+            &log,
+        )
+        .expect("store succeeds");
         assert_eq!(stored.paths.len(), 7);
         assert!(stored.all_exist());
 
-        let hit = cached_stems(&cache, &source, "hq-harmony/v1", HARMONY_STEM_LAYOUT, &log)
-            .expect("cache hit");
+        let hit = cached_stems(
+            &cache,
+            crate::dirlib::hash_path(&source),
+            &source,
+            "hq-harmony/v1",
+            HARMONY_STEM_LAYOUT,
+            &log,
+        )
+        .expect("cache hit");
         assert_eq!(hit, stored);
 
         // The same entry looked up under the six-stem layout misses:
         // there is no vocals.flac in a harmony entry.
-        assert!(cached_stems(&cache, &source, "hq-harmony/v1", SIX_STEM_LAYOUT, &log).is_none());
+        assert!(cached_stems(
+            &cache,
+            crate::dirlib::hash_path(&source),
+            &source,
+            "hq-harmony/v1",
+            SIX_STEM_LAYOUT,
+            &log
+        )
+        .is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 

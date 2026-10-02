@@ -215,13 +215,28 @@ impl MusicBrainzClient {
     /// with the special characters that the Lucene parser treats as operators
     /// escaped (so `AC/DC` doesn't blow up). Returns up to `limit` hits ranked
     /// by MB's relevance score.
+    ///
+    /// Soundtracks are credited to Various Artists, not the per-track feat.
+    /// artist (`Jim Sturgess feat. T.V. Carpio` on *Across the Universe*).
+    /// When the first query returns no hits and the album title is non-empty,
+    /// a second query retries with artist `Various Artists`.
+    ///
+    /// `on_retry` is called with the retry's URL just before it is sent,
+    /// and not at all when the first query is the answer, so a caller can
+    /// log the fallback without owning a second copy of the rule.
     pub fn search_releases(
         &self,
         artist: &str,
         album: &str,
         limit: u32,
+        on_retry: impl FnOnce(&str),
     ) -> Result<ReleaseSearchResponse, MbError> {
-        self.get_json(&self.search_releases_url(artist, album, limit))
+        search_with_various_artists_fallback(
+            artist,
+            album,
+            |artist| self.get_json(&self.search_releases_url(artist, album, limit)),
+            || on_retry(&self.search_releases_url(VARIOUS_ARTISTS, album, limit)),
+        )
     }
 
     /// The URL that [`Self::search_releases`] would request. Exposed so callers
@@ -278,6 +293,40 @@ impl MusicBrainzClient {
         );
         self.get_json(&url)
     }
+}
+
+const VARIOUS_ARTISTS: &str = "Various Artists";
+
+/// The Various Artists fallback, with the HTTP call abstracted to `query`
+/// (given the artist to search under) so the rule is testable offline and
+/// exists exactly once.
+fn search_with_various_artists_fallback<E>(
+    artist: &str,
+    album: &str,
+    mut query: impl FnMut(&str) -> Result<ReleaseSearchResponse, E>,
+    on_retry: impl FnOnce(),
+) -> Result<ReleaseSearchResponse, E> {
+    let first = query(artist)?;
+    if first.releases.is_empty() && should_retry_various_artists(artist, album) {
+        on_retry();
+        query(VARIOUS_ARTISTS)
+    } else {
+        Ok(first)
+    }
+}
+
+/// Soundtrack releases are filed under Various Artists. Retry that artist
+/// when `artist`+`album` produced no Solr hits — not when the album title is
+/// blank (that query would match every VA release) or the artist is already VA.
+fn should_retry_various_artists(artist: &str, album: &str) -> bool {
+    !album.trim().is_empty() && !is_various_artists(artist)
+}
+
+fn is_various_artists(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "various artists" | "various"
+    )
 }
 
 /// Escape a string for use inside a Lucene quoted phrase. We always wrap the
@@ -592,6 +641,57 @@ pub fn render_artist_credit(credits: &[ArtistCredit]) -> String {
         }
     }
     out
+}
+
+/// Album-artist for tags and `{AlbumArtist}/{Album}` folders.
+///
+/// Featuring joins stay on the *track* artist: the credit is cut at the
+/// first featuring join phrase. `2Pac feat. The Notorious B.I.G.` files
+/// under `2Pac`, and `A & B feat. C` under `A & B`. Collaborations joined
+/// with `&` / `and` / `,` keep the full credit.
+pub fn canonical_album_artist(credits: &[ArtistCredit]) -> String {
+    let kept = match credits.iter().position(has_featuring_join) {
+        // No featuring join: the whole credit is the album artist.
+        None => credits,
+        // The join sits on the first credit: that artist, without the guest.
+        Some(0) => &credits[..1],
+        // `A & B feat. C`: keep every credit up to and including the one
+        // whose join phrase introduces the guest.
+        Some(feat_at) => &credits[..=feat_at],
+    };
+    join_entity_names(kept)
+}
+
+/// Join credits on each artist entity's own name, not the per-release
+/// "credited as" spelling, so one artist does not land in two folders.
+fn join_entity_names(credits: &[ArtistCredit]) -> String {
+    let mut out = String::new();
+    for (i, ac) in credits.iter().enumerate() {
+        out.push_str(primary_credit_name(ac));
+        if i + 1 < credits.len() {
+            if let Some(jp) = &ac.joinphrase {
+                out.push_str(jp);
+            }
+        }
+    }
+    out.trim().to_string()
+}
+
+fn primary_credit_name(ac: &ArtistCredit) -> &str {
+    ac.artist
+        .as_ref()
+        .map(|a| a.name.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(ac.name.trim())
+}
+
+/// This credit's join phrase introduces a featured guest.
+fn has_featuring_join(credit: &ArtistCredit) -> bool {
+    credit.joinphrase.as_deref().is_some_and(|j| {
+        let l = j.to_ascii_lowercase();
+        l.contains("feat") || l.contains("ft.") || l.contains("ft ")
+    })
 }
 
 #[cfg(test)]
@@ -937,6 +1037,74 @@ mod tests {
             render_artist_credit(&credits),
             "Daft Punk feat. Pharrell Williams"
         );
+        assert_eq!(canonical_album_artist(&credits), "Daft Punk");
+    }
+
+    #[test]
+    fn canonical_album_artist_keeps_true_collaborations() {
+        let credits = vec![
+            ArtistCredit {
+                name: "Robert Plant".into(),
+                joinphrase: Some(" & ".into()),
+                artist: None,
+            },
+            ArtistCredit {
+                name: "Alison Krauss".into(),
+                joinphrase: None,
+                artist: None,
+            },
+        ];
+        assert_eq!(
+            canonical_album_artist(&credits),
+            "Robert Plant & Alison Krauss"
+        );
+    }
+
+    #[test]
+    fn canonical_album_artist_keeps_collaborators_before_feat() {
+        let credit = |name: &str, join: Option<&str>| ArtistCredit {
+            name: name.into(),
+            joinphrase: join.map(str::to_string),
+            artist: None,
+        };
+        let credits = vec![
+            credit("Robert Plant", Some(" & ")),
+            credit("Alison Krauss", Some(" feat. ")),
+            credit("T Bone Burnett", None),
+        ];
+        assert_eq!(
+            canonical_album_artist(&credits),
+            "Robert Plant & Alison Krauss",
+            "only the featured guest is dropped, not the co-billed artist"
+        );
+    }
+
+    #[test]
+    fn canonical_album_artist_uses_the_entity_name_on_every_path() {
+        // A credited-as spelling and the artist entity's own name must
+        // not land the same person in two folders. The entity name is the
+        // MusicBrainz spelling, whether or not a featuring join is present.
+        let entity = |credit: &str, canon: &str, join: Option<&str>| ArtistCredit {
+            name: credit.into(),
+            joinphrase: join.map(str::to_string),
+            artist: Some(Artist {
+                id: "id".into(),
+                name: canon.into(),
+                sort_name: None,
+            }),
+        };
+        assert_eq!(
+            canonical_album_artist(&[entity("Alice in Chains", "Alice In Chains", None)]),
+            "Alice In Chains"
+        );
+        assert_eq!(
+            canonical_album_artist(&[
+                entity("alice in chains", "Alice In Chains", Some(" & ")),
+                entity("jerry", "Jerry Cantrell", Some(" feat. ")),
+                entity("Guest", "Guest", None),
+            ]),
+            "Alice In Chains & Jerry Cantrell"
+        );
     }
 
     #[test]
@@ -960,6 +1128,96 @@ mod tests {
         let clean = c.search_releases_url("311", "", 12);
         assert_eq!(padded, clean);
         assert!(padded.contains("artist%3A%22311%22"));
+    }
+
+    #[test]
+    fn various_artists_fallback_skips_blank_album_and_existing_va() {
+        assert!(should_retry_various_artists(
+            "Jim Sturgess feat. T.V. Carpio",
+            "Across the Universe"
+        ));
+        assert!(!should_retry_various_artists(
+            "Various Artists",
+            "Across the Universe"
+        ));
+        assert!(!should_retry_various_artists(
+            "various",
+            "Across the Universe"
+        ));
+        assert!(!should_retry_various_artists("Jim Sturgess", "   "));
+        assert!(!should_retry_various_artists("Jim Sturgess", ""));
+    }
+
+    /// A search response with `n` hits, built the way the wire gives it.
+    fn response_with_hits(n: usize) -> ReleaseSearchResponse {
+        let hits: Vec<String> = (0..n)
+            .map(|i| format!(r#"{{"id":"rel-{i}","title":"Album"}}"#))
+            .collect();
+        serde_json::from_str(&format!(r#"{{"releases":[{}]}}"#, hits.join(","))).unwrap()
+    }
+
+    #[test]
+    fn various_artists_retry_runs_once_and_only_after_an_empty_first_query() {
+        // (artist, album, hits of the first query) -> artists queried.
+        let cases: [(&str, &str, usize, &[&str]); 4] = [
+            ("Jim Sturgess", "Across the Universe", 2, &["Jim Sturgess"]),
+            (
+                "Jim Sturgess",
+                "Across the Universe",
+                0,
+                &["Jim Sturgess", "Various Artists"],
+            ),
+            // Already Various Artists, or no album to narrow the retry.
+            ("various", "Across the Universe", 0, &["various"]),
+            ("Jim Sturgess", "  ", 0, &["Jim Sturgess"]),
+        ];
+        for (artist, album, first_hits, want_queries) in cases {
+            let mut queried: Vec<String> = Vec::new();
+            let mut announced = 0;
+            let resp = search_with_various_artists_fallback(
+                artist,
+                album,
+                |a| -> Result<_, MbError> {
+                    queried.push(a.to_string());
+                    // The retry, when it runs, finds the soundtrack.
+                    Ok(response_with_hits(if queried.len() == 1 {
+                        first_hits
+                    } else {
+                        1
+                    }))
+                },
+                || announced += 1,
+            )
+            .unwrap();
+            assert_eq!(queried, want_queries, "{artist:?} / {album:?}");
+            assert_eq!(
+                announced,
+                want_queries.len() - 1,
+                "the retry is announced exactly when it happens"
+            );
+            let want_hits = if want_queries.len() == 2 {
+                1
+            } else {
+                first_hits
+            };
+            assert_eq!(resp.releases.len(), want_hits);
+        }
+    }
+
+    #[test]
+    fn a_failed_first_query_is_an_error_not_a_retry() {
+        let mut calls = 0;
+        let out = search_with_various_artists_fallback(
+            "Jim Sturgess",
+            "Across the Universe",
+            |_| -> Result<ReleaseSearchResponse, &str> {
+                calls += 1;
+                Err("timeout")
+            },
+            || panic!("no retry after an error"),
+        );
+        assert_eq!(out.unwrap_err(), "timeout");
+        assert_eq!(calls, 1);
     }
 
     #[test]

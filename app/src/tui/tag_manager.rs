@@ -119,6 +119,8 @@ pub struct TagManagerOverlay {
     /// follow-up (library reread, anchor restore) needs both this and the
     /// list of source paths.
     pub last_rename_map: std::collections::HashMap<PathBuf, PathBuf>,
+    /// Tracks the last apply failed on, in diff order. Empty on success.
+    pub apply_failures: Vec<ApplyFailure>,
     /// Token stamped onto every outgoing MB worker request so we can drop
     /// stale responses. Incremented on each request; the worker echoes
     /// it back on the matching response, and `accepts_token` is the
@@ -134,6 +136,35 @@ pub struct TagManagerOverlay {
     /// Picard-canonical TXXX frame. `None` for overlays that resolved via
     /// the MBID-direct or MB-search paths (no AcoustID hit available).
     pub acoustid_uuid: Option<String>,
+    /// Tracks to diff against instead of a library lookup. Inbox drops and
+    /// artist-wide reshelve pass files that may not be in `App.library`.
+    pub source_tracks: Option<Vec<zytunes::library::Track>>,
+    /// Inbox / `F` filing: titles say "File into library", dismiss snoozes
+    /// the cluster, and close continues the album queue.
+    pub filing: bool,
+    /// An overlay the poll opened does not act on the first Enter. The
+    /// user may still be pressing Enter to play tracks.
+    pub enter_armed: bool,
+}
+
+/// What became of a track whose apply reported an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailedTrack {
+    /// It was to be renamed or filed and is still where it was.
+    NotMoved,
+    /// It reached its new path, but its tags were not written.
+    MovedUntagged,
+    /// No move was asked for; its tags were not written.
+    Untagged,
+}
+
+/// One failed track of the last apply, kept on the overlay so the Done
+/// screen can name it instead of pointing at the log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplyFailure {
+    pub file: PathBuf,
+    pub outcome: FailedTrack,
+    pub error: String,
 }
 
 impl TagManagerOverlay {
@@ -162,8 +193,28 @@ impl TagManagerOverlay {
             flattened_rows: Vec::new(),
             collapsed_tracks: HashSet::new(),
             last_rename_map: std::collections::HashMap::new(),
+            apply_failures: Vec::new(),
             pending_request_token: 0,
             acoustid_uuid: None,
+            source_tracks: None,
+            filing: false,
+            enter_armed: true,
+        }
+    }
+
+    /// A diff is loaded and no field would change anything: the file
+    /// already carries what MusicBrainz says. Rendered as a status line
+    /// in the diff view; Enter closes instead of applying.
+    pub fn tags_already_match(&self) -> bool {
+        self.diff.as_ref().is_some_and(|d| !d.has_any_change())
+    }
+
+    /// Key hint for the diff-preview title bar.
+    pub fn diff_preview_hint(&self) -> &'static str {
+        if self.tags_already_match() {
+            "j/k · c fold · Enter close · s search · Esc"
+        } else {
+            "j/k · Space · a/n · c fold · Enter apply · s search · Esc"
         }
     }
 
@@ -337,6 +388,60 @@ mod tests {
             .chain((0..n).map(|i| FocusRow::Field(0, i)))
             .collect();
         overlay
+    }
+
+    fn overlay_with_diff(enabled: bool) -> TagManagerOverlay {
+        use zytunes::tag_ops::{FieldDiff, FieldKind, ReleaseTagDiff, TrackTagDiff};
+        let mut overlay = overlay_with_field_count(0);
+        overlay.phase = TagManagerPhase::DiffPreview;
+        overlay.diff = Some(ReleaseTagDiff {
+            release_mbid: "rel-1".into(),
+            summary: "Dirt — Alice In Chains".into(),
+            tracks: vec![TrackTagDiff {
+                src_path: "/m/a.mp3".into(),
+                dest_path: None,
+                library_id: 1,
+                fields: vec![FieldDiff {
+                    kind: FieldKind::Identity,
+                    name: "Title",
+                    current: Some("Them Bones".into()),
+                    proposed: Some(if enabled { "Them Bones!" } else { "Them Bones" }.into()),
+                    enabled,
+                }],
+            }],
+        });
+        overlay
+    }
+
+    #[test]
+    fn tags_already_match_when_no_field_differs() {
+        assert!(overlay_with_diff(false).tags_already_match());
+        assert!(!overlay_with_diff(true).tags_already_match());
+        // A user disabling every row is not the same as nothing differing.
+        let mut disabled = overlay_with_diff(true);
+        for f in &mut disabled.diff.as_mut().unwrap().tracks[0].fields {
+            f.enabled = false;
+        }
+        assert!(
+            !disabled.tags_already_match(),
+            "rows the user turned off still differ from MusicBrainz"
+        );
+        let mut no_diff = overlay_with_field_count(0);
+        no_diff.phase = TagManagerPhase::DiffPreview;
+        assert!(
+            !no_diff.tags_already_match(),
+            "no diff loaded yet is not a match"
+        );
+    }
+
+    #[test]
+    fn diff_preview_hint_says_close_when_nothing_to_apply() {
+        assert!(overlay_with_diff(false)
+            .diff_preview_hint()
+            .contains("Enter close"));
+        assert!(overlay_with_diff(true)
+            .diff_preview_hint()
+            .contains("Enter apply"));
     }
 
     #[test]

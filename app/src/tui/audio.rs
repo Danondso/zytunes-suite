@@ -49,6 +49,15 @@ pub enum AudioCommand {
     Scrub {
         delta_ms: i64,
     },
+    /// A filing apply renamed the open file. The decoder keeps the
+    /// inode; this only updates the path the next scrub reopens. Applied
+    /// only when the path the thread has stored is `old` (a transcoded
+    /// temp is left alone). Stem playback needs nothing: its cache entry
+    /// is keyed on the track's ID and does not move.
+    Retarget {
+        old: String,
+        new: String,
+    },
 }
 
 /// What [`AudioCommand::SwapSource`] swaps to. `Stems` carries the shared
@@ -161,6 +170,18 @@ fn resolve_playback_path(path: &str) -> Result<String, String> {
         transcode_for_playback(path)
     } else {
         Ok(path.to_string())
+    }
+}
+
+/// Point the open source at where a filing apply moved it. The decoder
+/// keeps the inode; only the path a later scrub reopens changes. A stored
+/// path that is not `old` (a transcoded temp) is left alone, and so is
+/// stem playback, whose files did not move.
+fn apply_retarget(current: Option<&mut NowSource>, old: &str, new: String) {
+    if let Some(NowSource::File(path)) = current {
+        if *path == old {
+            *path = new;
+        }
     }
 }
 
@@ -430,6 +451,9 @@ pub fn spawn(
                         elapsed_ms: elapsed.as_millis() as u64,
                     });
                 }
+                Ok(AudioCommand::Retarget { old, new }) => {
+                    apply_retarget(current.as_mut(), &old, new);
+                }
                 Ok(AudioCommand::Scrub { delta_ms }) => {
                     // Compute new position
                     let elapsed_now = if playing {
@@ -678,5 +702,37 @@ mod tests {
         assert_eq!(sought.next(), Some(25.0), "eager fallback hit the mark");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retarget_rewrites_the_stored_file_and_leaves_a_transcode_temp() {
+        let mut file = Some(NowSource::File("/m/old.flac".into()));
+        apply_retarget(file.as_mut(), "/m/old.flac", "/m/new.flac".into());
+        assert!(matches!(file, Some(NowSource::File(p)) if p == "/m/new.flac"));
+
+        let mut temp = Some(NowSource::File("/tmp/zytunes-play.wav".into()));
+        apply_retarget(temp.as_mut(), "/m/old.flac", "/m/new.flac".into());
+        assert!(
+            matches!(temp, Some(NowSource::File(p)) if p == "/tmp/zytunes-play.wav"),
+            "a transcoded temp is not the file that was renamed"
+        );
+    }
+
+    #[test]
+    fn retarget_leaves_open_stems_alone() {
+        // The stem cache entry is keyed on the track's ID, so a move of
+        // the source file does not move the stem files the mixer has open.
+        use std::path::PathBuf;
+        use zytunes::stems::{new_stem_gains, StemSet, SIX_STEM_LAYOUT};
+        let dir = PathBuf::from("/cache/key");
+        let mut stems = Some(NowSource::Stems(
+            Box::new(StemSet::from_layout(&dir, "flac", SIX_STEM_LAYOUT)),
+            new_stem_gains(&[]),
+        ));
+        apply_retarget(stems.as_mut(), "/m/old.flac", "/m/new.flac".into());
+        let Some(NowSource::Stems(set, _)) = stems else {
+            panic!("stem source replaced");
+        };
+        assert!(set.paths.iter().all(|p| p.starts_with(&dir)));
     }
 }

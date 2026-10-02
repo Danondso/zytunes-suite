@@ -14,18 +14,23 @@ pub mod dirlib;
 pub mod fingerprint;
 pub mod genre_norm;
 pub mod library;
+pub mod library_layout;
 pub mod listen_log;
 pub mod local_plays;
 pub mod mtp;
 pub mod musicbrainz;
 pub mod paths;
+pub mod picard_keys;
 pub mod playlist;
 pub mod playlist_store;
 pub mod recommender;
 pub mod stems;
 pub mod tag_ops;
+pub mod track_ids;
 pub mod transcode;
 
+#[cfg(all(test, unix))]
+mod filing_model_tests;
 #[cfg(test)]
 mod test_audio;
 
