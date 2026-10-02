@@ -3884,36 +3884,27 @@ fn draw_tag_manager_overlay(f: &mut Frame, app: &App) {
     } else {
         "Tag manager"
     };
-    let title = if overlay.probing_conflicts {
-        format!(" {noun} — checking existing copies… ")
-    } else {
-        match overlay.phase {
-            TagManagerPhase::SearchInput => {
-                format!(" {noun} — edit query (Enter to search, Esc to close) ")
-            }
-            TagManagerPhase::SearchPending => format!(" {noun} — searching MusicBrainz… "),
-            TagManagerPhase::SearchResults => {
-                format!(" {noun} — ↑↓ select · Enter pick · s edit query · Esc back ")
-            }
-            TagManagerPhase::LoadingRelease => format!(" {noun} — loading release… "),
-            TagManagerPhase::DiffPreview => format!(" {noun} — {} ", overlay.diff_preview_hint()),
-            TagManagerPhase::ConfirmReplace => {
-                format!(
-                " {noun} — choose the copy to keep · Space switch · Enter/y apply · Esc/n back "
-            )
-            }
-            TagManagerPhase::Applying => format!(" {noun} — applying… "),
-            // `L` and, after a failed reread, Esc do not close this screen.
-            TagManagerPhase::Done if !overlay.apply_failures.is_empty() => {
-                if overlay.error.is_some() {
-                    format!(" {noun} — done with errors · L log · Esc search · other keys close ")
-                } else {
-                    format!(" {noun} — done with errors · L log · other keys close ")
-                }
-            }
-            TagManagerPhase::Done => format!(" {noun} — done (any key to close) "),
-            TagManagerPhase::Error => format!(" {noun} — error (any key to close) "),
+    let title = match overlay.phase {
+        TagManagerPhase::SearchInput => {
+            format!(" {noun} — edit query (Enter to search, Esc to close) ")
         }
+        TagManagerPhase::SearchPending => format!(" {noun} — searching MusicBrainz… "),
+        TagManagerPhase::SearchResults => {
+            format!(" {noun} — ↑↓ select · Enter pick · s edit query · Esc back ")
+        }
+        TagManagerPhase::LoadingRelease => format!(" {noun} — loading release… "),
+        TagManagerPhase::DiffPreview => format!(" {noun} — {} ", overlay.diff_preview_hint()),
+        TagManagerPhase::Applying => format!(" {noun} — applying… "),
+        // `L` and, after a failed reread, Esc do not close this screen.
+        TagManagerPhase::Done if !overlay.apply_failures.is_empty() => {
+            if overlay.error.is_some() {
+                format!(" {noun} — done with errors · L log · Esc search · other keys close ")
+            } else {
+                format!(" {noun} — done with errors · L log · other keys close ")
+            }
+        }
+        TagManagerPhase::Done => format!(" {noun} — done (any key to close) "),
+        TagManagerPhase::Error => format!(" {noun} — error (any key to close) "),
     };
     let block = t
         .block()
@@ -3938,9 +3929,6 @@ fn draw_tag_manager_overlay(f: &mut Frame, app: &App) {
         }
         TagManagerPhase::DiffPreview | TagManagerPhase::Applying => {
             draw_tag_manager_diff(f, app, overlay, inner);
-        }
-        TagManagerPhase::ConfirmReplace => {
-            draw_tag_manager_confirm_replace(f, app, overlay, inner);
         }
         TagManagerPhase::Done if !overlay.apply_failures.is_empty() => {
             draw_tag_manager_failures(f, app, overlay, inner);
@@ -4017,7 +4005,6 @@ fn draw_tag_manager_failures(
             FailedTrack::NotMoved => "not moved",
             FailedTrack::MovedUntagged => "moved, tags not written",
             FailedTrack::Untagged => "tags not written",
-            FailedTrack::SetAsideUntagged => "set aside, tags not written",
         };
         // A long file name gives way, not the outcome: what became of the
         // file is the point of the row.
@@ -4186,122 +4173,6 @@ fn draw_tag_manager_search_results(
     ];
     let table = Table::new(rows, widths).header(header);
     f.render_widget(table, inner);
-}
-
-fn draw_tag_manager_confirm_replace(
-    f: &mut Frame,
-    app: &App,
-    overlay: &crate::app::TagManagerOverlay,
-    inner: Rect,
-) {
-    use zytunes::tag_ops::KeepCopy;
-    let t = app.theme();
-    let conflicts = &overlay.replace_conflicts;
-    let n = conflicts.len();
-    let file_name = |p: &std::path::Path| {
-        p.file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    };
-    let mut lines = vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            format!(
-                " {n} track{} already at the destination. Choose the copy to keep;",
-                if n == 1 { " is" } else { "s are" }
-            ),
-            t.header(),
-        )),
-        Line::from(Span::styled(
-            " the other moves to \"Removed from Music\". The better copy is preselected.",
-            t.header(),
-        )),
-        Line::from(""),
-    ];
-    // Each conflict is a title, two copies and a spacer. Show the window
-    // of conflicts that holds the focused one.
-    const ROWS_PER_CONFLICT: usize = 4;
-    let room = (inner.height as usize).saturating_sub(lines.len() + 2);
-    let visible = (room / ROWS_PER_CONFLICT).max(1);
-    let focus = overlay.replace_focus.min(n.saturating_sub(1));
-    let first = (focus + 1).saturating_sub(visible);
-    for (i, c) in conflicts.iter().enumerate().skip(first).take(visible) {
-        let parent = c
-            .dest
-            .parent()
-            .and_then(|d| d.file_name())
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let focused = i == focus;
-        lines.push(Line::from(Span::styled(
-            format!(
-                " {} {parent}/{}",
-                if focused { "▸" } else { " " },
-                file_name(&c.dest)
-            ),
-            if focused { t.header() } else { t.dim() },
-        )));
-        let copies = [
-            (
-                KeepCopy::Incoming,
-                "incoming",
-                &c.incoming,
-                file_name(&c.src),
-            ),
-            (KeepCopy::Existing, "existing", &c.existing, String::new()),
-        ];
-        for (which, label, quality, name) in copies {
-            let kept = c.keep == which;
-            let mut text = format!(
-                "     {} {label}  {}",
-                if kept { "(●) keep  " } else { "( ) remove" },
-                describe_audio_quality(quality)
-            );
-            if !name.is_empty() {
-                text.push_str(&format!("  ← {name}"));
-            }
-            let style = if kept {
-                Style::default().fg(t.success_text)
-            } else {
-                t.dim()
-            };
-            lines.push(Line::from(Span::styled(text, style)));
-        }
-        lines.push(Line::from(""));
-    }
-    if n > visible {
-        lines.push(Line::from(Span::styled(
-            format!(" {} of {n}", focus + 1),
-            t.dim(),
-        )));
-    }
-    lines.push(Line::from(Span::styled(
-        " j/k: move   Space: switch copy   i/e: keep all incoming/existing   Enter/y: apply   Esc/n: back",
-        t.dim(),
-    )));
-    f.render_widget(Paragraph::new(lines), inner);
-}
-
-/// One copy of a track in the replace prompt: `FLAC 16-bit 44.1 kHz` or
-/// `320 kbps 44.1 kHz`, then length and size.
-fn describe_audio_quality(q: &zytunes::tag_ops::AudioQuality) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    if q.lossless {
-        parts.push(match q.bit_depth {
-            Some(bits) => format!("lossless {bits}-bit"),
-            None => "lossless".into(),
-        });
-    } else if let Some(kbps) = q.bitrate_kbps {
-        parts.push(format!("{kbps} kbps"));
-    }
-    if let Some(hz) = q.sample_rate {
-        parts.push(format!("{:.1} kHz", f64::from(hz) / 1000.0));
-    }
-    if q.duration_ms > 0 {
-        parts.push(format_duration_ms(q.duration_ms).trim().to_string());
-    }
-    parts.push(metadata::format_bytes(q.size_bytes));
-    parts.join(" · ")
 }
 
 fn draw_tag_manager_diff(
@@ -4660,7 +4531,6 @@ mod tests {
             current: Some(cur.into()),
             proposed: Some(prop.into()),
             enabled: true,
-            from_release: true,
         }
     }
 
@@ -4700,7 +4570,6 @@ mod tests {
                 current: Some("Dreams".into()),
                 proposed: Some("Dreams".into()),
                 enabled: false,
-                from_release: true,
             },
             field(FieldKind::Numbering, "Track #", "1", "1"),
         ]);
@@ -4727,7 +4596,6 @@ mod tests {
                 current: Some("/m/A/B/01 old.mp3".into()),
                 proposed: Some("/m/A/B/01 new.mp3".into()),
                 enabled: true,
-                from_release: true,
             },
         ]);
         let label = render_track_header(&track);
@@ -4742,7 +4610,6 @@ mod tests {
             current: Some("/m/A/B/01 old.mp3".into()),
             proposed: Some("/m/A/B/01 new.mp3".into()),
             enabled: false,
-            from_release: true,
         };
         let _ = &mut filename;
         let track = header_track(vec![filename]);
@@ -4923,55 +4790,6 @@ mod tests {
         assert!(
             screen.contains("— moved, tags not written"),
             "the outcome survives a long name: {screen}"
-        );
-    }
-
-    #[test]
-    fn confirm_replace_shows_both_copies_and_the_choice() {
-        use zytunes::tag_ops::{AudioQuality, KeepCopy, ReplaceConflict};
-        let mut overlay = crate::app::TagManagerOverlay::new(
-            zytunes::tag_ops::DiffScope::Album,
-            "2Pac".into(),
-            "Album".into(),
-            None,
-            crate::app::SelectionAnchor::default(),
-        );
-        overlay.filing = true;
-        overlay.replace_conflicts = vec![ReplaceConflict {
-            src: "/inbox/01 Song.mp3".into(),
-            dest: "/m/2Pac/Album/01 - Song.mp3".into(),
-            incoming: AudioQuality {
-                bitrate_kbps: Some(128),
-                sample_rate: Some(44_100),
-                duration_ms: 222_000,
-                size_bytes: 3_600_000,
-                ..Default::default()
-            },
-            existing: AudioQuality {
-                lossless: true,
-                bit_depth: Some(16),
-                sample_rate: Some(44_100),
-                duration_ms: 222_000,
-                size_bytes: 28_000_000,
-                ..Default::default()
-            },
-            keep: KeepCopy::Existing,
-        }];
-        let app = App::new();
-        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 14)).unwrap();
-        term.draw(|f| draw_tag_manager_confirm_replace(f, &app, &overlay, f.area()))
-            .unwrap();
-        let screen = screen_text(&term);
-        assert!(screen.contains("▸ Album/01 - Song.mp3"), "{screen}");
-        assert!(
-            screen.contains(
-                "( ) remove incoming  128 kbps · 44.1 kHz · 3:42 · 3.43 MB  ← 01 Song.mp3"
-            ),
-            "{screen}"
-        );
-        assert!(
-            screen.contains("(●) keep   existing  lossless 16-bit · 44.1 kHz · 3:42 · 26.70 MB"),
-            "{screen}"
         );
     }
 

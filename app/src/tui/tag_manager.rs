@@ -58,9 +58,6 @@ pub enum TagManagerPhase {
     LoadingRelease,
     /// Diff is rendered; user toggles fields with Space, applies with Enter.
     DiffPreview,
-    /// Filing would overwrite files already at the canonical path. Enter
-    /// replaces; Esc returns to [`Self::DiffPreview`].
-    ConfirmReplace,
     /// Apply is in flight — disabled all keys except a final "ack" once Done.
     Applying,
     /// Apply succeeded. Any key closes.
@@ -124,13 +121,6 @@ pub struct TagManagerOverlay {
     pub last_rename_map: std::collections::HashMap<PathBuf, PathBuf>,
     /// Tracks the last apply failed on, in diff order. Empty on success.
     pub apply_failures: Vec<ApplyFailure>,
-    /// Renames whose dest already holds another copy, computed once on
-    /// entering `ConfirmReplace` with the better copy preselected. The
-    /// prompt renders from this every frame (recomputing would probe the
-    /// files at the 50 ms tick) and the user's choices are edited in place.
-    pub replace_conflicts: Vec<zytunes::tag_ops::ReplaceConflict>,
-    /// Which conflict the `ConfirmReplace` cursor is on.
-    pub replace_focus: usize,
     /// Token stamped onto every outgoing MB worker request so we can drop
     /// stale responses. Incremented on each request; the worker echoes
     /// it back on the matching response, and `accepts_token` is the
@@ -155,8 +145,6 @@ pub struct TagManagerOverlay {
     /// An overlay the poll opened does not act on the first Enter. The
     /// user may still be pressing Enter to play tracks.
     pub enter_armed: bool,
-    /// A replace-conflict probe is in flight on the worker. Keys wait.
-    pub probing_conflicts: bool,
 }
 
 /// What became of a track whose apply reported an error.
@@ -168,10 +156,6 @@ pub enum FailedTrack {
     MovedUntagged,
     /// No move was asked for; its tags were not written.
     Untagged,
-    /// Its tags were not written, and an incoming copy then took its
-    /// place: the file is in the removed-files folder. The file now at its
-    /// old path is the incoming one, which is not the one that failed.
-    SetAsideUntagged,
 }
 
 /// One failed track of the last apply, kept on the overlay so the Done
@@ -210,14 +194,11 @@ impl TagManagerOverlay {
             collapsed_tracks: HashSet::new(),
             last_rename_map: std::collections::HashMap::new(),
             apply_failures: Vec::new(),
-            replace_conflicts: Vec::new(),
-            replace_focus: 0,
             pending_request_token: 0,
             acoustid_uuid: None,
             source_tracks: None,
             filing: false,
             enter_armed: true,
-            probing_conflicts: false,
         }
     }
 
@@ -426,7 +407,6 @@ mod tests {
                     current: Some("Them Bones".into()),
                     proposed: Some(if enabled { "Them Bones!" } else { "Them Bones" }.into()),
                     enabled,
-                    from_release: true,
                 }],
             }],
         });
@@ -528,7 +508,6 @@ mod tests {
                         current: Some("Same".into()),
                         proposed: Some("Same".into()),
                         enabled: false,
-                        from_release: true,
                     },
                     FieldDiff {
                         kind: FieldKind::Identity,
@@ -536,7 +515,6 @@ mod tests {
                         current: Some("Old".into()),
                         proposed: Some("New".into()),
                         enabled: true,
-                        from_release: true,
                     },
                 ],
             }],
@@ -584,7 +562,6 @@ mod tests {
                         current: Some("Same".into()),
                         proposed: Some("Same".into()),
                         enabled: false,
-                        from_release: true,
                     },
                     FieldDiff {
                         kind: FieldKind::Identity,
@@ -592,7 +569,6 @@ mod tests {
                         current: Some("Old".into()),
                         proposed: Some("New".into()),
                         enabled: false,
-                        from_release: true,
                     },
                 ],
             }],
@@ -630,7 +606,6 @@ mod tests {
                     current: Some("Old".into()),
                     proposed: Some("New".into()),
                     enabled: true,
-                    from_release: true,
                 },
                 FieldDiff {
                     kind: FieldKind::Identity,
@@ -638,7 +613,6 @@ mod tests {
                     current: Some("Same".into()),
                     proposed: Some("Same".into()),
                     enabled: false,
-                    from_release: true,
                 },
             ],
         };

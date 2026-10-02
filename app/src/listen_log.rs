@@ -132,49 +132,6 @@ impl ListenLog {
         }
     }
 
-    /// Re-key the events of each merged track to its survivor (`loser →
-    /// winner`, see `track_ids::TrackIds::apply_moves`). The log is
-    /// append-only on disk, so a change rewrites the whole file
-    /// atomically. Returns `true` if any event changed.
-    pub fn remap_track_ids(&mut self, map: &std::collections::HashMap<u64, u64>) -> bool {
-        let mut changed = false;
-        for e in &mut self.events {
-            if let Some(new) = map.get(&e.id) {
-                e.id = *new;
-                changed = true;
-            }
-        }
-        if changed {
-            if let Some(path) = self.save_path.as_deref() {
-                self.rewrite_disk(path);
-            }
-        }
-        changed
-    }
-
-    fn rewrite_disk(&self, path: &Path) {
-        let mut out = String::new();
-        for e in &self.events {
-            match serde_json::to_string(e) {
-                Ok(line) => {
-                    out.push_str(&line);
-                    out.push('\n');
-                }
-                Err(err) => {
-                    (self.logger)(&format!(
-                        "zytunes: listen-log: serialize event failed: {err}"
-                    ));
-                }
-            }
-        }
-        if let Err(err) = crate::paths::atomic_write_json(path, out.as_bytes()) {
-            (self.logger)(&format!(
-                "zytunes: listen-log: rewrite {} failed: {err}",
-                path.display()
-            ));
-        }
-    }
-
     fn append_to_disk(path: &Path, event: &ListenEvent, log: &Logger) {
         if let Some(parent) = path.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
@@ -332,32 +289,6 @@ mod tests {
             std::process::id(),
             stem
         ))
-    }
-
-    #[test]
-    fn remap_track_ids_rewrites_memory_and_disk() {
-        let path = temp_path("remap");
-        let _ = std::fs::remove_file(&path);
-        let mut log = ListenLog::new().with_save_path(path.clone());
-        log.append(ListenEvent {
-            ts: 1,
-            id: 1,
-            completed: true,
-        });
-        log.append(ListenEvent {
-            ts: 2,
-            id: 2,
-            completed: false,
-        });
-        let map = std::collections::HashMap::from([(1u64, 10u64)]);
-        assert!(log.remap_track_ids(&map));
-        assert_eq!(log.events()[0].id, 10);
-        assert_eq!(log.events()[1].id, 2);
-        let reloaded = ListenLog::load_from(&path, &crate::cache::default_logger());
-        let _ = std::fs::remove_file(&path);
-        let ids: Vec<u64> = reloaded.events().iter().map(|e| e.id).collect();
-        assert_eq!(ids, vec![10, 2], "the file was rewritten, not appended to");
-        assert!(!log.remap_track_ids(&map));
     }
 
     #[test]

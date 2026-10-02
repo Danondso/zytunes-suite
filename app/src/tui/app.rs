@@ -3118,48 +3118,6 @@ impl App {
         overlay.phase = TagManagerPhase::DiffPreview;
     }
 
-    /// Fold everything held under the ID of a track a replace merged away
-    /// into the track that survived (`loser → winner`).
-    ///
-    /// A move never changes a track's ID (see `zytunes::track_ids`), so
-    /// this is the only time an ID-keyed store is re-keyed: filing a file
-    /// onto a track the library already has leaves one track where there
-    /// were two.
-    pub(crate) fn fold_merged_track_ids(&mut self, merges: &std::collections::HashMap<u64, u64>) {
-        if merges.is_empty() {
-            return;
-        }
-        if self.playlists.remap_track_ids(merges) {
-            self.persist_playlists();
-        }
-        if self.local_plays.remap_track_ids(merges) {
-            self.persist_local_plays();
-        }
-        // The listen log rewrites its own file.
-        self.listen_log.remap_track_ids(merges);
-        let Some(np) = self.now_playing.as_mut() else {
-            return;
-        };
-        if let Some(winner) = np.track_id.and_then(|id| merges.get(&id)) {
-            np.track_id = Some(*winner);
-        }
-        // Queued rows are a snapshot. A loser's ID can be handed to a new
-        // file later, so a row must not keep pointing at it.
-        if np
-            .playlist
-            .iter()
-            .any(|t| t.library_id.is_some_and(|id| merges.contains_key(&id)))
-        {
-            let mut rows = np.playlist.to_vec();
-            for id in rows.iter_mut().filter_map(|t| t.library_id.as_mut()) {
-                if let Some(winner) = merges.get(id) {
-                    *id = *winner;
-                }
-            }
-            np.playlist = Arc::from(rows);
-        }
-    }
-
     /// The device sync queue holds each track's file path from when it was
     /// queued. Left alone, the sync would fail every track an apply moved
     /// or a folder retitle carried along as a missing file.
@@ -3287,7 +3245,6 @@ impl App {
         results: Vec<Result<(), String>>,
         rename_map: std::collections::HashMap<PathBuf, PathBuf>,
         dir_renames: &[(PathBuf, PathBuf)],
-        set_aside: &[zytunes::tag_ops::SetAside],
     ) {
         // The folders moved on disk whether or not this overlay is still
         // open, so queued clusters are remapped even for a stale token.
@@ -3333,39 +3290,17 @@ impl App {
             self.sync.log.push(format!("tag-manager: {path}: {e}"));
             if let Some(track) = track {
                 use tag_manager::FailedTrack;
-                use zytunes::tag_ops::SetAsideCopy;
                 // A rename that happened is in the map whatever else went
-                // wrong (a tag-write failure does not stop the move). A
-                // file that was set aside is the exception, either way
-                // round. An incoming file dropped for the copy at its dest
-                // did not move there: the error is the tag write on the
-                // copy that stayed. A track replaced where it stood left
-                // with its failed tag write: the file now at its path is
-                // the incoming one, and naming that path would point at a
-                // file that is fine.
-                let aside = set_aside.iter().find(|a| a.was == track.src_path);
-                let (file, outcome) = if let Some(aside) = aside {
-                    match aside.copy {
-                        SetAsideCopy::Incoming => {
-                            let kept = rename_map
-                                .get(&track.src_path)
-                                .cloned()
-                                .unwrap_or_else(|| track.src_path.clone());
-                            (kept, FailedTrack::Untagged)
-                        }
-                        SetAsideCopy::Replaced => {
-                            (aside.now.clone(), FailedTrack::SetAsideUntagged)
-                        }
-                    }
-                } else if rename_map.contains_key(&track.src_path) {
-                    (track.src_path.clone(), FailedTrack::MovedUntagged)
+                // wrong (a tag-write failure does not stop the move).
+                let outcome = if rename_map.contains_key(&track.src_path) {
+                    FailedTrack::MovedUntagged
                 } else if track.wants_rename() {
-                    (track.src_path.clone(), FailedTrack::NotMoved)
+                    FailedTrack::NotMoved
                 } else {
-                    (track.src_path.clone(), FailedTrack::Untagged)
+                    FailedTrack::Untagged
                 };
                 failures.push(tag_manager::ApplyFailure {
-                    file,
+                    file: track.src_path.clone(),
                     outcome,
                     error: e.clone(),
                 });
@@ -3375,7 +3310,27 @@ impl App {
         // and stays until a key is pressed; a toast would only cover that
         // list for its five seconds. Without one (closed mid-apply), the
         // toast is the only notice besides the log.
+        // A dest that was already held is never replaced: the file was
+        // filed beside it under a numbered name. The log names each one.
+        let beside = live_diff.map_or(0, |d| {
+            d.tracks
+                .iter()
+                .filter(|t| {
+                    let landed = rename_map.get(&t.src_path);
+                    landed.is_some() && landed != t.dest_path.as_ref()
+                })
+                .count()
+        });
         let listed = failures.len() == failed;
+        if failed == 0 && beside > 0 {
+            self.set_toast(
+                format!(
+                    "{beside} track{} already in the library: filed beside as a numbered copy, see log (L)",
+                    if beside == 1 { " was" } else { "s were" }
+                ),
+                false,
+            );
+        }
         if failed > 0 && !listed {
             self.set_toast(
                 format!(
@@ -3585,13 +3540,6 @@ impl App {
         let Some(overlay) = self.tag_manager.as_mut() else {
             return;
         };
-        if overlay.probing_conflicts {
-            if matches!(key.code, KeyCode::Esc) {
-                overlay.probing_conflicts = false;
-                overlay.next_request_token();
-            }
-            return;
-        }
         // Phase-independent: q closes (and on a filing run skips the
         // queued albums), except while the search field is taking text.
         // Esc handling is per-phase.
@@ -3629,9 +3577,6 @@ impl App {
             }
             TagManagerPhase::DiffPreview => {
                 self.handle_tag_manager_key_diff_preview(key, cmd_tx);
-            }
-            TagManagerPhase::ConfirmReplace => {
-                self.handle_tag_manager_key_confirm_replace(key, cmd_tx);
             }
             TagManagerPhase::SearchPending | TagManagerPhase::LoadingRelease => {
                 // Only Esc cancels (closes overlay) — Apply-in-flight can't
@@ -3771,13 +3716,7 @@ impl App {
             AlreadyMatches,
             /// Changes exist but the user disabled every row.
             NothingEnabled,
-            Apply {
-                replace_existing: bool,
-            },
-            Probe {
-                token: u64,
-                diff: zytunes::tag_ops::ReleaseTagDiff,
-            },
+            Apply,
         }
         let outcome = {
             let Some(overlay) = self.tag_manager.as_mut() else {
@@ -3852,21 +3791,8 @@ impl App {
                         Outcome::AlreadyMatches
                     } else if !diff.has_any_enabled() {
                         Outcome::NothingEnabled
-                    } else if overlay.filing {
-                        let probed = diff.needs_replace_probe().then(|| diff.clone());
-                        if let Some(diff) = probed {
-                            let token = overlay.next_request_token();
-                            overlay.probing_conflicts = true;
-                            Outcome::Probe { token, diff }
-                        } else {
-                            Outcome::Apply {
-                                replace_existing: true,
-                            }
-                        }
                     } else {
-                        Outcome::Apply {
-                            replace_existing: overlay.filing,
-                        }
+                        Outcome::Apply
                     }
                 }
                 _ => Outcome::Stay,
@@ -3884,96 +3810,11 @@ impl App {
                     false,
                 );
             }
-            Outcome::Apply { replace_existing } => {
-                self.dispatch_tag_diff_apply(Some(cmd_tx), replace_existing);
-            }
-            Outcome::Probe { token, diff } => {
-                let _ = cmd_tx.send(BgCommand::ProbeReplaceConflicts {
-                    token,
-                    diff: Box::new(diff),
-                });
-            }
+            Outcome::Apply => self.dispatch_tag_diff_apply(Some(cmd_tx)),
         }
     }
 
-    fn handle_tag_manager_key_confirm_replace(
-        &mut self,
-        key: KeyEvent,
-        cmd_tx: &mpsc::Sender<BgCommand>,
-    ) {
-        use zytunes::tag_ops::KeepCopy;
-        let Some(overlay) = self.tag_manager.as_mut() else {
-            return;
-        };
-        let last = overlay.replace_conflicts.len().saturating_sub(1);
-        match key.code {
-            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
-                self.dispatch_tag_diff_apply(Some(cmd_tx), true);
-            }
-            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
-                overlay.replace_conflicts.clear();
-                overlay.phase = TagManagerPhase::DiffPreview;
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                overlay.replace_focus = (overlay.replace_focus + 1).min(last);
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                overlay.replace_focus = overlay.replace_focus.saturating_sub(1);
-            }
-            KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right => {
-                if let Some(c) = overlay.replace_conflicts.get_mut(overlay.replace_focus) {
-                    c.keep = match c.keep {
-                        KeepCopy::Incoming => KeepCopy::Existing,
-                        KeepCopy::Existing => KeepCopy::Incoming,
-                    };
-                }
-            }
-            KeyCode::Char('i') => {
-                for c in &mut overlay.replace_conflicts {
-                    c.keep = KeepCopy::Incoming;
-                }
-            }
-            KeyCode::Char('e') => {
-                for c in &mut overlay.replace_conflicts {
-                    c.keep = KeepCopy::Existing;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn on_replace_conflicts_probed(
-        &mut self,
-        token: u64,
-        conflicts: Vec<zytunes::tag_ops::ReplaceConflict>,
-    ) {
-        let live = self
-            .tag_manager
-            .as_ref()
-            .is_some_and(|o| o.probing_conflicts && o.accepts_token(token));
-        if !live {
-            return;
-        }
-        if conflicts.is_empty() {
-            if let Some(overlay) = self.tag_manager.as_mut() {
-                overlay.probing_conflicts = false;
-            }
-            self.dispatch_tag_diff_apply(None, true);
-            return;
-        }
-        if let Some(overlay) = self.tag_manager.as_mut() {
-            overlay.probing_conflicts = false;
-            overlay.replace_conflicts = conflicts;
-            overlay.replace_focus = 0;
-            overlay.phase = TagManagerPhase::ConfirmReplace;
-        }
-    }
-
-    fn dispatch_tag_diff_apply(
-        &mut self,
-        cmd_tx: Option<&mpsc::Sender<BgCommand>>,
-        replace_existing: bool,
-    ) {
+    fn dispatch_tag_diff_apply(&mut self, cmd_tx: Option<&mpsc::Sender<BgCommand>>) {
         let Some(overlay) = self.tag_manager.as_mut() else {
             return;
         };
@@ -3998,12 +3839,6 @@ impl App {
         // Whatever `Done` shows in `error` must be this apply's.
         overlay.error = None;
         let token = overlay.next_request_token();
-        // Empty unless the apply came through `ConfirmReplace`.
-        let keep_existing = std::mem::take(&mut overlay.replace_conflicts)
-            .into_iter()
-            .filter(|c| c.keep == zytunes::tag_ops::KeepCopy::Existing)
-            .map(|c| c.src)
-            .collect();
         let fingerprint = self.scan_fingerprint;
         self.dispatch_bg(
             BgCommand::ApplyTagDiff {
@@ -4011,8 +3846,6 @@ impl App {
                 diff: Box::new(diff),
                 music_dir,
                 fingerprint,
-                replace_existing,
-                keep_existing,
             },
             cmd_tx,
         );
@@ -15108,7 +14941,7 @@ mod tests {
             PathBuf::from("/m/alice in chains"),
             PathBuf::from("/m/Alice In Chains"),
         )];
-        app.handle_tags_applied(0, vec![Ok(())], rename_map, &dir_renames, &[]);
+        app.handle_tags_applied(0, vec![Ok(())], rename_map, &dir_renames);
 
         // A track's ID does not change when its file moves, so nothing
         // keyed on it has anything to follow.
@@ -15124,75 +14957,6 @@ mod tests {
     }
 
     #[test]
-    fn a_replace_folds_the_losing_track_into_the_survivor() {
-        // Filing a file onto a track the library already has leaves one
-        // track where there were two. Everything the loser's ID held has
-        // to end up under the survivor's.
-        let (loser, winner) = (11u64, 22u64);
-        let row = |id: u64, path: &str| {
-            let mut info = TrackInfo::new(
-                "Song".into(),
-                "Artist".into(),
-                "Album".into(),
-                Some(200_000),
-                None,
-                Some(path.into()),
-                None,
-                None,
-                None,
-                false,
-            );
-            info.library_id = Some(id);
-            info
-        };
-        let mut app = App::new();
-        let pl = app
-            .playlists
-            .add(zytunes::playlist::Playlist::new_manual("Faves"));
-        app.playlists.add_track(pl, loser);
-        app.local_plays.record_play(loser, 5);
-        app.local_plays.record_play(winner, 9);
-        app.listen_log.append(ListenEvent {
-            ts: 1,
-            id: loser,
-            completed: true,
-        });
-        app.now_playing = Some(NowPlaying {
-            track_name: "Song".into(),
-            artist: "Artist".into(),
-            album: "Album".into(),
-            duration_ms: 200_000,
-            elapsed_ms: 0,
-            state: PlaybackState::Playing,
-            track_index: 0,
-            playlist: Arc::from(vec![
-                row(loser, "/m/Artist/Album/01.flac"),
-                row(33, "/m/x.flac"),
-            ]),
-            paused_frame: None,
-            track_id: Some(loser),
-            counted: false,
-            year: None,
-            metadata_marquee: String::new(),
-        });
-
-        app.fold_merged_track_ids(&HashMap::from([(loser, winner)]));
-
-        assert_eq!(app.playlists.get(pl).unwrap().track_ids, vec![winner]);
-        assert!(app.local_plays.get(loser).is_none());
-        assert_eq!(app.local_plays.get(winner).unwrap().play_count, 2);
-        assert_eq!(app.listen_log.events()[0].id, winner);
-        let np = app.now_playing.as_ref().unwrap();
-        assert_eq!(
-            np.track_id,
-            Some(winner),
-            "the play in progress counts for the survivor"
-        );
-        let row_ids: Vec<Option<u64>> = np.playlist.iter().map(|t| t.library_id).collect();
-        assert_eq!(row_ids, vec![Some(winner), Some(33)]);
-    }
-
-    #[test]
     fn failed_tag_writes_are_surfaced_not_just_logged() {
         let mut app = make_app_with_library_for_tagmgr();
         app.handle_tags_applied(
@@ -15202,7 +14966,6 @@ mod tests {
                 Err("lofty save failed: Invalid frame language".into()),
             ],
             std::collections::HashMap::new(),
-            &[],
             &[],
         );
         assert!(
@@ -15250,7 +15013,6 @@ mod tests {
             ],
             HashMap::from([(moved.clone(), moved_to)]),
             &[],
-            &[],
         );
         let overlay = app.tag_manager.as_ref().unwrap();
         assert_eq!(
@@ -15290,109 +15052,10 @@ mod tests {
     }
 
     #[test]
-    fn a_set_aside_tag_failure_names_the_copy_that_stayed() {
-        use crate::app::tag_manager::{ApplyFailure, FailedTrack};
-        use zytunes::tag_ops::{SetAside, SetAsideCopy};
-        let incoming = PathBuf::from("/inbox/01 Song.wav");
-        let kept = PathBuf::from("/m/Artist/Album/01 - Song.wav");
-
-        // Filename row off: nothing was going to move, so a tag error is
-        // not "not moved".
-        let mut app = filing_overlay_with_rename(&incoming, &kept);
-        app.tag_manager
-            .as_mut()
-            .unwrap()
-            .diff
-            .as_mut()
-            .unwrap()
-            .tracks[0]
-            .fields[0]
-            .enabled = false;
-        app.handle_tags_applied(
-            0,
-            vec![Err("tag-save: disk full".into())],
-            HashMap::new(),
-            &[],
-            &[],
-        );
-        assert_eq!(
-            app.tag_manager.as_ref().unwrap().apply_failures[0].outcome,
-            FailedTrack::Untagged
-        );
-
-        let mut app = filing_overlay_with_rename(&incoming, &kept);
-        app.handle_tags_applied(
-            0,
-            vec![Err("tag-save: disk full".into())],
-            HashMap::from([(incoming.clone(), kept.clone())]),
-            &[],
-            &[SetAside {
-                copy: SetAsideCopy::Incoming,
-                was: incoming.clone(),
-                now: PathBuf::from("/Removed from Music/inbox/01 Song.wav"),
-            }],
-        );
-        assert_eq!(
-            app.tag_manager.as_ref().unwrap().apply_failures,
-            vec![ApplyFailure {
-                file: kept,
-                outcome: FailedTrack::Untagged,
-                error: "tag-save: disk full".into(),
-            }]
-        );
-    }
-
-    #[test]
-    fn a_tag_failure_on_a_replaced_track_names_the_file_that_was_set_aside() {
-        use crate::app::tag_manager::{ApplyFailure, FailedTrack};
-        use zytunes::tag_ops::{SetAside, SetAsideCopy};
-        // The track stays at its path (Filename row off), its tag write
-        // fails, and a duplicate from the same diff then replaces it. The
-        // path now holds the duplicate, which was tagged.
-        let in_place = PathBuf::from("/m/Artist/Album/01 - Song.wav");
-        let removed = PathBuf::from("/Removed from Music/m/Artist/Album/01 - Song.wav");
-        let mut app = filing_overlay_with_rename(&in_place, &in_place);
-        app.tag_manager
-            .as_mut()
-            .unwrap()
-            .diff
-            .as_mut()
-            .unwrap()
-            .tracks[0]
-            .fields[0]
-            .enabled = false;
-        app.handle_tags_applied(
-            0,
-            vec![Err("tag-save: disk full".into())],
-            HashMap::new(),
-            &[],
-            &[SetAside {
-                copy: SetAsideCopy::Replaced,
-                was: in_place,
-                now: removed.clone(),
-            }],
-        );
-        assert_eq!(
-            app.tag_manager.as_ref().unwrap().apply_failures,
-            vec![ApplyFailure {
-                file: removed,
-                outcome: FailedTrack::SetAsideUntagged,
-                error: "tag-save: disk full".into(),
-            }]
-        );
-    }
-
-    #[test]
     fn a_reread_error_keeps_the_track_failures_on_screen() {
         let src = PathBuf::from("/inbox/01 Song.wav");
         let mut app = filing_overlay_with_rename(&src, std::path::Path::new("/m/01 - Song.wav"));
-        app.handle_tags_applied(
-            0,
-            vec![Err("rename collision".into())],
-            HashMap::new(),
-            &[],
-            &[],
-        );
+        app.handle_tags_applied(0, vec![Err("rename collision".into())], HashMap::new(), &[]);
         app.handle_library_reread_complete(0, Err("disk".into()));
         let overlay = app.tag_manager.as_ref().unwrap();
         assert_eq!(overlay.phase, TagManagerPhase::Done);
@@ -15419,13 +15082,7 @@ mod tests {
                     ..Default::default()
                 }],
             });
-        app.handle_tags_applied(
-            0,
-            vec![Err("rename collision".into())],
-            HashMap::new(),
-            &[],
-            &[],
-        );
+        app.handle_tags_applied(0, vec![Err("rename collision".into())], HashMap::new(), &[]);
         match reread {
             Ok(()) => app.tag_manager.as_mut().unwrap().phase = TagManagerPhase::Done,
             Err(e) => app.handle_library_reread_complete(0, Err(e.into())),
@@ -15509,7 +15166,6 @@ mod tests {
                 PathBuf::from("/m/Alice in Chains"),
                 PathBuf::from("/m/Alice In Chains"),
             )],
-            &[],
         );
         assert_eq!(
             app.inbox.queue[0].tracks[0].location.as_deref(),
@@ -15867,7 +15523,7 @@ mod tests {
             PathBuf::from("/m/alice in chains"),
             PathBuf::from("/m/Alice in Chains"),
         )];
-        app.handle_tags_applied(0, vec![Ok(())], rename_map, &dir_renames, &[]);
+        app.handle_tags_applied(0, vec![Ok(())], rename_map, &dir_renames);
 
         let np = app.now_playing.as_ref().unwrap();
         assert_eq!(
@@ -15946,7 +15602,7 @@ mod tests {
             0,
         );
         app.pending_bg_commands.clear();
-        app.handle_tags_applied(0, vec![Ok(())], HashMap::new(), &dir_renames, &[]);
+        app.handle_tags_applied(0, vec![Ok(())], HashMap::new(), &dir_renames);
         assert_eq!(app.stems.pending_path, None);
         let moved_to = "/m/Alice in Chains/Dirt/01 Them Bones.flac";
         let followed = vec![stem_track(1, moved_to), stem_track(2, stays)];
@@ -15971,7 +15627,7 @@ mod tests {
             0,
         );
         app.pending_bg_commands.clear();
-        app.handle_tags_applied(0, vec![Ok(())], HashMap::new(), &dir_renames, &[]);
+        app.handle_tags_applied(0, vec![Ok(())], HashMap::new(), &dir_renames);
         assert_eq!(
             app.stems_batch.as_ref().unwrap().tracks,
             vec![stem_track(1, moved_to)]
@@ -16090,7 +15746,7 @@ mod tests {
         app.stems.status = StemStatus::Separating { pct: None };
         app.stems.for_path = Some(old.to_string_lossy().into_owned());
         app.stems.job_gen = 4;
-        app.handle_tags_applied(0, vec![Ok(())], HashMap::from([(old, new)]), &[], &[]);
+        app.handle_tags_applied(0, vec![Ok(())], HashMap::from([(old, new)]), &[]);
         assert_eq!(
             app.stems.job_gen, 5,
             "the late result is a stale generation"
@@ -16129,7 +15785,6 @@ mod tests {
             vec![Ok(())],
             HashMap::from([(PathBuf::from(old), PathBuf::from(new))]),
             &[],
-            &[],
         );
         let tracks = &app.stems_batch.as_ref().unwrap().tracks;
         assert_eq!(tracks, &vec![stem_track(1, new), stem_track(2, stay)]);
@@ -16167,7 +15822,6 @@ mod tests {
             0,
             vec![Ok(())],
             HashMap::from([(PathBuf::from(old), PathBuf::from(new))]),
-            &[],
             &[],
         );
         assert_eq!(
@@ -16213,7 +15867,6 @@ mod tests {
                 PathBuf::from("/m/Alice in Chains"),
                 PathBuf::from("/m/Alice In Chains"),
             )],
-            &[],
         );
         let locs: Vec<&str> = app.sync.queue[0]
             .tracks
@@ -16243,7 +15896,6 @@ mod tests {
             0,
             vec![Ok(())],
             HashMap::from([(PathBuf::from(old), PathBuf::from(new))]),
-            &[],
             &[],
         );
         app.pending_bg_commands.clear();
@@ -16306,7 +15958,6 @@ mod tests {
             vec![Err("rename collision".into())],
             HashMap::from([(moved.clone(), dest)]),
             &[],
-            &[],
         );
         app.handle_library_reread_complete(0, Err("disk".into()));
         app.close_tag_manager();
@@ -16356,13 +16007,7 @@ mod tests {
                 ..Default::default()
             },
         ]);
-        app.handle_tags_applied(
-            0,
-            vec![Ok(())],
-            HashMap::from([(moved.clone(), dest)]),
-            &[],
-            &[],
-        );
+        app.handle_tags_applied(0, vec![Ok(())], HashMap::from([(moved.clone(), dest)]), &[]);
         app.handle_library_reread_complete(0, Err("disk".into()));
         assert_eq!(
             app.tag_manager.as_ref().unwrap().phase,
@@ -16579,7 +16224,6 @@ mod tests {
                     current: Some(src.display().to_string()),
                     proposed: Some(dest.display().to_string()),
                     enabled: true,
-                    from_release: true,
                 }],
             }],
         });
@@ -16790,125 +16434,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn filing_enter_probes_conflicts_off_the_ui_thread() {
-        let dir = std::env::temp_dir().join("zytunes-probe-off-thread");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let src = dir.join("feat.wav");
-        let dest = dir.join("2pac.wav");
-        std::fs::write(&src, b"src").unwrap();
-        std::fs::write(&dest, b"dest").unwrap();
-        let (tx, rx) = mpsc::channel::<BgCommand>();
-        let mut app = filing_overlay_with_rename(&src, &dest);
-        app.handle_tag_manager_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
-        assert_eq!(
-            app.tag_manager.as_ref().unwrap().phase,
-            TagManagerPhase::DiffPreview,
-            "Enter must not parse the files before the worker answers"
-        );
-        let (token, diff) = match rx.try_recv() {
-            Ok(BgCommand::ProbeReplaceConflicts { token, diff }) => (token, diff),
-            Ok(_) => panic!("expected a conflict probe, not an apply"),
-            Err(_) => panic!("Enter did not hand the probe to the worker"),
-        };
-        let conflicts = diff.replace_conflicts();
-        app.handle_bg_event(BgEvent::ReplaceConflictsProbed { token, conflicts });
-        assert_eq!(
-            app.tag_manager.as_ref().unwrap().phase,
-            TagManagerPhase::ConfirmReplace
-        );
-    }
-
-    #[test]
-    fn filing_enter_asks_before_replacing_existing_dest() {
-        let dir = std::env::temp_dir().join("zytunes-confirm-replace");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let src = dir.join("feat.wav");
-        let dest = dir.join("2pac.wav");
-        std::fs::write(&src, b"src").unwrap();
-        std::fs::write(&dest, b"dest").unwrap();
-
-        let (tx, rx) = mpsc::channel::<BgCommand>();
-        let mut app = filing_overlay_with_rename(&src, &dest);
-        app.handle_tag_manager_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
-        let (token, diff) = match rx.try_recv() {
-            Ok(BgCommand::ProbeReplaceConflicts { token, diff }) => (token, diff),
-            Ok(_) => panic!("expected a conflict probe"),
-            Err(_) => panic!("Enter did not hand the probe to the worker"),
-        };
-        app.handle_bg_event(BgEvent::ReplaceConflictsProbed {
-            token,
-            conflicts: diff.replace_conflicts(),
-        });
-        assert_eq!(
-            app.tag_manager.as_ref().unwrap().phase,
-            TagManagerPhase::ConfirmReplace
-        );
-        assert!(rx.try_recv().is_err(), "apply must wait for confirm");
-        // The list the prompt shows is computed once on entry: the
-        // renderer runs every 50 ms and must not stat the library per frame.
-        let conflicts = &app.tag_manager.as_ref().unwrap().replace_conflicts;
-        assert_eq!(conflicts.len(), 1);
-        assert_eq!(conflicts[0].dest, dest);
-
-        app.handle_tag_manager_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
-        assert_eq!(
-            app.tag_manager.as_ref().unwrap().phase,
-            TagManagerPhase::DiffPreview
-        );
-
-        app.handle_tag_manager_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
-        let (token, diff) = match rx.try_recv() {
-            Ok(BgCommand::ProbeReplaceConflicts { token, diff }) => (token, diff),
-            _ => panic!("expected a conflict probe"),
-        };
-        app.handle_bg_event(BgEvent::ReplaceConflictsProbed {
-            token,
-            conflicts: diff.replace_conflicts(),
-        });
-        app.handle_tag_manager_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE), &tx);
-        match rx.try_recv().expect("apply after yes") {
-            BgCommand::ApplyTagDiff {
-                replace_existing,
-                keep_existing,
-                ..
-            } => {
-                assert!(replace_existing);
-                assert!(keep_existing.is_empty(), "the incoming copy was kept");
-            }
-            _ => panic!("expected ApplyTagDiff"),
-        }
-
-        // Space flips the focused conflict to the copy already in place;
-        // the apply then carries that source as one to remove.
-        let mut app = filing_overlay_with_rename(&src, &dest);
-        let key = |c| KeyEvent::new(c, KeyModifiers::NONE);
-        app.handle_tag_manager_key(key(KeyCode::Enter), &tx);
-        let (token, diff) = match rx.try_recv() {
-            Ok(BgCommand::ProbeReplaceConflicts { token, diff }) => (token, diff),
-            _ => panic!("expected a conflict probe"),
-        };
-        app.handle_bg_event(BgEvent::ReplaceConflictsProbed {
-            token,
-            conflicts: diff.replace_conflicts(),
-        });
-        app.handle_tag_manager_key(key(KeyCode::Char(' ')), &tx);
-        assert_eq!(
-            app.tag_manager.as_ref().unwrap().replace_conflicts[0].keep,
-            zytunes::tag_ops::KeepCopy::Existing
-        );
-        app.handle_tag_manager_key(key(KeyCode::Enter), &tx);
-        match rx.try_recv().expect("apply after choosing") {
-            BgCommand::ApplyTagDiff { keep_existing, .. } => {
-                assert!(keep_existing.contains(&src));
-            }
-            _ => panic!("expected ApplyTagDiff"),
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// Tagged MP3 under `root/alice in chains/dirt/` (synthetic frames;
     /// lofty only needs a valid header to attach ID3v2).
     fn tagged_mp3(path: &std::path::Path) {
@@ -16996,33 +16521,115 @@ mod tests {
         }
     }
 
-    /// The worker's ApplyTagDiff arm, run inline: apply, reread, and feed
-    /// both events back to the app.
+    /// The worker's ApplyTagDiff arm, run inline: the same function the
+    /// worker calls, with its events fed straight back to the app.
     fn apply_open_overlay_inline(app: &mut App, root: &std::path::Path) {
         let overlay = app.tag_manager.as_ref().unwrap();
         let diff = overlay.diff.clone().unwrap();
         let token = overlay.pending_request_token;
-        let outcome = zytunes::tag_ops::apply_release_diff_with(&diff, false, root);
-        let paths = outcome.reread_paths(&diff, root);
-        let vacated = outcome.vacated();
-        let log = zytunes::cache::default_logger();
-        let lib = zytunes::dirlib::DirectoryLibrary::reread_paths_after(
-            root.to_str().unwrap(),
-            &paths,
-            &vacated,
-            &outcome.dir_renames,
-            false,
-            &log,
-        )
-        .unwrap();
-        app.handle_tags_applied(
-            token,
-            outcome.results,
-            outcome.rename_map,
-            &outcome.dir_renames,
-            &outcome.set_aside,
+        let (tx, rx) = mpsc::channel::<BgEvent>();
+        crate::background::run_tag_apply(token, &diff, root.to_str().unwrap(), false, &tx);
+        drop(tx);
+        for event in rx {
+            app.handle_bg_event(event);
+        }
+    }
+
+    #[test]
+    fn filing_enter_applies_without_asking_about_a_held_dest() {
+        // Filing never replaces a track, so there is nothing to ask: a
+        // dest that is already held just means the file lands beside it.
+        let dir = std::env::temp_dir().join("zytunes-filing-no-prompt");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("feat.wav");
+        let dest = dir.join("2pac.wav");
+        std::fs::write(&src, b"src").unwrap();
+        std::fs::write(&dest, b"dest").unwrap();
+        let (tx, rx) = mpsc::channel::<BgCommand>();
+        let mut app = filing_overlay_with_rename(&src, &dest);
+        app.handle_tag_manager_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        assert_eq!(
+            app.tag_manager.as_ref().unwrap().phase,
+            TagManagerPhase::Applying
         );
-        app.handle_library_reread_complete(token, Ok(Box::new(lib)));
+        assert!(matches!(rx.try_recv(), Ok(BgCommand::ApplyTagDiff { .. })));
+    }
+
+    #[test]
+    fn a_track_filed_beside_a_copy_already_there_is_announced() {
+        let src = PathBuf::from("/inbox/01 Song.wav");
+        let dest = PathBuf::from("/m/2Pac/Album/01 - Song.wav");
+        let landed = PathBuf::from("/m/2Pac/Album/01 - Song (2).wav");
+        let mut app = filing_overlay_with_rename(&src, &dest);
+        app.handle_tags_applied(0, vec![Ok(())], HashMap::from([(src, landed)]), &[]);
+        let toast = app.toast_message.as_ref().map(|t| t.0.as_str());
+        assert!(
+            toast.is_some_and(|t| t.contains("filed beside")),
+            "{toast:?}"
+        );
+
+        // A file that reached the dest it was bound for says nothing.
+        let src = PathBuf::from("/inbox/01 Song.wav");
+        let mut app = filing_overlay_with_rename(&src, &dest);
+        app.handle_tags_applied(0, vec![Ok(())], HashMap::from([(src, dest)]), &[]);
+        assert!(app.toast_message.is_none());
+    }
+
+    #[test]
+    fn filing_a_track_keeps_its_id_and_its_playlist_entry() {
+        // End to end through the worker's own apply function: the file is
+        // renamed and its folders retitled, and the playlist entry made
+        // before filing still resolves, at the new path.
+        let root = std::env::temp_dir().join("zytunes-file-keeps-id");
+        let _ = std::fs::remove_dir_all(&root);
+        let old = root
+            .join("alice in chains")
+            .join("dirt")
+            .join("01 - Them Bones.mp3");
+        tagged_mp3(&old);
+        let (tx, _rx) = mpsc::channel::<BgCommand>();
+        let mut app = App::new();
+        app.local_plays_save_path = None;
+        app.playlists_save_path = None;
+        app.music_dir_cache = Some(root.clone());
+        app.library = Some(Box::new(
+            zytunes::dirlib::DirectoryLibrary::scan(root.to_str().unwrap()).unwrap(),
+        ));
+        let id = app
+            .library
+            .as_ref()
+            .unwrap()
+            .all_tracks()
+            .next()
+            .unwrap()
+            .id;
+        let pl = app
+            .playlists
+            .add(zytunes::playlist::Playlist::new_manual("Faves"));
+        app.playlists.add_track(pl, id);
+        app.refresh_sidebar();
+        app.sidebar_selected = 0;
+        app.select_sidebar_item();
+        app.album_selected = 0;
+        app.select_album();
+        app.active_panel = Panel::TrackList;
+        app.track_selected = 0;
+
+        app.start_file_and_enrich(&tx);
+        let token = app.tag_manager.as_ref().unwrap().pending_request_token;
+        app.handle_mb_release_loaded(token, Ok(Box::new(dirt_release())));
+        apply_open_overlay_inline(&mut app, &root);
+
+        assert!(!old.exists(), "the file was filed somewhere else");
+        let lib = app.library.as_ref().unwrap();
+        let entry = app.playlists.get(pl).unwrap().track_ids[0];
+        let track = lib
+            .track_by_id(entry)
+            .expect("the playlist entry still names a library track");
+        assert_ne!(track.location.as_deref(), old.to_str());
+        assert_eq!(lib.track_count(), 1);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -2355,7 +2355,6 @@ mod tests {
                     current: Some(filed.display().to_string()),
                     proposed: Some(filed_new.display().to_string()),
                     enabled: true,
-                    from_release: true,
                 }],
             }],
         };
@@ -2418,7 +2417,6 @@ mod tests {
                     current: Some(src.display().to_string()),
                     proposed: Some(dest.display().to_string()),
                     enabled: true,
-                    from_release: true,
                 }],
             }],
         }
@@ -2449,10 +2447,9 @@ mod tests {
         let out = crate::tag_ops::apply_release_diff(&diff, &dir);
         assert!(out.results[0].is_ok(), "{:?}", out.results[0]);
         let log = crate::cache::default_logger();
-        let merges = crate::track_ids::record_moves(root, &log, |p| {
+        crate::track_ids::record_moves(root, &log, |p| {
             crate::tag_ops::moved_path(p, &out.rename_map, &out.dir_renames)
         });
-        assert!(merges.is_empty());
         let lib = DirectoryLibrary::reread_paths_after(
             root,
             &out.reread_paths(&diff, &dir),

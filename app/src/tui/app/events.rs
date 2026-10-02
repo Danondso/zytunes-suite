@@ -139,9 +139,6 @@ impl App {
             BgEvent::MbSearchResults { token, result } => {
                 self.handle_mb_search_results(token, result);
             }
-            BgEvent::ReplaceConflictsProbed { token, conflicts } => {
-                self.on_replace_conflicts_probed(token, conflicts);
-            }
             BgEvent::MbReleaseLoaded { token, result } => {
                 self.handle_mb_release_loaded(token, result);
             }
@@ -150,11 +147,8 @@ impl App {
                 results,
                 rename_map,
                 dir_renames,
-                set_aside,
-                id_merges,
             } => {
-                self.fold_merged_track_ids(&id_merges);
-                self.handle_tags_applied(token, results, rename_map, &dir_renames, &set_aside);
+                self.handle_tags_applied(token, results, rename_map, &dir_renames);
             }
             BgEvent::LibraryRereadComplete { token, result } => {
                 self.handle_library_reread_complete(token, result);

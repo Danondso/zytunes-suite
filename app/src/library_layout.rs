@@ -1,8 +1,7 @@
 //! Inbox discovery and canonical `{AlbumArtist}/{Album}` path helpers.
 //!
 //! The drop folder is a **sibling** of `music_dir` (`../Automatically Add to
-//! Music`) so it never sorts among artist folders. Copies that filing takes
-//! out of the library go to a second sibling (`../Removed from Music`). Filing itself goes through
+//! Music`) so it never sorts among artist folders. Filing itself goes through
 //! the tag-manager overlay (MusicBrainz diff + rename); this module only
 //! finds settled audio files and groups them by album.
 
@@ -24,17 +23,6 @@ const SETTLING: Duration = Duration::from_secs(2);
 /// has no parent (`/` or a relative `.`).
 pub fn default_inbox_dir(music_dir: &Path) -> Option<PathBuf> {
     music_dir.parent().map(|p| p.join(INBOX_DIR_NAME))
-}
-
-/// Folder name next to the music library root for copies that filing
-/// replaced or dropped. Outside both the library and the inbox, so neither
-/// scan picks the files back up.
-pub const REMOVED_DIR_NAME: &str = "Removed from Music";
-
-/// `{parent(music_dir)}/Removed from Music`. `None` when `music_dir` has no
-/// parent, as for [`default_inbox_dir`].
-pub fn default_removed_dir(music_dir: &Path) -> Option<PathBuf> {
-    music_dir.parent().map(|p| p.join(REMOVED_DIR_NAME))
 }
 
 /// Replace filesystem-hostile characters in a path component.

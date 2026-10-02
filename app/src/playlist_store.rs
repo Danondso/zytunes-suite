@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::cache::{default_logger, Logger};
-use crate::playlist::{now_unix_ms, Playlist, PlaylistKind, SeedStrategy};
+use crate::playlist::{now_unix_ms, Playlist};
 
 /// Bumped whenever the on-disk shape changes such that older entries would
 /// silently sit at default values for new fields. On mismatch the file is
@@ -163,41 +163,6 @@ impl PlaylistStore {
             Some(p) => p.remove_track(track_id),
             None => false,
         }
-    }
-
-    /// Point playlists at the survivor of each merged track (`loser →
-    /// winner`, see `track_ids::TrackIds::apply_moves`). Returns `true` if
-    /// any playlist changed.
-    pub fn remap_track_ids(&mut self, map: &std::collections::HashMap<u64, u64>) -> bool {
-        let mut changed = false;
-        for p in &mut self.playlists {
-            for id in p
-                .track_ids
-                .iter_mut()
-                .chain(p.previously_recommended.iter_mut())
-            {
-                if let Some(new) = map.get(id) {
-                    *id = *new;
-                    changed = true;
-                }
-            }
-            let PlaylistKind::Generated { params, .. } = &mut p.kind else {
-                continue;
-            };
-            if let SeedStrategy::Track(id) = &mut params.seed_strategy {
-                if let Some(new) = map.get(id) {
-                    *id = *new;
-                    changed = true;
-                }
-            }
-            for id in &mut params.exclude_track_ids {
-                if let Some(new) = map.get(id) {
-                    *id = *new;
-                    changed = true;
-                }
-            }
-        }
-        changed
     }
 
     /// Reorder a track within a playlist. Returns `true` on success.
@@ -371,8 +336,7 @@ fn derive_id(created_at_ms: u64, name: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::playlist::{GenerationParams, Playlist, PlaylistKind, SeedStrategy};
-    use std::collections::HashMap;
+    use crate::playlist::{GenerationParams, Playlist};
 
     fn temp_path(stem: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -443,35 +407,6 @@ mod tests {
         assert_eq!(s.get(id).unwrap().name, "Roadtrip");
         assert!(s.rename(id, "\tTabbed\n").is_ok());
         assert_eq!(s.get(id).unwrap().name, "Tabbed");
-    }
-
-    #[test]
-    fn remap_track_ids_follows_renamed_tracks() {
-        let mut s = PlaylistStore::new();
-        let id = s.add(Playlist::new_manual("Faves"));
-        s.add_track(id, 1);
-        s.add_track(id, 2);
-        s.add_track(id, 3);
-        let map = HashMap::from([(2u64, 20u64)]);
-        assert!(s.remap_track_ids(&map), "something changed");
-        assert_eq!(s.get(id).unwrap().track_ids, vec![1, 20, 3]);
-        assert!(!s.remap_track_ids(&map), "nothing left to remap");
-    }
-
-    #[test]
-    fn remap_track_ids_follows_a_generated_seed_and_its_excludes() {
-        let mut params = GenerationParams::default_discover_weekly();
-        params.seed_strategy = SeedStrategy::Track(5);
-        params.exclude_track_ids = vec![7, 8];
-        let mut s = PlaylistStore::new();
-        let id = s.add(Playlist::new_generated("More like this", params, vec![1]));
-        assert!(s.remap_track_ids(&HashMap::from([(5u64, 50), (7, 70)])));
-        let kind = &s.get(id).unwrap().kind;
-        let PlaylistKind::Generated { params, .. } = kind else {
-            panic!("generated playlist");
-        };
-        assert_eq!(params.seed_strategy, SeedStrategy::Track(50));
-        assert_eq!(params.exclude_track_ids, vec![70, 8]);
     }
 
     #[test]

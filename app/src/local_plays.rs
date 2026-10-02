@@ -147,31 +147,6 @@ impl LocalPlays {
         entry.last_played_at_ms = now_ms;
     }
 
-    /// Fold the play stats of each merged track into its survivor (`loser
-    /// → winner`, see `track_ids::TrackIds::apply_moves`): counts add, the
-    /// latest play wins. Returns `true` if anything moved.
-    ///
-    /// Every old entry is lifted out before any is put back, so a map
-    /// holding both `a -> b` and `b -> c` cannot land `a`'s stats on `b`
-    /// and then carry them on to `c`.
-    pub fn remap_track_ids(&mut self, map: &HashMap<u64, u64>) -> bool {
-        let lifted: Vec<(u64, TrackPlays)> = map
-            .iter()
-            .filter_map(|(old, new)| Some((*new, self.tracks.remove(old)?)))
-            .collect();
-        let changed = !lifted.is_empty();
-        for (new, moved) in lifted {
-            let entry = self.tracks.entry(new).or_default();
-            entry.play_count = entry.play_count.saturating_add(moved.play_count);
-            entry.skip_count = entry.skip_count.saturating_add(moved.skip_count);
-            entry.last_played_at_ms = entry.last_played_at_ms.max(moved.last_played_at_ms);
-            for (k, v) in moved.device_baselines {
-                entry.device_baselines.entry(k).or_insert(v);
-            }
-        }
-        changed
-    }
-
     /// Record a TUI skip: pre-threshold abandonment via next/prev/stop.
     /// Does not touch `last_played_at_ms` — a skip isn't a "play."
     pub fn record_skip(&mut self, track_id: u64) {
@@ -348,60 +323,6 @@ pub fn now_unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn remap_track_ids_carries_plays_to_the_new_id() {
-        let mut p = LocalPlays::new();
-        p.record_play(1, 100);
-        p.record_play(1, 200);
-        p.record_skip(1);
-        let map = HashMap::from([(1u64, 10u64)]);
-        assert!(p.remap_track_ids(&map));
-        assert!(p.get(1).is_none(), "old id is gone");
-        let moved = p.get(10).unwrap();
-        assert_eq!(
-            (moved.play_count, moved.skip_count, moved.last_played_at_ms),
-            (2, 1, 200)
-        );
-        assert!(!p.remap_track_ids(&map));
-    }
-
-    #[test]
-    fn remap_track_ids_merges_into_an_existing_entry() {
-        let mut p = LocalPlays::new();
-        p.record_play(1, 100);
-        p.record_play(10, 300);
-        assert!(p.remap_track_ids(&HashMap::from([(1u64, 10u64)])));
-        let merged = p.get(10).unwrap();
-        assert_eq!(merged.play_count, 2);
-        assert_eq!(merged.last_played_at_ms, 300, "latest play wins");
-    }
-
-    #[test]
-    fn remap_track_ids_keeps_a_rename_chain_apart() {
-        // An apply can move track 1 into the path track 2 just left, and
-        // so on down the album: id n -> n+1 for every track. Each track's
-        // plays must follow that track, not pile up at the end of the
-        // chain. Eight links so a lucky map order cannot pass by accident.
-        let mut p = LocalPlays::new();
-        for id in 1..=8u64 {
-            for _ in 0..id {
-                p.record_play(id, id * 100);
-            }
-        }
-        let map: HashMap<u64, u64> = (1..=8u64).map(|id| (id, id + 1)).collect();
-        assert!(p.remap_track_ids(&map));
-        assert!(p.get(1).is_none(), "nothing moved into the first id");
-        for id in 1..=8u64 {
-            let moved = p.get(id + 1).unwrap();
-            assert_eq!(
-                (u64::from(moved.play_count), moved.last_played_at_ms),
-                (id, id * 100),
-                "track {id}'s plays are under {}",
-                id + 1
-            );
-        }
-    }
 
     // -- play_threshold_ms --
 

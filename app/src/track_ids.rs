@@ -4,7 +4,8 @@
 //! file a new identity and each store keyed on the ID (playlists, play
 //! stats, the listen log) had to be re-keyed by hand. The registry here
 //! records `path → ID` once and moves the entry with the file: the ID a
-//! file was first seen under is the ID it keeps.
+//! file was first seen under is the ID it keeps, and nothing keyed on an
+//! ID is ever re-keyed.
 //!
 //! A new file's ID is still [`hash_path`] of where it was first seen, so
 //! every ID written before the registry existed stays valid with no
@@ -92,12 +93,12 @@ impl TrackIds {
     /// (itself when untouched). All moves are taken from one snapshot, so a
     /// chain (`a → b` while `b → c`) keeps both IDs apart.
     ///
-    /// A file that lands on a path another track still holds was folded
-    /// into that track (a replace). The occupant keeps its ID and the pair
-    /// is returned as `loser → winner`, the only case where a store keyed
-    /// on IDs has anything to re-key.
-    pub fn apply_moves(&mut self, moved: impl Fn(&Path) -> PathBuf) -> HashMap<u64, u64> {
-        let mut movers: Vec<(String, String)> = self
+    /// An apply never lands a file on another (it files it beside), so an
+    /// entry already at a mover's new path is for a file that is gone. The
+    /// mover keeps its own ID and that entry's ID is freed: no two tracks
+    /// are ever folded into one, and no store keyed on IDs is ever re-keyed.
+    pub fn apply_moves(&mut self, moved: impl Fn(&Path) -> PathBuf) {
+        let movers: Vec<(String, String)> = self
             .by_path
             .keys()
             .filter_map(|old| {
@@ -105,27 +106,16 @@ impl TrackIds {
                 (new != Path::new(old)).then(|| (old.clone(), new.to_string_lossy().into_owned()))
             })
             .collect();
-        // Two movers onto one path cannot both keep an ID; sorted so the
-        // survivor does not depend on map order.
-        movers.sort();
         let lifted: Vec<(String, u64)> = movers
             .into_iter()
             .filter_map(|(old, new)| self.by_path.remove(&old).map(|id| (new, id)))
             .collect();
-        let mut merges = HashMap::new();
         for (new, id) in lifted {
             self.dirty = true;
-            match self.by_path.get(&new) {
-                Some(&winner) => {
-                    self.used.remove(&id);
-                    merges.insert(id, winner);
-                }
-                None => {
-                    self.by_path.insert(new, id);
-                }
+            if let Some(stale) = self.by_path.insert(new, id) {
+                self.used.remove(&stale);
             }
         }
-        merges
     }
 
     /// Drop entries whose path `keep` rejects (files a full scan no longer
@@ -241,12 +231,7 @@ pub fn with_registry<R>(root: &str, log: &Logger, f: impl FnOnce(&mut TrackIds) 
 }
 
 /// Record the moves an apply performed, before the library is re-read.
-/// Returns the `loser → winner` merges of [`TrackIds::apply_moves`].
-pub fn record_moves(
-    root: &str,
-    log: &Logger,
-    moved: impl Fn(&Path) -> PathBuf,
-) -> HashMap<u64, u64> {
+pub fn record_moves(root: &str, log: &Logger, moved: impl Fn(&Path) -> PathBuf) {
     with_registry(root, log, |ids| ids.apply_moves(moved))
 }
 
@@ -290,8 +275,7 @@ mod tests {
     fn a_moved_file_keeps_its_id() {
         let mut ids = TrackIds::default();
         let id = ids.id_for(&p("/music/a/b/01.mp3"));
-        let merges = ids.apply_moves(renames(&[("/music/a/b/01.mp3", "/music/A/B/01.mp3")]));
-        assert!(merges.is_empty(), "a plain move merges nothing");
+        ids.apply_moves(renames(&[("/music/a/b/01.mp3", "/music/A/B/01.mp3")]));
         assert_eq!(ids.id_for(&p("/music/A/B/01.mp3")), id);
         assert_eq!(ids.get(&p("/music/a/b/01.mp3")), None);
     }
@@ -319,8 +303,7 @@ mod tests {
         let two = ids.id_for(&p("/music/alice in chains/Facelift/01.mp3"));
         let other = ids.id_for(&p("/music/Tool/Lateralus/01.mp3"));
         let dirs = vec![(p("/music/alice in chains"), p("/music/Alice In Chains"))];
-        let merges = ids.apply_moves(|old| crate::tag_ops::remap_through_dir_renames(old, &dirs));
-        assert!(merges.is_empty());
+        ids.apply_moves(|old| crate::tag_ops::remap_through_dir_renames(old, &dirs));
         assert_eq!(ids.get(&p("/music/Alice In Chains/Dirt/01.mp3")), Some(one));
         assert_eq!(
             ids.get(&p("/music/Alice In Chains/Facelift/01.mp3")),
@@ -331,34 +314,39 @@ mod tests {
     }
 
     #[test]
-    fn a_move_onto_a_held_path_merges_into_the_track_there() {
-        // A replace folds two tracks into one. The track already at the
-        // dest keeps its ID; the mover's ID is reported so stores can fold
-        // its playlist rows and play counts into the survivor.
+    fn a_move_onto_a_registered_path_takes_it_over() {
+        // An apply never lands a file on one that is there (it files it
+        // beside). So an entry at the new path is for a file that has
+        // since been deleted by hand, and the mover keeps its own ID.
         let mut ids = TrackIds::default();
-        let incoming = ids.id_for(&p("/music/feat/01.mp3"));
-        let in_place = ids.id_for(&p("/music/Artist/Album/01.mp3"));
-        let merges = ids.apply_moves(renames(&[(
+        let mover = ids.id_for(&p("/music/feat/01.mp3"));
+        let stale = ids.id_for(&p("/music/Artist/Album/01.mp3"));
+        ids.apply_moves(renames(&[(
             "/music/feat/01.mp3",
             "/music/Artist/Album/01.mp3",
         )]));
-        assert_eq!(merges, HashMap::from([(incoming, in_place)]));
-        assert_eq!(ids.get(&p("/music/Artist/Album/01.mp3")), Some(in_place));
+        assert_eq!(ids.get(&p("/music/Artist/Album/01.mp3")), Some(mover));
         assert_eq!(ids.get(&p("/music/feat/01.mp3")), None);
+        // The stale ID is free again.
+        assert_eq!(
+            ids.id_for(&p("/music/gone.mp3")),
+            hash_path(&p("/music/gone.mp3"))
+        );
+        ids.retain(|path| path != "/music/Artist/Album/01.mp3");
+        assert_eq!(ids.id_for(&p("/music/Artist/Album/01.mp3")), stale);
     }
 
     #[test]
     fn a_rename_chain_keeps_both_ids_apart() {
         // `a → b` while `b → c`: b's track is moving out, so a's arrival
-        // is not a merge.
+        // must not cost it its ID.
         let mut ids = TrackIds::default();
         let a = ids.id_for(&p("/music/a.mp3"));
         let b = ids.id_for(&p("/music/b.mp3"));
-        let merges = ids.apply_moves(renames(&[
+        ids.apply_moves(renames(&[
             ("/music/a.mp3", "/music/b.mp3"),
             ("/music/b.mp3", "/music/c.mp3"),
         ]));
-        assert!(merges.is_empty(), "{merges:?}");
         assert_eq!(ids.get(&p("/music/b.mp3")), Some(a));
         assert_eq!(ids.get(&p("/music/c.mp3")), Some(b));
         assert_eq!(ids.get(&p("/music/a.mp3")), None);

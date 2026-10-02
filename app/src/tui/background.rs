@@ -290,13 +290,6 @@ pub enum BgCommand {
         mb_base_url: Option<String>,
         mb_user_agent: Option<String>,
     },
-    /// Read the two copies of each filing conflict off the UI thread.
-    /// `replace_conflicts` parses audio (properties, and by default cover
-    /// art); doing that in the key handler freezes the TUI on a slow disk.
-    ProbeReplaceConflicts {
-        token: u64,
-        diff: Box<zytunes::tag_ops::ReleaseTagDiff>,
-    },
     /// Apply an approved tag diff to disk, then surgically re-read the
     /// affected files into the library. Emits [`BgEvent::TagsApplied`]
     /// followed by [`BgEvent::LibraryRereadComplete`].
@@ -314,12 +307,6 @@ pub enum BgCommand {
         diff: Box<zytunes::tag_ops::ReleaseTagDiff>,
         music_dir: String,
         fingerprint: bool,
-        /// Filing (`F` / inbox): overwrite a dest that already exists so
-        /// a feat-folder copy does not sit beside the canonical file.
-        replace_existing: bool,
-        /// Sources whose dest already holds the copy the user chose to
-        /// keep: the source is removed instead of replacing it.
-        keep_existing: std::collections::HashSet<std::path::PathBuf>,
     },
     /// Look up a Chromaprint fingerprint against the AcoustID web service.
     /// Result is delivered as [`BgEvent::AcoustIdResolved`]. The tag-manager
@@ -593,11 +580,6 @@ pub enum BgEvent {
         token: u64,
         result: Result<Vec<zytunes::musicbrainz::ReleaseSearchHit>, String>,
     },
-    /// Outcome of [`BgCommand::ProbeReplaceConflicts`].
-    ReplaceConflictsProbed {
-        token: u64,
-        conflicts: Vec<zytunes::tag_ops::ReplaceConflict>,
-    },
     /// Outcome of [`BgCommand::MbReleaseDetails`]. Boxed because the
     /// `Release` payload is comparable in size to the cd `Identified`
     /// variant; clippy's `large_enum_variant` would fire otherwise.
@@ -616,14 +598,6 @@ pub enum BgEvent {
         /// Albums outside the diff moved with them, so the app remaps any
         /// queued filing cluster that still points under `old`.
         dir_renames: Vec<(std::path::PathBuf, std::path::PathBuf)>,
-        /// The copies this apply moved out of the library. A tag error on
-        /// a track whose file is here needs telling apart: for a dropped
-        /// incoming file it is about the copy that stayed, for a replaced
-        /// one about the file that is now in the removed-files folder.
-        set_aside: Vec<zytunes::tag_ops::SetAside>,
-        /// Tracks a replace folded into another, `loser → winner` library
-        /// ID. Empty for plain moves: a moved track keeps its ID.
-        id_merges: std::collections::HashMap<u64, u64>,
     },
     /// Phase 2 of `ApplyTagDiff`: surgical re-scan complete. Replaces
     /// `App.library` and (when the token still matches the open overlay)
@@ -2350,73 +2324,12 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                     }
                     let _ = event_tx.send(BgEvent::MbReleaseLoaded { token, result });
                 }
-                BgCommand::ProbeReplaceConflicts { token, diff } => {
-                    let conflicts = diff.replace_conflicts();
-                    let _ = event_tx.send(BgEvent::ReplaceConflictsProbed { token, conflicts });
-                }
                 BgCommand::ApplyTagDiff {
                     token,
                     diff,
                     music_dir,
                     fingerprint,
-                    replace_existing,
-                    keep_existing,
-                } => {
-                    let outcome = zytunes::tag_ops::apply_release_diff_keeping(
-                        &diff,
-                        replace_existing,
-                        &keep_existing,
-                        std::path::Path::new(&music_dir),
-                    );
-                    for aside in &outcome.set_aside {
-                        let _ = event_tx.send(BgEvent::SyncMessage(format!(
-                            "tag-manager: moved {} out of the library to {}",
-                            aside.was.display(),
-                            aside.now.display()
-                        )));
-                    }
-                    let paths = outcome.reread_paths(&diff, std::path::Path::new(&music_dir));
-                    let vacated = outcome.vacated();
-                    let dir_renames = outcome.dir_renames.clone();
-                    let moved_anything = !outcome.rename_map.is_empty() || !dir_renames.is_empty();
-                    let log_tx = event_tx.clone();
-                    let scan_log: zytunes::cache::Logger = std::sync::Arc::new(move |msg: &str| {
-                        let _ = log_tx.send(BgEvent::SyncMessage(msg.to_string()));
-                    });
-                    // Move each file's ID with it before anything reads the
-                    // library at the new paths. This is what keeps
-                    // playlists, play stats and stem splits (all keyed on
-                    // the ID) attached without re-keying.
-                    let id_merges = if moved_anything {
-                        zytunes::track_ids::record_moves(&music_dir, &scan_log, |old| {
-                            zytunes::tag_ops::moved_path(old, &outcome.rename_map, &dir_renames)
-                        })
-                    } else {
-                        std::collections::HashMap::new()
-                    };
-                    let _ = event_tx.send(BgEvent::TagsApplied {
-                        token,
-                        results: outcome.results,
-                        rename_map: outcome.rename_map,
-                        dir_renames: outcome.dir_renames,
-                        set_aside: outcome.set_aside,
-                        id_merges,
-                    });
-
-                    let lib_result = zytunes::dirlib::DirectoryLibrary::reread_paths_after(
-                        &music_dir,
-                        &paths,
-                        &vacated,
-                        &dir_renames,
-                        fingerprint,
-                        &scan_log,
-                    )
-                    .map(|l| Box::new(l) as Box<dyn zytunes::library::MusicLibrary + Send>);
-                    let _ = event_tx.send(BgEvent::LibraryRereadComplete {
-                        token,
-                        result: lib_result,
-                    });
-                }
+                } => run_tag_apply(token, &diff, &music_dir, fingerprint, &event_tx),
                 BgCommand::AcoustIdLookup {
                     token,
                     fingerprint,
@@ -3184,6 +3097,70 @@ impl StemJobs {
     fn acquire(&self) -> std::sync::MutexGuard<'_, ()> {
         self.lock.lock().unwrap_or_else(|e| e.into_inner())
     }
+}
+
+/// The whole of [`BgCommand::ApplyTagDiff`]: write tags and move files,
+/// move each file's track ID with it, report ([`BgEvent::TagsApplied`]),
+/// then re-read the touched paths ([`BgEvent::LibraryRereadComplete`]).
+pub(crate) fn run_tag_apply(
+    token: u64,
+    diff: &zytunes::tag_ops::ReleaseTagDiff,
+    music_dir: &str,
+    fingerprint: bool,
+    event_tx: &mpsc::Sender<BgEvent>,
+) {
+    let root = std::path::Path::new(music_dir);
+    let outcome = zytunes::tag_ops::apply_release_diff(diff, root);
+    // A dest that was already held is never replaced: the file went
+    // beside it. Say where, so the duplicate can be found.
+    for track in &diff.tracks {
+        let landed = outcome.rename_map.get(&track.src_path);
+        if let (Some(landed), Some(dest)) = (landed, track.dest_path.as_ref()) {
+            if landed != dest {
+                let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                    "tag-manager: {} is already in the library; filed {} beside it as {}",
+                    dest.display(),
+                    track.src_path.display(),
+                    landed.display()
+                )));
+            }
+        }
+    }
+    let paths = outcome.reread_paths(diff, root);
+    let vacated = outcome.vacated();
+    let dir_renames = outcome.dir_renames.clone();
+    let log_tx = event_tx.clone();
+    let scan_log: zytunes::cache::Logger = std::sync::Arc::new(move |msg: &str| {
+        let _ = log_tx.send(BgEvent::SyncMessage(msg.to_string()));
+    });
+    // Move each file's ID with it before anything reads the library at
+    // the new paths. This is what keeps playlists, play stats and stem
+    // splits (all keyed on the ID) attached to a track that moved.
+    if !outcome.rename_map.is_empty() || !dir_renames.is_empty() {
+        zytunes::track_ids::record_moves(music_dir, &scan_log, |old| {
+            zytunes::tag_ops::moved_path(old, &outcome.rename_map, &dir_renames)
+        });
+    }
+    let _ = event_tx.send(BgEvent::TagsApplied {
+        token,
+        results: outcome.results,
+        rename_map: outcome.rename_map,
+        dir_renames: outcome.dir_renames,
+    });
+
+    let lib_result = zytunes::dirlib::DirectoryLibrary::reread_paths_after(
+        music_dir,
+        &paths,
+        &vacated,
+        &dir_renames,
+        fingerprint,
+        &scan_log,
+    )
+    .map(|l| Box::new(l) as Box<dyn zytunes::library::MusicLibrary + Send>);
+    let _ = event_tx.send(BgEvent::LibraryRereadComplete {
+        token,
+        result: lib_result,
+    });
 }
 
 /// One album batch — the whole batch is ONE worker job (one supersede
