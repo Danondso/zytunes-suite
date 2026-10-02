@@ -29,6 +29,8 @@ pub mod tag_ops;
 pub mod track_ids;
 pub mod transcode;
 
+#[cfg(all(test, unix))]
+mod filing_model_tests;
 #[cfg(test)]
 mod test_audio;
 

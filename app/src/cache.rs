@@ -526,6 +526,16 @@ where
     updates
 }
 
+/// Delete the dirlib cache of `dir_path`. For tests that scan many
+/// throwaway roots and would otherwise leave a cache file for each.
+#[cfg(test)]
+pub(crate) fn forget_dirlib_cache(dir_path: &str) {
+    let _guard = dirlib_write_lock();
+    if let Some(path) = cache_path(&dirlib_cache_name(dir_path)) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

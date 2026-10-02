@@ -3099,8 +3099,8 @@ impl StemJobs {
     }
 }
 
-/// The whole of [`BgCommand::ApplyTagDiff`]: write tags and move files,
-/// move each file's track ID with it, report ([`BgEvent::TagsApplied`]),
+/// The whole of [`BgCommand::ApplyTagDiff`]: write tags, move files and
+/// their track IDs, report ([`BgEvent::TagsApplied`]),
 /// then re-read the touched paths ([`BgEvent::LibraryRereadComplete`]).
 pub(crate) fn run_tag_apply(
     token: u64,
@@ -3110,7 +3110,13 @@ pub(crate) fn run_tag_apply(
     event_tx: &mpsc::Sender<BgEvent>,
 ) {
     let root = std::path::Path::new(music_dir);
-    let outcome = zytunes::tag_ops::apply_release_diff(diff, root);
+    let log_tx = event_tx.clone();
+    let scan_log: zytunes::cache::Logger = std::sync::Arc::new(move |msg: &str| {
+        let _ = log_tx.send(BgEvent::SyncMessage(msg.to_string()));
+    });
+    // Track IDs move with the files in the same call, before anything
+    // reads the library at the new paths.
+    let outcome = zytunes::tag_ops::apply_and_record_moves(diff, music_dir, &scan_log);
     // A dest that was already held is never replaced: the file went
     // beside it. Say where, so the duplicate can be found.
     for track in &diff.tracks {
@@ -3129,18 +3135,6 @@ pub(crate) fn run_tag_apply(
     let paths = outcome.reread_paths(diff, root);
     let vacated = outcome.vacated();
     let dir_renames = outcome.dir_renames.clone();
-    let log_tx = event_tx.clone();
-    let scan_log: zytunes::cache::Logger = std::sync::Arc::new(move |msg: &str| {
-        let _ = log_tx.send(BgEvent::SyncMessage(msg.to_string()));
-    });
-    // Move each file's ID with it before anything reads the library at
-    // the new paths. This is what keeps playlists, play stats and stem
-    // splits (all keyed on the ID) attached to a track that moved.
-    if !outcome.rename_map.is_empty() || !dir_renames.is_empty() {
-        zytunes::track_ids::record_moves(music_dir, &scan_log, |old| {
-            zytunes::tag_ops::moved_path(old, &outcome.rename_map, &dir_renames)
-        });
-    }
     let _ = event_tx.send(BgEvent::TagsApplied {
         token,
         results: outcome.results,
