@@ -186,11 +186,16 @@ impl DirectoryLibrary {
         // Every file's ID comes from the registry, never from the path it
         // has today: a file the tag manager moved keeps the ID it was
         // first seen under. Resolved here in one pass because assigning a
-        // new ID has to see every ID already taken. Entries for files the
-        // walk no longer finds are dropped first.
+        // new ID has to see every ID already taken.
+        //
+        // An entry whose file the walk did not find is kept. The walk
+        // cannot tell a deleted file from an unmounted volume or a folder
+        // it could not list, and the entry is the only record of a moved
+        // track's ID: dropping it on a bad day would detach that track's
+        // playlists and play stats for good. A stale entry costs nothing
+        // (a file that later lands on its path takes the path over).
         let ids: HashMap<String, u64> =
             crate::track_ids::with_registry(path, &options.log, |registry| {
-                registry.retain(|p| extant_paths.contains(p));
                 paths
                     .iter()
                     .map(|p| (p.to_string_lossy().into_owned(), registry.id_for(p)))
@@ -2363,9 +2368,12 @@ mod tests {
         assert_eq!(out.dir_renames.len(), 2, "{:?}", out.dir_renames);
 
         let log = crate::cache::default_logger();
-        crate::track_ids::record_moves(dir.to_str().unwrap(), &log, |p| {
-            crate::tag_ops::moved_path(p, &out.rename_map, &out.dir_renames)
-        });
+        crate::track_ids::record_moves(
+            dir.to_str().unwrap(),
+            &log,
+            |p| crate::tag_ops::moved_path(p, &out.rename_map, &out.dir_renames),
+            |p| out.rename_map.contains_key(p),
+        );
         let lib = DirectoryLibrary::reread_paths_after(
             dir.to_str().unwrap(),
             &out.reread_paths(&diff, &dir),
@@ -2429,6 +2437,40 @@ mod tests {
     }
 
     #[test]
+    fn a_scan_that_finds_nothing_does_not_cost_moved_tracks_their_ids() {
+        // An unmounted volume leaves the mount point as an empty folder.
+        // A scan then finds no files; if it dropped their registry entries
+        // every moved track would come back with a new ID once the volume
+        // is mounted again.
+        let dir = std::env::temp_dir().join(format!("zytunes-ids-unmount-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let root = dir.to_str().unwrap();
+        crate::track_ids::forget(root);
+        let old = dir.join("loose").join("track.mp3");
+        let new = dir.join("Artist").join("Album").join("01 - Song.mp3");
+        fs::create_dir_all(old.parent().unwrap()).unwrap();
+        fs::write(&old, b"fake").unwrap();
+        let lib = DirectoryLibrary::scan(root).unwrap();
+        let id = id_of(&lib, &old).expect("scanned");
+        let log = crate::cache::default_logger();
+        let out = crate::tag_ops::apply_and_record_moves(&rename_only_diff(&old, &new), root, &log);
+        assert!(out.results[0].is_ok(), "{:?}", out.results[0]);
+
+        let away = std::env::temp_dir().join(format!("zytunes-ids-away-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&away);
+        fs::rename(dir.join("Artist"), &away).unwrap();
+        let empty = DirectoryLibrary::scan(root).unwrap();
+        assert_eq!(empty.all_tracks().count(), 0);
+        fs::rename(&away, dir.join("Artist")).unwrap();
+
+        let lib = DirectoryLibrary::scan(root).unwrap();
+        assert_eq!(id_of(&lib, &new), Some(id));
+        crate::track_ids::forget(root);
+        crate::cache::forget_dirlib_cache(root);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_moved_track_keeps_its_id_through_the_reread() {
         // The ID is what playlists, play stats and the listen log hold. A
         // move must not change it, so none of them has to be told.
@@ -2447,9 +2489,12 @@ mod tests {
         let out = crate::tag_ops::apply_release_diff(&diff, &dir);
         assert!(out.results[0].is_ok(), "{:?}", out.results[0]);
         let log = crate::cache::default_logger();
-        crate::track_ids::record_moves(root, &log, |p| {
-            crate::tag_ops::moved_path(p, &out.rename_map, &out.dir_renames)
-        });
+        crate::track_ids::record_moves(
+            root,
+            &log,
+            |p| crate::tag_ops::moved_path(p, &out.rename_map, &out.dir_renames),
+            |p| out.rename_map.contains_key(p),
+        );
         let lib = DirectoryLibrary::reread_paths_after(
             root,
             &out.reread_paths(&diff, &dir),
@@ -2485,9 +2530,12 @@ mod tests {
         let out = crate::tag_ops::apply_release_diff(&diff, &dir);
         assert!(out.results[0].is_ok(), "{:?}", out.results[0]);
         let log = crate::cache::default_logger();
-        crate::track_ids::record_moves(root, &log, |p| {
-            crate::tag_ops::moved_path(p, &out.rename_map, &out.dir_renames)
-        });
+        crate::track_ids::record_moves(
+            root,
+            &log,
+            |p| crate::tag_ops::moved_path(p, &out.rename_map, &out.dir_renames),
+            |p| out.rename_map.contains_key(p),
+        );
         crate::cache::save_dirlib_cache(root, HashMap::new(), &log);
 
         let lib = DirectoryLibrary::scan(root).unwrap();

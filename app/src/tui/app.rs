@@ -1617,10 +1617,11 @@ impl App {
         }
         app.acoustid_fingerprint = cfg.acoustid_fingerprint.unwrap_or(true);
         app.scan_fingerprint = cfg.fingerprinting.unwrap_or(true);
-        app.music_dir_cache = cfg
-            .music_dir
-            .clone()
-            .or_else(|| std::env::var("ZYTUNES_MUSIC_DIR").ok())
+        // Same precedence as the scan (`resolve_music_dir`: environment,
+        // then config), so the two never name different folders.
+        app.music_dir_cache = zytunes::resolve_music_dir(cfg.music_dir.as_deref())
+            .ok()
+            .or_else(|| cfg.music_dir.clone())
             .map(std::path::PathBuf::from);
         app.stems_cfg = cfg.stems;
         app
@@ -2554,6 +2555,22 @@ impl App {
         cmd_tx: Option<&mpsc::Sender<BgCommand>>,
         enter_armed: bool,
     ) {
+        // An album whose files are all waiting in the queue already (`F`
+        // pressed twice on one artist) is not queued a second time: the
+        // second copy would open after the first was filed, on paths that
+        // are gone.
+        let queued: HashSet<&str> = self
+            .inbox
+            .queue
+            .iter()
+            .flat_map(|c| c.tracks.iter())
+            .filter_map(|t| t.location.as_deref())
+            .collect();
+        clusters.retain(|c| {
+            !c.tracks
+                .iter()
+                .all(|t| t.location.as_deref().is_some_and(|l| queued.contains(l)))
+        });
         if clusters.is_empty() {
             return;
         }
@@ -3023,6 +3040,7 @@ impl App {
         token: u64,
         result: Result<Box<zytunes::musicbrainz::Release>, String>,
     ) {
+        let music_root = self.music_root();
         let Some(overlay) = self.tag_manager.as_mut() else {
             return;
         };
@@ -3074,11 +3092,7 @@ impl App {
             return;
         }
 
-        let music_root_path = match self.music_dir_cache.clone().or_else(|| {
-            self.library
-                .as_ref()
-                .and_then(|l| l.music_folder().map(std::path::PathBuf::from))
-        }) {
+        let music_root_path = match music_root {
             Some(p) => p,
             None => {
                 // Without a known music root the proposed filename diff
@@ -3138,6 +3152,26 @@ impl App {
                 );
                 track.location = new.to_string_lossy().into_owned();
             }
+        }
+    }
+
+    /// The device sync queue also holds each track's artist, album and
+    /// title from when it was queued, and the upload files the track on
+    /// the device under those. After an apply they are taken again from
+    /// the re-read library, so a filed album syncs under its new names.
+    fn refresh_queued_sync_tags(&mut self) {
+        let Some(lib) = self.library.as_ref() else {
+            return;
+        };
+        for item in self.sync.queue.iter_mut().flat_map(|q| q.tracks.iter_mut()) {
+            let Some(track) = lib.track_by_location(&item.location) else {
+                continue;
+            };
+            item.artist = track.artist.clone();
+            item.album = track.album.clone();
+            item.name = track.name.clone();
+            item.track_number = track.track_number;
+            item.genre = track.genre.clone();
         }
     }
 
@@ -3246,17 +3280,19 @@ impl App {
         rename_map: std::collections::HashMap<PathBuf, PathBuf>,
         dir_renames: &[(PathBuf, PathBuf)],
     ) {
-        // The folders moved on disk whether or not this overlay is still
-        // open, so queued clusters are remapped even for a stale token.
-        if !dir_renames.is_empty() {
+        // The files and folders moved on disk whether or not this overlay
+        // is still open, so queued clusters are remapped even for a stale
+        // token.
+        if !rename_map.is_empty() || !dir_renames.is_empty() {
             let queued = self
                 .inbox
                 .queue
                 .iter_mut()
                 .flat_map(|c| c.tracks.iter_mut());
             for loc in queued.filter_map(|t| t.location.as_mut()) {
-                let moved = zytunes::tag_ops::remap_through_dir_renames(
+                let moved = zytunes::tag_ops::moved_path(
                     std::path::Path::new(loc.as_str()),
+                    &rename_map,
                     dir_renames,
                 );
                 *loc = moved.to_string_lossy().into_owned();
@@ -3365,6 +3401,7 @@ impl App {
             Ok(lib) => {
                 self.library = Some(lib);
                 self.inbox.hold_until_library = false;
+                self.refresh_queued_sync_tags();
                 self.refresh_track_info_lib();
                 self.rebuild_artist_device_status();
                 self.refresh_sidebar();
@@ -3389,8 +3426,10 @@ impl App {
                 // The files moved but the library still shows them where
                 // they were. Queued clusters wait for a library that
                 // loads, however this overlay is left: closed from Done or
-                // Error, or by way of Esc back to search.
+                // Error, or by way of Esc back to search. A full scan is
+                // the way back to a library that matches the disk.
                 self.inbox.hold_until_library = true;
+                self.queue_library_reload();
                 if overlay_matches {
                     if let Some(overlay) = self.tag_manager.as_mut() {
                         overlay.error = Some(e);
@@ -3815,21 +3854,13 @@ impl App {
     }
 
     fn dispatch_tag_diff_apply(&mut self, cmd_tx: Option<&mpsc::Sender<BgCommand>>) {
+        let music_dir = self.music_root().map(|p| p.to_string_lossy().into_owned());
         let Some(overlay) = self.tag_manager.as_mut() else {
             return;
         };
         let Some(diff) = overlay.diff.clone() else {
             return;
         };
-        let music_dir = self
-            .music_dir_cache
-            .as_ref()
-            .map(|p| p.to_string_lossy().to_string())
-            .or_else(|| {
-                self.library
-                    .as_ref()
-                    .and_then(|l| l.music_folder().map(String::from))
-            });
         let Some(music_dir) = music_dir else {
             overlay.error = Some("music directory unknown".into());
             overlay.phase = TagManagerPhase::Error;
@@ -4680,9 +4711,21 @@ impl App {
     /// Whether `loc` lives under the music library. `false` for device
     /// paths and when the library root is unknown.
     fn is_library_path(&self, loc: &str) -> bool {
-        self.music_dir_cache
-            .as_ref()
+        self.music_root()
             .is_some_and(|root| std::path::Path::new(loc).starts_with(root))
+    }
+
+    /// The library root: the folder the loaded library was scanned from,
+    /// spelled as the scan was given it. The track-ID registry and the
+    /// scan cache are both named after that string, so an apply handed
+    /// any other spelling (or the config's folder while the environment
+    /// variable picked another) would move files without moving their
+    /// IDs. The configured folder only stands in until a library loads.
+    fn music_root(&self) -> Option<PathBuf> {
+        self.library
+            .as_ref()
+            .and_then(|l| l.music_folder().map(PathBuf::from))
+            .or_else(|| self.music_dir_cache.clone())
     }
 
     /// Library track plus the id a play should be recorded under. A row
@@ -6032,7 +6075,7 @@ impl App {
     /// "imported a file" path. No-op if `music_dir_cache` is None
     /// (no library configured — there's nothing to scan).
     fn queue_library_reload(&mut self) {
-        let Some(music_dir) = self.music_dir_cache.as_ref() else {
+        let Some(music_dir) = self.music_root() else {
             return;
         };
         let music_dir_str = music_dir.to_string_lossy().into_owned();
@@ -6209,7 +6252,7 @@ impl App {
     /// `music_dir` from config cached at `App::new()`. Tests can override
     /// `music_dir_cache` directly without env var games.
     fn import_destination(&self) -> Option<std::path::PathBuf> {
-        self.music_dir_cache.clone()
+        self.music_root()
     }
 
     /// Cancel an in-flight rip. Sends `BgCommand::CancelRip`. The worker
@@ -6386,10 +6429,10 @@ impl App {
         if self.library.is_none() {
             return;
         }
-        let Some(music_dir) = self.music_dir_cache.as_ref() else {
+        let Some(music_dir) = self.music_root() else {
             return;
         };
-        let Some(inbox) = zytunes::library_layout::default_inbox_dir(music_dir) else {
+        let Some(inbox) = zytunes::library_layout::default_inbox_dir(&music_dir) else {
             return;
         };
         self.inbox.last_request = Some(Instant::now());
@@ -16698,5 +16741,124 @@ mod tests {
             "second open proposed {still_enabled:?} again"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn queued_cluster(location: &str) -> zytunes::library_layout::AlbumCluster {
+        zytunes::library_layout::AlbumCluster {
+            artist: "Alice In Chains".into(),
+            album: "Facelift".into(),
+            tracks: vec![Track {
+                id: 2,
+                name: "We Die Young".into(),
+                artist: "Alice In Chains".into(),
+                album: "Facelift".into(),
+                location: Some(location.into()),
+                ..Default::default()
+            }],
+        }
+    }
+
+    #[test]
+    fn the_apply_root_is_the_folder_the_library_was_scanned_from() {
+        // The ID registry is named after the scan root. With the
+        // environment variable and the config naming different folders
+        // (or one folder two ways), an apply given the config's would
+        // move files and leave their IDs behind.
+        let scanned = std::env::temp_dir().join(format!("zytunes-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scanned);
+        std::fs::create_dir_all(&scanned).unwrap();
+        let mut app = App::new();
+        app.music_dir_cache = Some(PathBuf::from("/from/config"));
+        assert_eq!(app.music_root(), Some(PathBuf::from("/from/config")));
+        let lib = zytunes::dirlib::DirectoryLibrary::scan(scanned.to_str().unwrap()).unwrap();
+        app.library = Some(Box::new(lib));
+        assert_eq!(app.music_root(), Some(scanned.clone()));
+        let _ = std::fs::remove_dir_all(&scanned);
+    }
+
+    #[test]
+    fn a_queued_album_follows_a_file_the_apply_renamed() {
+        // Queued clusters used to follow folder retitles only. One whose
+        // file an apply renamed opened later on a path that was gone.
+        let mut app = App::new();
+        app.inbox.queue.push_back(queued_cluster("/m/a/old.wav"));
+        let rename_map: std::collections::HashMap<PathBuf, PathBuf> = [(
+            PathBuf::from("/m/a/old.wav"),
+            PathBuf::from("/m/A/01 - New.wav"),
+        )]
+        .into();
+        app.handle_tags_applied(0, vec![Ok(())], rename_map, &[]);
+        assert_eq!(
+            app.inbox.queue[0].tracks[0].location.as_deref(),
+            Some("/m/A/01 - New.wav")
+        );
+    }
+
+    #[test]
+    fn filing_the_same_albums_twice_queues_them_once() {
+        let mut app = App::new();
+        app.inbox.queue.push_back(queued_cluster("/m/a/b.wav"));
+        app.enqueue_file_clusters(
+            vec![
+                queued_cluster("/m/a/first.wav"),
+                queued_cluster("/m/a/b.wav"),
+            ],
+            None,
+            false,
+        );
+        assert_eq!(app.inbox.queue.len(), 1, "already queued, not queued again");
+    }
+
+    #[test]
+    fn a_queued_sync_track_takes_the_tags_the_apply_wrote() {
+        // The sync uploads with the queued artist/album/title. Left at
+        // their pre-apply values, a filed album lands on the device under
+        // its old names.
+        let mut app = App::new();
+        app.sync.queue.push(QueuedItem {
+            label: "x".into(),
+            tracks: vec![SyncItem {
+                artist: "alice in chains".into(),
+                album: "dirt".into(),
+                name: "them bones".into(),
+                location: "/m/Alice In Chains/Dirt/01 - Them Bones.wav".into(),
+                ..Default::default()
+            }],
+        });
+        let lib = VecLibrary {
+            tracks: vec![Track {
+                id: 1,
+                name: "Them Bones".into(),
+                artist: "Alice In Chains".into(),
+                album: "Dirt".into(),
+                track_number: Some(1),
+                location: Some("/m/Alice In Chains/Dirt/01 - Them Bones.wav".into()),
+                ..Default::default()
+            }],
+        };
+        app.handle_library_reread_complete(0, Ok(Box::new(lib)));
+        let item = &app.sync.queue[0].tracks[0];
+        assert_eq!(
+            (
+                item.artist.as_str(),
+                item.album.as_str(),
+                item.name.as_str()
+            ),
+            ("Alice In Chains", "Dirt", "Them Bones")
+        );
+        assert_eq!(item.track_number, Some(1));
+    }
+
+    #[test]
+    fn a_failed_reread_asks_for_a_full_rescan() {
+        // The files moved; without a library that knows it, every moved
+        // row plays or syncs a path that is gone.
+        let mut app = App::new();
+        app.music_dir_cache = Some(PathBuf::from("/m"));
+        app.handle_library_reread_complete(0, Err("disk".into()));
+        assert!(app
+            .pending_bg_commands
+            .iter()
+            .any(|c| matches!(c, BgCommand::LoadLibrary { .. })));
     }
 }

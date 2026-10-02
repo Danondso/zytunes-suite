@@ -1036,9 +1036,12 @@ pub fn apply_and_record_moves(
 ) -> ApplyOutcome {
     let outcome = apply_release_diff(diff, Path::new(music_dir));
     if !outcome.rename_map.is_empty() || !outcome.dir_renames.is_empty() {
-        crate::track_ids::record_moves(music_dir, log, |old| {
-            moved_path(old, &outcome.rename_map, &outcome.dir_renames)
-        });
+        crate::track_ids::record_moves(
+            music_dir,
+            log,
+            |old| moved_path(old, &outcome.rename_map, &outcome.dir_renames),
+            |old| outcome.rename_map.contains_key(old),
+        );
     }
     outcome
 }
@@ -1084,8 +1087,17 @@ fn write_tags_at(src: &Path, to_apply: &[&FieldDiff]) -> Result<(), String> {
     let tmp = tagtmp_path(src);
     // Clean up a leftover from a prior crash before copying.
     let _ = std::fs::remove_file(&tmp);
-    std::fs::copy(src, &tmp)
-        .map_err(|e| format!("tag-save: copy {} -> {}: {e}", src.display(), tmp.display()))?;
+    if let Err(e) = std::fs::copy(src, &tmp) {
+        // A copy that ran out of disk leaves what it wrote so far. The
+        // file may be moved next, and nothing would come back for a temp
+        // beside its old path.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!(
+            "tag-save: copy {} -> {}: {e}",
+            src.display(),
+            tmp.display()
+        ));
+    }
 
     let result = write_then_swap(&tmp, src, to_apply);
     if result.is_err() {
@@ -1441,6 +1453,15 @@ fn perform_rename(
     library_root: &Path,
     dir_renames: &mut Vec<(PathBuf, PathBuf)>,
 ) -> Result<PathBuf, String> {
+    // `rename` between two hard links of one file succeeds and does
+    // nothing: both names stay, and the move would be reported as done.
+    if is_hard_link_pair(src, dest) {
+        return Err(format!(
+            "{} and {} are hard links to one file; left as they are",
+            src.display(),
+            dest.display()
+        ));
+    }
     // Every new spelling is free (or is this same entry on a case-folding
     // volume): change the stored names in place. Otherwise the canonical
     // folder already exists separately and takes the normal move below.
@@ -1459,9 +1480,49 @@ fn perform_rename(
     // file at `dest` that nothing could see earlier.
     let landing = landing_path(&src, dest);
     if landing != src {
+        refuse_relative_symlink(&src, &landing)?;
         move_file(&src, &landing)?;
     }
     Ok(landing)
+}
+
+/// `src` and `dest` are two directory entries for one file (hard links),
+/// as opposed to two spellings a case- or normalisation-folding volume
+/// resolves to ONE entry. Both have the same inode; only real links are
+/// both listed under their exact names.
+fn is_hard_link_pair(src: &Path, dest: &Path) -> bool {
+    fn listed(path: &Path) -> bool {
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            return false;
+        };
+        std::fs::read_dir(parent)
+            .is_ok_and(|entries| entries.flatten().any(|e| e.file_name() == name))
+    }
+    if src == dest || !same_inode(src, dest) || !listed(src) || !listed(dest) {
+        return false;
+    }
+    // One entry reached through two spellings of its folder.
+    let same_folder = match (src.parent(), dest.parent()) {
+        (Some(a), Some(b)) => a == b || same_inode(a, b),
+        _ => false,
+    };
+    !(same_folder && src.file_name() == dest.file_name())
+}
+
+/// A relative symlink moved to another folder points at nothing: the
+/// track would vanish from where it was and never show up where it went.
+fn refuse_relative_symlink(src: &Path, landing: &Path) -> Result<(), String> {
+    if src.parent() == landing.parent() {
+        return Ok(());
+    }
+    match std::fs::read_link(src) {
+        Ok(target) if target.is_relative() => Err(format!(
+            "{} is a relative symlink to {}; file the linked file instead",
+            src.display(),
+            target.display()
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Give each existing folder between `library_root` and `dest` the
@@ -3486,13 +3547,59 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn same_inode_dest_is_a_retitle_not_a_collision() {
+    fn hard_linked_src_and_dest_are_left_alone_and_reported() {
+        // `rename` between two links of one file does nothing. Reporting
+        // it as a move would drop `src` from the library while it is
+        // still on disk.
         let (src, dest) = same_file_two_unicode_spellings("same-inode-no-replace");
         let root = src.ancestors().nth(3).unwrap().to_path_buf();
-        let ApplyOutcome { results, .. } =
-            apply_release_diff(&rename_only_diff(&src, &dest), &root);
-        assert!(results[0].is_ok(), "{:?}", results[0]);
-        assert!(dest.exists());
+        let out = apply_release_diff(&rename_only_diff(&src, &dest), &root);
+        let err = out.results[0].as_ref().unwrap_err();
+        assert!(err.contains("hard links"), "{err}");
+        assert!(out.rename_map.is_empty(), "{:?}", out.rename_map);
+        assert!(src.exists() && dest.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_linked_case_variant_leaves_no_temp_name() {
+        let dir = fresh_dir("hard-link-case");
+        let src = dir.join("Artist").join("Album").join("a.wav");
+        let dest = src.with_file_name("A.wav");
+        std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+        write_sine_wav(&src, 1);
+        if std::fs::hard_link(&src, &dest).is_err() {
+            return; // case-folding volume: `A.wav` is `a.wav`
+        }
+        let out = apply_release_diff(&rename_only_diff(&src, &dest), &dir);
+        assert!(out.results[0].is_err(), "{:?}", out.results[0]);
+        let mut names: Vec<_> = std::fs::read_dir(src.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["A.wav", "a.wav"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_symlink_is_not_moved_to_another_folder() {
+        // Moved as a link it would point at nothing: gone from the inbox
+        // and never listed in the library.
+        let dir = fresh_dir("relative-symlink");
+        let stash = dir.join("stash").join("x.wav");
+        let src = dir.join("inbox").join("drop.wav");
+        let dest = dir.join("Artist").join("Album").join("01 - Song.wav");
+        std::fs::create_dir_all(stash.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+        write_sine_wav(&stash, 1);
+        std::os::unix::fs::symlink("../stash/x.wav", &src).unwrap();
+        let out = apply_release_diff(&rename_only_diff(&src, &dest), &dir);
+        let err = out.results[0].as_ref().unwrap_err();
+        assert!(err.contains("relative symlink"), "{err}");
+        assert!(src.is_file(), "the link still resolves where it was");
+        assert!(!dest.exists() && !dest.parent().unwrap().exists());
     }
 
     /// `Artist/Album` holding `01 Song.wav` (`extra_secs` long) beside the
@@ -4172,8 +4279,7 @@ mod tests {
         let len = src.metadata().unwrap().len();
         let root = src.ancestors().nth(3).unwrap().to_path_buf();
         assert!(!dest_is_held(&src, &dest));
-        let out = apply_release_diff(&rename_only_diff(&src, &dest), &root);
-        assert!(out.results[0].is_ok(), "{:?}", out.results[0]);
+        let _ = apply_release_diff(&rename_only_diff(&src, &dest), &root);
         assert_eq!(dest.metadata().unwrap().len(), len, "audio must survive");
         assert!(!numbered(&dest, 2).exists());
     }

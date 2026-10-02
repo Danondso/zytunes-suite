@@ -115,8 +115,11 @@ fn ipod_usb_label(pid: Option<u16>) -> String {
 
 /// Drain every command pending on `cmd_rx` during a sync run: appended
 /// items are spliced onto the back of `sync_queue` (bumping `total`), and
-/// `CancelSync` is reported via the return value. Any other command is
-/// dropped — the TUI doesn't send them while `SyncStatus` is `Running`.
+/// `CancelSync` is reported via the return value. Any other command goes
+/// onto `deferred`, which the worker loop runs once the sync is over.
+/// Dropping them left the app waiting for an answer that never came: an
+/// inbox scan that stayed "in flight" for the rest of the session, or a
+/// tag apply whose overlay sat in Applying with every key ignored.
 ///
 /// The sync loop must call this *before* its queue-empty exit check, not
 /// after popping an item: an `AppendSyncQueue` sent while the final track
@@ -125,6 +128,7 @@ fn ipod_usb_label(pid: Option<u16>) -> String {
 /// silently never sync.
 fn drain_sync_commands(
     cmd_rx: &mpsc::Receiver<BgCommand>,
+    deferred: &mut std::collections::VecDeque<BgCommand>,
     event_tx: &mpsc::Sender<BgEvent>,
     sync_queue: &mut std::collections::VecDeque<SyncItem>,
     total: &mut usize,
@@ -133,7 +137,10 @@ fn drain_sync_commands(
     while let Ok(cmd) = cmd_rx.try_recv() {
         match cmd {
             BgCommand::CancelSync => cancelled = true,
-            BgCommand::AppendSyncQueue(more) if !more.is_empty() => {
+            BgCommand::AppendSyncQueue(more) => {
+                if more.is_empty() {
+                    continue;
+                }
                 let _ = event_tx.send(BgEvent::SyncMessage(format!(
                     "Queued {} more track(s) during sync",
                     more.len()
@@ -141,7 +148,24 @@ fn drain_sync_commands(
                 *total += more.len();
                 sync_queue.extend(more);
             }
-            _ => {}
+            other => deferred.push_back(other),
+        }
+    }
+    cancelled
+}
+
+/// Whether a `CancelSync` is pending, for the loops that take no other
+/// command while they run (remove, photo and video sync). Everything else
+/// read on the way is kept on `deferred` (see [`drain_sync_commands`]).
+fn cancel_requested(
+    cmd_rx: &mpsc::Receiver<BgCommand>,
+    deferred: &mut std::collections::VecDeque<BgCommand>,
+) -> bool {
+    let mut cancelled = false;
+    while let Ok(cmd) = cmd_rx.try_recv() {
+        match cmd {
+            BgCommand::CancelSync => cancelled = true,
+            other => deferred.push_back(other),
         }
     }
     cancelled
@@ -808,7 +832,11 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
         // share one disk read + the in-memory map.
         let mut acoustid_cache: Option<zytunes::acoustid::AcoustIdCache> = None;
 
-        while let Ok(cmd) = cmd_rx.recv() {
+        // Commands that arrived while a sync or remove loop was reading
+        // the channel. They run, in order, before anything newer.
+        let mut deferred: std::collections::VecDeque<BgCommand> = std::collections::VecDeque::new();
+
+        while let Some(cmd) = deferred.pop_front().or_else(|| cmd_rx.recv().ok()) {
             match cmd {
                 BgCommand::LoadLibrary {
                     music_dir,
@@ -1201,7 +1229,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
 
                         for (i, (path, object_id)) in items.iter().enumerate() {
                             // Check for cancel.
-                            if let Ok(BgCommand::CancelSync) = cmd_rx.try_recv() {
+                            if cancel_requested(&cmd_rx, &mut deferred) {
                                 let _ =
                                     event_tx.send(BgEvent::SyncMessage("Removal cancelled".into()));
                                 break;
@@ -1338,7 +1366,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                             .send(BgEvent::SyncMessage(format!("Syncing {} photos...", total)));
 
                         for (i, file) in files.iter().enumerate() {
-                            if let Ok(BgCommand::CancelSync) = cmd_rx.try_recv() {
+                            if cancel_requested(&cmd_rx, &mut deferred) {
                                 let _ = event_tx
                                     .send(BgEvent::SyncMessage("Photo sync cancelled".into()));
                                 break;
@@ -1464,7 +1492,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                         let temp_dir = make_transcode_temp_dir();
 
                         for (i, file) in files.iter().enumerate() {
-                            if let Ok(BgCommand::CancelSync) = cmd_rx.try_recv() {
+                            if cancel_requested(&cmd_rx, &mut deferred) {
                                 let _ = event_tx
                                     .send(BgEvent::SyncMessage("Video sync cancelled".into()));
                                 break;
@@ -1598,6 +1626,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                             // still join this run instead of being lost.
                             cancelled |= drain_sync_commands(
                                 &cmd_rx,
+                                &mut deferred,
                                 &event_tx,
                                 &mut sync_queue,
                                 &mut total,
@@ -1619,6 +1648,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
 
                             cancelled |= drain_sync_commands(
                                 &cmd_rx,
+                                &mut deferred,
                                 &event_tx,
                                 &mut sync_queue,
                                 &mut total,
@@ -3541,7 +3571,9 @@ mod tests {
             }]))
             .unwrap();
 
-        let cancelled = drain_sync_commands(&cmd_rx, &event_tx, &mut queue, &mut total);
+        let mut deferred = std::collections::VecDeque::new();
+        let cancelled =
+            drain_sync_commands(&cmd_rx, &mut deferred, &event_tx, &mut queue, &mut total);
 
         assert!(!cancelled);
         assert_eq!(queue.len(), 1, "append must extend an already-empty queue");
@@ -3564,7 +3596,9 @@ mod tests {
         cmd_tx.send(BgCommand::AppendSyncQueue(vec![])).unwrap();
         cmd_tx.send(BgCommand::CancelSync).unwrap();
 
-        let cancelled = drain_sync_commands(&cmd_rx, &event_tx, &mut queue, &mut total);
+        let mut deferred = std::collections::VecDeque::new();
+        let cancelled =
+            drain_sync_commands(&cmd_rx, &mut deferred, &event_tx, &mut queue, &mut total);
 
         assert!(cancelled, "CancelSync must be reported");
         assert!(queue.is_empty(), "empty appends must not enqueue anything");
@@ -3573,6 +3607,39 @@ mod tests {
             event_rx.try_recv().is_err(),
             "empty appends must not log a splice message"
         );
+    }
+
+    #[test]
+    fn commands_read_during_a_sync_are_kept_for_after_it() {
+        // An inbox scan or a tag apply sent while a sync runs used to be
+        // read and dropped. The app then waited forever for its answer.
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (event_tx, _event_rx) = mpsc::channel();
+        let mut queue: std::collections::VecDeque<SyncItem> = std::collections::VecDeque::new();
+        let mut total = 1usize;
+        let mut deferred = std::collections::VecDeque::new();
+
+        cmd_tx.send(BgCommand::CancelRip).unwrap();
+        cmd_tx.send(BgCommand::CancelSync).unwrap();
+        cmd_tx.send(BgCommand::Disconnect).unwrap();
+        assert!(drain_sync_commands(
+            &cmd_rx,
+            &mut deferred,
+            &event_tx,
+            &mut queue,
+            &mut total
+        ));
+        cmd_tx.send(BgCommand::CancelRip).unwrap();
+        assert!(!cancel_requested(&cmd_rx, &mut deferred));
+
+        assert!(matches!(
+            deferred.make_contiguous(),
+            [
+                BgCommand::CancelRip,
+                BgCommand::Disconnect,
+                BgCommand::CancelRip
+            ]
+        ));
     }
 
     #[test]
