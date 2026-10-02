@@ -147,14 +147,13 @@ impl LocalPlays {
         entry.last_played_at_ms = now_ms;
     }
 
-    /// Move play stats to tracks whose library ID changed (a file move
-    /// re-hashes the path). Stats already under the new ID are merged:
-    /// counts add, the latest play wins. Returns `true` if anything moved.
+    /// Fold the play stats of each merged track into its survivor (`loser
+    /// → winner`, see `track_ids::TrackIds::apply_moves`): counts add, the
+    /// latest play wins. Returns `true` if anything moved.
     ///
-    /// Every old entry is lifted out before any is put back. One apply can
-    /// yield `a -> b` and `b -> c` together (a file renamed into the path
-    /// another file just left); moving them one at a time, in map order,
-    /// could land `a`'s stats on `b` and then carry them on to `c`.
+    /// Every old entry is lifted out before any is put back, so a map
+    /// holding both `a -> b` and `b -> c` cannot land `a`'s stats on `b`
+    /// and then carry them on to `c`.
     pub fn remap_track_ids(&mut self, map: &HashMap<u64, u64>) -> bool {
         let lifted: Vec<(u64, TrackPlays)> = map
             .iter()

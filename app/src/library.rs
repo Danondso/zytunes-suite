@@ -214,10 +214,17 @@ pub trait MusicLibrary {
     fn all_tracks(&self) -> Box<dyn Iterator<Item = &Track> + '_>;
     /// The music folder path, if known.
     fn music_folder(&self) -> Option<&str>;
-    /// Look up a track by its stable path-hash id. Default walks `all_tracks`;
+    /// Look up a track by its stable id. Default walks `all_tracks`;
     /// backends keyed by id should override for O(1).
     fn track_by_id(&self, id: u64) -> Option<&Track> {
         self.all_tracks().find(|t| t.id == id)
+    }
+    /// Look up a track by the file it is read from. A track's id says
+    /// nothing about its path (see `track_ids`), so this walks
+    /// `all_tracks`; fine at play start, too slow per frame.
+    fn track_by_location(&self, location: &str) -> Option<&Track> {
+        self.all_tracks()
+            .find(|t| t.location.as_deref() == Some(location))
     }
 
     /// Fill in Chromaprint ids computed after the library was already shown.

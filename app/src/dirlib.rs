@@ -183,6 +183,20 @@ impl DirectoryLibrary {
             .collect();
         let working: Mutex<HashMap<String, crate::cache::CachedFile>> = Mutex::new(cached.clone());
 
+        // Every file's ID comes from the registry, never from the path it
+        // has today: a file the tag manager moved keeps the ID it was
+        // first seen under. Resolved here in one pass because assigning a
+        // new ID has to see every ID already taken. Entries for files the
+        // walk no longer finds are dropped first.
+        let ids: HashMap<String, u64> =
+            crate::track_ids::with_registry(path, &options.log, |registry| {
+                registry.retain(|p| extant_paths.contains(p));
+                paths
+                    .iter()
+                    .map(|p| (p.to_string_lossy().into_owned(), registry.id_for(p)))
+                    .collect()
+            });
+
         // Tracks how many entries genuinely changed since the last on-disk
         // save. Increments when the file is new, its acoustic id changed, or
         // its fingerprint-failed flag changed. A pure reload accumulates
@@ -196,6 +210,7 @@ impl DirectoryLibrary {
                 .filter_map(|p| {
                     let key = p.to_string_lossy().to_string();
                     let fingerprint = crate::cache::FileFingerprint::from_path(p)?;
+                    let id = *ids.get(&key)?;
 
                     let (mut track, came_from_cache, prev_acoustic, mut fingerprint_failed) =
                         match cached.get(&key) {
@@ -207,10 +222,14 @@ impl DirectoryLibrary {
                             ),
                             _ => {
                                 cache_miss.fetch_add(1, Ordering::Relaxed);
-                                (build_track(p, hash_path(p)), false, None, false)
+                                (build_track(p, id), false, None, false)
                             }
                         };
                     let prev_failed = fingerprint_failed;
+                    // The registry is the authority; the cached copy of the
+                    // ID is corrected (and saved) if it ever disagrees.
+                    let id_changed = track.id != id;
+                    track.id = id;
 
                     if came_from_cache {
                         if track.acoustic_id.is_some() {
@@ -246,6 +265,7 @@ impl DirectoryLibrary {
                     }
 
                     if !came_from_cache
+                        || id_changed
                         || track.acoustic_id != prev_acoustic
                         || fingerprint_failed != prev_failed
                     {
@@ -436,15 +456,33 @@ impl DirectoryLibrary {
                 (moved != Path::new(key)).then(|| (key.clone(), moved))
             })
             .collect();
+
+        // IDs come from the registry, which already has this apply's moves
+        // (`track_ids::record_moves`): a file read at its new path gets
+        // the ID it had at the old one. Paths with no file are left out so
+        // a vacated path is never registered.
+        let ids: HashMap<PathBuf, u64> = crate::track_ids::with_registry(root, log, |registry| {
+            carried
+                .iter()
+                .map(|(_, moved)| moved)
+                .chain(paths)
+                .filter(|p| p.is_file())
+                .map(|p| (p.clone(), registry.id_for(p)))
+                .collect()
+        });
+
         for (key, moved) in carried {
             let Some(entry) = cached.remove(&key) else {
                 continue;
             };
-            let Some(fp) = crate::cache::FileFingerprint::from_path(&moved) else {
+            let (Some(fp), Some(&id)) = (
+                crate::cache::FileFingerprint::from_path(&moved),
+                ids.get(&moved),
+            ) else {
                 continue;
             };
-            let mut track = track_from_lofty(&moved, hash_path(&moved))
-                .unwrap_or_else(|| track_from_path(&moved, hash_path(&moved)));
+            let mut track =
+                track_from_lofty(&moved, id).unwrap_or_else(|| track_from_path(&moved, id));
             if track.acoustic_id.is_none() {
                 track.acoustic_id = entry.track.acoustic_id;
             }
@@ -460,17 +498,15 @@ impl DirectoryLibrary {
 
         for p in paths {
             let key = p.to_string_lossy().to_string();
-            let fp = match crate::cache::FileFingerprint::from_path(p) {
-                Some(f) => f,
-                None => {
-                    // File doesn't exist (e.g. old path of a rename) — drop it.
-                    cached.remove(&key);
-                    continue;
-                }
+            let (Some(fp), Some(&id)) = (crate::cache::FileFingerprint::from_path(p), ids.get(p))
+            else {
+                // File doesn't exist (e.g. old path of a rename) — drop it.
+                cached.remove(&key);
+                continue;
             };
-            let mut track = match track_from_lofty(p, hash_path(p)) {
+            let mut track = match track_from_lofty(p, id) {
                 Some(t) => t,
-                None => track_from_path(p, hash_path(p)),
+                None => track_from_path(p, id),
             };
             if fingerprint && track.acoustic_id.is_none() {
                 track.acoustic_id = crate::fingerprint::compute_fingerprint(p);
@@ -732,6 +768,9 @@ pub(crate) fn is_audio_file(path: &Path) -> bool {
         .is_some_and(|ext| AUDIO_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
 }
 
+/// Hash of a path. This is the ID a file gets the first time it is seen,
+/// NOT the ID of whatever is at `path` now: a moved file keeps its first
+/// ID. Ask [`crate::track_ids`] (or the library) for a track's ID.
 pub fn hash_path(path: &Path) -> u64 {
     let mut hasher = DefaultHasher::new();
     path.to_string_lossy().hash(&mut hasher);
@@ -1663,7 +1702,8 @@ mod tests {
         // Metadata from the seeded cache must survive — proof we took the
         // cache-hit path rather than re-parsing tags from the file.
         assert_eq!(track.name, "Back Song");
-        assert_eq!(track.id, 42);
+        // The ID is the registry's, not whatever the cache entry carried.
+        assert_eq!(track.id, hash_path(&file));
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2279,7 +2319,7 @@ mod tests {
     fn reread_paths_follows_a_nested_directory_rename() {
         // Retitling artist AND album records the album rename under the
         // artist's new name. A track the diff did not list must still
-        // follow both, and keep the ID playlists were remapped to.
+        // follow both, and keep its ID.
         use crate::tag_ops::{FieldDiff, FieldKind, ReleaseTagDiff, TrackTagDiff};
         let dir = std::env::temp_dir().join("zytunes-dirlib-reread-nested-rename");
         let _ = fs::remove_dir_all(&dir);
@@ -2290,12 +2330,15 @@ mod tests {
         let sibling = old_album.join("02 - Dam That River.mp3");
         fs::write(&filed, b"fake").unwrap();
         fs::write(&sibling, b"fake").unwrap();
-        let _ = DirectoryLibrary::scan_with_options(
+        crate::track_ids::forget(dir.to_str().unwrap());
+        let scanned = DirectoryLibrary::scan_with_options(
             dir.to_str().unwrap(),
             ScanOptions::default(),
             |_| {},
         )
         .unwrap();
+        let filed_id = id_of(&scanned, &filed).expect("scanned");
+        let sibling_id = id_of(&scanned, &sibling).expect("scanned");
 
         let filed_new = new_album.join("01 - Them Bones.mp3");
         let sibling_new = new_album.join("02 - Dam That River.mp3");
@@ -2321,6 +2364,9 @@ mod tests {
         assert_eq!(out.dir_renames.len(), 2, "{:?}", out.dir_renames);
 
         let log = crate::cache::default_logger();
+        crate::track_ids::record_moves(dir.to_str().unwrap(), &log, |p| {
+            crate::tag_ops::moved_path(p, &out.rename_map, &out.dir_renames)
+        });
         let lib = DirectoryLibrary::reread_paths_after(
             dir.to_str().unwrap(),
             &out.reread_paths(&diff, &dir),
@@ -2343,16 +2389,121 @@ mod tests {
             ],
             "the unlisted track must follow both folder renames"
         );
-        let remap = crate::tag_ops::track_id_remap(
-            [filed.as_path(), sibling.as_path()],
-            &out.rename_map,
+        let id_at = |path: &Path| {
+            lib.all_tracks()
+                .find(|t| t.location.as_deref() == path.to_str())
+                .map(|t| t.id)
+        };
+        assert_eq!(
+            (id_at(&filed_new), id_at(&sibling_new)),
+            (Some(filed_id), Some(sibling_id)),
+            "both tracks keep the IDs playlists already hold"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// One fake track under `root`, moved by a Filename-only diff.
+    fn rename_only_diff(src: &Path, dest: &Path) -> crate::tag_ops::ReleaseTagDiff {
+        use crate::tag_ops::{FieldDiff, FieldKind, ReleaseTagDiff, TrackTagDiff};
+        ReleaseTagDiff {
+            release_mbid: "rel-1".into(),
+            summary: "test".into(),
+            tracks: vec![TrackTagDiff {
+                src_path: src.to_path_buf(),
+                dest_path: Some(dest.to_path_buf()),
+                library_id: 1,
+                fields: vec![FieldDiff {
+                    kind: FieldKind::Filename,
+                    name: "Filename",
+                    current: Some(src.display().to_string()),
+                    proposed: Some(dest.display().to_string()),
+                    enabled: true,
+                    from_release: true,
+                }],
+            }],
+        }
+    }
+
+    fn id_of(lib: &DirectoryLibrary, path: &Path) -> Option<u64> {
+        lib.all_tracks()
+            .find(|t| t.location.as_deref() == path.to_str())
+            .map(|t| t.id)
+    }
+
+    #[test]
+    fn a_moved_track_keeps_its_id_through_the_reread() {
+        // The ID is what playlists, play stats and the listen log hold. A
+        // move must not change it, so none of them has to be told.
+        let dir = std::env::temp_dir().join("zytunes-dirlib-stable-id-reread");
+        let _ = fs::remove_dir_all(&dir);
+        let root = dir.to_str().unwrap();
+        crate::track_ids::forget(root);
+        let old = dir.join("Various").join("Album").join("01 - Song.mp3");
+        let new = dir.join("Artist").join("Album").join("01 - Song.mp3");
+        fs::create_dir_all(old.parent().unwrap()).unwrap();
+        fs::write(&old, b"fake").unwrap();
+        let lib = DirectoryLibrary::scan(root).unwrap();
+        let id = id_of(&lib, &old).expect("scanned");
+
+        let diff = rename_only_diff(&old, &new);
+        let out = crate::tag_ops::apply_release_diff(&diff, &dir);
+        assert!(out.results[0].is_ok(), "{:?}", out.results[0]);
+        let log = crate::cache::default_logger();
+        let merges = crate::track_ids::record_moves(root, &log, |p| {
+            crate::tag_ops::moved_path(p, &out.rename_map, &out.dir_renames)
+        });
+        assert!(merges.is_empty());
+        let lib = DirectoryLibrary::reread_paths_after(
+            root,
+            &out.reread_paths(&diff, &dir),
+            &out.vacated(),
             &out.dir_renames,
-        );
-        let sibling_id = remap[&hash_path(&sibling)];
-        assert!(
-            lib.all_tracks().any(|t| t.id == sibling_id),
-            "playlists are remapped to an ID the library holds"
-        );
+            false,
+            &log,
+        )
+        .unwrap();
+        assert_eq!(id_of(&lib, &new), Some(id));
+        assert_eq!(lib.track_count(), 1);
+        crate::track_ids::forget(root);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_moved_track_keeps_its_id_when_the_scan_cache_is_gone() {
+        // The dirlib cache is discardable (a schema bump drops entries).
+        // Identity must not live in it: a full scan with an empty cache
+        // still finds the moved track under the ID it always had.
+        let dir = std::env::temp_dir().join("zytunes-dirlib-stable-id-rescan");
+        let _ = fs::remove_dir_all(&dir);
+        let root = dir.to_str().unwrap();
+        crate::track_ids::forget(root);
+        let old = dir.join("Various").join("Album").join("01 - Song.mp3");
+        let new = dir.join("Artist").join("Album").join("01 - Song.mp3");
+        fs::create_dir_all(old.parent().unwrap()).unwrap();
+        fs::write(&old, b"fake").unwrap();
+        let lib = DirectoryLibrary::scan(root).unwrap();
+        let id = id_of(&lib, &old).expect("scanned");
+
+        let diff = rename_only_diff(&old, &new);
+        let out = crate::tag_ops::apply_release_diff(&diff, &dir);
+        assert!(out.results[0].is_ok(), "{:?}", out.results[0]);
+        let log = crate::cache::default_logger();
+        crate::track_ids::record_moves(root, &log, |p| {
+            crate::tag_ops::moved_path(p, &out.rename_map, &out.dir_renames)
+        });
+        crate::cache::save_dirlib_cache(root, HashMap::new(), &log);
+
+        let lib = DirectoryLibrary::scan(root).unwrap();
+        assert_eq!(id_of(&lib, &new), Some(id));
+
+        // A new rip dropped at the path the track left is a different track.
+        fs::create_dir_all(old.parent().unwrap()).unwrap();
+        fs::write(&old, b"other").unwrap();
+        let lib = DirectoryLibrary::scan(root).unwrap();
+        assert_eq!(id_of(&lib, &new), Some(id));
+        let newcomer = id_of(&lib, &old).expect("scanned");
+        assert_ne!(newcomer, id);
+        crate::track_ids::forget(root);
         let _ = fs::remove_dir_all(&dir);
     }
 

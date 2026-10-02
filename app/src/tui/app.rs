@@ -3117,39 +3117,46 @@ impl App {
         overlay.phase = TagManagerPhase::DiffPreview;
     }
 
-    /// Track IDs hash the file path, so every file an apply moved has a
-    /// new ID. Re-key playlists, play stats and the listen log before the
-    /// library reread lands, while the old locations are still known.
-    fn follow_moved_track_ids(
-        &mut self,
-        rename_map: &std::collections::HashMap<PathBuf, PathBuf>,
-        dir_renames: &[(PathBuf, PathBuf)],
-        stem_dir_renames: &[(PathBuf, PathBuf)],
-    ) {
-        self.follow_moved_now_playing(rename_map, dir_renames, stem_dir_renames);
-        let Some(lib) = self.library.as_ref() else {
-            return;
-        };
-        let locations: Vec<PathBuf> = lib
-            .all_tracks()
-            .filter_map(|t| t.location.as_deref().map(PathBuf::from))
-            .collect();
-        let map = zytunes::tag_ops::track_id_remap(
-            locations.iter().map(PathBuf::as_path),
-            rename_map,
-            dir_renames,
-        );
-        if map.is_empty() {
+    /// Fold everything held under the ID of a track a replace merged away
+    /// into the track that survived (`loser → winner`).
+    ///
+    /// A move never changes a track's ID (see `zytunes::track_ids`), so
+    /// this is the only time an ID-keyed store is re-keyed: filing a file
+    /// onto a track the library already has leaves one track where there
+    /// were two.
+    pub(crate) fn fold_merged_track_ids(&mut self, merges: &std::collections::HashMap<u64, u64>) {
+        if merges.is_empty() {
             return;
         }
-        if self.playlists.remap_track_ids(&map) {
+        if self.playlists.remap_track_ids(merges) {
             self.persist_playlists();
         }
-        if self.local_plays.remap_track_ids(&map) {
+        if self.local_plays.remap_track_ids(merges) {
             self.persist_local_plays();
         }
         // The listen log rewrites its own file.
-        self.listen_log.remap_track_ids(&map);
+        self.listen_log.remap_track_ids(merges);
+        let Some(np) = self.now_playing.as_mut() else {
+            return;
+        };
+        if let Some(winner) = np.track_id.and_then(|id| merges.get(&id)) {
+            np.track_id = Some(*winner);
+        }
+        // Queued rows are a snapshot. A loser's ID can be handed to a new
+        // file later, so a row must not keep pointing at it.
+        if np
+            .playlist
+            .iter()
+            .any(|t| t.library_id.is_some_and(|id| merges.contains_key(&id)))
+        {
+            let mut rows = np.playlist.to_vec();
+            for id in rows.iter_mut().filter_map(|t| t.library_id.as_mut()) {
+                if let Some(winner) = merges.get(id) {
+                    *id = *winner;
+                }
+            }
+            np.playlist = Arc::from(rows);
+        }
     }
 
     /// The device sync queue holds each track's file path from when it was
@@ -3175,13 +3182,12 @@ impl App {
         }
     }
 
-    /// The playing session holds a snapshot taken before the apply: the
-    /// playing track's library ID and every queued row's file path. Left
-    /// alone, the play would be recorded under an ID no track has any
-    /// more, and next/prev would ask for a path that is gone. The audio
-    /// thread keeps the inode open across the rename; [`AudioCommand::Retarget`]
-    /// tells it which path the next scrub should reopen, and stem exit
-    /// follows `stems.for_path`.
+    /// The playing session holds a snapshot taken before the apply: every
+    /// queued row's file path. Left alone, next/prev would ask for a path
+    /// that is gone. The audio thread keeps the inode open across the
+    /// rename; [`AudioCommand::Retarget`] tells it which path the next
+    /// scrub should reopen, and stem exit follows `stems.for_path`. The
+    /// playing track's ID is untouched: a move does not change it.
     fn follow_moved_now_playing(
         &mut self,
         rename_map: &std::collections::HashMap<PathBuf, PathBuf>,
@@ -3264,13 +3270,6 @@ impl App {
         let Some(np) = self.now_playing.as_mut() else {
             return;
         };
-        // The ID is the hash of the playing row's path, so it follows that
-        // row's move. A session with no library ID (device play) stays so.
-        // `playing_retarget` is that move; the playlist walk below is the
-        // only other pass.
-        if let (Some(_), Some((_, new))) = (np.track_id, playing_retarget.as_ref()) {
-            np.track_id = Some(zytunes::dirlib::hash_path(std::path::Path::new(new)));
-        }
         let mut rows = np.playlist.to_vec();
         let mut changed = false;
         for loc in rows.iter_mut().filter_map(|t| t.location.as_mut()) {
@@ -3311,7 +3310,7 @@ impl App {
         }
         self.remap_queued_sync(&rename_map, dir_renames);
         if !rename_map.is_empty() || !dir_renames.is_empty() || !stem_dir_renames.is_empty() {
-            self.follow_moved_track_ids(&rename_map, dir_renames, stem_dir_renames);
+            self.follow_moved_now_playing(&rename_map, dir_renames, stem_dir_renames);
         }
         // Per-track failures are surfaced via the sync log so the user sees
         // *which* tracks failed without sifting through the diff view. We log
@@ -4813,22 +4812,16 @@ impl App {
         // The playlist row still has the pre-apply title. After a filing
         // rename the path is what identifies the track; name/artist/album
         // is the fallback for rows that were not moved.
-        // A directory library's ids are path hashes, so this is one map
-        // lookup; the location check keeps any other backend honest.
         if let Some(loc) = track.location.as_deref() {
-            let id = zytunes::dirlib::hash_path(std::path::Path::new(loc));
-            if let Some(t) = lib
-                .track_by_id(id)
-                .filter(|t| t.location.as_deref() == Some(loc))
-            {
+            if let Some(t) = lib.track_by_location(loc) {
                 return Some(t.clone());
             }
             // The playlist path was updated before the library swap, or
-            // the swap failed. A name match would return the pre-move
-            // track. The id of a library file is the hash of its path
-            // either way; device paths fall through to the name match.
-            if self.library_file_id(loc).is_some() {
-                return None;
+            // the swap failed. The row's own library id still names the
+            // track (a move does not change it); a name match could pick
+            // another one. Device paths fall through to the name match.
+            if self.is_library_path(loc) {
+                return track.library_id.and_then(|id| lib.track_by_id(id)).cloned();
             }
         }
         let lookup = |name: &str| -> Option<Track> {
@@ -4849,26 +4842,20 @@ impl App {
         None
     }
 
-    /// Path-hash id of `loc` when it lives under the music library.
-    /// `None` for device paths and when the library root is unknown.
-    fn library_file_id(&self, loc: &str) -> Option<u64> {
-        let root = self.music_dir_cache.as_ref()?;
-        std::path::Path::new(loc)
-            .starts_with(root)
-            .then(|| zytunes::dirlib::hash_path(std::path::Path::new(loc)))
+    /// Whether `loc` lives under the music library. `false` for device
+    /// paths and when the library root is unknown.
+    fn is_library_path(&self, loc: &str) -> bool {
+        self.music_dir_cache
+            .as_ref()
+            .is_some_and(|root| std::path::Path::new(loc).starts_with(root))
     }
 
-    /// Library track plus the id a play should be recorded under.
-    /// A library path that the index does not have yet still records
-    /// under `hash_path`, which is the id the reread will assign.
+    /// Library track plus the id a play should be recorded under. A row
+    /// the library cannot resolve right now (its reread failed) still
+    /// records under the id the row was built with.
     fn resolved_play(&self, track: &TrackInfo) -> (Option<Track>, Option<u64>) {
         let lib_track = self.lookup_library_track(track);
-        let id = lib_track.as_ref().map(|t| t.id).or_else(|| {
-            track
-                .location
-                .as_deref()
-                .and_then(|loc| self.library_file_id(loc))
-        });
+        let id = lib_track.as_ref().map(|t| t.id).or(track.library_id);
         (lib_track, id)
     }
 
@@ -15068,7 +15055,7 @@ mod tests {
     }
 
     #[test]
-    fn playlists_and_play_stats_follow_a_track_through_a_move() {
+    fn a_move_leaves_playlists_and_play_stats_alone() {
         use zytunes::dirlib::hash_path;
         let old = PathBuf::from("/m/alice in chains/Dirt/01 - Them Bones.mp3");
         let sibling = PathBuf::from("/m/alice in chains/Facelift/01 - We Die Young.mp3");
@@ -15101,29 +15088,93 @@ mod tests {
         // The apply retitled the artist folder (carrying Facelift along)
         // and renamed the Dirt track.
         let new = PathBuf::from("/m/Alice In Chains/Dirt/01 - Them Bones.mp3");
-        let sibling_new = PathBuf::from("/m/Alice In Chains/Facelift/01 - We Die Young.mp3");
-        let rename_map = std::collections::HashMap::from([(old.clone(), new.clone())]);
+        let rename_map = std::collections::HashMap::from([(old.clone(), new)]);
         let dir_renames = vec![(
             PathBuf::from("/m/alice in chains"),
             PathBuf::from("/m/Alice In Chains"),
         )];
         app.handle_tags_applied(0, vec![Ok(())], rename_map, &dir_renames, &[], &[]);
 
+        // A track's ID does not change when its file moves, so nothing
+        // keyed on it has anything to follow.
         assert_eq!(
             app.playlists.get(pl).unwrap().track_ids,
-            vec![hash_path(&new), hash_path(&sibling_new)],
-            "playlist entries point at the moved files"
+            vec![hash_path(&old), hash_path(&sibling)],
         );
-        assert!(app.local_plays.get(hash_path(&sibling)).is_none());
         assert_eq!(
-            app.local_plays
-                .get(hash_path(&sibling_new))
-                .unwrap()
-                .play_count,
-            1,
-            "play stats for the sibling album survived the folder retitle"
+            app.local_plays.get(hash_path(&sibling)).unwrap().play_count,
+            1
         );
-        assert_eq!(app.listen_log.events()[0].id, hash_path(&new));
+        assert_eq!(app.listen_log.events()[0].id, hash_path(&old));
+    }
+
+    #[test]
+    fn a_replace_folds_the_losing_track_into_the_survivor() {
+        // Filing a file onto a track the library already has leaves one
+        // track where there were two. Everything the loser's ID held has
+        // to end up under the survivor's.
+        let (loser, winner) = (11u64, 22u64);
+        let row = |id: u64, path: &str| {
+            let mut info = TrackInfo::new(
+                "Song".into(),
+                "Artist".into(),
+                "Album".into(),
+                Some(200_000),
+                None,
+                Some(path.into()),
+                None,
+                None,
+                None,
+                false,
+            );
+            info.library_id = Some(id);
+            info
+        };
+        let mut app = App::new();
+        let pl = app
+            .playlists
+            .add(zytunes::playlist::Playlist::new_manual("Faves"));
+        app.playlists.add_track(pl, loser);
+        app.local_plays.record_play(loser, 5);
+        app.local_plays.record_play(winner, 9);
+        app.listen_log.append(ListenEvent {
+            ts: 1,
+            id: loser,
+            completed: true,
+        });
+        app.now_playing = Some(NowPlaying {
+            track_name: "Song".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            duration_ms: 200_000,
+            elapsed_ms: 0,
+            state: PlaybackState::Playing,
+            track_index: 0,
+            playlist: Arc::from(vec![
+                row(loser, "/m/Artist/Album/01.flac"),
+                row(33, "/m/x.flac"),
+            ]),
+            paused_frame: None,
+            track_id: Some(loser),
+            counted: false,
+            year: None,
+            metadata_marquee: String::new(),
+        });
+
+        app.fold_merged_track_ids(&HashMap::from([(loser, winner)]));
+
+        assert_eq!(app.playlists.get(pl).unwrap().track_ids, vec![winner]);
+        assert!(app.local_plays.get(loser).is_none());
+        assert_eq!(app.local_plays.get(winner).unwrap().play_count, 2);
+        assert_eq!(app.listen_log.events()[0].id, winner);
+        let np = app.now_playing.as_ref().unwrap();
+        assert_eq!(
+            np.track_id,
+            Some(winner),
+            "the play in progress counts for the survivor"
+        );
+        let row_ids: Vec<Option<u64>> = np.playlist.iter().map(|t| t.library_id).collect();
+        assert_eq!(row_ids, vec![Some(winner), Some(33)]);
     }
 
     #[test]
@@ -15814,8 +15865,8 @@ mod tests {
         let np = app.now_playing.as_ref().unwrap();
         assert_eq!(
             np.track_id,
-            Some(hash_path(&new1)),
-            "the play is recorded under the ID the library now has"
+            Some(hash_path(&old1)),
+            "the track is the same track, so the play is recorded under the same ID"
         );
         let queued: Vec<&str> = np
             .playlist
@@ -15847,11 +15898,13 @@ mod tests {
             tracks: vec![
                 {
                     let mut t = lib_track("Them Bones", &new1);
+                    t.id = hash_path(&old1);
                     t.name = "Them Bones (MB)".into();
                     t
                 },
                 {
                     let mut t = lib_track("Dam That River", &new2);
+                    t.id = hash_path(&old2);
                     t.name = "Dam That River (MB)".into();
                     t
                 },
@@ -15861,7 +15914,7 @@ mod tests {
         app.next_track(&tx);
         assert_eq!(
             app.now_playing.as_ref().unwrap().track_id,
-            Some(hash_path(&new2)),
+            Some(hash_path(&old2)),
             "the queued track keeps its library id after the title changes"
         );
     }
@@ -16295,7 +16348,7 @@ mod tests {
     }
 
     #[test]
-    fn next_track_before_the_library_swap_uses_the_new_path_id() {
+    fn next_track_before_the_library_swap_keeps_the_tracks_id() {
         use zytunes::dirlib::hash_path;
         let old = PathBuf::from("/m/alice/02.flac");
         let new = PathBuf::from("/m/Alice/02 Dam.flac");
@@ -16333,7 +16386,13 @@ mod tests {
             elapsed_ms: 0,
             state: PlaybackState::Playing,
             track_index: 0,
-            playlist: Arc::from(vec![row(&PathBuf::from("/m/alice/01.flac")), row(&new)]),
+            playlist: Arc::from(vec![row(&PathBuf::from("/m/alice/01.flac")), {
+                // The queued row already points at the new path; the
+                // library still lists the track at the old one.
+                let mut moved = row(&new);
+                moved.library_id = Some(hash_path(&old));
+                moved
+            }]),
             paused_frame: None,
             track_id: Some(1),
             counted: true,
@@ -16344,8 +16403,8 @@ mod tests {
         app.next_track(&tx);
         assert_eq!(
             app.now_playing.as_ref().unwrap().track_id,
-            Some(hash_path(&new)),
-            "the play is not recorded under the pre-move id"
+            Some(hash_path(&old)),
+            "a move does not change the ID the play is recorded under"
         );
     }
 

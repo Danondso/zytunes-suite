@@ -628,6 +628,9 @@ pub enum BgEvent {
         set_aside: Vec<zytunes::tag_ops::SetAside>,
         /// Stem-cache directories renamed onto a moved file's new key.
         stem_dir_renames: Vec<(std::path::PathBuf, std::path::PathBuf)>,
+        /// Tracks a replace folded into another, `loser → winner` library
+        /// ID. Empty for plain moves: a moved track keeps its ID.
+        id_merges: std::collections::HashMap<u64, u64>,
     },
     /// Phase 2 of `ApplyTagDiff`: surgical re-scan complete. Replaces
     /// `App.library` and (when the token still matches the open overlay)
@@ -2416,6 +2419,20 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                         }
                         _ => Vec::new(),
                     };
+                    let log_tx = event_tx.clone();
+                    let scan_log: zytunes::cache::Logger = std::sync::Arc::new(move |msg: &str| {
+                        let _ = log_tx.send(BgEvent::SyncMessage(msg.to_string()));
+                    });
+                    // Move each file's ID with it before anything reads the
+                    // library at the new paths. This is what keeps
+                    // playlists and play stats attached without re-keying.
+                    let id_merges = if moved_anything {
+                        zytunes::track_ids::record_moves(&music_dir, &scan_log, |old| {
+                            zytunes::tag_ops::moved_path(old, &outcome.rename_map, &dir_renames)
+                        })
+                    } else {
+                        std::collections::HashMap::new()
+                    };
                     let _ = event_tx.send(BgEvent::TagsApplied {
                         token,
                         results: outcome.results,
@@ -2423,12 +2440,9 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                         dir_renames: outcome.dir_renames,
                         set_aside: outcome.set_aside,
                         stem_dir_renames,
+                        id_merges,
                     });
 
-                    let log_tx = event_tx.clone();
-                    let scan_log: zytunes::cache::Logger = std::sync::Arc::new(move |msg: &str| {
-                        let _ = log_tx.send(BgEvent::SyncMessage(msg.to_string()));
-                    });
                     let lib_result = zytunes::dirlib::DirectoryLibrary::reread_paths_after(
                         &music_dir,
                         &paths,

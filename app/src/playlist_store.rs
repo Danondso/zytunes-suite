@@ -165,8 +165,9 @@ impl PlaylistStore {
         }
     }
 
-    /// Point playlists at tracks whose library ID changed (a file move
-    /// re-hashes the path). Returns `true` if any playlist changed.
+    /// Point playlists at the survivor of each merged track (`loser →
+    /// winner`, see `track_ids::TrackIds::apply_moves`). Returns `true` if
+    /// any playlist changed.
     pub fn remap_track_ids(&mut self, map: &std::collections::HashMap<u64, u64>) -> bool {
         let mut changed = false;
         for p in &mut self.playlists {

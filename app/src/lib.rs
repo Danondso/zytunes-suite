@@ -26,6 +26,7 @@ pub mod playlist_store;
 pub mod recommender;
 pub mod stems;
 pub mod tag_ops;
+pub mod track_ids;
 pub mod transcode;
 
 #[cfg(test)]

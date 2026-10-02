@@ -152,7 +152,9 @@ impl App {
                 dir_renames,
                 set_aside,
                 stem_dir_renames,
+                id_merges,
             } => {
+                self.fold_merged_track_ids(&id_merges);
                 self.handle_tags_applied(
                     token,
                     results,

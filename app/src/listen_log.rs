@@ -132,9 +132,10 @@ impl ListenLog {
         }
     }
 
-    /// Re-key events whose track ID changed (a file move re-hashes the
-    /// path). The log is append-only on disk, so a change rewrites the
-    /// whole file atomically. Returns `true` if any event changed.
+    /// Re-key the events of each merged track to its survivor (`loser →
+    /// winner`, see `track_ids::TrackIds::apply_moves`). The log is
+    /// append-only on disk, so a change rewrites the whole file
+    /// atomically. Returns `true` if any event changed.
     pub fn remap_track_ids(&mut self, map: &std::collections::HashMap<u64, u64>) -> bool {
         let mut changed = false;
         for e in &mut self.events {
