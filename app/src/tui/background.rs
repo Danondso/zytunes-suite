@@ -611,6 +611,9 @@ pub enum BgEvent {
         token: u64,
         result: Result<Box<zytunes::musicbrainz::Release>, String>,
     },
+    /// A tag-manager apply moved files and then could not save their
+    /// track IDs. Sent after [`BgEvent::TagsApplied`].
+    TrackIdsUnsaved(String),
     /// Phase 1 of `ApplyTagDiff`: tag writes + renames are done. Per-track
     /// `results` lines up with the diff's `tracks` vec; `rename_map` carries
     /// only successful renames. `token` matches the originating command.
@@ -3169,6 +3172,7 @@ pub(crate) fn run_tag_apply(
             "tag-manager: a file beside the music was left behind: {e}"
         )));
     }
+    let ids_unsaved = outcome.ids_unsaved.clone();
     let paths = outcome.reread_paths(diff, root);
     let vacated = outcome.vacated();
     let dir_renames = outcome.dir_renames.clone();
@@ -3179,6 +3183,9 @@ pub(crate) fn run_tag_apply(
         rename_map: outcome.rename_map,
         dir_renames: outcome.dir_renames,
     });
+    if let Some(why) = ids_unsaved {
+        let _ = event_tx.send(BgEvent::TrackIdsUnsaved(why));
+    }
 
     // A refused apply touched nothing, and its reread would fail on the
     // same registry and send the app into a full reload for a no-op.

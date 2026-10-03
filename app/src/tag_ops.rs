@@ -789,6 +789,10 @@ pub struct ApplyOutcome {
     /// (the track-ID registry could not be used): every result is `Err`,
     /// the disk is as it was, and there is nothing to re-read.
     pub refused: bool,
+    /// The files moved, and then the track-ID registry could not be
+    /// saved (it could when the apply began): why. The moved tracks come
+    /// back as new ones, so this has to reach the user.
+    pub ids_unsaved: Option<String>,
 }
 
 impl ApplyOutcome {
@@ -1036,6 +1040,7 @@ pub fn apply_release_diff(diff: &ReleaseTagDiff, library_root: &Path) -> ApplyOu
         dir_renames,
         sidecar_errors,
         refused: false,
+        ids_unsaved: None,
     }
 }
 
@@ -1313,8 +1318,8 @@ fn same_bytes(mut a: impl std::io::Read, mut b: impl std::io::Read) -> bool {
 /// registry).
 ///
 /// A diff that would move a file is applied inside the registry's
-/// read-modify-write, so the registry is known usable before the first
-/// move. When it is not, nothing is applied and every track reports
+/// read-modify-write, so the registry is known usable (read, and saved
+/// once unchanged) before the first move. When it is not, nothing is applied and every track reports
 /// why: a file moved without its ID is a new track after the next scan,
 /// and there is no putting that back.
 pub fn apply_and_record_moves(
@@ -1325,7 +1330,7 @@ pub fn apply_and_record_moves(
     if !diff.tracks.iter().any(TrackTagDiff::wants_rename) {
         return apply_release_diff(diff, Path::new(music_dir));
     }
-    crate::track_ids::with_registry(music_dir, log, |ids| {
+    crate::track_ids::with_writable_registry(music_dir, log, |ids| {
         let outcome = apply_release_diff(diff, Path::new(music_dir));
         if !outcome.rename_map.is_empty() || !outcome.dir_renames.is_empty() {
             ids.apply_moves(
@@ -1334,6 +1339,10 @@ pub fn apply_and_record_moves(
             );
         }
         outcome
+    })
+    .map(|(outcome, saved)| ApplyOutcome {
+        ids_unsaved: saved.err(),
+        ..outcome
     })
     .unwrap_or_else(|why| ApplyOutcome {
         results: vec![Err(format!("not applied: {why}")); diff.tracks.len()],

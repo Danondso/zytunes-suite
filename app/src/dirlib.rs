@@ -2827,6 +2827,30 @@ mod tests {
     }
 
     #[test]
+    fn an_apply_moves_nothing_when_the_registry_cannot_be_saved() {
+        // The registry reads, but nothing can be written beside it (a
+        // full disk, a cache dir gone read-only). Finding that out after
+        // the files moved is too late: the moves are not recorded and
+        // the next scan takes the moved tracks for new ones.
+        let (dir, one, _two) = two_album_library("apply-no-save");
+        let root = dir.to_str().unwrap();
+        crate::track_ids::block_saves(root);
+        let new = one.with_file_name("01 - Song.mp3");
+        let log = crate::cache::default_logger();
+        let out = crate::tag_ops::apply_and_record_moves(&rename_only_diff(&one, &new), root, &log);
+        assert!(
+            out.results[0]
+                .as_ref()
+                .is_err_and(|e| e.contains("track-ID registry")),
+            "{:?}",
+            out.results[0]
+        );
+        assert!(out.refused);
+        assert!(one.is_file() && !new.exists(), "nothing moved");
+        forget_library(&dir);
+    }
+
+    #[test]
     fn a_scan_without_its_registry_keeps_the_ids_the_cache_has() {
         // One launch cannot read the registry. The cache's copy of each ID
         // is the registry's last answer, so a moved track keeps its ID

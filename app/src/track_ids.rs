@@ -187,16 +187,20 @@ impl TrackIds {
         })
     }
 
-    fn save_to(&self, file: &Path, root: &str, log: &Logger) {
+    fn try_save_to(&self, file: &Path, root: &str) -> Result<(), String> {
         let on_disk = OnDisk {
             schema_version: SCHEMA_VERSION,
             root: root.to_string(),
             ids: self.by_path.clone(),
         };
-        let result = serde_json::to_vec(&on_disk)
+        serde_json::to_vec(&on_disk)
             .map_err(|e| format!("serialize {} entries failed: {e}", self.by_path.len()))
-            .and_then(|data| crate::paths::atomic_write_json(file, &data));
-        if let Err(e) = result {
+            .and_then(|data| crate::paths::atomic_write_json(file, &data))
+    }
+
+    #[cfg(test)]
+    fn save_to(&self, file: &Path, root: &str, log: &Logger) {
+        if let Err(e) = self.try_save_to(file, root) {
             log(&format!("zytunes: track-ids: {e}"));
         }
     }
@@ -278,15 +282,37 @@ fn with_registry_file<R>(
     log: &Logger,
     f: impl FnOnce(&mut TrackIds) -> R,
 ) -> Result<R, String> {
-    let _held = match file {
-        Some(file) => Some(lock_registry_file(file, log).map_err(|e| {
-            format!(
-                "the track-ID registry {} cannot be locked ({e}); it is left as it is",
-                file.display()
-            )
-        })?),
-        None => None,
-    };
+    let (out, saved) = read_modify_write(file, root, log, false, f)?;
+    if let Err(e) = saved {
+        log(&format!("zytunes: track-ids: {e}"));
+    }
+    Ok(out)
+}
+
+/// [`with_registry`] for a caller about to do what cannot be undone on
+/// the strength of the registry recording it (an apply moving files).
+/// The registry is saved once, unchanged, BEFORE `f` runs: `Err` when
+/// that fails (a full disk, a cache dir gone read-only), and `f` is not
+/// run. The second value is the save after `f`, which the caller has to
+/// report: by then the files have moved.
+pub fn with_writable_registry<R>(
+    root: &str,
+    log: &Logger,
+    f: impl FnOnce(&mut TrackIds) -> R,
+) -> Result<(R, Result<(), String>), String> {
+    let _guard = registry_lock();
+    let root = &normalised_root(root);
+    read_modify_write(registry_path(root).as_deref(), root, log, true, f)
+}
+
+fn read_modify_write<R>(
+    file: Option<&Path>,
+    root: &str,
+    log: &Logger,
+    prove_writable: bool,
+    f: impl FnOnce(&mut TrackIds) -> R,
+) -> Result<(R, Result<(), String>), String> {
+    let _held = file.and_then(|file| lock_registry_file(file, log));
     let mut ids = match file {
         Some(file) => TrackIds::load_from(file, root, log).ok_or_else(|| {
             format!(
@@ -296,14 +322,24 @@ fn with_registry_file<R>(
         })?,
         None => TrackIds::default(),
     };
-    let out = f(&mut ids);
-    if ids.dirty {
-        match file {
-            Some(file) => ids.save_to(file, root, log),
-            None => log("zytunes: track-ids: HOME unset, cannot persist track IDs"),
-        }
+    if let (true, Some(file)) = (prove_writable, file) {
+        ids.try_save_to(file, root).map_err(|e| {
+            format!(
+                "the track-ID registry {} cannot be written ({e})",
+                file.display()
+            )
+        })?;
     }
-    Ok(out)
+    let out = f(&mut ids);
+    let saved = match file {
+        Some(file) if ids.dirty => ids.try_save_to(file, root),
+        None if ids.dirty => {
+            log("zytunes: track-ids: HOME unset, cannot persist track IDs");
+            Ok(())
+        }
+        _ => Ok(()),
+    };
+    Ok((out, saved))
 }
 
 /// Lock the registry at `file` against every other zytunes process
@@ -312,26 +348,47 @@ fn with_registry_file<R>(
 /// moves). The lock is on a sibling `.lock` file, since the registry
 /// itself is replaced by rename on every save. Blocks until free; the
 /// lock is released when the returned file is dropped.
-fn lock_registry_file(file: &Path, log: &Logger) -> std::io::Result<std::fs::File> {
-    if let Some(parent) = file.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let lock = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(file.with_extension("json.lock"))?;
+///
+/// `None`, with a line in the log, when the lock itself cannot be had
+/// (a filesystem with no lock support, a lock file that cannot be made).
+/// The registry is then used unlocked, as it was before there was a
+/// lock: refusing it would refuse every filing on such a cache dir for
+/// good, though it reads and writes fine.
+fn lock_registry_file(file: &Path, log: &Logger) -> Option<std::fs::File> {
+    let unlocked = |e: std::io::Error| {
+        log(&format!(
+            "zytunes: track-ids: {} cannot be locked ({e}); used without the lock, so run one zytunes at a time",
+            file.display()
+        ));
+        None
+    };
+    let opened = file
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(file.with_extension("json.lock"))
+        });
+    let lock = match opened {
+        Ok(lock) => lock,
+        Err(e) => return unlocked(e),
+    };
     match lock.try_lock() {
-        Ok(()) => return Ok(lock),
+        Ok(()) => return Some(lock),
         Err(std::fs::TryLockError::WouldBlock) => log(&format!(
             "zytunes: track-ids: waiting for another zytunes to finish with {}",
             file.display()
         )),
-        Err(std::fs::TryLockError::Error(e)) => return Err(e),
+        Err(std::fs::TryLockError::Error(e)) => return unlocked(e),
     }
-    lock.lock()?;
-    Ok(lock)
+    match lock.lock() {
+        Ok(()) => Some(lock),
+        Err(e) => unlocked(e),
+    }
 }
 
 /// Record moves that already happened on disk. Tests only: production
@@ -377,8 +434,20 @@ pub fn mark_newer_schema(root: &str) {
 pub fn forget(root: &str) {
     let _guard = registry_lock();
     if let Some(file) = registry_path(&normalised_root(root)) {
+        let _ = std::fs::remove_dir(file.with_extension("json.tmp"));
         let _ = std::fs::remove_file(file);
     }
+}
+
+/// Make every save of the registry of `root` fail (a folder sits where
+/// the writer stages its temp file) while it still reads: a full disk,
+/// a cache dir gone read-only. [`forget`] undoes it. `pub` for the TUI's
+/// tests; not part of the API.
+#[doc(hidden)]
+pub fn block_saves(root: &str) {
+    let _guard = registry_lock();
+    let file = registry_path(&normalised_root(root)).expect("HOME set");
+    std::fs::create_dir_all(file.with_extension("json.tmp")).unwrap();
 }
 
 #[cfg(test)]
@@ -576,6 +645,49 @@ mod tests {
         });
         holder.join().unwrap();
         assert!(ran.is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_save_that_fails_after_the_work_is_handed_to_the_caller() {
+        // The registry was writable when the apply began and is not when
+        // it ends. The files have moved by then; the caller must be told
+        // so it can say so, not find a line in the log.
+        let dir =
+            std::env::temp_dir().join(format!("zytunes-track-ids-latefail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join("track-ids.json");
+        let log = default_logger();
+        let (_, saved) = read_modify_write(Some(&file), "/music", &log, true, |ids| {
+            ids.id_for(&p("/music/a.mp3"));
+            std::fs::create_dir_all(file.with_extension("json.tmp")).unwrap();
+        })
+        .expect("writable when it began");
+        assert!(saved.is_err_and(|e| e.contains("json.tmp")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_registry_that_cannot_be_locked_is_still_used() {
+        // A cache dir on a filesystem with no lock support (NFS without a
+        // lock daemon), or one where the lock file cannot be made. The
+        // registry itself reads and writes: refusing it would refuse
+        // every filing for good, to guard against a second process that
+        // is almost never there.
+        let dir =
+            std::env::temp_dir().join(format!("zytunes-track-ids-nolock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join("track-ids.json");
+        std::fs::create_dir_all(file.with_extension("json.lock")).unwrap();
+        let log = default_logger();
+        let id = with_registry_file(Some(&file), "/music", &log, |ids| {
+            ids.id_for(&p("/music/a.mp3"))
+        })
+        .expect("usable without its lock");
+        let again = with_registry_file(Some(&file), "/music", &log, |ids| {
+            ids.get(&p("/music/a.mp3"))
+        });
+        assert_eq!(again, Ok(Some(id)), "and saved");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
