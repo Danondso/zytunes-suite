@@ -3420,6 +3420,9 @@ impl App {
             Ok(lib) => {
                 // `None`: the apply was refused whole and the disk is as
                 // it was, so the library the app has is still right.
+                // The selection is where it was too: the proposed names
+                // were never written, so the anchor must not follow them.
+                let reread = lib.is_some();
                 if let Some(lib) = lib {
                     self.library = Some(lib);
                     self.inbox.hold_until_library = false;
@@ -3429,16 +3432,20 @@ impl App {
                     self.refresh_sidebar();
                 }
                 if overlay_matches {
-                    // Rewrite the anchor's album/track name to the proposed
-                    // target so post-rename navigation finds the renamed row.
-                    self.rewrite_anchor_post_rename();
-                    if self.browse_mode == BrowseMode::Library {
-                        self.restore_selection_anchor();
-                    } else {
-                        // Device and Playlists sidebars are not the library
-                        // artist list. Re-select whatever is already open
-                        // so the track list comes back after the refresh.
-                        self.select_sidebar_item();
+                    if reread {
+                        // Rewrite the anchor's album/track name to the
+                        // proposed target so post-rename navigation finds
+                        // the renamed row.
+                        self.rewrite_anchor_post_rename();
+                        if self.browse_mode == BrowseMode::Library {
+                            self.restore_selection_anchor();
+                        } else {
+                            // Device and Playlists sidebars are not the
+                            // library artist list. Re-select whatever is
+                            // already open so the track list comes back
+                            // after the refresh.
+                            self.select_sidebar_item();
+                        }
                     }
                     if let Some(overlay) = self.tag_manager.as_mut() {
                         overlay.phase = TagManagerPhase::Done;
@@ -16754,9 +16761,15 @@ mod tests {
         app.handle_mb_release_loaded(token, Ok(Box::new(dirt_release())));
         zytunes::track_ids::mark_newer_schema(root.to_str().unwrap());
         app.pending_bg_commands.clear();
+        let anchor = format!("{:?}", app.tag_manager.as_ref().unwrap().anchor);
         apply_open_overlay_inline(&mut app, &root);
 
         assert!(old.exists(), "nothing was moved");
+        assert_eq!(
+            format!("{:?}", app.tag_manager.as_ref().unwrap().anchor),
+            anchor,
+            "the selection anchor follows names that were never written"
+        );
         assert!(!app.inbox.hold_until_library);
         assert!(
             !app.pending_bg_commands

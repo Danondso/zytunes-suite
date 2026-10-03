@@ -134,16 +134,6 @@ impl DirectoryLibrary {
         // so first launches just fall through to a full parse.
         let cached = crate::cache::load_dirlib_cache(path, &options.log);
 
-        // Parallel directory walk.
-        let walk = Walk::of(root);
-        let paths = &walk.files;
-        let total = paths.len() as u64;
-        on_progress(ScanProgress {
-            completed: 0,
-            total,
-            sample: None,
-        });
-
         // For each file: stat → fingerprint → reuse cached Track if the
         // (mtime,size) fingerprint matches, otherwise run lofty to parse tags
         // + duration. Stats are cheap; lofty is the expensive step, so the
@@ -178,10 +168,6 @@ impl DirectoryLibrary {
         // in the working map (still pointing at the previous-scan entry), so
         // a Ctrl+C mid-scan only loses the current chunk's work — never the
         // previous run's entries for files we just haven't reached yet.
-        let extant_paths: HashSet<String> = paths
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
         let working: Mutex<HashMap<String, crate::cache::CachedFile>> = Mutex::new(cached.clone());
 
         // Every file's ID comes from the registry, never from the path it
@@ -201,8 +187,21 @@ impl DirectoryLibrary {
         // keyed on an ID it will not have tomorrow. A file the cache does
         // not know takes the hash of its path, as an empty registry
         // would have given it.
-        let ids: HashMap<String, u64> =
+        //
+        // The parallel directory walk runs inside the registry's
+        // read-modify-write. A scan that walked first and then waited for
+        // another zytunes to finish an apply would judge the registry the
+        // apply left against folders as they were before it: the moved
+        // tracks' entries proven gone, their IDs handed to the paths they
+        // left.
+        let (walk, ids): (Walk, HashMap<String, u64>) =
             crate::track_ids::with_registry(path, &options.log, |registry| {
+                let walk = Walk::of(root);
+                let extant_paths: HashSet<String> = walk
+                    .files
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect();
                 // Entries are path strings, and so is the root as the user
                 // spelled it: a root spelled another way today (`/m//Music`)
                 // matches no entry, and that is not evidence of anything.
@@ -211,19 +210,23 @@ impl DirectoryLibrary {
                         || !p.starts_with(path)
                         || !walk.proves_gone(Path::new(p), root)
                 });
-                paths
+                let ids = walk
+                    .files
                     .iter()
                     .map(|p| (p.to_string_lossy().into_owned(), registry.id_for(p)))
-                    .collect()
+                    .collect();
+                (walk, ids)
             })
             .unwrap_or_else(|why| {
+                let walk = Walk::of(root);
                 (options.log)(&format!(
                     "zytunes: {why}; this scan keeps the track IDs the cache has"
                 ));
                 // A file the cache knows keeps its ID; one it does not is
                 // hashed as the registry would, salted away from an ID a
                 // moved track holds (a fresh file at its old path).
-                let keyed: Vec<(String, Option<u64>)> = paths
+                let keyed: Vec<(String, Option<u64>)> = walk
+                    .files
                     .iter()
                     .map(|p| {
                         let key = p.to_string_lossy().into_owned();
@@ -232,7 +235,7 @@ impl DirectoryLibrary {
                     })
                     .collect();
                 let mut used: HashSet<u64> = keyed.iter().filter_map(|(_, id)| *id).collect();
-                keyed
+                let ids = keyed
                     .into_iter()
                     .map(|(key, id)| {
                         let id = id.unwrap_or_else(|| {
@@ -242,8 +245,16 @@ impl DirectoryLibrary {
                         });
                         (key, id)
                     })
-                    .collect()
+                    .collect();
+                (walk, ids)
             });
+        let paths = &walk.files;
+        let total = paths.len() as u64;
+        on_progress(ScanProgress {
+            completed: 0,
+            total,
+            sample: None,
+        });
 
         // Tracks how many entries genuinely changed since the last on-disk
         // save. Increments when the file is new, its acoustic id changed, or
@@ -379,7 +390,7 @@ impl DirectoryLibrary {
         let mut final_cache = working.into_inner().expect("working cache lock");
         let pruned = {
             let before = final_cache.len();
-            final_cache.retain(|k, _| extant_paths.contains(k));
+            final_cache.retain(|k, _| ids.contains_key(k));
             before - final_cache.len()
         };
 
@@ -517,7 +528,29 @@ impl DirectoryLibrary {
                 .filter(|p| p.is_file())
                 .map(|p| (p.clone(), registry.id_for(p)))
                 .collect()
-        })?;
+        })
+        .unwrap_or_else(|why| {
+            // Nothing moved (an apply that would move a file is refused
+            // without the registry), so this is a tag edit read in place
+            // and the cache's copy of each ID is still the track's.
+            log(&format!(
+                "zytunes: {why}; this reread keeps the track IDs the cache has"
+            ));
+            let mut used: HashSet<u64> = cached.values().map(|entry| entry.track.id).collect();
+            let mut ids: HashMap<PathBuf, u64> = carried
+                .iter()
+                .filter_map(|(key, moved)| Some((moved.clone(), cached.get(key)?.track.id)))
+                .collect();
+            for p in paths.iter().filter(|p| p.is_file()) {
+                let known = cached.get(p.to_string_lossy().as_ref());
+                let id = known
+                    .map(|entry| entry.track.id)
+                    .unwrap_or_else(|| crate::track_ids::unused_id(p, &used));
+                used.insert(id);
+                ids.entry(p.clone()).or_insert(id);
+            }
+            ids
+        });
 
         // A carried file was not touched, only its folder was, and an
         // artist folder can hold thousands: the cached entry is reused
@@ -2819,6 +2852,78 @@ mod tests {
         assert_eq!(id_of(&lib, &new), Some(id));
         let fresh = id_of(&lib, &one).expect("the fresh file is in the library");
         assert_ne!(fresh, id, "two files, two IDs");
+        forget_library(&dir);
+    }
+
+    #[test]
+    fn a_scan_that_waited_out_an_apply_sees_the_library_the_apply_left() {
+        // Another zytunes holds the registry while it files a track. A
+        // scan that walked the library before waiting would then judge
+        // the registry against folders as they were before the move: the
+        // moved track's entry "proven gone", its ID handed back to the
+        // path it left.
+        let (dir, one, _two) = two_album_library("scan-waits-apply");
+        let root = dir.to_str().unwrap().to_string();
+        let id = id_of(&DirectoryLibrary::scan(&root).unwrap(), &one).expect("scanned");
+        let new = one.with_file_name("01 - Song.mp3");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let apply = std::thread::spawn({
+            let (root, one, new) = (root.clone(), one.clone(), new.clone());
+            move || {
+                let log = crate::cache::default_logger();
+                crate::track_ids::with_registry(&root, &log, |ids| {
+                    started_tx.send(()).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    fs::rename(&one, &new).unwrap();
+                    ids.apply_moves(
+                        |old| {
+                            if old == one {
+                                new.clone()
+                            } else {
+                                old.to_path_buf()
+                            }
+                        },
+                        |old| old == one,
+                    );
+                })
+                .expect("registry usable");
+            }
+        });
+        started_rx.recv().unwrap();
+        let lib = DirectoryLibrary::scan(&root).unwrap();
+        apply.join().unwrap();
+        assert_eq!(id_of(&lib, &new), Some(id), "the moved track and its ID");
+        assert!(registered(&dir, &new));
+        assert!(!registered(&dir, &one), "nothing is at the path it left");
+        forget_library(&dir);
+    }
+
+    #[test]
+    fn a_tag_edit_is_reread_when_the_registry_cannot_be_used() {
+        // A tag-only apply moves nothing, so it runs without the registry.
+        // Its reread must not then fail for want of one: the cache's copy
+        // of each ID is the registry's last answer.
+        let (dir, one, _two) = two_album_library("reread-no-registry");
+        let root = dir.to_str().unwrap();
+        let new = one.with_file_name("01 - Song.mp3");
+        let log = crate::cache::default_logger();
+        let out = crate::tag_ops::apply_and_record_moves(&rename_only_diff(&one, &new), root, &log);
+        assert!(out.results[0].is_ok(), "{:?}", out.results[0]);
+        let id = id_of(&DirectoryLibrary::scan(root).unwrap(), &new).expect("scanned");
+        assert_ne!(id, hash_path(&new));
+
+        crate::track_ids::mark_newer_schema(root);
+        let lib = DirectoryLibrary::reread_paths_after(
+            root,
+            std::slice::from_ref(&new),
+            &[],
+            &[],
+            false,
+            &log,
+        )
+        .expect("a reread in place needs no registry");
+        assert_eq!(id_of(&lib, &new), Some(id));
+        assert_eq!(lib.track_count(), 2);
         forget_library(&dir);
     }
 

@@ -1043,6 +1043,13 @@ pub fn apply_release_diff(diff: &ReleaseTagDiff, library_root: &Path) -> ApplyOu
 /// describe the folder that is going away.
 const OS_JUNK: &[&str] = &[".DS_Store", "Thumbs.db", "desktop.ini"];
 
+/// Windows writes `Thumbs.db` and `desktop.ini` in whatever case the
+/// tool that made them chose.
+fn is_os_junk(name: &std::ffi::OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| OS_JUNK.iter().any(|junk| name.eq_ignore_ascii_case(junk)))
+}
+
 /// Extensions a writer gives a file it has not finished (browsers,
 /// rsync, aria2, qBittorrent, our own rip): the writer will rename it
 /// when it is done, so it is left where the writer expects it.
@@ -1228,16 +1235,19 @@ fn move_sidecars(from: &Path, to: &Path, errors: &mut Vec<String>) {
             continue;
         }
         if kind.is_dir() {
+            // Anything that stayed in the subfolder is already on
+            // `errors`, and the subfolder stays with it.
+            let reported = errors.len();
             move_sidecars(&path, &to.join(&name), errors);
-            if let Err(e) = std::fs::remove_dir(&path) {
-                errors.push(format!("remove {}: {e}", path.display()));
+            if errors.len() == reported {
+                if let Err(e) = std::fs::remove_dir(&path) {
+                    errors.push(format!("remove {}: {e}", path.display()));
+                }
             }
             continue;
         }
         let target = to.join(&name);
-        let moved = if OS_JUNK.iter().any(|junk| name == *junk)
-            || (target.is_file() && same_contents(&path, &target))
-        {
+        let moved = if is_os_junk(&name) || (target.is_file() && same_contents(&path, &target)) {
             std::fs::remove_file(&path).map_err(|e| format!("remove {}: {e}", path.display()))
         } else {
             move_file(&path, &landing_path(&path, &target))
@@ -4064,6 +4074,41 @@ mod tests {
             "{:?}",
             out.sidecar_errors
         );
+    }
+
+    #[test]
+    fn a_subfolder_kept_for_a_file_left_in_place_is_reported_once() {
+        // `Scans/` stays because of the download inside it. That is one
+        // thing left behind, not two: no "remove Scans: Directory not
+        // empty" on top of the line that names the file.
+        let dir = fresh_dir("sidecars-in-progress-nested");
+        let rip = dir.join("inbox").join("rip");
+        let src = rip.join("10 - Done.wav");
+        wav_at(&src);
+        file_at(&rip.join("Scans").join("back.png.part"), b"half");
+        let album = dir.join("Artist").join("Album");
+        let out = apply_release_diff(&rename_only_diff(&src, &album.join("10 - Done.wav")), &dir);
+        assert!(out.results[0].is_ok(), "{:?}", out.results[0]);
+        assert!(rip.join("Scans").join("back.png.part").exists());
+        assert_eq!(out.sidecar_errors.len(), 1, "{:?}", out.sidecar_errors);
+        assert!(out.sidecar_errors[0].contains("still being written"));
+    }
+
+    #[test]
+    fn os_junk_is_dropped_however_its_name_is_cased() {
+        let dir = fresh_dir("sidecars-junk-case");
+        let rip = dir.join("inbox").join("rip");
+        let src = rip.join("a.wav");
+        wav_at(&src);
+        file_at(&rip.join("thumbs.db"), b"junk");
+        file_at(&rip.join("Desktop.ini"), b"junk");
+        let album = dir.join("Artist").join("Album");
+        let out = apply_release_diff(&rename_only_diff(&src, &album.join("01 - A.wav")), &dir);
+        assert!(out.results[0].is_ok(), "{:?}", out.results[0]);
+        assert!(out.sidecar_errors.is_empty(), "{:?}", out.sidecar_errors);
+        assert!(!album.join("thumbs.db").exists());
+        assert!(!album.join("Desktop.ini").exists());
+        assert!(!rip.exists());
     }
 
     #[test]
