@@ -949,6 +949,7 @@ pub fn apply_release_diff(diff: &ReleaseTagDiff, library_root: &Path) -> ApplyOu
     // one can carry a file that has already landed, so the map is brought
     // up to date at the end.
     let mut landed_after: HashMap<PathBuf, usize> = HashMap::new();
+    let mut folder_case = FolderCase::default();
     let mut pending = to_rename;
     loop {
         let mut blocked: Vec<(usize, &PathBuf, &PathBuf)> = Vec::new();
@@ -965,7 +966,13 @@ pub fn apply_release_diff(diff: &ReleaseTagDiff, library_root: &Path) -> ApplyOu
             let landed = if live_src == *dest {
                 Ok(live_src.clone())
             } else {
-                perform_rename(&live_src, dest, library_root, &mut dir_renames)
+                perform_rename(
+                    &live_src,
+                    dest,
+                    library_root,
+                    &mut dir_renames,
+                    &mut folder_case,
+                )
             };
             progressed = true;
             match landed {
@@ -1208,17 +1215,37 @@ fn move_sidecars(from: &Path, to: &Path, errors: &mut Vec<String>) {
 
 /// Byte-for-byte equal, read in chunks: a sidecar can be a disc image.
 fn same_contents(a: &Path, b: &Path) -> bool {
-    use std::io::Read;
     let len = |p: &Path| std::fs::metadata(p).map(|m| m.len()).ok();
     if len(a).is_none() || len(a) != len(b) {
         return false;
     }
-    let (Ok(mut a), Ok(mut b)) = (std::fs::File::open(a), std::fs::File::open(b)) else {
+    let (Ok(a), Ok(b)) = (std::fs::File::open(a), std::fs::File::open(b)) else {
         return false;
     };
+    same_bytes(a, b)
+}
+
+/// [`same_contents`] on open readers. Each buffer is filled before the
+/// two are compared: a read may return fewer bytes than asked (a network
+/// mount does), and not the same number for both sides.
+fn same_bytes(mut a: impl std::io::Read, mut b: impl std::io::Read) -> bool {
+    use std::io::ErrorKind;
+    // Fill `buf` or hit end of file; `None` on a read error.
+    fn fill(reader: &mut impl std::io::Read, buf: &mut [u8]) -> Option<usize> {
+        let mut filled = 0;
+        while filled < buf.len() {
+            match reader.read(&mut buf[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(_) => return None,
+            }
+        }
+        Some(filled)
+    }
     let (mut x, mut y) = (vec![0u8; 64 * 1024], vec![0u8; 64 * 1024]);
     loop {
-        let (Ok(n), Ok(m)) = (a.read(&mut x), b.read(&mut y)) else {
+        let (Some(n), Some(m)) = (fill(&mut a, &mut x), fill(&mut b, &mut y)) else {
             return false;
         };
         if n != m || x[..n] != y[..m] {
@@ -1239,21 +1266,34 @@ fn same_contents(a: &Path, b: &Path) -> bool {
 /// playlists, play stats and stem splits are left behind. `music_dir` is
 /// the library root exactly as the scan was given it (it names the
 /// registry).
+///
+/// A diff that would move a file is applied inside the registry's
+/// read-modify-write, so the registry is known usable before the first
+/// move. When it is not, nothing is applied and every track reports
+/// why: a file moved without its ID is a new track after the next scan,
+/// and there is no putting that back.
 pub fn apply_and_record_moves(
     diff: &ReleaseTagDiff,
     music_dir: &str,
     log: &crate::cache::Logger,
 ) -> ApplyOutcome {
-    let outcome = apply_release_diff(diff, Path::new(music_dir));
-    if !outcome.rename_map.is_empty() || !outcome.dir_renames.is_empty() {
-        crate::track_ids::record_moves(
-            music_dir,
-            log,
-            |old| moved_path(old, &outcome.rename_map, &outcome.dir_renames),
-            |old| outcome.rename_map.contains_key(old),
-        );
+    if !diff.tracks.iter().any(TrackTagDiff::wants_rename) {
+        return apply_release_diff(diff, Path::new(music_dir));
     }
-    outcome
+    crate::track_ids::with_registry(music_dir, log, |ids| {
+        let outcome = apply_release_diff(diff, Path::new(music_dir));
+        if !outcome.rename_map.is_empty() || !outcome.dir_renames.is_empty() {
+            ids.apply_moves(
+                |old| moved_path(old, &outcome.rename_map, &outcome.dir_renames),
+                |old| outcome.rename_map.contains_key(old),
+            );
+        }
+        outcome
+    })
+    .unwrap_or_else(|why| ApplyOutcome {
+        results: vec![Err(format!("not applied: {why}")); diff.tracks.len()],
+        ..Default::default()
+    })
 }
 
 /// Record why a track did not move. The move error leads: the file is
@@ -1662,6 +1702,7 @@ fn perform_rename(
     dest: &Path,
     library_root: &Path,
     dir_renames: &mut Vec<(PathBuf, PathBuf)>,
+    folder_case: &mut FolderCase,
 ) -> Result<PathBuf, String> {
     // `rename` between two hard links of one file succeeds and does
     // nothing: both names stay, and the move would be reported as done.
@@ -1684,7 +1725,7 @@ fn perform_rename(
     // retitled first: on a case-folding volume `create_dir_all` keeps the
     // old spelling, and the rename map would name a path the next scan
     // does not see.
-    let src = retitle_dest_folders(src, dest, library_root, dir_renames)?;
+    let src = retitle_dest_folders(src, dest, library_root, dir_renames, folder_case)?;
     // Decided here, after the folder retitles and right before the move:
     // on a case-sensitive volume a retitled folder can turn out to hold a
     // file at `dest` that nothing could see earlier.
@@ -1746,6 +1787,7 @@ fn retitle_dest_folders(
     dest: &Path,
     library_root: &Path,
     dir_renames: &mut Vec<(PathBuf, PathBuf)>,
+    folder_case: &mut FolderCase,
 ) -> Result<PathBuf, String> {
     let Some(folders) = dest
         .parent()
@@ -1757,8 +1799,9 @@ fn retitle_dest_folders(
     let mut built = library_root.to_path_buf();
     for component in folders.components() {
         if let std::path::Component::Normal(want) = component {
-            if let Some(have) = sole_case_variant(&built, want) {
+            if let Some(have) = folder_case.variant(&built, want) {
                 retitle_case_along(&built.join(have), &built.join(want), dir_renames)?;
+                folder_case.retitled(&built, want);
             }
         }
         built.push(component);
@@ -1767,6 +1810,44 @@ fn retitle_dest_folders(
         src,
         &dir_renames[retitled_from..],
     ))
+}
+
+/// The folder spellings one apply has already settled, keyed by the
+/// wanted path. Every track of an album asks the same question of the
+/// same folders, and the first one costs a listing of the library root
+/// (one entry per artist): the answer is kept, and set to "nothing to
+/// retitle" once the folder has been retitled.
+///
+/// Nothing but this apply changes those listings meanwhile: a move
+/// creates the wanted spelling (which is also "nothing to retitle"),
+/// and the folders it empties are below the ones asked about.
+#[derive(Default)]
+struct FolderCase {
+    settled: HashMap<PathBuf, Option<std::ffi::OsString>>,
+    #[cfg(test)]
+    listings: usize,
+}
+
+impl FolderCase {
+    /// [`sole_case_variant`], listing `dir` the first time only.
+    fn variant(&mut self, dir: &Path, want: &std::ffi::OsStr) -> Option<std::ffi::OsString> {
+        let key = dir.join(want);
+        if let Some(settled) = self.settled.get(&key) {
+            return settled.clone();
+        }
+        #[cfg(test)]
+        {
+            self.listings += 1;
+        }
+        let variant = sole_case_variant(dir, want);
+        self.settled.insert(key, variant.clone());
+        variant
+    }
+
+    /// `dir/want` now has the wanted spelling.
+    fn retitled(&mut self, dir: &Path, want: &std::ffi::OsStr) {
+        self.settled.insert(dir.join(want), None);
+    }
 }
 
 /// The one folder in `dir` whose name is `want` in another ASCII case.
@@ -3811,6 +3892,60 @@ mod tests {
         // A byte-identical copy is not kept twice.
         assert!(!album.join("notes (2).txt").exists());
         assert!(!dir.join("loose").exists());
+    }
+
+    #[test]
+    fn a_folder_is_listed_once_per_apply_however_many_tracks_land_in_it() {
+        let dir = fresh_dir("folder-case-memo");
+        std::fs::create_dir_all(dir.join("artist")).unwrap();
+        let want = std::ffi::OsStr::new("Artist");
+        let mut folder_case = FolderCase::default();
+        assert_eq!(
+            folder_case.variant(&dir, want).as_deref(),
+            Some(std::ffi::OsStr::new("artist"))
+        );
+        assert_eq!(
+            folder_case.variant(&dir, want).as_deref(),
+            Some(std::ffi::OsStr::new("artist"))
+        );
+        assert_eq!(
+            folder_case.listings, 1,
+            "the second track does not list again"
+        );
+        std::fs::rename(dir.join("artist"), dir.join("Artist")).unwrap();
+        folder_case.retitled(&dir, want);
+        assert_eq!(folder_case.variant(&dir, want), None);
+        assert_eq!(folder_case.listings, 1);
+    }
+
+    #[test]
+    fn identical_bytes_served_in_different_pieces_still_compare_equal() {
+        // A network mount answers a read with fewer bytes than asked, and
+        // not the same number for both files. The comparison fills each
+        // buffer before it looks, so an identical cover is still removed
+        // instead of filed as `cover (2).jpg`.
+        struct Dribble<'a> {
+            data: &'a [u8],
+            at_most: usize,
+        }
+        impl std::io::Read for Dribble<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.data.len().min(buf.len()).min(self.at_most);
+                buf[..n].copy_from_slice(&self.data[..n]);
+                self.data = &self.data[n..];
+                Ok(n)
+            }
+        }
+        let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let mut other = data.clone();
+        other[150_001] ^= 1;
+        fn dribble(data: &[u8], at_most: usize) -> Dribble<'_> {
+            Dribble { data, at_most }
+        }
+        assert!(same_bytes(dribble(&data, 7), dribble(&data, 65_536)));
+        assert!(same_bytes(dribble(&data, 1000), dribble(&data, 3)));
+        assert!(!same_bytes(dribble(&data, 7), dribble(&other, 65_536)));
+        assert!(!same_bytes(dribble(&data, 7), dribble(&data[..199_999], 7)));
     }
 
     #[test]

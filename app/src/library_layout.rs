@@ -10,7 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use crate::dirlib::{is_audio_file, track_from_lofty};
+use crate::dirlib::{is_audio_file, probe_track, Probed};
 use crate::library::Track;
 
 /// Folder name next to the music library root (not inside it).
@@ -75,7 +75,10 @@ pub fn scan_inbox(inbox: &Path, skip: &HashSet<String>, fingerprint: bool) -> Ve
             continue;
         }
         let id = crate::dirlib::hash_path(&path);
-        let mut track = track_from_lofty(&path, id).unwrap_or_else(|| untagged_track(&path, id));
+        let mut track = match probe_track(&path, id) {
+            Probed::Tagged(track) => *track,
+            Probed::Untagged { duration_ms } => untagged_track(&path, id, duration_ms),
+        };
         if fingerprint && track.acoustic_id.is_none() {
             track.acoustic_id = crate::fingerprint::compute_fingerprint(&path);
         }
@@ -145,7 +148,9 @@ pub fn cluster_by_album(tracks: Vec<Track>) -> Vec<AlbumCluster> {
         .collect()
 }
 
-fn untagged_track(path: &Path, id: u64) -> Track {
+/// A drop with no usable tag. `duration_ms` is what the probe read, so
+/// the file is not opened a second time for it.
+fn untagged_track(path: &Path, id: u64, duration_ms: Option<u64>) -> Track {
     let name = path
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -155,7 +160,7 @@ fn untagged_track(path: &Path, id: u64) -> Track {
         name,
         artist: "Unknown".into(),
         album: "Unknown".into(),
-        total_time_ms: crate::dirlib::audio_duration_ms(path),
+        total_time_ms: duration_ms,
         location: Some(path.to_string_lossy().into_owned()),
         ..Default::default()
     }

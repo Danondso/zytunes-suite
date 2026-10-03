@@ -248,7 +248,17 @@ fn registry_lock() -> std::sync::MutexGuard<'static, ()> {
 
 /// Run `f` against the registry of `root`, saving it afterwards when `f`
 /// changed anything.
-pub fn with_registry<R>(root: &str, log: &Logger, f: impl FnOnce(&mut TrackIds) -> R) -> R {
+///
+/// `Err` (naming the file and why) when the registry is there but cannot
+/// be used right now; `f` is not run. There is no working on a stand-in:
+/// an ID handed out against an empty registry is not the track's, and a
+/// move recorded there is lost. Callers decide what that means for them:
+/// a scan keeps the IDs its cache already has, an apply moves nothing.
+pub fn with_registry<R>(
+    root: &str,
+    log: &Logger,
+    f: impl FnOnce(&mut TrackIds) -> R,
+) -> Result<R, String> {
     let _guard = registry_lock();
     let root = &normalised_root(root);
     with_registry_file(registry_path(root).as_deref(), root, log, f)
@@ -259,36 +269,61 @@ fn with_registry_file<R>(
     root: &str,
     log: &Logger,
     f: impl FnOnce(&mut TrackIds) -> R,
-) -> R {
-    let loaded = match file {
-        Some(file) => TrackIds::load_from(file, root, log),
-        None => Some(TrackIds::default()),
+) -> Result<R, String> {
+    let mut ids = match file {
+        Some(file) => TrackIds::load_from(file, root, log).ok_or_else(|| {
+            format!(
+                "the track-ID registry {} cannot be used (see the log); it is left as it is",
+                file.display()
+            )
+        })?,
+        None => TrackIds::default(),
     };
-    let usable = loaded.is_some();
-    let mut ids = loaded.unwrap_or_default();
     let out = f(&mut ids);
     if ids.dirty {
         match file {
-            Some(file) if usable => ids.save_to(file, root, log),
-            Some(file) => log(&format!(
-                "zytunes: track-ids: {} could not be used, so it is left as it is and this session's track IDs are not saved",
-                file.display()
-            )),
+            Some(file) => ids.save_to(file, root, log),
             None => log("zytunes: track-ids: HOME unset, cannot persist track IDs"),
         }
     }
-    out
+    Ok(out)
 }
 
 /// Record the moves an apply performed, before the library is re-read.
 /// `moved` and `renamed` are as for [`TrackIds::apply_moves`].
+///
+/// The moves have already happened by the time this runs, so a caller
+/// must check the registry can be used BEFORE moving anything
+/// ([`crate::tag_ops::apply_and_record_moves`] does); an `Err` here means
+/// those files have lost their IDs.
 pub fn record_moves(
     root: &str,
     log: &Logger,
     moved: impl Fn(&Path) -> PathBuf,
     renamed: impl Fn(&Path) -> bool,
-) {
+) -> Result<(), String> {
     with_registry(root, log, |ids| ids.apply_moves(moved, renamed))
+}
+
+/// Rewrite the registry of `root` as a newer build would have, so this
+/// build cannot use it. Tests stand in for the bad day.
+#[cfg(test)]
+pub(crate) fn mark_newer_schema(root: &str) {
+    let _guard = registry_lock();
+    let root = normalised_root(root);
+    let file = registry_path(&root).expect("HOME set");
+    let ids = std::fs::read(&file)
+        .ok()
+        .and_then(|data| serde_json::from_slice::<OnDisk>(&data).ok())
+        .map(|parsed| parsed.ids)
+        .unwrap_or_default();
+    let newer = OnDisk {
+        schema_version: SCHEMA_VERSION + 1,
+        root,
+        ids,
+    };
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, serde_json::to_vec(&newer).unwrap()).unwrap();
 }
 
 /// Delete the registry of `root`. Tests reuse temp-dir names across runs,
@@ -480,17 +515,19 @@ mod tests {
             .unwrap()
             .replace("\"schema_version\":1", "\"schema_version\":2");
         std::fs::write(&file, &newer).unwrap();
-        with_registry_file(Some(&file), "/music", &log, |ids| {
+        let ran = with_registry_file(Some(&file), "/music", &log, |ids| {
             ids.id_for(&p("/music/new.mp3"));
         });
+        assert!(ran.is_err(), "the caller is told, not handed a stand-in");
         assert_eq!(std::fs::read_to_string(&file).unwrap(), newer);
 
         // The read itself fails (the path is a directory).
         std::fs::remove_file(&file).unwrap();
         std::fs::create_dir(&file).unwrap();
-        with_registry_file(Some(&file), "/music", &log, |ids| {
+        let ran = with_registry_file(Some(&file), "/music", &log, |ids| {
             ids.id_for(&p("/music/new.mp3"));
         });
+        assert!(ran.is_err());
         assert!(file.is_dir());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -506,7 +543,8 @@ mod tests {
         std::fs::write(&file, b"{ not json").unwrap();
         with_registry_file(Some(&file), "/music", &log, |ids| {
             ids.id_for(&p("/music/a.mp3"));
-        });
+        })
+        .expect("a registry moved aside reads as empty");
         assert_eq!(
             std::fs::read(dir.join("track-ids.json.corrupt")).unwrap(),
             b"{ not json"

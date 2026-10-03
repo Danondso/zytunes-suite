@@ -457,7 +457,7 @@ pub enum BgCommand {
         inbox: PathBuf,
         /// Locations dismissed this session. Dropped before the tag read
         /// and the fingerprint decode, not after the scan returns.
-        dismissed: std::collections::HashSet<String>,
+        dismissed: std::sync::Arc<std::collections::HashSet<String>>,
         fingerprint: bool,
         /// Create the inbox folder before scanning. Set on the first scan
         /// of a session only: the folder exists by default, but a parent

@@ -1097,8 +1097,10 @@ pub struct InboxState {
     /// Remaining album clusters waiting for the tag-manager overlay.
     pub queue: VecDeque<zytunes::library_layout::AlbumCluster>,
     /// Inbox locations the user dismissed this session. Filtered out of
-    /// later scans until the TUI restarts.
-    pub dismissed: HashSet<String>,
+    /// later scans until the TUI restarts. Shared with each scan command
+    /// rather than copied per poll; add through
+    /// [`App::snooze_inbox_paths`].
+    pub dismissed: Arc<HashSet<String>>,
     /// A filing apply's library reread failed. The queue stays put until
     /// a library swap succeeds; the poll must not open it against the
     /// pre-apply library.
@@ -1115,7 +1117,7 @@ impl Default for InboxState {
             last_request: Some(Instant::now()),
             scan_in_flight: false,
             queue: VecDeque::new(),
-            dismissed: HashSet::new(),
+            dismissed: Arc::default(),
             hold_until_library: false,
             dir_requested: false,
         }
@@ -2774,14 +2776,29 @@ impl App {
             self.close_tag_manager();
             return;
         }
-        let queued = self
+        let queued: Vec<String> = self
             .inbox
             .queue
             .drain(..)
             .flat_map(|c| c.tracks)
-            .filter_map(|t| t.location);
-        self.inbox.dismissed.extend(queued);
+            .filter_map(|t| t.location)
+            .collect();
+        self.snooze_inbox_paths(queued);
         self.close_tag_manager();
+    }
+
+    /// Keep `paths` out of this session's inbox scans. A path inside the
+    /// library is not an inbox drop and never meets a scan, so it is not
+    /// kept: `F` on an artist would otherwise leave every track of
+    /// theirs in the set.
+    fn snooze_inbox_paths(&mut self, paths: impl IntoIterator<Item = String>) {
+        let paths: Vec<String> = paths
+            .into_iter()
+            .filter(|loc| !self.is_library_path(loc))
+            .collect();
+        if !paths.is_empty() {
+            Arc::make_mut(&mut self.inbox.dismissed).extend(paths);
+        }
     }
 
     /// Close the overlay. `advance` opens the next queued filing cluster
@@ -2803,7 +2820,7 @@ impl App {
         // rename map did move, including when the reread failed and the
         // screen is Error rather than Done, so a file dropped there again
         // this session still opens.
-        let still_there = overlay
+        let still_there: Vec<String> = overlay
             .source_tracks
             .iter()
             .flatten()
@@ -2812,8 +2829,10 @@ impl App {
                 !overlay
                     .last_rename_map
                     .contains_key(std::path::Path::new(loc.as_str()))
-            });
-        self.inbox.dismissed.extend(still_there.cloned());
+            })
+            .cloned()
+            .collect();
+        self.snooze_inbox_paths(still_there);
         // A dismiss keeps the rest of the queue: those clusters were
         // already tag-read and fingerprinted, and the next poll opens the
         // next one from the queue instead of rescanning the inbox.
@@ -6440,7 +6459,7 @@ impl App {
         let fingerprint = self.scan_fingerprint && self.acoustid_app_key.is_some();
         self.pending_bg_commands.push(BgCommand::ScanInbox {
             inbox,
-            dismissed: self.inbox.dismissed.clone(),
+            dismissed: Arc::clone(&self.inbox.dismissed),
             fingerprint,
             create_dir: !std::mem::replace(&mut self.inbox.dir_requested, true),
         });
@@ -15335,10 +15354,11 @@ mod tests {
     fn dismissing_a_filing_cluster_keeps_the_rest_queued_for_the_next_poll() {
         let dir = std::env::temp_dir().join("zytunes-dismiss-keeps-queue");
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir.join("Music")).unwrap();
+        // A drop beside the library, bound for a place inside it.
         let src = dir.join("a.wav");
         std::fs::write(&src, b"src").unwrap();
-        let mut app = filing_overlay_with_rename(&src, &dir.join("b.wav"));
+        let mut app = filing_overlay_with_rename(&src, &dir.join("Music").join("b.wav"));
         app.tag_manager.as_mut().unwrap().source_tracks = Some(vec![Track {
             id: 1,
             name: "a".into(),
@@ -15737,7 +15757,7 @@ mod tests {
         app.library = Some(make_minimal_library());
         app.music_dir_cache = Some(std::path::PathBuf::from("/tmp/zytunes-music"));
         app.inbox.last_request = None;
-        app.inbox.dismissed.insert("/inbox/skip.mp3".into());
+        app.snooze_inbox_paths(["/inbox/skip.mp3".to_string()]);
         app.maybe_request_inbox_scan();
         let sent = app.pending_bg_commands.iter().find_map(|c| match c {
             BgCommand::ScanInbox { dismissed, .. } => Some(dismissed),
@@ -15747,6 +15767,29 @@ mod tests {
             sent.is_some_and(|d| d.contains("/inbox/skip.mp3")),
             "the worker must know what to skip before it reads or fingerprints"
         );
+        // The set is shared with the worker, not copied every five seconds.
+        assert!(sent.is_some_and(|d| Arc::ptr_eq(d, &app.inbox.dismissed)));
+    }
+
+    #[test]
+    fn closing_a_library_filing_overlay_snoozes_nothing() {
+        // `F` on a library artist files tracks that are not in the inbox.
+        // The snooze list only ever filters inbox scans, so those paths
+        // would sit in it for the session doing nothing, a few thousand
+        // strings per artist, and ride along to the worker.
+        let src = PathBuf::from("/m/Artist/Album/01 Song.wav");
+        let mut app =
+            filing_overlay_with_rename(&src, std::path::Path::new("/m/Artist/Album/01 - Song.wav"));
+        app.tag_manager.as_mut().unwrap().source_tracks = Some(vec![Track {
+            id: 1,
+            name: "Song".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            location: Some(src.display().to_string()),
+            ..Default::default()
+        }]);
+        app.close_tag_manager();
+        assert!(app.inbox.dismissed.is_empty(), "{:?}", app.inbox.dismissed);
     }
 
     #[test]
@@ -16244,7 +16287,7 @@ mod tests {
     fn filing_overlay_with_rename(src: &std::path::Path, dest: &std::path::Path) -> App {
         use zytunes::tag_ops::{FieldDiff, FieldKind, ReleaseTagDiff, TrackTagDiff};
         let mut app = make_app_with_library_for_tagmgr();
-        app.music_dir_cache = Some(src.parent().unwrap().to_path_buf());
+        app.music_dir_cache = Some(dest.parent().unwrap().to_path_buf());
         let mut overlay = TagManagerOverlay::new(
             zytunes::tag_ops::DiffScope::Album,
             "2Pac".into(),

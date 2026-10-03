@@ -194,6 +194,13 @@ impl DirectoryLibrary {
         // an unmounted volume or a folder it could not list, and the entry
         // is the only record of a moved track's ID: dropping it on a bad
         // day would detach that track's playlists and play stats for good.
+        //
+        // A registry that cannot be used today is not stood in for: the
+        // cached copy of each ID is its last answer, so a moved track
+        // keeps its ID for the session and nothing recorded meanwhile is
+        // keyed on an ID it will not have tomorrow. A file the cache does
+        // not know takes the hash of its path, as an empty registry
+        // would have given it.
         let ids: HashMap<String, u64> =
             crate::track_ids::with_registry(path, &options.log, |registry| {
                 // Entries are path strings, and so is the root as the user
@@ -207,6 +214,21 @@ impl DirectoryLibrary {
                 paths
                     .iter()
                     .map(|p| (p.to_string_lossy().into_owned(), registry.id_for(p)))
+                    .collect()
+            })
+            .unwrap_or_else(|why| {
+                (options.log)(&format!(
+                    "zytunes: {why}; this scan keeps the track IDs the cache has"
+                ));
+                paths
+                    .iter()
+                    .map(|p| {
+                        let key = p.to_string_lossy().into_owned();
+                        let id = cached
+                            .get(&key)
+                            .map_or_else(|| hash_path(p), |entry| entry.track.id);
+                        (key, id)
+                    })
                     .collect()
             });
 
@@ -482,8 +504,12 @@ impl DirectoryLibrary {
                 .filter(|p| p.is_file())
                 .map(|p| (p.clone(), registry.id_for(p)))
                 .collect()
-        });
+        })?;
 
+        // A carried file was not touched, only its folder was, and an
+        // artist folder can hold thousands: the cached entry is reused
+        // while its fingerprint still matches, and the file is read again
+        // only when it does not.
         for (key, moved) in carried {
             let Some(entry) = cached.remove(&key) else {
                 continue;
@@ -494,11 +520,16 @@ impl DirectoryLibrary {
             ) else {
                 continue;
             };
-            let mut track =
-                track_from_lofty(&moved, id).unwrap_or_else(|| track_from_path(&moved, id));
-            if track.acoustic_id.is_none() {
-                track.acoustic_id = entry.track.acoustic_id;
-            }
+            let mut track = if entry.fingerprint == fp {
+                carried_track(entry.track, Path::new(&key), &moved)
+            } else {
+                let mut track = build_track(&moved, id);
+                if track.acoustic_id.is_none() {
+                    track.acoustic_id = entry.track.acoustic_id;
+                }
+                track
+            };
+            track.id = id;
             cached.insert(
                 moved.to_string_lossy().to_string(),
                 crate::cache::CachedFile {
@@ -517,10 +548,7 @@ impl DirectoryLibrary {
                 cached.remove(&key);
                 continue;
             };
-            let mut track = match track_from_lofty(p, id) {
-                Some(t) => t,
-                None => track_from_path(p, id),
-            };
+            let mut track = build_track(p, id);
             if fingerprint && track.acoustic_id.is_none() {
                 track.acoustic_id = crate::fingerprint::compute_fingerprint(p);
             }
@@ -849,13 +877,30 @@ pub fn hash_path(path: &Path) -> u64 {
 }
 
 fn build_track(path: &Path, id: u64) -> Track {
-    // Try lofty for all formats (FLAC, M4A, OGG, WAV, MP3, etc.)
-    if let Some(track) = track_from_lofty(path, id) {
-        return track;
+    match probe_track(path, id) {
+        Probed::Tagged(track) => *track,
+        // Fallback: infer metadata from directory structure.
+        Probed::Untagged { duration_ms } => track_from_path(path, id, duration_ms),
     }
+}
 
-    // Fallback: infer metadata from directory structure.
-    track_from_path(path, id)
+/// What one lofty read of a file yields.
+pub(crate) enum Probed {
+    /// A tag with at least a title or an artist, and the audio properties.
+    Tagged(Box<Track>),
+    /// No usable tag. The duration is still what the probe read (`None`
+    /// when the file could not be read at all), so the path fallback
+    /// need not open the file again.
+    Untagged { duration_ms: Option<u64> },
+}
+
+/// [`probe_track`], for tests that only want a tagged track.
+#[cfg(test)]
+pub(crate) fn track_from_lofty(path: &Path, id: u64) -> Option<Track> {
+    match probe_track(path, id) {
+        Probed::Tagged(track) => Some(*track),
+        Probed::Untagged { .. } => None,
+    }
 }
 
 /// Read metadata (tags + duration) from any audio file using lofty.
@@ -863,7 +908,7 @@ fn build_track(path: &Path, id: u64) -> Track {
 /// Reading properties is slow for MP3 VBR files because lofty has to sample
 /// frames across the whole file to compute duration, but the per-file cache
 /// makes sure we only pay that cost once per file per change.
-pub(crate) fn track_from_lofty(path: &Path, id: u64) -> Option<Track> {
+pub(crate) fn probe_track(path: &Path, id: u64) -> Probed {
     use lofty::config::ParseOptions;
     use lofty::file::{AudioFile, TaggedFileExt};
     use lofty::prelude::ItemKey;
@@ -878,24 +923,32 @@ pub(crate) fn track_from_lofty(path: &Path, id: u64) -> Option<Track> {
     // wasted alloc + memcpy. `read_properties(true)` stays on because
     // duration / sample_rate / etc. populate library columns and AcoustID
     // queries.
-    let tagged = Probe::open(path)
-        .ok()?
-        .options(
-            ParseOptions::new()
-                .read_cover_art(false)
-                .read_properties(true),
-        )
-        .guess_file_type()
-        .ok()?
-        .read()
-        .ok()?;
-    let tag = tagged.primary_tag().or_else(|| tagged.first_tag())?;
-
+    let Some(tagged) = Probe::open(path)
+        .ok()
+        .and_then(|p| {
+            p.options(
+                ParseOptions::new()
+                    .read_cover_art(false)
+                    .read_properties(true),
+            )
+            .guess_file_type()
+            .ok()
+        })
+        .and_then(|p| p.read().ok())
+    else {
+        return Probed::Untagged { duration_ms: None };
+    };
+    let duration_ms = |props: &lofty::properties::FileProperties| {
+        let dur = props.duration();
+        (!dur.is_zero()).then_some(dur.as_millis() as u64)
+    };
+    let tag = tagged.primary_tag().or_else(|| tagged.first_tag());
     // Require at least a title or artist to consider the tag useful
-    let has_useful_data = tag.title().is_some() || tag.artist().is_some();
-    if !has_useful_data {
-        return None;
-    }
+    let Some(tag) = tag.filter(|tag| tag.title().is_some() || tag.artist().is_some()) else {
+        return Probed::Untagged {
+            duration_ms: duration_ms(tagged.properties()),
+        };
+    };
 
     // Identity-like fields are routinely space-padded by legacy taggers
     // (fixed-width ID3v2 frames, some CD-ripper firmwares). Strip leading/
@@ -934,7 +987,7 @@ pub(crate) fn track_from_lofty(path: &Path, id: u64) -> Option<Track> {
     let props = tagged.properties();
     let file_size_bytes = std::fs::metadata(path).ok().map(|m| m.len());
 
-    Some(Track {
+    Probed::Tagged(Box::new(Track {
         id,
         name,
         artist,
@@ -943,14 +996,7 @@ pub(crate) fn track_from_lofty(path: &Path, id: u64) -> Option<Track> {
         year: tag.year(),
         track_number: tag.track(),
         disc_number: tag.disk(),
-        total_time_ms: {
-            let dur = props.duration();
-            if dur.is_zero() {
-                None
-            } else {
-                Some(dur.as_millis() as u64)
-            }
-        },
+        total_time_ms: duration_ms(props),
         location: Some(path.to_string_lossy().to_string()),
         kind: Some(format!(
             "{} audio file",
@@ -1012,37 +1058,15 @@ pub(crate) fn track_from_lofty(path: &Path, id: u64) -> Option<Track> {
         audio_bitrate_kbps: props.audio_bitrate(),
         overall_bitrate_kbps: props.overall_bitrate(),
         file_size_bytes,
-    })
+    }))
 }
 
-/// Duration of the audio stream, without reading any tag.
+/// Infer metadata from directory structure: Artist/Album/Track.ext.
 ///
-/// The fallback for untagged files: identity comes from the path, but
-/// AcoustID needs the duration next to the fingerprint, and an untagged
-/// file is the one it exists to identify.
-pub(crate) fn audio_duration_ms(path: &Path) -> Option<u64> {
-    use lofty::config::ParseOptions;
-    use lofty::file::AudioFile;
-    use lofty::probe::Probe;
-
-    let tagged = Probe::open(path)
-        .ok()?
-        .options(
-            ParseOptions::new()
-                .read_tags(false)
-                .read_cover_art(false)
-                .read_properties(true),
-        )
-        .guess_file_type()
-        .ok()?
-        .read()
-        .ok()?;
-    let dur = tagged.properties().duration();
-    (!dur.is_zero()).then_some(dur.as_millis() as u64)
-}
-
-/// Infer metadata from directory structure: Artist/Album/Track.ext
-fn track_from_path(path: &Path, id: u64) -> Track {
+/// `duration_ms` is what the probe that found no tag read: identity comes
+/// from the path, but AcoustID needs the duration next to the
+/// fingerprint, and an untagged file is the one it exists to identify.
+fn track_from_path(path: &Path, id: u64, duration_ms: Option<u64>) -> Track {
     let raw_stem = stem(path);
     let name = crate::strip_track_number(&raw_stem).to_string();
 
@@ -1051,7 +1075,7 @@ fn track_from_path(path: &Path, id: u64) -> Track {
         name,
         artist: parent_name(path, 2),
         album: parent_name(path, 1),
-        total_time_ms: audio_duration_ms(path),
+        total_time_ms: duration_ms,
         location: Some(path.to_string_lossy().to_string()),
         kind: Some(format!(
             "{} audio file",
@@ -1062,6 +1086,21 @@ fn track_from_path(path: &Path, id: u64) -> Track {
         )),
         ..Default::default()
     }
+}
+
+/// `track`, read at `from`, now that its folder has been retitled and it
+/// sits at `to`. Artist and album are the only fields a folder name can
+/// have supplied (when the tag had none), and a retitle changes nothing
+/// but ASCII case: a value equal to the old folder name takes the new
+/// one, every other value is the tag's and stays.
+fn carried_track(mut track: Track, from: &Path, to: &Path) -> Track {
+    for (field, levels) in [(&mut track.artist, 2), (&mut track.album, 1)] {
+        if *field == parent_name(from, levels) {
+            *field = parent_name(to, levels);
+        }
+    }
+    track.location = Some(to.to_string_lossy().to_string());
+    track
 }
 
 /// Get the file stem (name without extension).
@@ -1220,7 +1259,7 @@ mod tests {
     #[test]
     fn track_from_path_extracts_metadata() {
         let path = Path::new("/music/Radiohead/OK Computer/01 Airbag.flac");
-        let track = track_from_path(path, 42);
+        let track = track_from_path(path, 42, None);
         assert_eq!(track.name, "Airbag");
         assert_eq!(track.album, "OK Computer");
         assert_eq!(track.artist, "Radiohead");
@@ -1628,7 +1667,7 @@ mod tests {
         let path = album_dir.join("01 Untagged.mp3");
         fs::write(&path, b"not a real mp3").unwrap();
 
-        let track = track_from_path(&path, 1);
+        let track = track_from_path(&path, 1, None);
         assert!(track.composer.is_none());
         assert!(track.isrc.is_none());
         assert!(track.bpm.is_none());
@@ -1643,14 +1682,17 @@ mod tests {
     use crate::test_audio::write_sine_wav;
 
     #[test]
-    fn track_from_path_reads_the_duration_of_untagged_audio() {
+    fn an_untagged_file_is_read_once_for_its_duration() {
+        // The probe that found no useful tag already parsed the audio
+        // properties; the path fallback takes the duration from it rather
+        // than opening the file a second time.
         let dir = std::env::temp_dir().join("zytunes-dirlib-untagged-duration");
         let _ = fs::remove_dir_all(&dir);
         let album_dir = dir.join("Artist").join("Album");
         fs::create_dir_all(&album_dir).unwrap();
         let path = album_dir.join("01 Untagged.wav");
         write_sine_wav(&path, 2);
-        let track = track_from_path(&path, 1);
+        let track = build_track(&path, 1);
         let _ = fs::remove_dir_all(&dir);
         assert_eq!(track.artist, "Artist");
         assert!(
@@ -1659,6 +1701,13 @@ mod tests {
                 .is_some_and(|ms| (1500..=2500).contains(&ms)),
             "got {:?}",
             track.total_time_ms
+        );
+        // The fallback itself never touches the file: it is handed what
+        // the one probe read.
+        let gone = Path::new("/nonexistent/Artist/Album/01 Untagged.wav");
+        assert_eq!(
+            track_from_path(gone, 1, Some(1234)).total_time_ms,
+            Some(1234)
         );
     }
 
@@ -2387,6 +2436,90 @@ mod tests {
     }
 
     #[test]
+    fn a_track_a_retitle_carried_is_not_read_again() {
+        // A folder retitle moves every album under it. Those files did
+        // not change, and an artist folder can hold thousands of them:
+        // reading each one's tags again is what would stall the worker.
+        // The cached entry is reused when its fingerprint still matches;
+        // only the fields that came from the folder names take the new
+        // spelling (a retitle changes ASCII case and nothing else).
+        let dir = std::env::temp_dir().join("zytunes-dirlib-reread-carried-reuse");
+        let _ = fs::remove_dir_all(&dir);
+        let old_artist = dir.join("artist e");
+        let new_artist = dir.join("Artist E");
+        let filed = old_artist.join("AlbumA").join("01 Filed.mp3");
+        let sibling = old_artist.join("album b").join("01 Sibling.wav");
+        let untagged = old_artist.join("album b").join("02 Untagged.mp3");
+        fs::create_dir_all(filed.parent().unwrap()).unwrap();
+        fs::create_dir_all(sibling.parent().unwrap()).unwrap();
+        fs::write(&filed, b"fake").unwrap();
+        fs::write(&untagged, b"fake").unwrap();
+        make_test_wav(&sibling);
+        {
+            use lofty::file::TaggedFileExt;
+            use lofty::tag::{Accessor, Tag, TagExt};
+            let mut tagged = lofty::probe::read_from_path(&sibling).unwrap();
+            let tag_type = tagged.primary_tag_type();
+            tagged.insert_tag(Tag::new(tag_type));
+            let tag = tagged.primary_tag_mut().unwrap();
+            tag.set_title("Tagged Title".to_string());
+            tag.set_artist("Tagged Artist".to_string());
+            tag.save_to_path(&sibling, lofty::config::WriteOptions::default())
+                .unwrap();
+        }
+        let _ = DirectoryLibrary::scan(dir.to_str().unwrap()).unwrap();
+
+        // The retitle. The sibling's bytes are then swapped for ones that
+        // carry no tag, keeping size and mtime: a reread that opens the
+        // file sees an untagged one, a reread that trusts the cache does
+        // not notice.
+        fs::rename(&old_artist, &new_artist).unwrap();
+        let sibling_new = new_artist.join("album b").join("01 Sibling.wav");
+        let untagged_new = new_artist.join("album b").join("02 Untagged.mp3");
+        let meta = fs::metadata(&sibling_new).unwrap();
+        fs::write(&sibling_new, vec![0u8; meta.len() as usize]).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&sibling_new)
+            .unwrap()
+            .set_modified(meta.modified().unwrap())
+            .unwrap();
+
+        let filed_new = new_artist.join("AlbumA").join("01 Filed.mp3");
+        let log = crate::cache::default_logger();
+        let lib = DirectoryLibrary::reread_paths_after(
+            dir.to_str().unwrap(),
+            std::slice::from_ref(&filed_new),
+            std::slice::from_ref(&filed),
+            &[(old_artist.clone(), new_artist.clone())],
+            false,
+            &log,
+        )
+        .unwrap();
+        let at = |p: &Path| {
+            lib.all_tracks()
+                .find(|t| t.location.as_deref() == p.to_str())
+                .cloned()
+                .expect("in the library")
+        };
+        let carried = at(&sibling_new);
+        assert_eq!(carried.name, "Tagged Title", "the cached tags were kept");
+        assert_eq!(carried.artist, "Tagged Artist");
+        assert_eq!(
+            carried.album, "album b",
+            "an album name from the folder stays"
+        );
+        let carried = at(&untagged_new);
+        assert_eq!(
+            carried.artist, "Artist E",
+            "an artist name that came from the folder takes the new spelling"
+        );
+        assert_eq!(carried.album, "album b");
+        assert_eq!(carried.name, "Untagged");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn reread_paths_follows_a_nested_directory_rename() {
         // Retitling artist AND album records the album rename under the
         // artist's new name. A track the diff did not list must still
@@ -2439,7 +2572,8 @@ mod tests {
             &log,
             |p| crate::tag_ops::moved_path(p, &out.rename_map, &out.dir_renames),
             |p| out.rename_map.contains_key(p),
-        );
+        )
+        .expect("registry usable");
         let lib = DirectoryLibrary::reread_paths_after(
             dir.to_str().unwrap(),
             &out.reread_paths(&diff, &dir),
@@ -2555,6 +2689,52 @@ mod tests {
     fn registered(root: &Path, path: &Path) -> bool {
         let log = crate::cache::default_logger();
         crate::track_ids::with_registry(root.to_str().unwrap(), &log, |r| r.get(path).is_some())
+            .expect("registry readable")
+    }
+
+    #[test]
+    fn an_apply_moves_nothing_when_it_cannot_record_the_moves() {
+        // A registry this build cannot use (a newer schema, a read error)
+        // means a move cannot carry its ID. Moved files would be proven
+        // gone by the next good scan and come back as new tracks, so the
+        // files must stay where they are until the registry is usable.
+        let (dir, one, _two) = two_album_library("apply-no-registry");
+        let root = dir.to_str().unwrap();
+        crate::track_ids::mark_newer_schema(root);
+        let new = one.with_file_name("01 - Song.mp3");
+        let log = crate::cache::default_logger();
+        let out = crate::tag_ops::apply_and_record_moves(&rename_only_diff(&one, &new), root, &log);
+        assert!(
+            out.results[0]
+                .as_ref()
+                .is_err_and(|e| e.contains("track-ID registry")),
+            "{:?}",
+            out.results[0]
+        );
+        assert!(one.is_file() && !new.exists(), "nothing moved");
+        assert!(out.rename_map.is_empty() && out.dir_renames.is_empty());
+        forget_library(&dir);
+    }
+
+    #[test]
+    fn a_scan_without_its_registry_keeps_the_ids_the_cache_has() {
+        // One launch cannot read the registry. The cache's copy of each ID
+        // is the registry's last answer, so a moved track keeps its ID
+        // for the session instead of taking the hash of its new path and
+        // orphaning every play recorded meanwhile.
+        let (dir, one, _two) = two_album_library("scan-no-registry");
+        let root = dir.to_str().unwrap();
+        let new = one.with_file_name("01 - Song.mp3");
+        let log = crate::cache::default_logger();
+        let out = crate::tag_ops::apply_and_record_moves(&rename_only_diff(&one, &new), root, &log);
+        assert!(out.results[0].is_ok(), "{:?}", out.results[0]);
+        let id = id_of(&DirectoryLibrary::scan(root).unwrap(), &new).expect("scanned");
+        assert_ne!(id, hash_path(&new));
+
+        crate::track_ids::mark_newer_schema(root);
+        let lib = DirectoryLibrary::scan(root).unwrap();
+        assert_eq!(id_of(&lib, &new), Some(id));
+        forget_library(&dir);
     }
 
     fn forget_library(dir: &Path) {
@@ -2687,7 +2867,8 @@ mod tests {
             &log,
             |p| crate::tag_ops::moved_path(p, &out.rename_map, &out.dir_renames),
             |p| out.rename_map.contains_key(p),
-        );
+        )
+        .expect("registry usable");
         let lib = DirectoryLibrary::reread_paths_after(
             root,
             &out.reread_paths(&diff, &dir),
@@ -2728,7 +2909,8 @@ mod tests {
             &log,
             |p| crate::tag_ops::moved_path(p, &out.rename_map, &out.dir_renames),
             |p| out.rename_map.contains_key(p),
-        );
+        )
+        .expect("registry usable");
         crate::cache::save_dirlib_cache(root, HashMap::new(), &log);
 
         let lib = DirectoryLibrary::scan(root).unwrap();
