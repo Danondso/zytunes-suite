@@ -190,16 +190,27 @@ impl Model {
         self.files.insert(meta.ino(), meta.len());
     }
 
-    /// A cover image beside `audio`, unless its folder has one. Each has
-    /// its own contents, so none is ever a byte-identical copy of another.
-    fn create_cover(&mut self, audio: &Path) {
-        let cover = audio.with_file_name("cover.jpg");
-        if cover.exists() {
-            return;
+    /// What sits beside `audio` on a rip: a cover image, a `Scans`
+    /// folder, and the junk file the OS leaves. Each file has its own
+    /// contents, so none is ever a byte-identical copy of another.
+    fn create_sidecars(&mut self, audio: &Path, rng: &mut Rng) {
+        let n = self.files.len();
+        let mut sidecars = vec![audio.with_file_name("cover.jpg")];
+        if rng.one_in(2) {
+            sidecars.push(audio.with_file_name("Scans").join("back.png"));
         }
-        std::fs::write(&cover, format!("cover {}", self.files.len())).unwrap();
-        let meta = std::fs::metadata(&cover).unwrap();
-        self.files.insert(meta.ino(), meta.len());
+        for path in sidecars {
+            if path.exists() {
+                continue;
+            }
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, format!("{} {n}", path.display())).unwrap();
+            let meta = std::fs::metadata(&path).unwrap();
+            self.files.insert(meta.ino(), meta.len());
+        }
+        if rng.one_in(2) {
+            std::fs::write(audio.with_file_name(".DS_Store"), b"junk").unwrap();
+        }
     }
 
     /// Check everything that must hold between applies. `lib` is what the
@@ -211,6 +222,7 @@ impl Model {
 
         for path in in_root.iter().chain(&in_inbox).chain(&dirs) {
             let name = path.file_name().unwrap().to_string_lossy();
+
             assert!(
                 !ARTEFACTS.iter().any(|a| name.contains(a)),
                 "{at}: temp artefact left behind: {}",
@@ -218,9 +230,11 @@ impl Model {
             );
         }
 
-        // Nothing lost, duplicated, truncated, or made up.
+        // Nothing lost, duplicated, truncated, or made up. OS junk is
+        // nobody's: carried or dropped, either is fine.
         let mut seen: HashMap<u64, &PathBuf> = HashMap::new();
-        for path in in_root.iter().chain(&in_inbox) {
+        let is_junk = |p: &&PathBuf| p.file_name().is_some_and(|n| n == ".DS_Store");
+        for path in in_root.iter().chain(&in_inbox).filter(|p| !is_junk(p)) {
             let meta = std::fs::metadata(path).unwrap();
             let Some(len) = self.files.get(&meta.ino()) else {
                 panic!("{at}: a file the test never made: {}", path.display());
@@ -268,9 +282,17 @@ impl Model {
         );
 
         if !self.faulted {
+            // A folder holds audio somewhere under it, or is a sidecar
+            // folder (`Scans`) beside audio.
             for dir in &dirs {
+                let beside_audio = dir.parent().is_some_and(|p| {
+                    std::fs::read_dir(p)
+                        .unwrap()
+                        .flatten()
+                        .any(|e| is_audio(&e.path()))
+                });
                 assert!(
-                    holds_audio(dir),
+                    holds_audio(dir) || beside_audio,
                     "{at}: folder left with no audio in it: {}",
                     dir.display()
                 );
@@ -311,7 +333,7 @@ fn run(seed: u64, reached: &mut Reached) {
         if !path.exists() {
             model.create(&path, *rng.pick(LENGTHS));
             if rng.one_in(2) {
-                model.create_cover(&path);
+                model.create_sidecars(&path, &mut rng);
             }
         }
     }

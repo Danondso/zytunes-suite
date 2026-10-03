@@ -196,8 +196,14 @@ impl DirectoryLibrary {
         // day would detach that track's playlists and play stats for good.
         let ids: HashMap<String, u64> =
             crate::track_ids::with_registry(path, &options.log, |registry| {
-                registry
-                    .retain(|p| extant_paths.contains(p) || !walk.proves_gone(Path::new(p), root));
+                // Entries are path strings, and so is the root as the user
+                // spelled it: a root spelled another way today (`/m//Music`)
+                // matches no entry, and that is not evidence of anything.
+                registry.retain(|p| {
+                    extant_paths.contains(p)
+                        || !p.starts_with(path)
+                        || !walk.proves_gone(Path::new(p), root)
+                });
                 paths
                     .iter()
                     .map(|p| (p.to_string_lossy().into_owned(), registry.id_for(p)))
@@ -745,20 +751,23 @@ fn log_fingerprint_stopped(
     ));
 }
 
+/// The names in every folder a walk read in full.
+type Listed = HashMap<PathBuf, HashSet<std::ffi::OsString>>;
+
 /// One walk of the library folder.
 struct Walk {
     /// Every audio file found.
     files: Vec<PathBuf>,
-    /// Folders that were read and had something in them. Only such a
-    /// folder is evidence about what is missing from it: one that could
-    /// not be read says nothing, and an empty one may be the mount point
-    /// of a volume that is not mounted.
-    listed: HashSet<PathBuf>,
+    /// The names in every folder that was read in full and had something
+    /// in it. Only such a folder is evidence about what is missing from
+    /// it: one that could not be read (or not fully) says nothing, and an
+    /// empty one may be the mount point of a volume that is not mounted.
+    listed: Listed,
 }
 
 impl Walk {
     fn of(root: &Path) -> Self {
-        let listed = Mutex::new(HashSet::new());
+        let listed = Mutex::new(Listed::new());
         let files = collect_audio_paths(root, &listed);
         Walk {
             files,
@@ -768,23 +777,25 @@ impl Walk {
 
     /// The walk did not find `path` (a file under `root`), and that is
     /// because it is gone rather than out of reach: the nearest folder
-    /// above it that still exists was read, had entries, and the next
-    /// step towards `path` was not among them. A walk that found no files
-    /// at all proves nothing.
+    /// above it that was read in full does not have the next step towards
+    /// `path` in it. A folder on the way that exists but was not read, or
+    /// a walk that found no files at all, proves nothing.
     fn proves_gone(&self, path: &Path, root: &Path) -> bool {
         if self.files.is_empty() {
             return false;
         }
+        let mut child = path;
         for dir in path.ancestors().skip(1) {
             if !dir.starts_with(root) {
                 return false;
             }
-            if self.listed.contains(dir) {
-                return true;
+            if let Some(names) = self.listed.get(dir) {
+                return child.file_name().is_some_and(|name| !names.contains(name));
             }
             if dir.exists() {
                 return false;
             }
+            child = dir;
         }
         false
     }
@@ -794,16 +805,18 @@ impl Walk {
 ///
 /// For large libraries the serial `read_dir` walk alone can take several seconds;
 /// rayon's recursive parallelism turns it into a few hundred milliseconds on SSD.
-fn collect_audio_paths(dir: &Path, listed: &Mutex<HashSet<PathBuf>>) -> Vec<PathBuf> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e.flatten().collect::<Vec<_>>(),
-        Err(_) => return Vec::new(),
+fn collect_audio_paths(dir: &Path, listed: &Mutex<Listed>) -> Vec<PathBuf> {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return Vec::new();
     };
-    if !entries.is_empty() {
-        listed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(dir.to_path_buf());
+    let (entries, errors): (Vec<_>, Vec<_>) = read.partition(Result::is_ok);
+    let entries: Vec<_> = entries.into_iter().flatten().collect();
+    // A folder with an entry that could not be read was not read in full.
+    if !entries.is_empty() && errors.is_empty() {
+        listed.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            dir.to_path_buf(),
+            entries.iter().map(|e| e.file_name()).collect(),
+        );
     }
     entries
         .par_iter()
@@ -2606,6 +2619,46 @@ mod tests {
             // Not so when the tests run as root.
             assert!(registered(&dir, &one));
         }
+        assert!(registered(&dir, &two));
+        forget_library(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_listed_but_not_enterable_keeps_its_registry_entries() {
+        // Readable but not traversable: the artist folder lists the album,
+        // and nothing under the album can be reached. Its tracks are out
+        // of reach, not gone.
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, one, two) = two_album_library("unenterable-folder");
+        // Something the walk can still find, or it would prove nothing.
+        let other = dir.join("Other").join("Album").join("01.mp3");
+        fs::create_dir_all(other.parent().unwrap()).unwrap();
+        fs::write(&other, b"fake").unwrap();
+        let artist = one.parent().unwrap().parent().unwrap();
+        fs::set_permissions(artist, fs::Permissions::from_mode(0o444)).unwrap();
+        let unenterable = !one.parent().unwrap().is_dir();
+        DirectoryLibrary::scan(dir.to_str().unwrap()).unwrap();
+        fs::set_permissions(artist, fs::Permissions::from_mode(0o755)).unwrap();
+        if unenterable {
+            // Not so when the tests run as root.
+            assert!(registered(&dir, &one));
+            assert!(registered(&dir, &two));
+        }
+        forget_library(&dir);
+    }
+
+    #[test]
+    fn a_root_spelled_another_way_keeps_the_registry_entries() {
+        // `/m//Music` and `/m/Music` share one registry (the file is named
+        // by the normalised root) but their path strings differ, so the
+        // odd spelling finds none of the entries. That is not evidence
+        // that the files are gone.
+        let (dir, one, two) = two_album_library("odd-root");
+        let odd = dir.to_str().unwrap().replacen("/zytunes", "//zytunes", 1);
+        assert_ne!(odd, dir.to_str().unwrap());
+        DirectoryLibrary::scan(&odd).unwrap();
+        assert!(registered(&dir, &one));
         assert!(registered(&dir, &two));
         forget_library(&dir);
     }

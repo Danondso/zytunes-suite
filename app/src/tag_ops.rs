@@ -1047,7 +1047,11 @@ const OS_JUNK: &[&str] = &[".DS_Store", "Thumbs.db", "desktop.ini"];
 /// library root or the inbox (neither is ever cleared itself), but only
 /// of loose files and only once they hold no folder at all: that carries
 /// the cover that sits above `CD1`/`CD2`, without hauling along a sibling
-/// folder that was never part of the album.
+/// folder that was never part of the album. Their files go to the folder
+/// at the same depth below the library root on the landing side
+/// (`artist.jpg` beside the artist's albums, not inside one; a cover
+/// above `CD1` into the album), or into the landing folder itself when
+/// the source lay deeper.
 fn carry_sidecars(
     rename_map: &HashMap<PathBuf, PathBuf>,
     dir_renames: &[(PathBuf, PathBuf)],
@@ -1079,19 +1083,32 @@ fn carry_sidecars(
             continue;
         };
         let mut dir = from.as_path();
-        let mut whole_tree = true;
+        let mut levels_up = 0;
         while may_remove_empty_dir(dir, library_root, inbox.as_deref()) {
             if dir.is_dir() {
-                if has_audio_beneath(dir) || (!whole_tree && has_subfolder(dir)) {
+                if levels_up > 0 && has_subfolder(dir) {
                     break;
                 }
-                move_sidecars(dir, to, &mut errors);
+                match audio_beneath(dir) {
+                    Ok(false) => {}
+                    Ok(true) => break,
+                    Err(e) => {
+                        errors.push(e);
+                        break;
+                    }
+                }
+                let target = if levels_up == 0 {
+                    to.to_path_buf()
+                } else {
+                    same_depth(dir, to, library_root)
+                };
+                move_sidecars(dir, &target, &mut errors);
                 prune_empty_parents(dir, library_root);
                 if dir.exists() {
                     break;
                 }
             }
-            whole_tree = false;
+            levels_up += 1;
             let Some(parent) = dir.parent() else {
                 break;
             };
@@ -1101,20 +1118,40 @@ fn carry_sidecars(
     errors
 }
 
-/// Any audio file anywhere under `dir`. A folder that cannot be read
-/// counts as holding some.
-fn has_audio_beneath(dir: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return true;
+/// The ancestor of `to` (or `to` itself) as deep below `library_root` as
+/// `dir` is. `to` for a `dir` outside the library (the inbox) or deeper
+/// than `to`.
+fn same_depth(dir: &Path, to: &Path, library_root: &Path) -> PathBuf {
+    let depth = |p: &Path| {
+        p.strip_prefix(library_root)
+            .map(|rel| rel.components().count())
+            .ok()
     };
-    entries.flatten().any(|entry| {
+    match (depth(dir), depth(to)) {
+        (Some(d), Some(t)) if d > 0 && d < t => to
+            .ancestors()
+            .nth(t - d)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| to.to_path_buf()),
+        _ => to.to_path_buf(),
+    }
+}
+
+/// Whether any audio file is anywhere under `dir`; an error names the
+/// first folder that could not be read, which leaves the question open.
+fn audio_beneath(dir: &Path) -> Result<bool, String> {
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("read {}: {e}", dir.display()))?;
+    for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            has_audio_beneath(&path)
-        } else {
-            crate::dirlib::is_audio_file(&path)
+            if audio_beneath(&path)? {
+                return Ok(true);
+            }
+        } else if crate::dirlib::is_audio_file(&path) {
+            return Ok(true);
         }
-    })
+    }
+    Ok(false)
 }
 
 fn has_subfolder(dir: &Path) -> bool {
@@ -1123,25 +1160,36 @@ fn has_subfolder(dir: &Path) -> bool {
 
 /// Move every file under `from` to the same place under `to`. Symlinks
 /// are left (a relative one would dangle), which keeps `from` in place.
+/// Whatever stays, and why, goes on `errors`.
 fn move_sidecars(from: &Path, to: &Path, errors: &mut Vec<String>) {
     if same_inode(from, to) {
         return;
     }
-    let Ok(entries) = std::fs::read_dir(from) else {
-        return;
+    let entries = match std::fs::read_dir(from) {
+        Ok(entries) => entries,
+        Err(e) => {
+            errors.push(format!("read {}: {e}", from.display()));
+            return;
+        }
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name();
-        let Ok(kind) = entry.file_type() else {
-            continue;
-        };
+    for entry in entries {
+        let (path, name, kind) =
+            match entry.and_then(|e| Ok((e.path(), e.file_name(), e.file_type()?))) {
+                Ok(entry) => entry,
+                Err(e) => {
+                    errors.push(format!("read {}: {e}", from.display()));
+                    continue;
+                }
+            };
         if kind.is_symlink() {
+            errors.push(format!("{} is a symlink; left in place", path.display()));
             continue;
         }
         if kind.is_dir() {
             move_sidecars(&path, &to.join(&name), errors);
-            let _ = std::fs::remove_dir(&path);
+            if let Err(e) = std::fs::remove_dir(&path) {
+                errors.push(format!("remove {}: {e}", path.display()));
+            }
             continue;
         }
         let target = to.join(&name);
@@ -1158,11 +1206,28 @@ fn move_sidecars(from: &Path, to: &Path, errors: &mut Vec<String>) {
     }
 }
 
+/// Byte-for-byte equal, read in chunks: a sidecar can be a disc image.
 fn same_contents(a: &Path, b: &Path) -> bool {
+    use std::io::Read;
     let len = |p: &Path| std::fs::metadata(p).map(|m| m.len()).ok();
-    len(a).is_some()
-        && len(a) == len(b)
-        && matches!((std::fs::read(a), std::fs::read(b)), (Ok(x), Ok(y)) if x == y)
+    if len(a).is_none() || len(a) != len(b) {
+        return false;
+    }
+    let (Ok(mut a), Ok(mut b)) = (std::fs::File::open(a), std::fs::File::open(b)) else {
+        return false;
+    };
+    let (mut x, mut y) = (vec![0u8; 64 * 1024], vec![0u8; 64 * 1024]);
+    loop {
+        let (Ok(n), Ok(m)) = (a.read(&mut x), b.read(&mut y)) else {
+            return false;
+        };
+        if n != m || x[..n] != y[..m] {
+            return false;
+        }
+        if n == 0 {
+            return true;
+        }
+    }
 }
 
 /// [`apply_release_diff`], then move each moved file's track ID with it
@@ -3768,6 +3833,48 @@ mod tests {
         assert!(album.join("cover.jpg").exists());
         assert!(album.join("disc2.cue").exists());
         assert!(!dir.join("artist").exists());
+    }
+
+    #[test]
+    fn artist_level_files_follow_to_the_artist_level() {
+        // `artist.jpg` sits beside the artist's albums, not inside one.
+        let dir = fresh_dir("sidecars-artist-level");
+        let one = dir.join("alice in chains").join("Dirt").join("a.wav");
+        wav_at(&one);
+        file_at(&dir.join("alice in chains").join("artist.jpg"), b"portrait");
+        wav_at(&dir.join("Alice In Chains").join("Facelift").join("b.wav"));
+        let album = dir.join("Alice In Chains").join("Dirt");
+        let out = apply_release_diff(&rename_only_diff(&one, &album.join("01 - A.wav")), &dir);
+        assert!(out.results[0].is_ok(), "{:?}", out.results[0]);
+        assert!(dir.join("Alice In Chains").join("artist.jpg").exists());
+        assert!(!album.join("artist.jpg").exists());
+        assert!(!dir.join("alice in chains").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_sidecar_folder_that_cannot_be_read_is_reported() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = fresh_dir("sidecars-unreadable");
+        let src = dir.join("loose").join("a.wav");
+        wav_at(&src);
+        let scans = src.with_file_name("Scans");
+        file_at(&scans.join("back.png"), b"back");
+        std::fs::set_permissions(&scans, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = std::fs::read_dir(&scans).is_err();
+        let dest = dir.join("Artist").join("Album").join("01 - Song.wav");
+        let out = apply_release_diff(&rename_only_diff(&src, &dest), &dir);
+        std::fs::set_permissions(&scans, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(out.results[0].is_ok(), "{:?}", out.results[0]);
+        if unreadable {
+            // Not so when the tests run as root.
+            assert!(scans.join("back.png").exists());
+            assert!(
+                out.sidecar_errors.iter().any(|e| e.contains("Scans")),
+                "{:?}",
+                out.sidecar_errors
+            );
+        }
     }
 
     #[test]
