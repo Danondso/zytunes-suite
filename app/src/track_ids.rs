@@ -65,20 +65,7 @@ impl TrackIds {
     /// [`hash_path`] of `path` unless a moved track still holds that
     /// value, then the first free salted hash.
     fn unused_id(&self, path: &Path) -> u64 {
-        let base = hash_path(path);
-        if !self.used.contains(&base) {
-            return base;
-        }
-        let key = path.to_string_lossy();
-        (1u64..)
-            .map(|salt| {
-                let mut hasher = DefaultHasher::new();
-                key.hash(&mut hasher);
-                salt.hash(&mut hasher);
-                hasher.finish()
-            })
-            .find(|id| !self.used.contains(id))
-            .expect("a free u64 exists")
+        unused_id(path, &self.used)
     }
 
     fn insert(&mut self, path: String, id: u64) {
@@ -215,6 +202,27 @@ impl TrackIds {
     }
 }
 
+/// [`hash_path`] of `path` unless `used` (the IDs other tracks hold)
+/// contains that value, then the first free salted hash. A scan that
+/// cannot read the registry resolves IDs with this too, so a new file at
+/// a moved track's old path never takes the moved track's ID.
+pub(crate) fn unused_id(path: &Path, used: &HashSet<u64>) -> u64 {
+    let base = hash_path(path);
+    if !used.contains(&base) {
+        return base;
+    }
+    let key = path.to_string_lossy();
+    (1u64..)
+        .map(|salt| {
+            let mut hasher = DefaultHasher::new();
+            key.hash(&mut hasher);
+            salt.hash(&mut hasher);
+            hasher.finish()
+        })
+        .find(|id| !used.contains(id))
+        .expect("a free u64 exists")
+}
+
 /// `root` with trailing separators, doubled separators and `.` components
 /// dropped. The TUI and `zytunes-serve` are each handed the root as the
 /// user typed it; `~/Music` and `~/Music/` are one library and must find
@@ -270,6 +278,15 @@ fn with_registry_file<R>(
     log: &Logger,
     f: impl FnOnce(&mut TrackIds) -> R,
 ) -> Result<R, String> {
+    let _held = match file {
+        Some(file) => Some(lock_registry_file(file, log).map_err(|e| {
+            format!(
+                "the track-ID registry {} cannot be locked ({e}); it is left as it is",
+                file.display()
+            )
+        })?),
+        None => None,
+    };
     let mut ids = match file {
         Some(file) => TrackIds::load_from(file, root, log).ok_or_else(|| {
             format!(
@@ -289,14 +306,40 @@ fn with_registry_file<R>(
     Ok(out)
 }
 
-/// Record the moves an apply performed, before the library is re-read.
-/// `moved` and `renamed` are as for [`TrackIds::apply_moves`].
-///
-/// The moves have already happened by the time this runs, so a caller
-/// must check the registry can be used BEFORE moving anything
-/// ([`crate::tag_ops::apply_and_record_moves`] does); an `Err` here means
-/// those files have lost their IDs.
-pub fn record_moves(
+/// Lock the registry at `file` against every other zytunes process
+/// (the TUI holds it for the length of an apply; a `zytunes-serve`
+/// scanning the library mid-move would save its stale answer over the
+/// moves). The lock is on a sibling `.lock` file, since the registry
+/// itself is replaced by rename on every save. Blocks until free; the
+/// lock is released when the returned file is dropped.
+fn lock_registry_file(file: &Path, log: &Logger) -> std::io::Result<std::fs::File> {
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(file.with_extension("json.lock"))?;
+    match lock.try_lock() {
+        Ok(()) => return Ok(lock),
+        Err(std::fs::TryLockError::WouldBlock) => log(&format!(
+            "zytunes: track-ids: waiting for another zytunes to finish with {}",
+            file.display()
+        )),
+        Err(std::fs::TryLockError::Error(e)) => return Err(e),
+    }
+    lock.lock()?;
+    Ok(lock)
+}
+
+/// Record moves that already happened on disk. Tests only: production
+/// moves go through [`crate::tag_ops::apply_and_record_moves`], which
+/// proves the registry usable BEFORE anything moves (an `Err` here would
+/// mean the files had already lost their IDs).
+#[cfg(test)]
+pub(crate) fn record_moves(
     root: &str,
     log: &Logger,
     moved: impl Fn(&Path) -> PathBuf,
@@ -306,9 +349,10 @@ pub fn record_moves(
 }
 
 /// Rewrite the registry of `root` as a newer build would have, so this
-/// build cannot use it. Tests stand in for the bad day.
-#[cfg(test)]
-pub(crate) fn mark_newer_schema(root: &str) {
+/// build cannot use it. Tests stand in for the bad day (`pub` so the
+/// TUI's tests can too; not part of the API).
+#[doc(hidden)]
+pub fn mark_newer_schema(root: &str) {
     let _guard = registry_lock();
     let root = normalised_root(root);
     let file = registry_path(&root).expect("HOME set");
@@ -328,8 +372,9 @@ pub(crate) fn mark_newer_schema(root: &str) {
 
 /// Delete the registry of `root`. Tests reuse temp-dir names across runs,
 /// and a registry left by an earlier run would hand out that run's IDs.
-#[cfg(test)]
-pub(crate) fn forget(root: &str) {
+/// `pub` for the TUI's tests; not part of the API.
+#[doc(hidden)]
+pub fn forget(root: &str) {
     let _guard = registry_lock();
     if let Some(file) = registry_path(&normalised_root(root)) {
         let _ = std::fs::remove_file(file);
@@ -495,6 +540,43 @@ mod tests {
         assert_eq!(normalised_root("/m/Music/"), "/m/Music");
         assert_eq!(normalised_root("/m//Music/."), "/m/Music");
         assert_eq!(normalised_root("/m/Music"), "/m/Music");
+    }
+
+    #[test]
+    fn another_process_holding_the_registry_is_waited_for() {
+        // The TUI holds the registry for the length of an apply; a
+        // `zytunes-serve` starting up then must wait, not scan the library
+        // mid-move and save its stale answer over the TUI's. The lock is a
+        // file lock (the in-process mutex says nothing across processes),
+        // held here on its own descriptor as another process would.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let dir =
+            std::env::temp_dir().join(format!("zytunes-track-ids-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("track-ids.json");
+        let released = Arc::new(AtomicBool::new(false));
+        let holder = {
+            let released = Arc::clone(&released);
+            let held = lock_registry_file(&file, &default_logger()).expect("lock file opens");
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                released.store(true, Ordering::SeqCst);
+                drop(held);
+            })
+        };
+        let log = default_logger();
+        let ran = with_registry_file(Some(&file), "/music", &log, |ids| {
+            assert!(
+                released.load(Ordering::SeqCst),
+                "ran while another holder had the registry"
+            );
+            ids.id_for(&p("/music/a.mp3"));
+        });
+        holder.join().unwrap();
+        assert!(ran.is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

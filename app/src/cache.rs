@@ -273,7 +273,7 @@ fn migrate_cache(
     // Step 2 → 3: trim whitespace on identity-like string fields. v2
     // entries from legacy taggers hold values like Artist="311           "
     // that poison MB queries and sidebar grouping. Mirror the canonical
-    // list in `dirlib::track_from_lofty` — free-form fields (comment,
+    // list in `dirlib::probe_track` — free-form fields (comment,
     // description, lyrics) keep their whitespace.
     if current == 2 {
         fn trim_string(s: &mut String, dirty: &mut bool) {
@@ -630,7 +630,7 @@ mod tests {
         assert_eq!(track.album, "Album Name");
         assert_eq!(track.album_artist.as_deref(), Some("311"));
         assert_eq!(track.isrc.as_deref(), Some("USRC11111111"));
-        // Free-form fields keep their whitespace (mirrors track_from_lofty).
+        // Free-form fields keep their whitespace (mirrors probe_track).
         assert_eq!(
             track.comment.as_deref(),
             Some("  intentional padding  "),

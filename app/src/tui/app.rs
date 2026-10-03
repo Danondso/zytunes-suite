@@ -3406,7 +3406,7 @@ impl App {
     fn handle_library_reread_complete(
         &mut self,
         token: u64,
-        result: Result<Box<dyn MusicLibrary + Send>, String>,
+        result: Result<Option<Box<dyn MusicLibrary + Send>>, String>,
     ) {
         // Token-match decides whether the *currently open* overlay (if any)
         // gets its anchor rewritten / phase advanced. The library swap on
@@ -3418,12 +3418,16 @@ impl App {
             .is_some_and(|o| o.accepts_token(token));
         match result {
             Ok(lib) => {
-                self.library = Some(lib);
-                self.inbox.hold_until_library = false;
-                self.refresh_queued_sync_tags();
-                self.refresh_track_info_lib();
-                self.rebuild_artist_device_status();
-                self.refresh_sidebar();
+                // `None`: the apply was refused whole and the disk is as
+                // it was, so the library the app has is still right.
+                if let Some(lib) = lib {
+                    self.library = Some(lib);
+                    self.inbox.hold_until_library = false;
+                    self.refresh_queued_sync_tags();
+                    self.refresh_track_info_lib();
+                    self.rebuild_artist_device_status();
+                    self.refresh_sidebar();
+                }
                 if overlay_matches {
                     // Rewrite the anchor's album/track name to the proposed
                     // target so post-rename navigation finds the renamed row.
@@ -11185,7 +11189,7 @@ mod tests {
         app.tag_manager.as_mut().unwrap().filing = true;
         app.handle_library_reread_complete(
             0,
-            Ok(Box::new(VecLibrary {
+            Ok(Some(Box::new(VecLibrary {
                 tracks: vec![zytunes::library::Track {
                     id: 7,
                     name: "Song".into(),
@@ -11194,7 +11198,7 @@ mod tests {
                     location: Some("/m/song.wav".into()),
                     ..Default::default()
                 }],
-            })),
+            }))),
         );
         assert_eq!(app.sidebar_selected, keep_idx, "the open playlist stays");
         assert_eq!(
@@ -15514,7 +15518,7 @@ mod tests {
         app.handle_tag_manager_key(key(KeyCode::Esc), &tx);
         poll_leaves_the_queue(&mut app, "closed from search");
 
-        app.handle_library_reread_complete(0, Ok(Box::new(VecLibrary { tracks: vec![] })));
+        app.handle_library_reread_complete(0, Ok(Some(Box::new(VecLibrary { tracks: vec![] }))));
         app.inbox.last_request = None;
         app.maybe_request_inbox_scan();
         assert!(
@@ -16066,7 +16070,7 @@ mod tests {
         );
         assert_eq!(app.inbox.queue.len(), 1);
 
-        app.handle_library_reread_complete(0, Ok(Box::new(VecLibrary { tracks: vec![] })));
+        app.handle_library_reread_complete(0, Ok(Some(Box::new(VecLibrary { tracks: vec![] }))));
         app.inbox.last_request = None;
         app.maybe_request_inbox_scan();
         assert!(
@@ -16719,6 +16723,60 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_apply_leaves_the_library_as_it_is_without_a_reload() {
+        // The registry cannot be used, so the apply touched nothing. There
+        // is nothing to re-read: the library stays, no full reload is
+        // queued, and the overlay's Done screen names each refused track.
+        let root = std::env::temp_dir().join("zytunes-file-refused");
+        let _ = std::fs::remove_dir_all(&root);
+        let old = root
+            .join("alice in chains")
+            .join("dirt")
+            .join("01 - Them Bones.mp3");
+        tagged_mp3(&old);
+        let (tx, _rx) = mpsc::channel::<BgCommand>();
+        let mut app = App::new();
+        app.local_plays_save_path = None;
+        app.playlists_save_path = None;
+        app.music_dir_cache = Some(root.clone());
+        app.library = Some(Box::new(
+            zytunes::dirlib::DirectoryLibrary::scan(root.to_str().unwrap()).unwrap(),
+        ));
+        app.refresh_sidebar();
+        app.sidebar_selected = 0;
+        app.select_sidebar_item();
+        app.album_selected = 0;
+        app.select_album();
+        app.active_panel = Panel::TrackList;
+        app.track_selected = 0;
+        app.start_file_and_enrich(&tx);
+        let token = app.tag_manager.as_ref().unwrap().pending_request_token;
+        app.handle_mb_release_loaded(token, Ok(Box::new(dirt_release())));
+        zytunes::track_ids::mark_newer_schema(root.to_str().unwrap());
+        app.pending_bg_commands.clear();
+        apply_open_overlay_inline(&mut app, &root);
+
+        assert!(old.exists(), "nothing was moved");
+        assert!(!app.inbox.hold_until_library);
+        assert!(
+            !app.pending_bg_commands
+                .iter()
+                .any(|c| matches!(c, BgCommand::LoadLibrary { .. })),
+            "a full reload for an apply that touched nothing"
+        );
+        let overlay = app.tag_manager.as_ref().unwrap();
+        assert_eq!(overlay.phase, TagManagerPhase::Done);
+        assert_eq!(overlay.apply_failures.len(), 1);
+        assert!(overlay.apply_failures[0].error.contains("not applied"));
+        assert!(overlay.error.is_none(), "{:?}", overlay.error);
+        let lib = app.library.as_ref().unwrap();
+        assert_eq!(lib.track_count(), 1);
+        assert!(lib.track_by_location(old.to_str().unwrap()).is_some());
+        zytunes::track_ids::forget(root.to_str().unwrap());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn filing_then_retagging_the_same_track_finds_nothing_left_to_change() {
         let root = std::env::temp_dir().join("zytunes-file-then-retag");
         let _ = std::fs::remove_dir_all(&root);
@@ -16879,7 +16937,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        app.handle_library_reread_complete(0, Ok(Box::new(lib)));
+        app.handle_library_reread_complete(0, Ok(Some(Box::new(lib))));
         let item = &app.sync.queue[0].tracks[0];
         assert_eq!(
             (

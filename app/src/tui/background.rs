@@ -625,10 +625,12 @@ pub enum BgEvent {
     },
     /// Phase 2 of `ApplyTagDiff`: surgical re-scan complete. Replaces
     /// `App.library` and (when the token still matches the open overlay)
-    /// triggers the post-rename selection restore.
+    /// triggers the post-rename selection restore. `Ok(None)` when the
+    /// apply was refused whole and touched nothing: the library the app
+    /// has is still right.
     LibraryRereadComplete {
         token: u64,
-        result: Result<Box<dyn zytunes::library::MusicLibrary + Send>, String>,
+        result: Result<Option<Box<dyn zytunes::library::MusicLibrary + Send>>, String>,
     },
     /// Outcome of [`BgCommand::AcoustIdLookup`]. `hits` is sorted highest
     /// score first by the worker. Empty vec = no AcoustID match (the
@@ -3170,6 +3172,7 @@ pub(crate) fn run_tag_apply(
     let paths = outcome.reread_paths(diff, root);
     let vacated = outcome.vacated();
     let dir_renames = outcome.dir_renames.clone();
+    let refused = outcome.refused;
     let _ = event_tx.send(BgEvent::TagsApplied {
         token,
         results: outcome.results,
@@ -3177,15 +3180,21 @@ pub(crate) fn run_tag_apply(
         dir_renames: outcome.dir_renames,
     });
 
-    let lib_result = zytunes::dirlib::DirectoryLibrary::reread_paths_after(
-        music_dir,
-        &paths,
-        &vacated,
-        &dir_renames,
-        fingerprint,
-        &scan_log,
-    )
-    .map(|l| Box::new(l) as Box<dyn zytunes::library::MusicLibrary + Send>);
+    // A refused apply touched nothing, and its reread would fail on the
+    // same registry and send the app into a full reload for a no-op.
+    let lib_result = if refused {
+        Ok(None)
+    } else {
+        zytunes::dirlib::DirectoryLibrary::reread_paths_after(
+            music_dir,
+            &paths,
+            &vacated,
+            &dir_renames,
+            fingerprint,
+            &scan_log,
+        )
+        .map(|l| Some(Box::new(l) as Box<dyn zytunes::library::MusicLibrary + Send>))
+    };
     let _ = event_tx.send(BgEvent::LibraryRereadComplete {
         token,
         result: lib_result,

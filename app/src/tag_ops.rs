@@ -785,6 +785,10 @@ pub struct ApplyOutcome {
     /// the audio out of a folder, one message each. The file is still
     /// where it was, and so is its folder.
     pub sidecar_errors: Vec<String>,
+    /// The whole diff was refused before anything was written or moved
+    /// (the track-ID registry could not be used): every result is `Err`,
+    /// the disk is as it was, and there is nothing to re-read.
+    pub refused: bool,
 }
 
 impl ApplyOutcome {
@@ -1031,12 +1035,32 @@ pub fn apply_release_diff(diff: &ReleaseTagDiff, library_root: &Path) -> ApplyOu
         rename_map,
         dir_renames,
         sidecar_errors,
+        refused: false,
     }
 }
 
 /// Files the OS scatters into folders. Removed rather than carried: they
 /// describe the folder that is going away.
 const OS_JUNK: &[&str] = &[".DS_Store", "Thumbs.db", "desktop.ini"];
+
+/// Extensions a writer gives a file it has not finished (browsers,
+/// rsync, aria2, qBittorrent, our own rip): the writer will rename it
+/// when it is done, so it is left where the writer expects it.
+const IN_PROGRESS: &[&str] = &[
+    "part",
+    "partial",
+    "crdownload",
+    "download",
+    "tmp",
+    "aria2",
+    "!qb",
+];
+
+fn is_in_progress(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| IN_PROGRESS.iter().any(|p| e.eq_ignore_ascii_case(p)))
+}
 
 /// Move what is left in each folder the audio moved out of (cover art,
 /// cue sheets, scans, a subfolder of them) to where the audio went, so
@@ -1082,7 +1106,10 @@ fn carry_sidecars(
         }
     }
     let mut errors = Vec::new();
-    for (from, landings) in left {
+    // Deepest folder first: a parent sorts before its children, and a
+    // parent handled first would haul `CD1/` along whole instead of
+    // flattening it into the album the way `CD1` alone is.
+    for (from, landings) in left.into_iter().rev() {
         let Some((to, _)) = landings
             .iter()
             .max_by_key(|(dir, count)| (**count, std::cmp::Reverse(*dir)))
@@ -1166,7 +1193,8 @@ fn has_subfolder(dir: &Path) -> bool {
 }
 
 /// Move every file under `from` to the same place under `to`. Symlinks
-/// are left (a relative one would dangle), which keeps `from` in place.
+/// are left (a relative one would dangle) and so is a file still being
+/// written ([`IN_PROGRESS`]), which keeps `from` in place.
 /// Whatever stays, and why, goes on `errors`.
 fn move_sidecars(from: &Path, to: &Path, errors: &mut Vec<String>) {
     if same_inode(from, to) {
@@ -1190,6 +1218,13 @@ fn move_sidecars(from: &Path, to: &Path, errors: &mut Vec<String>) {
             };
         if kind.is_symlink() {
             errors.push(format!("{} is a symlink; left in place", path.display()));
+            continue;
+        }
+        if is_in_progress(&path) {
+            errors.push(format!(
+                "{} is still being written; left in place",
+                path.display()
+            ));
             continue;
         }
         if kind.is_dir() {
@@ -1292,6 +1327,7 @@ pub fn apply_and_record_moves(
     })
     .unwrap_or_else(|why| ApplyOutcome {
         results: vec![Err(format!("not applied: {why}")); diff.tracks.len()],
+        refused: true,
         ..Default::default()
     })
 }
@@ -3968,6 +4004,66 @@ mod tests {
         assert!(album.join("cover.jpg").exists());
         assert!(album.join("disc2.cue").exists());
         assert!(!dir.join("artist").exists());
+    }
+
+    #[test]
+    fn disc_folders_flatten_the_same_whether_or_not_a_loose_track_left_with_them() {
+        // The album had a loose track beside its disc folders. The parent
+        // leaves in the same apply as the discs, and the discs' cue sheets
+        // still land in the album, not in `Album/CD1/`.
+        let dir = fresh_dir("sidecars-discs-and-loose");
+        let old = dir.join("artist").join("old album");
+        let loose = old.join("x.wav");
+        let one = old.join("CD1").join("a.wav");
+        let two = old.join("CD2").join("b.wav");
+        wav_at(&loose);
+        wav_at(&one);
+        wav_at(&two);
+        file_at(&old.join("cover.jpg"), b"cover");
+        file_at(&old.join("CD1").join("disc1.cue"), b"cue1");
+        file_at(&old.join("CD2").join("disc2.cue"), b"cue2");
+        let album = dir.join("Artist").join("Album");
+        let diff = renames_diff(&[
+            (&loose, &album.join("1-00 - X.wav")),
+            (&one, &album.join("1-01 - A.wav")),
+            (&two, &album.join("2-01 - B.wav")),
+        ]);
+        let out = apply_release_diff(&diff, &dir);
+        assert!(out.results.iter().all(Result::is_ok), "{:?}", out.results);
+        assert!(out.sidecar_errors.is_empty(), "{:?}", out.sidecar_errors);
+        assert!(album.join("cover.jpg").exists());
+        assert!(album.join("disc1.cue").exists());
+        assert!(album.join("disc2.cue").exists());
+        assert!(!album.join("CD1").exists());
+        assert!(!album.join("CD2").exists());
+        assert!(!dir.join("artist").exists());
+    }
+
+    #[test]
+    fn a_file_still_being_written_is_left_where_its_writer_expects_it() {
+        // `11 - Last.flac.part` is a download in progress (a browser, rsync,
+        // our own rip). Moving it, or removing its folder, fails the
+        // writer's final rename; it stays, the folder stays, and the apply
+        // says so.
+        let dir = fresh_dir("sidecars-in-progress");
+        let rip = dir.join("inbox").join("rip");
+        let src = rip.join("10 - Done.wav");
+        wav_at(&src);
+        file_at(&rip.join("11 - Last.flac.part"), b"half");
+        file_at(&rip.join("cover.jpg"), b"cover");
+        let album = dir.join("Artist").join("Album");
+        let out = apply_release_diff(&rename_only_diff(&src, &album.join("10 - Done.wav")), &dir);
+        assert!(out.results[0].is_ok(), "{:?}", out.results[0]);
+        assert!(rip.join("11 - Last.flac.part").exists());
+        assert!(!album.join("11 - Last.flac.part").exists());
+        assert!(album.join("cover.jpg").exists());
+        assert!(
+            out.sidecar_errors
+                .iter()
+                .any(|e| e.contains("11 - Last.flac.part") && e.contains("still being written")),
+            "{:?}",
+            out.sidecar_errors
+        );
     }
 
     #[test]
