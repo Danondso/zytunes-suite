@@ -517,7 +517,7 @@ impl DirectoryLibrary {
             .collect();
 
         // IDs come from the registry, which already has this apply's moves
-        // (`track_ids::record_moves`): a file read at its new path gets
+        // (`tag_ops::apply_and_record_moves`): a file read at its new path gets
         // the ID it had at the old one. Paths with no file are left out so
         // a vacated path is never registered.
         let ids: HashMap<PathBuf, u64> = crate::track_ids::with_registry(root, log, |registry| {
@@ -2672,18 +2672,10 @@ mod tests {
                 }],
             }],
         };
-        let out = crate::tag_ops::apply_release_diff(&diff, &dir);
+        let log = crate::cache::default_logger();
+        let out = crate::tag_ops::apply_and_record_moves(&diff, dir.to_str().unwrap(), &log);
         assert!(out.results[0].is_ok(), "{:?}", out.results[0]);
         assert_eq!(out.dir_renames.len(), 2, "{:?}", out.dir_renames);
-
-        let log = crate::cache::default_logger();
-        crate::track_ids::record_moves(
-            dir.to_str().unwrap(),
-            &log,
-            |p| crate::tag_ops::moved_path(p, &out.rename_map, &out.dir_renames),
-            |p| out.rename_map.contains_key(p),
-        )
-        .expect("registry usable");
         let lib = DirectoryLibrary::reread_paths_after(
             dir.to_str().unwrap(),
             &out.reread_paths(&diff, &dir),
@@ -3073,16 +3065,9 @@ mod tests {
         let id = id_of(&lib, &old).expect("scanned");
 
         let diff = rename_only_diff(&old, &new);
-        let out = crate::tag_ops::apply_release_diff(&diff, &dir);
-        assert!(out.results[0].is_ok(), "{:?}", out.results[0]);
         let log = crate::cache::default_logger();
-        crate::track_ids::record_moves(
-            root,
-            &log,
-            |p| crate::tag_ops::moved_path(p, &out.rename_map, &out.dir_renames),
-            |p| out.rename_map.contains_key(p),
-        )
-        .expect("registry usable");
+        let out = crate::tag_ops::apply_and_record_moves(&diff, root, &log);
+        assert!(out.results[0].is_ok(), "{:?}", out.results[0]);
         let lib = DirectoryLibrary::reread_paths_after(
             root,
             &out.reread_paths(&diff, &dir),
@@ -3115,16 +3100,9 @@ mod tests {
         let id = id_of(&lib, &old).expect("scanned");
 
         let diff = rename_only_diff(&old, &new);
-        let out = crate::tag_ops::apply_release_diff(&diff, &dir);
-        assert!(out.results[0].is_ok(), "{:?}", out.results[0]);
         let log = crate::cache::default_logger();
-        crate::track_ids::record_moves(
-            root,
-            &log,
-            |p| crate::tag_ops::moved_path(p, &out.rename_map, &out.dir_renames),
-            |p| out.rename_map.contains_key(p),
-        )
-        .expect("registry usable");
+        let out = crate::tag_ops::apply_and_record_moves(&diff, root, &log);
+        assert!(out.results[0].is_ok(), "{:?}", out.results[0]);
         crate::cache::save_dirlib_cache(root, HashMap::new(), &log);
 
         let lib = DirectoryLibrary::scan(root).unwrap();

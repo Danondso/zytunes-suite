@@ -391,20 +391,6 @@ fn lock_registry_file(file: &Path, log: &Logger) -> Option<std::fs::File> {
     }
 }
 
-/// Record moves that already happened on disk. Tests only: production
-/// moves go through [`crate::tag_ops::apply_and_record_moves`], which
-/// proves the registry usable BEFORE anything moves (an `Err` here would
-/// mean the files had already lost their IDs).
-#[cfg(test)]
-pub(crate) fn record_moves(
-    root: &str,
-    log: &Logger,
-    moved: impl Fn(&Path) -> PathBuf,
-    renamed: impl Fn(&Path) -> bool,
-) -> Result<(), String> {
-    with_registry(root, log, |ids| ids.apply_moves(moved, renamed))
-}
-
 /// Rewrite the registry of `root` as a newer build would have, so this
 /// build cannot use it. Tests stand in for the bad day (`pub` so the
 /// TUI's tests can too; not part of the API).

@@ -7,7 +7,7 @@
 //! Powers the `m` "tag manager" overlay in the TUI: the overlay surfaces
 //! the diff for user toggle / approval, then routes the approved
 //! `ReleaseTagDiff` through the background worker which calls
-//! [`apply_release_diff`].
+//! [`apply_and_record_moves`].
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -767,7 +767,7 @@ fn build_track_fields(
     fields
 }
 
-/// What [`apply_release_diff_with`] did on disk.
+/// What [`apply_and_record_moves`] did on disk.
 #[derive(Debug, Clone, Default)]
 pub struct ApplyOutcome {
     /// One entry per diff track, in diff order.
@@ -869,7 +869,7 @@ impl ApplyOutcome {
 /// removed only while they sit strictly inside the library or the sibling
 /// inbox. The library root, the inbox folder, and anything above either
 /// are left in place.
-pub fn apply_release_diff(diff: &ReleaseTagDiff, library_root: &Path) -> ApplyOutcome {
+pub(crate) fn apply_release_diff(diff: &ReleaseTagDiff, library_root: &Path) -> ApplyOutcome {
     let mut results: Vec<Result<(), String>> = vec![Ok(()); diff.tracks.len()];
     let mut rename_map: HashMap<PathBuf, PathBuf> = HashMap::new();
 
@@ -1307,8 +1307,8 @@ fn same_bytes(mut a: impl std::io::Read, mut b: impl std::io::Read) -> bool {
     }
 }
 
-/// [`apply_release_diff`], then move each moved file's track ID with it
-/// ([`crate::track_ids::record_moves`]).
+/// `apply_release_diff`, then move each moved file's track ID with it
+/// ([`crate::track_ids::TrackIds::apply_moves`]).
 ///
 /// This is the entry point for anything that goes on to read the library:
 /// the IDs have to follow the files before the next scan or reread sees
