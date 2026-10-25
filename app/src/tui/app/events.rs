@@ -155,9 +155,8 @@ impl App {
                 token,
                 results,
                 rename_map,
-                dir_renames,
             } => {
-                self.handle_tags_applied(token, results, rename_map, &dir_renames);
+                self.handle_tags_applied(token, results, rename_map);
             }
             BgEvent::LibraryRereadComplete { token, result } => {
                 self.handle_library_reread_complete(token, result);

@@ -621,10 +621,6 @@ pub enum BgEvent {
         token: u64,
         results: Vec<Result<(), String>>,
         rename_map: std::collections::HashMap<std::path::PathBuf, std::path::PathBuf>,
-        /// Whole folders a case retitle renamed, `(old, new)` in order.
-        /// Albums outside the diff moved with them, so the app remaps any
-        /// queued filing cluster that still points under `old`.
-        dir_renames: Vec<(std::path::PathBuf, std::path::PathBuf)>,
     },
     /// Phase 2 of `ApplyTagDiff`: surgical re-scan complete. Replaces
     /// `App.library` and (when the token still matches the open overlay)
@@ -3157,7 +3153,7 @@ pub(crate) fn run_tag_apply(
     for track in &diff.tracks {
         let landed = outcome.rename_map.get(&track.src_path);
         if let (Some(landed), Some(dest)) = (landed, track.dest_path.as_ref()) {
-            if landed != dest {
+            if landed.file_name() != dest.file_name() {
                 let _ = event_tx.send(BgEvent::SyncMessage(format!(
                     "tag-manager: {} is already in the library; filed {} beside it as {}",
                     dest.display(),
@@ -3175,13 +3171,11 @@ pub(crate) fn run_tag_apply(
     let ids_unsaved = outcome.ids_unsaved.clone();
     let paths = outcome.reread_paths(diff, root);
     let vacated = outcome.vacated();
-    let dir_renames = outcome.dir_renames.clone();
     let refused = outcome.refused;
     let _ = event_tx.send(BgEvent::TagsApplied {
         token,
         results: outcome.results,
         rename_map: outcome.rename_map,
-        dir_renames: outcome.dir_renames,
     });
     if let Some(why) = ids_unsaved {
         let _ = event_tx.send(BgEvent::TrackIdsUnsaved(why));
@@ -3196,7 +3190,6 @@ pub(crate) fn run_tag_apply(
             music_dir,
             &paths,
             &vacated,
-            &dir_renames,
             fingerprint,
             &scan_log,
         )

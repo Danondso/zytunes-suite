@@ -3152,23 +3152,16 @@ impl App {
     }
 
     /// The device sync queue holds each track's file path from when it was
-    /// queued. Left alone, the sync would fail every track an apply moved
-    /// or a folder retitle carried along as a missing file.
-    fn remap_queued_sync(
-        &mut self,
-        rename_map: &std::collections::HashMap<PathBuf, PathBuf>,
-        dir_renames: &[(PathBuf, PathBuf)],
-    ) {
-        if rename_map.is_empty() && dir_renames.is_empty() {
+    /// queued. Left alone, the sync would fail every track an apply moved,
+    /// as a missing file.
+    fn remap_queued_sync(&mut self, rename_map: &std::collections::HashMap<PathBuf, PathBuf>) {
+        if rename_map.is_empty() {
             return;
         }
         for item in &mut self.sync.queue {
             for track in &mut item.tracks {
-                let new = zytunes::tag_ops::moved_path(
-                    std::path::Path::new(&track.location),
-                    rename_map,
-                    dir_renames,
-                );
+                let new =
+                    zytunes::tag_ops::moved_path(std::path::Path::new(&track.location), rename_map);
                 track.location = new.to_string_lossy().into_owned();
             }
         }
@@ -3204,11 +3197,10 @@ impl App {
     fn follow_moved_now_playing(
         &mut self,
         rename_map: &std::collections::HashMap<PathBuf, PathBuf>,
-        dir_renames: &[(PathBuf, PathBuf)],
     ) {
         let moved = |loc: &str| {
             let old = std::path::Path::new(loc);
-            let new = zytunes::tag_ops::moved_path(old, rename_map, dir_renames);
+            let new = zytunes::tag_ops::moved_path(old, rename_map);
             (new != old).then_some(new)
         };
         let playing_retarget = self.now_playing.as_ref().and_then(|np| {
@@ -3297,29 +3289,24 @@ impl App {
         token: u64,
         results: Vec<Result<(), String>>,
         rename_map: std::collections::HashMap<PathBuf, PathBuf>,
-        dir_renames: &[(PathBuf, PathBuf)],
     ) {
-        // The files and folders moved on disk whether or not this overlay
-        // is still open, so queued clusters are remapped even for a stale
-        // token.
-        if !rename_map.is_empty() || !dir_renames.is_empty() {
+        // The files moved on disk whether or not this overlay is still
+        // open, so queued clusters are remapped even for a stale token.
+        if !rename_map.is_empty() {
             let queued = self
                 .inbox
                 .queue
                 .iter_mut()
                 .flat_map(|c| c.tracks.iter_mut());
             for loc in queued.filter_map(|t| t.location.as_mut()) {
-                let moved = zytunes::tag_ops::moved_path(
-                    std::path::Path::new(loc.as_str()),
-                    &rename_map,
-                    dir_renames,
-                );
+                let moved =
+                    zytunes::tag_ops::moved_path(std::path::Path::new(loc.as_str()), &rename_map);
                 *loc = moved.to_string_lossy().into_owned();
             }
         }
-        self.remap_queued_sync(&rename_map, dir_renames);
-        if !rename_map.is_empty() || !dir_renames.is_empty() {
-            self.follow_moved_now_playing(&rename_map, dir_renames);
+        self.remap_queued_sync(&rename_map);
+        if !rename_map.is_empty() {
+            self.follow_moved_now_playing(&rename_map);
         }
         // Per-track failures are surfaced via the sync log so the user sees
         // *which* tracks failed without sifting through the diff view. We log
@@ -3372,7 +3359,11 @@ impl App {
                 .iter()
                 .filter(|t| {
                     let landed = rename_map.get(&t.src_path);
-                    landed.is_some() && landed != t.dest_path.as_ref()
+                    // Numbered copies only: the folder part of a dest is
+                    // already the one on disk.
+                    landed
+                        .zip(t.dest_path.as_ref())
+                        .is_some_and(|(landed, dest)| landed.file_name() != dest.file_name())
                 })
                 .count()
         });
@@ -15006,15 +14997,10 @@ mod tests {
             completed: true,
         });
 
-        // The apply retitled the artist folder (carrying Facelift along)
-        // and renamed the Dirt track.
+        // The apply renamed the Dirt track.
         let new = PathBuf::from("/m/Alice In Chains/Dirt/01 - Them Bones.mp3");
         let rename_map = std::collections::HashMap::from([(old.clone(), new)]);
-        let dir_renames = vec![(
-            PathBuf::from("/m/alice in chains"),
-            PathBuf::from("/m/Alice In Chains"),
-        )];
-        app.handle_tags_applied(0, vec![Ok(())], rename_map, &dir_renames);
+        app.handle_tags_applied(0, vec![Ok(())], rename_map);
 
         // A track's ID does not change when its file moves, so nothing
         // keyed on it has anything to follow.
@@ -15039,7 +15025,6 @@ mod tests {
                 Err("lofty save failed: Invalid frame language".into()),
             ],
             std::collections::HashMap::new(),
-            &[],
         );
         assert!(
             app.toast_message
@@ -15085,7 +15070,6 @@ mod tests {
                 Ok(()),
             ],
             HashMap::from([(moved.clone(), moved_to)]),
-            &[],
         );
         let overlay = app.tag_manager.as_ref().unwrap();
         assert_eq!(
@@ -15128,7 +15112,7 @@ mod tests {
     fn a_reread_error_keeps_the_track_failures_on_screen() {
         let src = PathBuf::from("/inbox/01 Song.wav");
         let mut app = filing_overlay_with_rename(&src, std::path::Path::new("/m/01 - Song.wav"));
-        app.handle_tags_applied(0, vec![Err("rename collision".into())], HashMap::new(), &[]);
+        app.handle_tags_applied(0, vec![Err("rename collision".into())], HashMap::new());
         app.handle_library_reread_complete(0, Err("disk".into()));
         let overlay = app.tag_manager.as_ref().unwrap();
         assert_eq!(overlay.phase, TagManagerPhase::Done);
@@ -15155,7 +15139,7 @@ mod tests {
                     ..Default::default()
                 }],
             });
-        app.handle_tags_applied(0, vec![Err("rename collision".into())], HashMap::new(), &[]);
+        app.handle_tags_applied(0, vec![Err("rename collision".into())], HashMap::new());
         match reread {
             Ok(()) => app.tag_manager.as_mut().unwrap().phase = TagManagerPhase::Done,
             Err(e) => app.handle_library_reread_complete(0, Err(e.into())),
@@ -15212,37 +15196,6 @@ mod tests {
         assert!(
             app.tag_manager.is_some(),
             "L dumps the log and leaves the screen up"
-        );
-    }
-
-    #[test]
-    fn queued_file_clusters_follow_directory_retitle() {
-        let mut app = make_app_with_library_for_tagmgr();
-        app.inbox
-            .queue
-            .push_back(zytunes::library_layout::AlbumCluster {
-                artist: "Alice in Chains".into(),
-                album: "Facelift".into(),
-                tracks: vec![zytunes::library::Track {
-                    name: "We Die Young".into(),
-                    location: Some("/m/Alice in Chains/Facelift/01.mp3".into()),
-                    ..Default::default()
-                }],
-            });
-        // Filing `Dirt` retitled the artist folder; the queued `Facelift`
-        // cluster moved with it and must not keep the dead source path.
-        app.handle_tags_applied(
-            0,
-            Vec::new(),
-            std::collections::HashMap::new(),
-            &[(
-                PathBuf::from("/m/Alice in Chains"),
-                PathBuf::from("/m/Alice In Chains"),
-            )],
-        );
-        assert_eq!(
-            app.inbox.queue[0].tracks[0].location.as_deref(),
-            Some("/m/Alice In Chains/Facelift/01.mp3")
         );
     }
 
@@ -15538,7 +15491,7 @@ mod tests {
     fn filing_the_playing_album_keeps_now_playing_pointed_at_the_files() {
         use zytunes::dirlib::hash_path;
         // Track 1 is playing and is renamed by the apply; track 2 is next
-        // in the queue and only rides along with a folder retitle.
+        // in the queue and is renamed with it.
         let old1 = PathBuf::from("/m/alice in chains/Dirt/01 Them Bones.flac");
         let new1 = PathBuf::from("/m/Alice in Chains/Dirt/01 - Them Bones.flac");
         let old2 = PathBuf::from("/m/alice in chains/Dirt/02 Dam That River.flac");
@@ -15592,12 +15545,9 @@ mod tests {
         });
         app.stems.for_path = Some(old1.to_string_lossy().into_owned());
 
-        let rename_map = HashMap::from([(old1.clone(), new1.clone())]);
-        let dir_renames = vec![(
-            PathBuf::from("/m/alice in chains"),
-            PathBuf::from("/m/Alice in Chains"),
-        )];
-        app.handle_tags_applied(0, vec![Ok(())], rename_map, &dir_renames);
+        let rename_map =
+            HashMap::from([(old1.clone(), new1.clone()), (old2.clone(), new2.clone())]);
+        app.handle_tags_applied(0, vec![Ok(())], rename_map);
 
         let np = app.now_playing.as_ref().unwrap();
         assert_eq!(
@@ -15660,10 +15610,8 @@ mod tests {
     fn a_waiting_split_is_dropped_and_a_running_batch_follows_the_move() {
         let moved = "/m/alice in chains/Dirt/01 Them Bones.flac";
         let stays = "/m/Tool/Lateralus/01 The Grudge.flac";
-        let dir_renames = vec![(
-            PathBuf::from("/m/alice in chains"),
-            PathBuf::from("/m/Alice in Chains"),
-        )];
+        let moved_to = "/m/Alice in Chains/Dirt/01 Them Bones.flac";
+        let rename_map = HashMap::from([(PathBuf::from(moved), PathBuf::from(moved_to))]);
 
         // A split waiting on the engine install, and a batch with one
         // track on each side of the move.
@@ -15676,9 +15624,8 @@ mod tests {
             0,
         );
         app.pending_bg_commands.clear();
-        app.handle_tags_applied(0, vec![Ok(())], HashMap::new(), &dir_renames);
+        app.handle_tags_applied(0, vec![Ok(())], rename_map.clone());
         assert_eq!(app.stems.pending_path, None);
-        let moved_to = "/m/Alice in Chains/Dirt/01 Them Bones.flac";
         let followed = vec![stem_track(1, moved_to), stem_track(2, stays)];
         assert_eq!(
             app.stems_batch.as_ref().unwrap().tracks,
@@ -15701,7 +15648,7 @@ mod tests {
             0,
         );
         app.pending_bg_commands.clear();
-        app.handle_tags_applied(0, vec![Ok(())], HashMap::new(), &dir_renames);
+        app.handle_tags_applied(0, vec![Ok(())], rename_map);
         assert_eq!(
             app.stems_batch.as_ref().unwrap().tracks,
             vec![stem_track(1, moved_to)]
@@ -15843,7 +15790,7 @@ mod tests {
         app.stems.status = StemStatus::Separating { pct: None };
         app.stems.for_path = Some(old.to_string_lossy().into_owned());
         app.stems.job_gen = 4;
-        app.handle_tags_applied(0, vec![Ok(())], HashMap::from([(old, new)]), &[]);
+        app.handle_tags_applied(0, vec![Ok(())], HashMap::from([(old, new)]));
         assert_eq!(
             app.stems.job_gen, 5,
             "the late result is a stale generation"
@@ -15881,7 +15828,6 @@ mod tests {
             0,
             vec![Ok(())],
             HashMap::from([(PathBuf::from(old), PathBuf::from(new))]),
-            &[],
         );
         let tracks = &app.stems_batch.as_ref().unwrap().tracks;
         assert_eq!(tracks, &vec![stem_track(1, new), stem_track(2, stay)]);
@@ -15919,7 +15865,6 @@ mod tests {
             0,
             vec![Ok(())],
             HashMap::from([(PathBuf::from(old), PathBuf::from(new))]),
-            &[],
         );
         assert_eq!(
             app.stems_batch.as_ref().unwrap().tracks,
@@ -15956,15 +15901,7 @@ mod tests {
                 },
             ],
         });
-        app.handle_tags_applied(
-            0,
-            vec![Ok(())],
-            HashMap::from([(old.clone(), new.clone())]),
-            &[(
-                PathBuf::from("/m/Alice in Chains"),
-                PathBuf::from("/m/Alice In Chains"),
-            )],
-        );
+        app.handle_tags_applied(0, vec![Ok(())], HashMap::from([(old.clone(), new.clone())]));
         let locs: Vec<&str> = app.sync.queue[0]
             .tracks
             .iter()
@@ -15972,10 +15909,7 @@ mod tests {
             .collect();
         assert_eq!(
             locs,
-            vec![
-                new.to_str().unwrap(),
-                "/m/Alice In Chains/Dirt/02 Other.wav",
-            ]
+            vec![new.to_str().unwrap(), sibling.to_str().unwrap(),]
         );
     }
 
@@ -15993,7 +15927,6 @@ mod tests {
             0,
             vec![Ok(())],
             HashMap::from([(PathBuf::from(old), PathBuf::from(new))]),
-            &[],
         );
         app.pending_bg_commands.clear();
         app.dispatch_separation(new.into(), zytunes::stems::RecipeKind::Demucs);
@@ -16054,7 +15987,6 @@ mod tests {
             0,
             vec![Err("rename collision".into())],
             HashMap::from([(moved.clone(), dest)]),
-            &[],
         );
         app.handle_library_reread_complete(0, Err("disk".into()));
         app.close_tag_manager();
@@ -16104,7 +16036,7 @@ mod tests {
                 ..Default::default()
             },
         ]);
-        app.handle_tags_applied(0, vec![Ok(())], HashMap::from([(moved.clone(), dest)]), &[]);
+        app.handle_tags_applied(0, vec![Ok(())], HashMap::from([(moved.clone(), dest)]));
         app.handle_library_reread_complete(0, Err("disk".into()));
         assert_eq!(
             app.tag_manager.as_ref().unwrap().phase,
@@ -16659,7 +16591,7 @@ mod tests {
         let dest = PathBuf::from("/m/2Pac/Album/01 - Song.wav");
         let landed = PathBuf::from("/m/2Pac/Album/01 - Song (2).wav");
         let mut app = filing_overlay_with_rename(&src, &dest);
-        app.handle_tags_applied(0, vec![Ok(())], HashMap::from([(src, landed)]), &[]);
+        app.handle_tags_applied(0, vec![Ok(())], HashMap::from([(src, landed)]));
         let toast = app.toast_message.as_ref().map(|t| t.0.as_str());
         assert!(
             toast.is_some_and(|t| t.contains("filed beside")),
@@ -16669,20 +16601,20 @@ mod tests {
         // A file that reached the dest it was bound for says nothing.
         let src = PathBuf::from("/inbox/01 Song.wav");
         let mut app = filing_overlay_with_rename(&src, &dest);
-        app.handle_tags_applied(0, vec![Ok(())], HashMap::from([(src, dest)]), &[]);
+        app.handle_tags_applied(0, vec![Ok(())], HashMap::from([(src, dest)]));
         assert!(app.toast_message.is_none());
     }
 
     #[test]
     fn filing_a_track_keeps_its_id_and_its_playlist_entry() {
         // End to end through the worker's own apply function: the file is
-        // renamed and its folders retitled, and the playlist entry made
+        // renamed, and the playlist entry made
         // before filing still resolves, at the new path.
         let root = std::env::temp_dir().join("zytunes-file-keeps-id");
         let _ = std::fs::remove_dir_all(&root);
         let old = root
             .join("alice in chains")
-            .join("dirt")
+            .join("dirt (deluxe)")
             .join("01 - Them Bones.mp3");
         tagged_mp3(&old);
         let (tx, _rx) = mpsc::channel::<BgCommand>();
@@ -16738,7 +16670,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let old = root
             .join("alice in chains")
-            .join("dirt")
+            .join("dirt (deluxe)")
             .join("01 - Them Bones.mp3");
         tagged_mp3(&old);
         let (tx, _rx) = mpsc::channel::<BgCommand>();
@@ -16796,7 +16728,7 @@ mod tests {
         tagged_mp3(
             &root
                 .join("alice in chains")
-                .join("dirt")
+                .join("dirt (deluxe)")
                 .join("01 - Them Bones.mp3"),
         );
         let (tx, _rx) = mpsc::channel::<BgCommand>();
@@ -16892,8 +16824,8 @@ mod tests {
 
     #[test]
     fn a_queued_album_follows_a_file_the_apply_renamed() {
-        // Queued clusters used to follow folder retitles only. One whose
-        // file an apply renamed opened later on a path that was gone.
+        // A queued cluster whose file an apply renamed would otherwise open
+        // later on a path that was gone.
         let mut app = App::new();
         app.inbox.queue.push_back(queued_cluster("/m/a/old.wav"));
         let rename_map: std::collections::HashMap<PathBuf, PathBuf> = [(
@@ -16901,7 +16833,7 @@ mod tests {
             PathBuf::from("/m/A/01 - New.wav"),
         )]
         .into();
-        app.handle_tags_applied(0, vec![Ok(())], rename_map, &[]);
+        app.handle_tags_applied(0, vec![Ok(())], rename_map);
         assert_eq!(
             app.inbox.queue[0].tracks[0].location.as_deref(),
             Some("/m/A/01 - New.wav")

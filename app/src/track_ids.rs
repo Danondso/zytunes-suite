@@ -85,10 +85,10 @@ impl TrackIds {
     /// mover keeps its own ID and that entry's ID is freed: no two tracks
     /// are ever folded into one, and no store keyed on IDs is ever re-keyed.
     ///
-    /// `renamed` says which old paths the apply renamed itself. A folder
-    /// retitle can carry such a gone file's entry onto the very path a
-    /// renamed file landed on; the renamed file is the one on disk, so it
-    /// wins whatever order the entries come in.
+    /// `renamed` says which old paths the apply renamed itself. A gone
+    /// file's entry can sit on the very path a renamed file landed on; the
+    /// renamed file is the one on disk, so it wins whatever order the
+    /// entries come in.
     pub fn apply_moves(
         &mut self,
         moved: impl Fn(&Path) -> PathBuf,
@@ -493,26 +493,6 @@ mod tests {
     }
 
     #[test]
-    fn a_directory_rename_carries_every_id_under_it() {
-        let mut ids = TrackIds::default();
-        let one = ids.id_for(&p("/music/alice in chains/Dirt/01.mp3"));
-        let two = ids.id_for(&p("/music/alice in chains/Facelift/01.mp3"));
-        let other = ids.id_for(&p("/music/Tool/Lateralus/01.mp3"));
-        let dirs = vec![(p("/music/alice in chains"), p("/music/Alice In Chains"))];
-        ids.apply_moves(
-            |old| crate::tag_ops::remap_through_dir_renames(old, &dirs),
-            none,
-        );
-        assert_eq!(ids.get(&p("/music/Alice In Chains/Dirt/01.mp3")), Some(one));
-        assert_eq!(
-            ids.get(&p("/music/Alice In Chains/Facelift/01.mp3")),
-            Some(two)
-        );
-        assert_eq!(ids.get(&p("/music/Tool/Lateralus/01.mp3")), Some(other));
-        assert_eq!(ids.get(&p("/music/alice in chains/Dirt/01.mp3")), None);
-    }
-
-    #[test]
     fn a_move_onto_a_registered_path_takes_it_over() {
         // An apply never lands a file on one that is there (it files it
         // beside). So an entry at the new path is for a file that has
@@ -556,22 +536,21 @@ mod tests {
     #[test]
     fn a_renamed_file_beats_a_gone_files_entry_carried_onto_its_path() {
         // `alice/02 - Song.mp3` was deleted by hand; its entry is still
-        // here. An apply retitles `alice` to `Alice` and renames
-        // `alice/track02.mp3` to `Alice/02 - Song.mp3`. Both entries now
-        // map to one path. The file on disk is the renamed one. Repeated
-        // because the order the two come in follows the map's hashing.
-        let dirs = vec![(p("/m/alice"), p("/m/Alice"))];
+        // here. An apply renames `alice/track02.mp3` to it. Both entries
+        // now map to one path. The file on disk is the renamed one.
+        // Repeated because the order the two come in follows the map's
+        // hashing.
         let files: HashMap<PathBuf, PathBuf> =
-            [(p("/m/alice/track02.mp3"), p("/m/Alice/02 - Song.mp3"))].into();
+            [(p("/m/alice/track02.mp3"), p("/m/alice/02 - Song.mp3"))].into();
         for _ in 0..64 {
             let mut ids = TrackIds::default();
             let live = ids.id_for(&p("/m/alice/track02.mp3"));
             ids.id_for(&p("/m/alice/02 - Song.mp3"));
             ids.apply_moves(
-                |old| crate::tag_ops::moved_path(old, &files, &dirs),
+                |old| crate::tag_ops::moved_path(old, &files),
                 |old| files.contains_key(old),
             );
-            assert_eq!(ids.get(&p("/m/Alice/02 - Song.mp3")), Some(live));
+            assert_eq!(ids.get(&p("/m/alice/02 - Song.mp3")), Some(live));
         }
     }
 

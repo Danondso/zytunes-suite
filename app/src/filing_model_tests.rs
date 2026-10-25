@@ -45,7 +45,7 @@ const NAMES: &[&str] = &[
 /// Lengths in seconds. Two files within 2 s of each other count as copies
 /// of one recording, so both "a copy" and "a different song" come up.
 const LENGTHS: &[u32] = &[1, 1, 5];
-const ARTEFACTS: &[&str] = &[".zytunes-case-", ".tagtmp", ".zytunes-part"];
+const ARTEFACTS: &[&str] = &[".tagtmp", ".zytunes-part"];
 
 /// xorshift64*: deterministic per seed, no dependency.
 struct Rng(u64);
@@ -158,8 +158,7 @@ struct Reached {
     moved: usize,
     filed_from_inbox: usize,
     landed_beside: usize,
-    refused_as_wrong_pairing: usize,
-    folders_retitled: usize,
+    folders_adopted: usize,
     failed_on_a_locked_folder: usize,
     sidecars_carried: usize,
 }
@@ -191,13 +190,17 @@ impl Model {
     }
 
     /// What sits beside `audio` on a rip: a cover image, a `Scans`
-    /// folder, and the junk file the OS leaves. Each file has its own
-    /// contents, so none is ever a byte-identical copy of another.
+    /// folder, and the junk file the OS leaves. Filing treats them all
+    /// alike (moved, never deleted), and each has its own contents so a
+    /// lost one cannot hide behind another.
     fn create_sidecars(&mut self, audio: &Path, rng: &mut Rng) {
         let n = self.files.len();
         let mut sidecars = vec![audio.with_file_name("cover.jpg")];
         if rng.one_in(2) {
             sidecars.push(audio.with_file_name("Scans").join("back.png"));
+        }
+        if rng.one_in(2) {
+            sidecars.push(audio.with_file_name(".DS_Store"));
         }
         for path in sidecars {
             if path.exists() {
@@ -207,9 +210,6 @@ impl Model {
             std::fs::write(&path, format!("{} {n}", path.display())).unwrap();
             let meta = std::fs::metadata(&path).unwrap();
             self.files.insert(meta.ino(), meta.len());
-        }
-        if rng.one_in(2) {
-            std::fs::write(audio.with_file_name(".DS_Store"), b"junk").unwrap();
         }
     }
 
@@ -230,11 +230,9 @@ impl Model {
             );
         }
 
-        // Nothing lost, duplicated, truncated, or made up. OS junk is
-        // nobody's: carried or dropped, either is fine.
+        // Nothing lost, duplicated, truncated, or made up.
         let mut seen: HashMap<u64, &PathBuf> = HashMap::new();
-        let is_junk = |p: &&PathBuf| p.file_name().is_some_and(|n| n == ".DS_Store");
-        for path in in_root.iter().chain(&in_inbox).filter(|p| !is_junk(p)) {
+        for path in in_root.iter().chain(&in_inbox) {
             let meta = std::fs::metadata(path).unwrap();
             let Some(len) = self.files.get(&meta.ino()) else {
                 panic!("{at}: a file the test never made: {}", path.display());
@@ -388,41 +386,39 @@ fn run(seed: u64, reached: &mut Reached) {
         let sidecars = sidecars_under(&root);
         let outcome = apply_and_record_moves(&diff, &root_str, &log);
 
-        // The folder may have been carried along by a retitle of its
-        // parent, or removed: an empty one is pruned when a move into it
-        // fails, which only needs its parent to be writable.
+        // The folder may have been removed: an empty one is pruned when a
+        // move into it fails, which only needs its parent to be writable.
         if let Some(dir) = locked {
-            let now = crate::tag_ops::remap_through_dir_renames(&dir, &outcome.dir_renames);
-            if now.exists() {
-                std::fs::set_permissions(&now, std::fs::Permissions::from_mode(0o755)).unwrap();
+            if dir.exists() {
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
             }
         }
 
         let detail = format!("{at}\n  diff: {:#?}\n  outcome: {outcome:#?}", diff.tracks);
         assert_eq!(outcome.results.len(), diff.tracks.len(), "{detail}");
         reached.moved += outcome.rename_map.len();
-        reached.folders_retitled += outcome.dir_renames.len();
         let sidecars_now = sidecars_under(&root);
         reached.sidecars_carried += sidecars
             .iter()
-            .filter(|(ino, was)| {
-                let carried = crate::tag_ops::remap_through_dir_renames(was, &outcome.dir_renames);
-                sidecars_now.get(*ino).is_some_and(|now| *now != carried)
-            })
+            .filter(|(ino, was)| sidecars_now.get(*ino).is_some_and(|now| now != *was))
             .count();
         for (track, result) in diff.tracks.iter().zip(&outcome.results) {
             let landed = outcome.rename_map.get(&track.src_path);
             if landed.is_some() && track.src_path.starts_with(&inbox) {
                 reached.filed_from_inbox += 1;
             }
-            if landed.is_some() && landed != track.dest_path.as_ref() {
-                reached.landed_beside += 1;
+            if let (Some(landed), Some(dest)) = (landed, track.dest_path.as_ref()) {
+                if landed.file_name() != dest.file_name() {
+                    reached.landed_beside += 1;
+                }
+                if landed.parent() != dest.parent() {
+                    reached.folders_adopted += 1;
+                }
             }
             match result {
                 Err(e) if e.contains("Permission denied") => {
                     reached.failed_on_a_locked_folder += 1;
                 }
-                Err(e) if e.contains("collision") => reached.refused_as_wrong_pairing += 1,
                 _ => {}
             }
         }
@@ -443,7 +439,6 @@ fn run(seed: u64, reached: &mut Reached) {
             &root_str,
             &outcome.reread_paths(&diff, &root),
             &outcome.vacated(),
-            &outcome.dir_renames,
             false,
             &log,
         )
@@ -465,8 +460,7 @@ fn filing_keeps_every_file_and_its_identity_through_random_applies() {
         reached.moved > 0
             && reached.filed_from_inbox > 0
             && reached.landed_beside > 0
-            && reached.refused_as_wrong_pairing > 0
-            && reached.folders_retitled > 0
+            && reached.folders_adopted > 0
             && reached.sidecars_carried > 0,
         "the generator no longer reaches every case: {reached:?}"
     );

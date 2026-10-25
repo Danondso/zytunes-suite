@@ -468,23 +468,16 @@ impl DirectoryLibrary {
         fingerprint: bool,
         log: &crate::cache::Logger,
     ) -> Result<Self, String> {
-        Self::reread_paths_after(root, paths, &[], &[], fingerprint, log)
+        Self::reread_paths_after(root, paths, &[], fingerprint, log)
     }
 
-    /// [`Self::reread_paths`], plus the renames an apply performed.
+    /// [`Self::reread_paths`], plus the files an apply moved.
     ///
     /// `vacated` are old paths of moved files; their entries are dropped.
-    ///
-    /// A case retitle (`Alice in Chains/` → `Alice In Chains/`) moves every
-    /// album under the folder, not only the files in `paths`. Each cached
-    /// entry under an `old` directory is re-keyed to its place under `new`
-    /// so those albums stay in the library without a full rescan. The
-    /// stored AcoustID rides along (the audio did not change).
     pub fn reread_paths_after(
         root: &str,
         paths: &[PathBuf],
         vacated: &[PathBuf],
-        dir_renames: &[(PathBuf, PathBuf)],
         fingerprint: bool,
         log: &crate::cache::Logger,
     ) -> Result<Self, String> {
@@ -500,31 +493,13 @@ impl DirectoryLibrary {
             cached.remove(old.to_string_lossy().as_ref());
         }
 
-        // Re-key entries carried along by a directory rename. The old key
-        // is always dropped: on a case-folding volume it still resolves,
-        // so the ghost prune below would keep it as a duplicate.
-        //
-        // Each key goes through the WHOLE chain before the file is looked
-        // at. A retitle of two nested folders records the second rename
-        // under the first one's new name, so the path after only the first
-        // step never existed on disk and a stat there would drop the entry.
-        let carried: Vec<(String, PathBuf)> = cached
-            .keys()
-            .filter_map(|key| {
-                let moved = crate::tag_ops::remap_through_dir_renames(Path::new(key), dir_renames);
-                (moved != Path::new(key)).then(|| (key.clone(), moved))
-            })
-            .collect();
-
         // IDs come from the registry, which already has this apply's moves
         // (`tag_ops::apply_and_record_moves`): a file read at its new path gets
         // the ID it had at the old one. Paths with no file are left out so
         // a vacated path is never registered.
         let ids: HashMap<PathBuf, u64> = crate::track_ids::with_registry(root, log, |registry| {
-            carried
+            paths
                 .iter()
-                .map(|(_, moved)| moved)
-                .chain(paths)
                 .filter(|p| p.is_file())
                 .map(|p| (p.clone(), registry.id_for(p)))
                 .collect()
@@ -537,10 +512,7 @@ impl DirectoryLibrary {
                 "zytunes: {why}; this reread keeps the track IDs the cache has"
             ));
             let mut used: HashSet<u64> = cached.values().map(|entry| entry.track.id).collect();
-            let mut ids: HashMap<PathBuf, u64> = carried
-                .iter()
-                .filter_map(|(key, moved)| Some((moved.clone(), cached.get(key)?.track.id)))
-                .collect();
+            let mut ids: HashMap<PathBuf, u64> = HashMap::new();
             for p in paths.iter().filter(|p| p.is_file()) {
                 let known = cached.get(p.to_string_lossy().as_ref());
                 let id = known
@@ -551,43 +523,6 @@ impl DirectoryLibrary {
             }
             ids
         });
-
-        // A carried file was not touched, only its folder was, and an
-        // artist folder can hold thousands: the cached entry is reused
-        // while its fingerprint still matches. The file is read again
-        // when it does not, or when a retitled folder name may have
-        // supplied its artist or album (`carried_track`).
-        for (key, moved) in carried {
-            let Some(entry) = cached.remove(&key) else {
-                continue;
-            };
-            let (Some(fp), Some(&id)) = (
-                crate::cache::FileFingerprint::from_path(&moved),
-                ids.get(&moved),
-            ) else {
-                continue;
-            };
-            let acoustic_id = entry.track.acoustic_id.clone();
-            let reused = (entry.fingerprint == fp)
-                .then(|| carried_track(entry.track, Path::new(&key), &moved))
-                .flatten();
-            let mut track = reused.unwrap_or_else(|| {
-                let mut track = build_track(&moved, id);
-                if track.acoustic_id.is_none() {
-                    track.acoustic_id = acoustic_id;
-                }
-                track
-            });
-            track.id = id;
-            cached.insert(
-                moved.to_string_lossy().to_string(),
-                crate::cache::CachedFile {
-                    fingerprint: fp,
-                    track,
-                    fingerprint_failed: entry.fingerprint_failed,
-                },
-            );
-        }
 
         for p in paths {
             let key = p.to_string_lossy().to_string();
@@ -624,11 +559,6 @@ impl DirectoryLibrary {
             .iter()
             .chain(vacated)
             .filter_map(|p| p.parent().map(Path::to_path_buf))
-            .chain(
-                dir_renames
-                    .iter()
-                    .flat_map(|(old, new)| [old.clone(), new.clone()]),
-            )
             .collect();
         let before = cached.len();
         cached.retain(|path, _| {
@@ -1135,23 +1065,6 @@ fn track_from_path(path: &Path, id: u64, duration_ms: Option<u64>) -> Track {
         )),
         ..Default::default()
     }
-}
-
-/// `track`, read at `from`, now that its folder has been retitled and it
-/// sits at `to`: the same track at its new location, when the folder
-/// names cannot have supplied any of it. `None` when its artist or album
-/// equals a folder name the retitle changed: the cache does not record
-/// whether that value was the tag's (stays) or the folder's (takes the
-/// new spelling), so the file has to be read to say.
-fn carried_track(mut track: Track, from: &Path, to: &Path) -> Option<Track> {
-    for (field, levels) in [(&track.artist, 2), (&track.album, 1)] {
-        let was = parent_name(from, levels);
-        if *field == was && was != parent_name(to, levels) {
-            return None;
-        }
-    }
-    track.location = Some(to.to_string_lossy().to_string());
-    Some(track)
 }
 
 /// Get the file stem (name without extension).
@@ -2437,280 +2350,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reread_paths_follows_directory_rename() {
-        let dir = std::env::temp_dir().join("zytunes-dirlib-reread-dir-rename");
-        let _ = fs::remove_dir_all(&dir);
-        let old_artist = dir.join("artist d");
-        let new_artist = dir.join("Artist D");
-        let filed = old_artist.join("AlbumA").join("01 Filed.mp3");
-        let sibling = old_artist.join("AlbumB").join("01 Sibling.mp3");
-        fs::create_dir_all(filed.parent().unwrap()).unwrap();
-        fs::create_dir_all(sibling.parent().unwrap()).unwrap();
-        fs::write(&filed, b"fake").unwrap();
-        fs::write(&sibling, b"fake").unwrap();
-        let _ = DirectoryLibrary::scan_with_options(
-            dir.to_str().unwrap(),
-            ScanOptions::default(),
-            |_| {},
-        )
-        .unwrap();
-
-        // Filing AlbumA retitled the artist folder; AlbumB rode along.
-        fs::rename(&old_artist, &new_artist).unwrap();
-        let filed_new = new_artist.join("AlbumA").join("01 Filed.mp3");
-        let sibling_new = new_artist.join("AlbumB").join("01 Sibling.mp3");
-        let log = crate::cache::default_logger();
-        let lib = DirectoryLibrary::reread_paths_after(
-            dir.to_str().unwrap(),
-            std::slice::from_ref(&filed_new),
-            std::slice::from_ref(&filed),
-            &[(old_artist.clone(), new_artist.clone())],
-            false,
-            &log,
-        )
-        .unwrap();
-        let mut paths: Vec<String> = lib
-            .all_tracks()
-            .filter_map(|t| t.location.clone())
-            .collect();
-        paths.sort();
-        assert_eq!(
-            paths,
-            vec![
-                filed_new.to_str().unwrap().to_string(),
-                sibling_new.to_str().unwrap().to_string()
-            ],
-            "the sibling album must follow the folder, under its new path only"
-        );
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_track_a_retitle_carried_is_not_read_again() {
-        // A folder retitle moves every album under it. Those files did
-        // not change, and an artist folder can hold thousands of them:
-        // reading each one's tags again is what would stall the worker.
-        // The cached entry is reused when its fingerprint still matches;
-        // a file whose artist or album may have come from a retitled
-        // folder name (the untagged one here) is read again.
-        let dir = std::env::temp_dir().join("zytunes-dirlib-reread-carried-reuse");
-        let _ = fs::remove_dir_all(&dir);
-        let old_artist = dir.join("artist e");
-        let new_artist = dir.join("Artist E");
-        let filed = old_artist.join("AlbumA").join("01 Filed.mp3");
-        let sibling = old_artist.join("album b").join("01 Sibling.wav");
-        let untagged = old_artist.join("album b").join("02 Untagged.mp3");
-        fs::create_dir_all(filed.parent().unwrap()).unwrap();
-        fs::create_dir_all(sibling.parent().unwrap()).unwrap();
-        fs::write(&filed, b"fake").unwrap();
-        fs::write(&untagged, b"fake").unwrap();
-        make_test_wav(&sibling);
-        {
-            use lofty::file::TaggedFileExt;
-            use lofty::tag::{Accessor, Tag, TagExt};
-            let mut tagged = lofty::probe::read_from_path(&sibling).unwrap();
-            let tag_type = tagged.primary_tag_type();
-            tagged.insert_tag(Tag::new(tag_type));
-            let tag = tagged.primary_tag_mut().unwrap();
-            tag.set_title("Tagged Title".to_string());
-            tag.set_artist("Tagged Artist".to_string());
-            tag.save_to_path(&sibling, lofty::config::WriteOptions::default())
-                .unwrap();
-        }
-        let _ = DirectoryLibrary::scan(dir.to_str().unwrap()).unwrap();
-
-        // The retitle. The sibling's bytes are then swapped for ones that
-        // carry no tag, keeping size and mtime: a reread that opens the
-        // file sees an untagged one, a reread that trusts the cache does
-        // not notice.
-        fs::rename(&old_artist, &new_artist).unwrap();
-        let sibling_new = new_artist.join("album b").join("01 Sibling.wav");
-        let untagged_new = new_artist.join("album b").join("02 Untagged.mp3");
-        let meta = fs::metadata(&sibling_new).unwrap();
-        fs::write(&sibling_new, vec![0u8; meta.len() as usize]).unwrap();
-        fs::File::options()
-            .write(true)
-            .open(&sibling_new)
-            .unwrap()
-            .set_modified(meta.modified().unwrap())
-            .unwrap();
-
-        let filed_new = new_artist.join("AlbumA").join("01 Filed.mp3");
-        let log = crate::cache::default_logger();
-        let lib = DirectoryLibrary::reread_paths_after(
-            dir.to_str().unwrap(),
-            std::slice::from_ref(&filed_new),
-            std::slice::from_ref(&filed),
-            &[(old_artist.clone(), new_artist.clone())],
-            false,
-            &log,
-        )
-        .unwrap();
-        let at = |p: &Path| {
-            lib.all_tracks()
-                .find(|t| t.location.as_deref() == p.to_str())
-                .cloned()
-                .expect("in the library")
-        };
-        let carried = at(&sibling_new);
-        assert_eq!(carried.name, "Tagged Title", "the cached tags were kept");
-        assert_eq!(carried.artist, "Tagged Artist");
-        assert_eq!(
-            carried.album, "album b",
-            "an album name from the folder stays"
-        );
-        let carried = at(&untagged_new);
-        assert_eq!(
-            carried.artist, "Artist E",
-            "an artist name that came from the folder takes the new spelling"
-        );
-        assert_eq!(carried.album, "album b");
-        assert_eq!(carried.name, "Untagged");
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_carried_track_keeps_a_tag_that_matched_the_old_folder_name() {
-        // The library was laid out from its tags, so the artist tag is
-        // the old folder name. A retitle of the folder changes no file:
-        // the reread must say what a scan of the file says, not hand the
-        // tag the folder's new spelling.
-        let dir = std::env::temp_dir().join("zytunes-dirlib-reread-carried-tag");
-        let _ = fs::remove_dir_all(&dir);
-        let old_artist = dir.join("artist e");
-        let new_artist = dir.join("Artist E");
-        let filed = old_artist.join("AlbumA").join("01 Filed.mp3");
-        let sibling = old_artist.join("album b").join("01 Sibling.wav");
-        fs::create_dir_all(filed.parent().unwrap()).unwrap();
-        fs::create_dir_all(sibling.parent().unwrap()).unwrap();
-        fs::write(&filed, b"fake").unwrap();
-        make_test_wav(&sibling);
-        {
-            use lofty::file::TaggedFileExt;
-            use lofty::tag::{Accessor, Tag, TagExt};
-            let mut tagged = lofty::probe::read_from_path(&sibling).unwrap();
-            let tag_type = tagged.primary_tag_type();
-            tagged.insert_tag(Tag::new(tag_type));
-            let tag = tagged.primary_tag_mut().unwrap();
-            tag.set_title("Tagged Title".to_string());
-            tag.set_artist("artist e".to_string());
-            tag.save_to_path(&sibling, lofty::config::WriteOptions::default())
-                .unwrap();
-        }
-        let _ = DirectoryLibrary::scan(dir.to_str().unwrap()).unwrap();
-        fs::rename(&old_artist, &new_artist).unwrap();
-        let sibling_new = new_artist.join("album b").join("01 Sibling.wav");
-        let filed_new = new_artist.join("AlbumA").join("01 Filed.mp3");
-        let log = crate::cache::default_logger();
-        let reread = DirectoryLibrary::reread_paths_after(
-            dir.to_str().unwrap(),
-            std::slice::from_ref(&filed_new),
-            std::slice::from_ref(&filed),
-            &[(old_artist.clone(), new_artist.clone())],
-            false,
-            &log,
-        )
-        .unwrap();
-        let artist_of = |lib: &DirectoryLibrary| {
-            lib.all_tracks()
-                .find(|t| t.location.as_deref() == sibling_new.to_str())
-                .map(|t| t.artist.clone())
-                .expect("in the library")
-        };
-        assert_eq!(
-            artist_of(&reread),
-            "artist e",
-            "the tag, as the file has it"
-        );
-        crate::cache::forget_dirlib_cache(dir.to_str().unwrap());
-        let cold = DirectoryLibrary::scan(dir.to_str().unwrap()).unwrap();
-        assert_eq!(artist_of(&reread), artist_of(&cold));
-        forget_library(&dir);
-    }
-
-    #[test]
-    fn reread_paths_follows_a_nested_directory_rename() {
-        // Retitling artist AND album records the album rename under the
-        // artist's new name. A track the diff did not list must still
-        // follow both, and keep its ID.
-        use crate::tag_ops::{FieldDiff, FieldKind, ReleaseTagDiff, TrackTagDiff};
-        let dir = std::env::temp_dir().join("zytunes-dirlib-reread-nested-rename");
-        let _ = fs::remove_dir_all(&dir);
-        let old_album = dir.join("alice in chains").join("dirt");
-        let new_album = dir.join("Alice In Chains").join("Dirt");
-        fs::create_dir_all(&old_album).unwrap();
-        let filed = old_album.join("01 - Them Bones.mp3");
-        let sibling = old_album.join("02 - Dam That River.mp3");
-        fs::write(&filed, b"fake").unwrap();
-        fs::write(&sibling, b"fake").unwrap();
-        crate::track_ids::forget(dir.to_str().unwrap());
-        let scanned = DirectoryLibrary::scan_with_options(
-            dir.to_str().unwrap(),
-            ScanOptions::default(),
-            |_| {},
-        )
-        .unwrap();
-        let filed_id = id_of(&scanned, &filed).expect("scanned");
-        let sibling_id = id_of(&scanned, &sibling).expect("scanned");
-
-        let filed_new = new_album.join("01 - Them Bones.mp3");
-        let sibling_new = new_album.join("02 - Dam That River.mp3");
-        let diff = ReleaseTagDiff {
-            release_mbid: "rel-1".into(),
-            summary: "test".into(),
-            tracks: vec![TrackTagDiff {
-                src_path: filed.clone(),
-                dest_path: Some(filed_new.clone()),
-                library_id: 1,
-                fields: vec![FieldDiff {
-                    kind: FieldKind::Filename,
-                    name: "Filename",
-                    current: Some(filed.display().to_string()),
-                    proposed: Some(filed_new.display().to_string()),
-                    enabled: true,
-                }],
-            }],
-        };
-        let log = crate::cache::default_logger();
-        let out = crate::tag_ops::apply_and_record_moves(&diff, dir.to_str().unwrap(), &log);
-        assert!(out.results[0].is_ok(), "{:?}", out.results[0]);
-        assert_eq!(out.dir_renames.len(), 2, "{:?}", out.dir_renames);
-        let lib = DirectoryLibrary::reread_paths_after(
-            dir.to_str().unwrap(),
-            &out.reread_paths(&diff, &dir),
-            &out.vacated(),
-            &out.dir_renames,
-            false,
-            &log,
-        )
-        .unwrap();
-        let mut paths: Vec<String> = lib
-            .all_tracks()
-            .filter_map(|t| t.location.clone())
-            .collect();
-        paths.sort();
-        assert_eq!(
-            paths,
-            vec![
-                filed_new.to_str().unwrap().to_string(),
-                sibling_new.to_str().unwrap().to_string()
-            ],
-            "the unlisted track must follow both folder renames"
-        );
-        let id_at = |path: &Path| {
-            lib.all_tracks()
-                .find(|t| t.location.as_deref() == path.to_str())
-                .map(|t| t.id)
-        };
-        assert_eq!(
-            (id_at(&filed_new), id_at(&sibling_new)),
-            (Some(filed_id), Some(sibling_id)),
-            "both tracks keep the IDs playlists already hold"
-        );
-        let _ = fs::remove_dir_all(&dir);
-    }
-
     /// One fake track under `root`, moved by a Filename-only diff.
     fn rename_only_diff(src: &Path, dest: &Path) -> crate::tag_ops::ReleaseTagDiff {
         use crate::tag_ops::{FieldDiff, FieldKind, ReleaseTagDiff, TrackTagDiff};
@@ -2814,7 +2453,7 @@ mod tests {
             out.results[0]
         );
         assert!(one.is_file() && !new.exists(), "nothing moved");
-        assert!(out.rename_map.is_empty() && out.dir_renames.is_empty());
+        assert!(out.rename_map.is_empty());
         forget_library(&dir);
     }
 
@@ -2932,7 +2571,6 @@ mod tests {
         let lib = DirectoryLibrary::reread_paths_after(
             root,
             std::slice::from_ref(&new),
-            &[],
             &[],
             false,
             &log,
@@ -3072,7 +2710,6 @@ mod tests {
             root,
             &out.reread_paths(&diff, &dir),
             &out.vacated(),
-            &out.dir_renames,
             false,
             &log,
         )
@@ -3121,7 +2758,7 @@ mod tests {
 
     #[test]
     fn reread_paths_drops_vacated_source_that_still_resolves() {
-        // On a case-folding volume the old spelling of a retitled file
+        // On a case-folding volume the old spelling of a renamed file
         // still opens. A file left in place stands in for that here: a
         // vacated path must leave the library even though it "exists".
         let dir = std::env::temp_dir().join("zytunes-dirlib-reread-vacated");
@@ -3141,7 +2778,6 @@ mod tests {
             dir.to_str().unwrap(),
             &[],
             std::slice::from_ref(&old),
-            &[],
             false,
             &log,
         )
@@ -3222,7 +2858,6 @@ mod tests {
             dir.to_str().unwrap(),
             std::slice::from_ref(&moved_dest),
             std::slice::from_ref(&moved_src),
-            &[],
             false,
             &log,
         )
