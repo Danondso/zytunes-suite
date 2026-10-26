@@ -1745,12 +1745,12 @@ fn copy_no_replace_with(src: &Path, dest: &Path, link: LinkFn) -> Result<(), Mov
             dest.display()
         ))
     };
-    std::fs::copy(src, &staged).map_err(&fail)?;
+    std::fs::copy(src, &staged).map_err(fail)?;
     // Without this the data can still be in memory when `src` goes, and
     // a power cut leaves a short file under the final name.
     std::fs::File::open(&staged)
         .and_then(|f| f.sync_all())
-        .map_err(&fail)?;
+        .map_err(fail)?;
     // Link, not rename: a rename would replace a file that turned up
     // while the copy ran. A volume with no hard links at all (FAT) gets
     // the rename, after a last look at the name.
@@ -1822,6 +1822,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Whether `dir`'s filesystem treats `a` and `b` as one name (APFS and
+    /// default Windows volumes fold case; APFS also folds Unicode forms).
+    /// Tests about two folders that differ only that way cannot be set up
+    /// there, so they return early.
+    fn names_collide(dir: &Path, a: &str, b: &str) -> bool {
+        let probe = dir.join(a);
+        std::fs::create_dir_all(&probe).unwrap();
+        let collides = dir.join(b).exists();
+        std::fs::remove_dir_all(&probe).unwrap();
+        collides
     }
 
     fn make_release(title: &str, artist: &str) -> Release {
@@ -3759,6 +3771,9 @@ mod tests {
     fn artist_level_files_follow_to_the_artist_level() {
         // `artist.jpg` sits beside the artist's albums, not inside one.
         let dir = fresh_dir("sidecars-artist-level");
+        if names_collide(&dir, "alice in chains", "Alice In Chains") {
+            return;
+        }
         let one = dir.join("alice in chains").join("Dirt").join("a.wav");
         wav_at(&one);
         file_at(&dir.join("alice in chains").join("artist.jpg"), b"portrait");
@@ -3927,6 +3942,13 @@ mod tests {
         // `rename` between two links of one file does nothing. Reporting
         // it as a move would drop `src` from the library while it is
         // still on disk.
+        if names_collide(
+            &fresh_dir("same-inode-probe"),
+            "Beyonce\u{301}",
+            "Beyonc\u{e9}",
+        ) {
+            return;
+        }
         let (src, dest) = same_file_two_unicode_spellings("same-inode-no-replace");
         let root = src.ancestors().nth(3).unwrap().to_path_buf();
         let out = apply_release_diff(&rename_only_diff(&src, &dest), &root);
@@ -4666,6 +4688,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_second_name_for_the_source_is_not_a_held_dest() {
+        if names_collide(
+            &fresh_dir("same-inode-held-probe"),
+            "Beyonce\u{301}",
+            "Beyonc\u{e9}",
+        ) {
+            return;
+        }
         let (src, dest) = same_file_two_unicode_spellings("same-inode-held");
         let len = src.metadata().unwrap().len();
         let root = src.ancestors().nth(3).unwrap().to_path_buf();
