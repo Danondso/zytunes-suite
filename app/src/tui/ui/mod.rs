@@ -640,11 +640,8 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
             let name = entry.display();
             let (icon, icon_style) = if show_device_status {
                 let presence = match entry {
-                    SidebarEntry::Artist(artist) => app.artist_device_status.get(artist).copied(),
-                    SidebarEntry::Album { artist, album } => app
-                        .album_device_status
-                        .get(&(artist.clone(), album.clone()))
-                        .copied(),
+                    SidebarEntry::Artist(artist) => app.artist_presence(artist),
+                    SidebarEntry::Album { artist, album } => app.album_presence(artist, album),
                     // Playlists never show device-presence indicators —
                     // they're library-side state. (`show_device_status` is
                     // also gated on `BrowseMode::Library` above.)
@@ -754,10 +751,7 @@ fn draw_album_browser(f: &mut Frame, app: &App, area: Rect) {
         let is_selected = i == app.album_selected;
         let prefix = if is_selected { "> " } else { "  " };
         let prefix_w = disp_width(prefix);
-        let icon = match app
-            .album_device_status
-            .get(&(album.artist.clone(), album.name.clone()))
-        {
+        let icon = match app.album_presence(&album.artist, &album.name) {
             Some(DevicePresence::Full) => "✓ ",
             Some(DevicePresence::Partial) => "◐ ",
             _ => "",

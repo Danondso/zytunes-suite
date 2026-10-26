@@ -5042,11 +5042,13 @@ impl App {
         let mut artist_counts: BTreeMap<String, (usize, usize)> = BTreeMap::new();
         let mut album_counts: BTreeMap<(String, String), (usize, usize)> = BTreeMap::new();
         for t in lib.all_tracks() {
-            let artist_entry = artist_counts.entry(t.artist.clone()).or_default();
+            // Keyed ASCII-case-insensitively: a sidebar row stands for
+            // every spelling of its name, so it counts all their tracks.
+            let (artist_key, album_key) =
+                (t.artist.to_ascii_lowercase(), t.album.to_ascii_lowercase());
+            let artist_entry = artist_counts.entry(artist_key.clone()).or_default();
             artist_entry.1 += 1;
-            let album_entry = album_counts
-                .entry((t.artist.clone(), t.album.clone()))
-                .or_default();
+            let album_entry = album_counts.entry((artist_key, album_key)).or_default();
             album_entry.1 += 1;
             if is_on_device(&t.artist, &t.name, &self.device) {
                 artist_entry.0 += 1;
@@ -5065,6 +5067,21 @@ impl App {
                 self.album_device_status.insert(key, status);
             }
         }
+    }
+
+    /// Device presence of the sidebar row for `artist`, whatever the case
+    /// of the tags behind it.
+    pub fn artist_presence(&self, artist: &str) -> Option<DevicePresence> {
+        self.artist_device_status
+            .get(&artist.to_ascii_lowercase())
+            .copied()
+    }
+
+    /// [`Self::artist_presence`] for an album.
+    pub fn album_presence(&self, artist: &str, album: &str) -> Option<DevicePresence> {
+        self.album_device_status
+            .get(&(artist.to_ascii_lowercase(), album.to_ascii_lowercase()))
+            .copied()
     }
 
     pub fn clear_device_index(&mut self) {
@@ -10170,12 +10187,31 @@ mod tests {
                 track(3, "Radiohead", "Kid A", "Idioteque"),
                 track(4, "Radiohead", "Kid A", "The National Anthem"),
                 track(5, "Bjork", "Post", "Army of Me"),
+                track(6, "Portishead", "Dummy", "Roads"),
+                track(7, "PORTISHEAD", "dummy", "Glory Box"),
             ],
         };
 
         let mut app = App::new();
         app.library = Some(Box::new(lib));
         app.device.status = DeviceStatus::Connected;
+        // Only one of Portishead's two spellings is on the device.
+        app.device.album_tracks.insert(
+            ("PORTISHEAD".into(), "dummy".into()),
+            vec![DeviceTrackInfo {
+                name: "Glory Box".into(),
+                device_path: "/Music/PORTISHEAD/dummy/Glory Box.mp3".into(),
+                object_id: 9,
+                artist: "PORTISHEAD".into(),
+                album: "dummy".into(),
+                track_number: None,
+                disc_number: None,
+                play_count: None,
+                rating: None,
+                skip_count: None,
+                duration_ms: None,
+            }],
+        );
         // Put both OK Computer tracks + one Kid A track on device.
         app.device.album_tracks.insert(
             ("Radiohead".into(), "OK Computer".into()),
@@ -10229,29 +10265,43 @@ mod tests {
         app.rebuild_artist_device_status();
 
         assert_eq!(
-            app.artist_device_status.get("Radiohead"),
+            app.artist_device_status.get("radiohead"),
             Some(&DevicePresence::Partial),
             "Radiohead should be Partial (3 of 4 on device)",
         );
+        // A sidebar row stands for every spelling of its name, so the
+        // marker counts the tracks of all of them, whichever is shown.
+        for artist in ["Portishead", "PORTISHEAD"] {
+            assert_eq!(
+                app.artist_presence(artist),
+                Some(DevicePresence::Partial),
+                "{artist}"
+            );
+            assert_eq!(
+                app.album_presence(artist, "Dummy"),
+                Some(DevicePresence::Partial),
+                "{artist}"
+            );
+        }
         assert!(
-            !app.artist_device_status.contains_key("Bjork"),
+            !app.artist_device_status.contains_key("bjork"),
             "Bjork should have no entry (nothing on device)",
         );
         assert_eq!(
             app.album_device_status
-                .get(&("Radiohead".into(), "OK Computer".into())),
+                .get(&("radiohead".into(), "ok computer".into())),
             Some(&DevicePresence::Full),
             "OK Computer should be Full",
         );
         assert_eq!(
             app.album_device_status
-                .get(&("Radiohead".into(), "Kid A".into())),
+                .get(&("radiohead".into(), "kid a".into())),
             Some(&DevicePresence::Partial),
             "Kid A should be Partial",
         );
         assert!(
             !app.album_device_status
-                .contains_key(&("Bjork".into(), "Post".into())),
+                .contains_key(&("bjork".into(), "post".into())),
             "Post should not be tracked (nothing on device)",
         );
     }
