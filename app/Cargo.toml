@@ -27,7 +27,7 @@ rodio = { version = "0.22", default-features = true, features = [
     "symphonia-aac", "symphonia-isomp4", "symphonia-alac",
     "symphonia-flac", "symphonia-vorbis", "symphonia-wav", "symphonia-mp3",
 ] }
-symphonia = { version = "0.5", features = ["all"] }
+symphonia = { version = "0.6", features = ["all"] }
 rusty-chromaprint = "0.3"
 base64 = "0.22"
 rayon = "1"
