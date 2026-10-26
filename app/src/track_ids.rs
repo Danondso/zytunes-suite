@@ -1,0 +1,755 @@
+//! Stable track IDs for the directory library.
+//!
+//! A track's ID used to be the hash of its path, so every move gave the
+//! file a new identity and each store keyed on the ID (playlists, play
+//! stats, the listen log) had to be re-keyed by hand. The registry here
+//! records `path → ID` once and moves the entry with the file: the ID a
+//! file was first seen under is the ID it keeps, and nothing keyed on an
+//! ID is ever re-keyed.
+//!
+//! A new file's ID is still [`hash_path`] of where it was first seen, so
+//! every ID written before the registry existed stays valid with no
+//! migration. Only a file landing on a path whose hash a moved track still
+//! holds gets a salted ID.
+//!
+//! The registry is its own file under the shared cache root, beside the
+//! play stats, and is NOT part of the dirlib cache: a schema bump there
+//! discards entries, and a discarded entry must not cost a track its
+//! identity.
+
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+use serde::{Deserialize, Serialize};
+
+use crate::cache::Logger;
+use crate::dirlib::hash_path;
+
+const SCHEMA_VERSION: u32 = 1;
+
+#[derive(Serialize, Deserialize, Default)]
+struct OnDisk {
+    schema_version: u32,
+    root: String,
+    /// Keyed by absolute file path, like the dirlib cache.
+    ids: HashMap<String, u64>,
+}
+
+/// `path → ID` for every file of one library root.
+#[derive(Debug, Default)]
+pub struct TrackIds {
+    by_path: HashMap<String, u64>,
+    used: HashSet<u64>,
+    dirty: bool,
+}
+
+impl TrackIds {
+    /// The ID registered for `path`, if any.
+    pub fn get(&self, path: &Path) -> Option<u64> {
+        self.by_path.get(path.to_string_lossy().as_ref()).copied()
+    }
+
+    /// The ID of the file at `path`, assigning one on first sight.
+    pub fn id_for(&mut self, path: &Path) -> u64 {
+        if let Some(id) = self.get(path) {
+            return id;
+        }
+        let id = self.unused_id(path);
+        self.insert(path.to_string_lossy().into_owned(), id);
+        id
+    }
+
+    /// [`hash_path`] of `path` unless a moved track still holds that
+    /// value, then the first free salted hash.
+    fn unused_id(&self, path: &Path) -> u64 {
+        unused_id(path, &self.used)
+    }
+
+    fn insert(&mut self, path: String, id: u64) {
+        self.by_path.insert(path, id);
+        self.used.insert(id);
+        self.dirty = true;
+    }
+
+    /// Move every entry whose path `moved` changes, IDs riding along.
+    ///
+    /// `moved` maps a path from before an apply to where that file is now
+    /// (itself when untouched). All moves are taken from one snapshot, so a
+    /// chain (`a → b` while `b → c`) keeps both IDs apart.
+    ///
+    /// An apply never lands a file on another (it files it beside), so an
+    /// entry already at a mover's new path is for a file that is gone. The
+    /// mover keeps its own ID and that entry's ID is freed: no two tracks
+    /// are ever folded into one, and no store keyed on IDs is ever re-keyed.
+    ///
+    /// `renamed` says which old paths the apply renamed itself. A gone
+    /// file's entry can sit on the very path a renamed file landed on; the
+    /// renamed file is the one on disk, so it wins whatever order the
+    /// entries come in.
+    pub fn apply_moves(
+        &mut self,
+        moved: impl Fn(&Path) -> PathBuf,
+        renamed: impl Fn(&Path) -> bool,
+    ) {
+        let movers: Vec<(String, String)> = self
+            .by_path
+            .keys()
+            .filter_map(|old| {
+                let new = moved(Path::new(old));
+                (new != Path::new(old)).then(|| (old.clone(), new.to_string_lossy().into_owned()))
+            })
+            .collect();
+        let mut lifted: Vec<(bool, String, u64)> = movers
+            .into_iter()
+            .filter_map(|(old, new)| {
+                let id = self.by_path.remove(&old)?;
+                Some((renamed(Path::new(&old)), new, id))
+            })
+            .collect();
+        // Carried entries first, so a renamed file's insert is the last.
+        lifted.sort_by_key(|(renamed, _, _)| *renamed);
+        for (_, new, id) in lifted {
+            self.dirty = true;
+            if let Some(stale) = self.by_path.insert(new, id) {
+                self.used.remove(&stale);
+            }
+        }
+    }
+
+    /// Drop entries whose path `keep` rejects, freeing their IDs. Only for
+    /// files a scan has proved gone: an entry is the only record of a
+    /// moved track's ID.
+    pub fn retain(&mut self, keep: impl Fn(&str) -> bool) {
+        let before = self.by_path.len();
+        self.by_path.retain(|path, id| {
+            let kept = keep(path);
+            if !kept {
+                self.used.remove(id);
+            }
+            kept
+        });
+        if self.by_path.len() != before {
+            self.dirty = true;
+        }
+    }
+
+    /// The registry in `file`. A missing file is an empty registry: IDs
+    /// then fall back to path hashes, which is what they were before the
+    /// registry existed.
+    ///
+    /// `None` when the file is there but cannot be used right now (a read
+    /// error, a newer schema, another root). The caller must not save over
+    /// it: it is the only record of every moved track's ID, and one failed
+    /// read must not cost them all. A file that does not parse is moved
+    /// aside to `.corrupt` and reads as empty, so IDs persist again.
+    fn load_from(file: &Path, root: &str, log: &Logger) -> Option<Self> {
+        let data = match std::fs::read(file) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(Self::default()),
+            Err(e) => {
+                log(&format!(
+                    "zytunes: track-ids: read {} failed: {e}",
+                    file.display()
+                ));
+                return None;
+            }
+        };
+        let parsed: OnDisk = match serde_json::from_slice(&data) {
+            Ok(p) => p,
+            Err(e) => {
+                let aside = file.with_extension("json.corrupt");
+                log(&format!(
+                    "zytunes: track-ids: parse {} ({} bytes) failed: {e}; moving it to {}",
+                    file.display(),
+                    data.len(),
+                    aside.display()
+                ));
+                return std::fs::rename(file, &aside).ok().map(|()| Self::default());
+            }
+        };
+        if parsed.schema_version != SCHEMA_VERSION || parsed.root != root {
+            log(&format!(
+                "zytunes: track-ids: {} is for root {:?} schema {}, not {root:?} schema {SCHEMA_VERSION}",
+                file.display(),
+                parsed.root,
+                parsed.schema_version,
+            ));
+            return None;
+        }
+        let used = parsed.ids.values().copied().collect();
+        Some(Self {
+            by_path: parsed.ids,
+            used,
+            dirty: false,
+        })
+    }
+
+    fn try_save_to(&self, file: &Path, root: &str) -> Result<(), String> {
+        let on_disk = OnDisk {
+            schema_version: SCHEMA_VERSION,
+            root: root.to_string(),
+            ids: self.by_path.clone(),
+        };
+        serde_json::to_vec(&on_disk)
+            .map_err(|e| format!("serialize {} entries failed: {e}", self.by_path.len()))
+            .and_then(|data| crate::paths::atomic_write_json(file, &data))
+    }
+
+    #[cfg(test)]
+    fn save_to(&self, file: &Path, root: &str, log: &Logger) {
+        if let Err(e) = self.try_save_to(file, root) {
+            log(&format!("zytunes: track-ids: {e}"));
+        }
+    }
+}
+
+/// [`hash_path`] of `path` unless `used` (the IDs other tracks hold)
+/// contains that value, then the first free salted hash. A scan that
+/// cannot read the registry resolves IDs with this too, so a new file at
+/// a moved track's old path never takes the moved track's ID.
+pub(crate) fn unused_id(path: &Path, used: &HashSet<u64>) -> u64 {
+    let base = hash_path(path);
+    if !used.contains(&base) {
+        return base;
+    }
+    let key = path.to_string_lossy();
+    (1u64..)
+        .map(|salt| {
+            let mut hasher = DefaultHasher::new();
+            key.hash(&mut hasher);
+            salt.hash(&mut hasher);
+            hasher.finish()
+        })
+        .find(|id| !used.contains(id))
+        .expect("a free u64 exists")
+}
+
+/// `root` with trailing separators, doubled separators and `.` components
+/// dropped. The TUI and `zytunes-serve` are each handed the root as the
+/// user typed it; `~/Music` and `~/Music/` are one library and must find
+/// one registry.
+fn normalised_root(root: &str) -> String {
+    Path::new(root)
+        .components()
+        .collect::<PathBuf>()
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Registry filename, keyed by a hash of the (normalised) library root
+/// like the dirlib cache so several roots (and tests) do not share one
+/// file.
+fn registry_name(root: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    root.hash(&mut hasher);
+    format!("track-ids-{:016x}.json", hasher.finish())
+}
+
+fn registry_path(root: &str) -> Option<PathBuf> {
+    crate::paths::zytunes_cache_root().map(|d| d.join(registry_name(root)))
+}
+
+/// Serialises every read-modify-write of a registry file.
+fn registry_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Run `f` against the registry of `root`, saving it afterwards when `f`
+/// changed anything.
+///
+/// `Err` (naming the file and why) when the registry is there but cannot
+/// be used right now; `f` is not run. There is no working on a stand-in:
+/// an ID handed out against an empty registry is not the track's, and a
+/// move recorded there is lost. Callers decide what that means for them:
+/// a scan keeps the IDs its cache already has, an apply moves nothing.
+pub fn with_registry<R>(
+    root: &str,
+    log: &Logger,
+    f: impl FnOnce(&mut TrackIds) -> R,
+) -> Result<R, String> {
+    let _guard = registry_lock();
+    let root = &normalised_root(root);
+    with_registry_file(registry_path(root).as_deref(), root, log, f)
+}
+
+fn with_registry_file<R>(
+    file: Option<&Path>,
+    root: &str,
+    log: &Logger,
+    f: impl FnOnce(&mut TrackIds) -> R,
+) -> Result<R, String> {
+    let (out, saved) = read_modify_write(file, root, log, false, f)?;
+    if let Err(e) = saved {
+        log(&format!("zytunes: track-ids: {e}"));
+    }
+    Ok(out)
+}
+
+/// [`with_registry`] for a caller about to do what cannot be undone on
+/// the strength of the registry recording it (an apply moving files).
+/// The registry is saved once, unchanged, BEFORE `f` runs: `Err` when
+/// that fails (a full disk, a cache dir gone read-only), and `f` is not
+/// run. The second value is the save after `f`, which the caller has to
+/// report: by then the files have moved.
+pub fn with_writable_registry<R>(
+    root: &str,
+    log: &Logger,
+    f: impl FnOnce(&mut TrackIds) -> R,
+) -> Result<(R, Result<(), String>), String> {
+    let _guard = registry_lock();
+    let root = &normalised_root(root);
+    read_modify_write(registry_path(root).as_deref(), root, log, true, f)
+}
+
+fn read_modify_write<R>(
+    file: Option<&Path>,
+    root: &str,
+    log: &Logger,
+    prove_writable: bool,
+    f: impl FnOnce(&mut TrackIds) -> R,
+) -> Result<(R, Result<(), String>), String> {
+    let _held = file.and_then(|file| lock_registry_file(file, log));
+    let mut ids = match file {
+        Some(file) => TrackIds::load_from(file, root, log).ok_or_else(|| {
+            format!(
+                "the track-ID registry {} cannot be used (see the log); it is left as it is",
+                file.display()
+            )
+        })?,
+        None => TrackIds::default(),
+    };
+    if let (true, Some(file)) = (prove_writable, file) {
+        ids.try_save_to(file, root).map_err(|e| {
+            format!(
+                "the track-ID registry {} cannot be written ({e})",
+                file.display()
+            )
+        })?;
+    }
+    let out = f(&mut ids);
+    let saved = match file {
+        Some(file) if ids.dirty => ids.try_save_to(file, root),
+        None if ids.dirty => {
+            log("zytunes: track-ids: HOME unset, cannot persist track IDs");
+            Ok(())
+        }
+        _ => Ok(()),
+    };
+    Ok((out, saved))
+}
+
+/// Lock the registry at `file` against every other zytunes process
+/// (the TUI holds it for the length of an apply; a `zytunes-serve`
+/// scanning the library mid-move would save its stale answer over the
+/// moves). The lock is on a sibling `.lock` file, since the registry
+/// itself is replaced by rename on every save. Blocks until free; the
+/// lock is released when the returned file is dropped.
+///
+/// `None`, with a line in the log, when the lock itself cannot be had
+/// (a filesystem with no lock support, a lock file that cannot be made).
+/// The registry is then used unlocked, as it was before there was a
+/// lock: refusing it would refuse every filing on such a cache dir for
+/// good, though it reads and writes fine.
+fn lock_registry_file(file: &Path, log: &Logger) -> Option<std::fs::File> {
+    let unlocked = |e: std::io::Error| {
+        log(&format!(
+            "zytunes: track-ids: {} cannot be locked ({e}); used without the lock, so run one zytunes at a time",
+            file.display()
+        ));
+        None
+    };
+    let opened = file
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(file.with_extension("json.lock"))
+        });
+    let lock = match opened {
+        Ok(lock) => lock,
+        Err(e) => return unlocked(e),
+    };
+    match lock.try_lock() {
+        Ok(()) => return Some(lock),
+        Err(std::fs::TryLockError::WouldBlock) => log(&format!(
+            "zytunes: track-ids: waiting for another zytunes to finish with {}",
+            file.display()
+        )),
+        Err(std::fs::TryLockError::Error(e)) => return unlocked(e),
+    }
+    match lock.lock() {
+        Ok(()) => Some(lock),
+        Err(e) => unlocked(e),
+    }
+}
+
+/// Rewrite the registry of `root` as a newer build would have, so this
+/// build cannot use it. Tests stand in for the bad day (`pub` so the
+/// TUI's tests can too; not part of the API).
+#[doc(hidden)]
+pub fn mark_newer_schema(root: &str) {
+    let _guard = registry_lock();
+    let root = normalised_root(root);
+    let file = registry_path(&root).expect("HOME set");
+    let ids = std::fs::read(&file)
+        .ok()
+        .and_then(|data| serde_json::from_slice::<OnDisk>(&data).ok())
+        .map(|parsed| parsed.ids)
+        .unwrap_or_default();
+    let newer = OnDisk {
+        schema_version: SCHEMA_VERSION + 1,
+        root,
+        ids,
+    };
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, serde_json::to_vec(&newer).unwrap()).unwrap();
+}
+
+/// Delete the registry of `root`. Tests reuse temp-dir names across runs,
+/// and a registry left by an earlier run would hand out that run's IDs.
+/// `pub` for the TUI's tests; not part of the API.
+#[doc(hidden)]
+pub fn forget(root: &str) {
+    let _guard = registry_lock();
+    if let Some(file) = registry_path(&normalised_root(root)) {
+        let _ = std::fs::remove_dir(file.with_extension("json.tmp"));
+        let _ = std::fs::remove_file(file);
+    }
+}
+
+/// Make every save of the registry of `root` fail (a folder sits where
+/// the writer stages its temp file) while it still reads: a full disk,
+/// a cache dir gone read-only. [`forget`] undoes it. `pub` for the TUI's
+/// tests; not part of the API.
+#[doc(hidden)]
+pub fn block_saves(root: &str) {
+    let _guard = registry_lock();
+    let file = registry_path(&normalised_root(root)).expect("HOME set");
+    std::fs::create_dir_all(file.with_extension("json.tmp")).unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cache::default_logger;
+
+    fn p(s: &str) -> PathBuf {
+        PathBuf::from(s)
+    }
+
+    /// `moved` closure for a set of exact file renames.
+    fn renames(pairs: &[(&str, &str)]) -> impl Fn(&Path) -> PathBuf {
+        let map: HashMap<PathBuf, PathBuf> = pairs.iter().map(|(a, b)| (p(a), p(b))).collect();
+        move |old| map.get(old).cloned().unwrap_or_else(|| old.to_path_buf())
+    }
+
+    /// No path counts as renamed by the apply itself.
+    fn none(_: &Path) -> bool {
+        false
+    }
+
+    #[test]
+    fn a_new_file_gets_the_hash_of_its_path() {
+        // IDs written before the registry existed are path hashes. A file
+        // seen for the first time has to get that same value, or every
+        // existing playlist and play count would point at nothing.
+        let mut ids = TrackIds::default();
+        let path = p("/music/A/B/01.mp3");
+        assert_eq!(ids.id_for(&path), hash_path(&path));
+        assert_eq!(ids.get(&path), Some(hash_path(&path)));
+    }
+
+    #[test]
+    fn a_moved_file_keeps_its_id() {
+        let mut ids = TrackIds::default();
+        let id = ids.id_for(&p("/music/a/b/01.mp3"));
+        ids.apply_moves(renames(&[("/music/a/b/01.mp3", "/music/A/B/01.mp3")]), none);
+        assert_eq!(ids.id_for(&p("/music/A/B/01.mp3")), id);
+        assert_eq!(ids.get(&p("/music/a/b/01.mp3")), None);
+    }
+
+    #[test]
+    fn a_new_file_at_a_vacated_path_gets_its_own_id() {
+        // The moved track still holds the hash of its first path. A new
+        // rip dropped at that path must not share it.
+        let mut ids = TrackIds::default();
+        let moved_id = ids.id_for(&p("/music/old.mp3"));
+        ids.apply_moves(renames(&[("/music/old.mp3", "/music/new.mp3")]), none);
+        let newcomer = ids.id_for(&p("/music/old.mp3"));
+        assert_ne!(newcomer, moved_id);
+        assert_eq!(
+            ids.id_for(&p("/music/old.mp3")),
+            newcomer,
+            "and it is stable"
+        );
+    }
+
+    #[test]
+    fn a_move_onto_a_registered_path_takes_it_over() {
+        // An apply never lands a file on one that is there (it files it
+        // beside). So an entry at the new path is for a file that has
+        // since been deleted by hand, and the mover keeps its own ID.
+        let mut ids = TrackIds::default();
+        let mover = ids.id_for(&p("/music/feat/01.mp3"));
+        let stale = ids.id_for(&p("/music/Artist/Album/01.mp3"));
+        ids.apply_moves(
+            renames(&[("/music/feat/01.mp3", "/music/Artist/Album/01.mp3")]),
+            none,
+        );
+        assert_eq!(ids.get(&p("/music/Artist/Album/01.mp3")), Some(mover));
+        assert_eq!(ids.get(&p("/music/feat/01.mp3")), None);
+        // The stale ID is free again.
+        assert_eq!(
+            ids.id_for(&p("/music/gone.mp3")),
+            hash_path(&p("/music/gone.mp3"))
+        );
+        assert_ne!(ids.get(&p("/music/Artist/Album/01.mp3")), Some(stale));
+    }
+
+    #[test]
+    fn a_rename_chain_keeps_both_ids_apart() {
+        // `a → b` while `b → c`: b's track is moving out, so a's arrival
+        // must not cost it its ID.
+        let mut ids = TrackIds::default();
+        let a = ids.id_for(&p("/music/a.mp3"));
+        let b = ids.id_for(&p("/music/b.mp3"));
+        ids.apply_moves(
+            renames(&[
+                ("/music/a.mp3", "/music/b.mp3"),
+                ("/music/b.mp3", "/music/c.mp3"),
+            ]),
+            none,
+        );
+        assert_eq!(ids.get(&p("/music/b.mp3")), Some(a));
+        assert_eq!(ids.get(&p("/music/c.mp3")), Some(b));
+        assert_eq!(ids.get(&p("/music/a.mp3")), None);
+    }
+
+    #[test]
+    fn a_renamed_file_beats_a_gone_files_entry_carried_onto_its_path() {
+        // `alice/02 - Song.mp3` was deleted by hand; its entry is still
+        // here. An apply renames `alice/track02.mp3` to it. Both entries
+        // now map to one path. The file on disk is the renamed one.
+        // Repeated because the order the two come in follows the map's
+        // hashing.
+        let files: HashMap<PathBuf, PathBuf> =
+            [(p("/m/alice/track02.mp3"), p("/m/alice/02 - Song.mp3"))].into();
+        for _ in 0..64 {
+            let mut ids = TrackIds::default();
+            let live = ids.id_for(&p("/m/alice/track02.mp3"));
+            ids.id_for(&p("/m/alice/02 - Song.mp3"));
+            ids.apply_moves(
+                |old| crate::tag_ops::moved_path(old, &files),
+                |old| files.contains_key(old),
+            );
+            assert_eq!(ids.get(&p("/m/alice/02 - Song.mp3")), Some(live));
+        }
+    }
+
+    #[test]
+    fn retain_frees_the_ids_of_files_that_are_gone() {
+        let mut ids = TrackIds::default();
+        ids.id_for(&p("/music/keep.mp3"));
+        let moved = ids.id_for(&p("/music/first.mp3"));
+        ids.apply_moves(renames(&[("/music/first.mp3", "/music/gone.mp3")]), none);
+        ids.dirty = false;
+        ids.retain(|path| path != "/music/gone.mp3");
+        assert!(ids.dirty);
+        assert_eq!(ids.get(&p("/music/gone.mp3")), None);
+        assert!(ids.get(&p("/music/keep.mp3")).is_some());
+        // Its ID is free: a new file at the first path gets the plain hash.
+        assert_eq!(ids.id_for(&p("/music/first.mp3")), moved);
+    }
+
+    #[test]
+    fn one_library_root_spelled_two_ways_has_one_registry() {
+        assert_eq!(normalised_root("/m/Music/"), "/m/Music");
+        assert_eq!(normalised_root("/m//Music/."), "/m/Music");
+        assert_eq!(normalised_root("/m/Music"), "/m/Music");
+    }
+
+    #[test]
+    fn another_process_holding_the_registry_is_waited_for() {
+        // The TUI holds the registry for the length of an apply; a
+        // `zytunes-serve` starting up then must wait, not scan the library
+        // mid-move and save its stale answer over the TUI's. The lock is a
+        // file lock (the in-process mutex says nothing across processes),
+        // held here on its own descriptor as another process would.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let dir =
+            std::env::temp_dir().join(format!("zytunes-track-ids-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("track-ids.json");
+        let released = Arc::new(AtomicBool::new(false));
+        let holder = {
+            let released = Arc::clone(&released);
+            let held = lock_registry_file(&file, &default_logger()).expect("lock file opens");
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                released.store(true, Ordering::SeqCst);
+                drop(held);
+            })
+        };
+        let log = default_logger();
+        let ran = with_registry_file(Some(&file), "/music", &log, |ids| {
+            assert!(
+                released.load(Ordering::SeqCst),
+                "ran while another holder had the registry"
+            );
+            ids.id_for(&p("/music/a.mp3"));
+        });
+        holder.join().unwrap();
+        assert!(ran.is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_save_that_fails_after_the_work_is_handed_to_the_caller() {
+        // The registry was writable when the apply began and is not when
+        // it ends. The files have moved by then; the caller must be told
+        // so it can say so, not find a line in the log.
+        let dir =
+            std::env::temp_dir().join(format!("zytunes-track-ids-latefail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join("track-ids.json");
+        let log = default_logger();
+        let (_, saved) = read_modify_write(Some(&file), "/music", &log, true, |ids| {
+            ids.id_for(&p("/music/a.mp3"));
+            std::fs::create_dir_all(file.with_extension("json.tmp")).unwrap();
+        })
+        .expect("writable when it began");
+        assert!(saved.is_err_and(|e| e.contains("json.tmp")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_registry_that_cannot_be_locked_is_still_used() {
+        // A cache dir on a filesystem with no lock support (NFS without a
+        // lock daemon), or one where the lock file cannot be made. The
+        // registry itself reads and writes: refusing it would refuse
+        // every filing for good, to guard against a second process that
+        // is almost never there.
+        let dir =
+            std::env::temp_dir().join(format!("zytunes-track-ids-nolock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join("track-ids.json");
+        std::fs::create_dir_all(file.with_extension("json.lock")).unwrap();
+        let log = default_logger();
+        let id = with_registry_file(Some(&file), "/music", &log, |ids| {
+            ids.id_for(&p("/music/a.mp3"))
+        })
+        .expect("usable without its lock");
+        let again = with_registry_file(Some(&file), "/music", &log, |ids| {
+            ids.get(&p("/music/a.mp3"))
+        });
+        assert_eq!(again, Ok(Some(id)), "and saved");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_registry_that_cannot_be_read_is_not_replaced() {
+        // One failed read must not turn into an empty registry saved over
+        // the real one: every moved track would lose its ID for good.
+        let dir = std::env::temp_dir().join(format!("zytunes-track-ids-ro-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join("track-ids.json");
+        let log = default_logger();
+        let mut ids = TrackIds::default();
+        ids.id_for(&p("/music/old.mp3"));
+        ids.apply_moves(renames(&[("/music/old.mp3", "/music/new.mp3")]), none);
+        ids.save_to(&file, "/music", &log);
+
+        // A build with a newer schema wrote it.
+        let newer = std::fs::read_to_string(&file)
+            .unwrap()
+            .replace("\"schema_version\":1", "\"schema_version\":2");
+        std::fs::write(&file, &newer).unwrap();
+        let ran = with_registry_file(Some(&file), "/music", &log, |ids| {
+            ids.id_for(&p("/music/new.mp3"));
+        });
+        assert!(ran.is_err(), "the caller is told, not handed a stand-in");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), newer);
+
+        // The read itself fails (the path is a directory).
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        let ran = with_registry_file(Some(&file), "/music", &log, |ids| {
+            ids.id_for(&p("/music/new.mp3"));
+        });
+        assert!(ran.is_err());
+        assert!(file.is_dir());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_registry_that_does_not_parse_is_moved_aside() {
+        let dir =
+            std::env::temp_dir().join(format!("zytunes-track-ids-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("track-ids.json");
+        let log = default_logger();
+        std::fs::write(&file, b"{ not json").unwrap();
+        with_registry_file(Some(&file), "/music", &log, |ids| {
+            ids.id_for(&p("/music/a.mp3"));
+        })
+        .expect("a registry moved aside reads as empty");
+        assert_eq!(
+            std::fs::read(dir.join("track-ids.json.corrupt")).unwrap(),
+            b"{ not json"
+        );
+        let reloaded = TrackIds::load_from(&file, "/music", &log).unwrap();
+        assert!(reloaded.get(&p("/music/a.mp3")).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_registry_round_trips_through_disk() {
+        let dir = std::env::temp_dir().join(format!("zytunes-track-ids-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join("track-ids.json");
+        let log = default_logger();
+
+        let mut ids = TrackIds::default();
+        let id = ids.id_for(&p("/music/old.mp3"));
+        ids.apply_moves(renames(&[("/music/old.mp3", "/music/new.mp3")]), none);
+        let newcomer = ids.id_for(&p("/music/old.mp3"));
+        assert!(ids.dirty);
+        ids.save_to(&file, "/music", &log);
+
+        let mut loaded = TrackIds::load_from(&file, "/music", &log).unwrap();
+        assert!(!loaded.dirty, "a fresh load has nothing to save");
+        assert_eq!(loaded.get(&p("/music/new.mp3")), Some(id));
+        assert_eq!(loaded.get(&p("/music/old.mp3")), Some(newcomer));
+        // IDs in use are rebuilt on load: a third file cannot take either.
+        let third = loaded.id_for(&p("/music/third.mp3"));
+        assert!(third != id && third != newcomer);
+
+        // A registry written for another root is not this library's.
+        assert!(TrackIds::load_from(&file, "/elsewhere", &log).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unchanged_registry_is_not_dirty() {
+        let mut ids = TrackIds::default();
+        ids.id_for(&p("/music/a.mp3"));
+        ids.dirty = false;
+        ids.id_for(&p("/music/a.mp3"));
+        ids.apply_moves(|old| old.to_path_buf(), none);
+        assert!(
+            !ids.dirty,
+            "lookups and no-op moves must not force a rewrite"
+        );
+    }
+}

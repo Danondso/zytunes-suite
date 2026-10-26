@@ -32,6 +32,37 @@ fn spawn_acoustic_backfill(gen: u64, dir: String, event_tx: mpsc::Sender<BgEvent
     }
 }
 
+/// Chromaprint inbox drops off the worker thread. The tracks are handed
+/// over only after `spawn` succeeds so a failure still delivers
+/// `InboxScanned` and the poll does not stay in flight.
+fn spawn_inbox_fingerprints(
+    tracks: Vec<zytunes::library::Track>,
+    event_tx: &mpsc::Sender<BgEvent>,
+) {
+    let (work_tx, work_rx) = mpsc::channel();
+    let tx = event_tx.clone();
+    let spawned = thread::Builder::new()
+        .name("inbox-fingerprint".into())
+        .spawn(move || {
+            let Ok(tracks) = work_rx.recv() else {
+                return;
+            };
+            let tracks = zytunes::library_layout::fingerprint_missing(tracks);
+            let _ = tx.send(BgEvent::InboxScanned { tracks });
+        });
+    match spawned {
+        Ok(_) => {
+            let _ = work_tx.send(tracks);
+        }
+        Err(e) => {
+            let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                "inbox: fingerprint thread failed to start: {e}"
+            )));
+            let _ = event_tx.send(BgEvent::InboxScanned { tracks });
+        }
+    }
+}
+
 /// True when `err` indicates the MTP session is effectively dead and no
 /// further bulk ops on this session will succeed — only a physical replug
 /// recovers.
@@ -84,8 +115,11 @@ fn ipod_usb_label(pid: Option<u16>) -> String {
 
 /// Drain every command pending on `cmd_rx` during a sync run: appended
 /// items are spliced onto the back of `sync_queue` (bumping `total`), and
-/// `CancelSync` is reported via the return value. Any other command is
-/// dropped — the TUI doesn't send them while `SyncStatus` is `Running`.
+/// `CancelSync` is reported via the return value. Any other command goes
+/// onto `deferred`, which the worker loop runs once the sync is over.
+/// Dropping them left the app waiting for an answer that never came: an
+/// inbox scan that stayed "in flight" for the rest of the session, or a
+/// tag apply whose overlay sat in Applying with every key ignored.
 ///
 /// The sync loop must call this *before* its queue-empty exit check, not
 /// after popping an item: an `AppendSyncQueue` sent while the final track
@@ -94,6 +128,7 @@ fn ipod_usb_label(pid: Option<u16>) -> String {
 /// silently never sync.
 fn drain_sync_commands(
     cmd_rx: &mpsc::Receiver<BgCommand>,
+    deferred: &mut std::collections::VecDeque<BgCommand>,
     event_tx: &mpsc::Sender<BgEvent>,
     sync_queue: &mut std::collections::VecDeque<SyncItem>,
     total: &mut usize,
@@ -102,7 +137,10 @@ fn drain_sync_commands(
     while let Ok(cmd) = cmd_rx.try_recv() {
         match cmd {
             BgCommand::CancelSync => cancelled = true,
-            BgCommand::AppendSyncQueue(more) if !more.is_empty() => {
+            BgCommand::AppendSyncQueue(more) => {
+                if more.is_empty() {
+                    continue;
+                }
                 let _ = event_tx.send(BgEvent::SyncMessage(format!(
                     "Queued {} more track(s) during sync",
                     more.len()
@@ -110,7 +148,24 @@ fn drain_sync_commands(
                 *total += more.len();
                 sync_queue.extend(more);
             }
-            _ => {}
+            other => deferred.push_back(other),
+        }
+    }
+    cancelled
+}
+
+/// Whether a `CancelSync` is pending, for the loops that take no other
+/// command while they run (remove, photo and video sync). Everything else
+/// read on the way is kept on `deferred` (see [`drain_sync_commands`]).
+fn cancel_requested(
+    cmd_rx: &mpsc::Receiver<BgCommand>,
+    deferred: &mut std::collections::VecDeque<BgCommand>,
+) -> bool {
+    let mut cancelled = false;
+    while let Ok(cmd) = cmd_rx.try_recv() {
+        match cmd {
+            BgCommand::CancelSync => cancelled = true,
+            other => deferred.push_back(other),
         }
     }
     cancelled
@@ -331,6 +386,9 @@ pub enum BgCommand {
         /// [`BgCommand::ProvisionStemEngine::gen`].
         gen: u64,
         track_path: String,
+        /// The track's library ID, which keys its cache entry (a file
+        /// with no library track passes the hash of its path).
+        track_id: u64,
         /// Explicit engine path from `[stems].command`; `None` falls back
         /// to PATH and the managed bin dir.
         engine_command: Option<PathBuf>,
@@ -382,7 +440,7 @@ pub enum BgCommand {
         /// Batch generation echoed on `StemBatch*` events (independent
         /// of the per-track job gen).
         gen: u64,
-        track_paths: Vec<String>,
+        tracks: Vec<zytunes::stems::StemTrack>,
         engine_command: Option<PathBuf>,
         recipe: zytunes::stems::RecipeKind,
         model: String,
@@ -390,6 +448,21 @@ pub enum BgCommand {
         /// Resolved stem-cache root (`[stems].cache_dir` override or the
         /// default). `None` only when `$HOME` can't be resolved.
         cache_dir: Option<PathBuf>,
+    },
+    /// Scan the Automatically Add to Music inbox (sibling of `music_dir`).
+    /// When `fingerprint` is set, Chromaprint runs on a side thread and
+    /// [`BgEvent::InboxScanned`] arrives after those ids are filled. The
+    /// worker itself only reads tags.
+    ScanInbox {
+        inbox: PathBuf,
+        /// Locations dismissed this session. Dropped before the tag read
+        /// and the fingerprint decode, not after the scan returns.
+        dismissed: std::sync::Arc<std::collections::HashSet<String>>,
+        fingerprint: bool,
+        /// Create the inbox folder before scanning. Set on the first scan
+        /// of a session only: the folder exists by default, but a parent
+        /// that refuses the mkdir must not log every poll.
+        create_dir: bool,
     },
 }
 
@@ -538,6 +611,9 @@ pub enum BgEvent {
         token: u64,
         result: Result<Box<zytunes::musicbrainz::Release>, String>,
     },
+    /// A tag-manager apply moved files and then could not save their
+    /// track IDs. Sent after [`BgEvent::TagsApplied`].
+    TrackIdsUnsaved(String),
     /// Phase 1 of `ApplyTagDiff`: tag writes + renames are done. Per-track
     /// `results` lines up with the diff's `tracks` vec; `rename_map` carries
     /// only successful renames. `token` matches the originating command.
@@ -548,10 +624,12 @@ pub enum BgEvent {
     },
     /// Phase 2 of `ApplyTagDiff`: surgical re-scan complete. Replaces
     /// `App.library` and (when the token still matches the open overlay)
-    /// triggers the post-rename selection restore.
+    /// triggers the post-rename selection restore. `Ok(None)` when the
+    /// apply was refused whole and touched nothing: the library the app
+    /// has is still right.
     LibraryRereadComplete {
         token: u64,
-        result: Result<Box<dyn zytunes::library::MusicLibrary + Send>, String>,
+        result: Result<Option<Box<dyn zytunes::library::MusicLibrary + Send>>, String>,
     },
     /// Outcome of [`BgCommand::AcoustIdLookup`]. `hits` is sorted highest
     /// score first by the worker. Empty vec = no AcoustID match (the
@@ -643,6 +721,11 @@ pub enum BgEvent {
         skipped: usize,
         failed: usize,
         cancelled: bool,
+    },
+    /// Inbox scan finished. Tracks are settled audio files (possibly
+    /// fingerprinted); the TUI clusters them and opens the tag manager.
+    InboxScanned {
+        tracks: Vec<zytunes::library::Track>,
     },
 }
 
@@ -750,7 +833,11 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
         // share one disk read + the in-memory map.
         let mut acoustid_cache: Option<zytunes::acoustid::AcoustIdCache> = None;
 
-        while let Ok(cmd) = cmd_rx.recv() {
+        // Commands that arrived while a sync or remove loop was reading
+        // the channel. They run, in order, before anything newer.
+        let mut deferred: std::collections::VecDeque<BgCommand> = std::collections::VecDeque::new();
+
+        while let Some(cmd) = deferred.pop_front().or_else(|| cmd_rx.recv().ok()) {
             match cmd {
                 BgCommand::LoadLibrary {
                     music_dir,
@@ -1143,7 +1230,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
 
                         for (i, (path, object_id)) in items.iter().enumerate() {
                             // Check for cancel.
-                            if let Ok(BgCommand::CancelSync) = cmd_rx.try_recv() {
+                            if cancel_requested(&cmd_rx, &mut deferred) {
                                 let _ =
                                     event_tx.send(BgEvent::SyncMessage("Removal cancelled".into()));
                                 break;
@@ -1280,7 +1367,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                             .send(BgEvent::SyncMessage(format!("Syncing {} photos...", total)));
 
                         for (i, file) in files.iter().enumerate() {
-                            if let Ok(BgCommand::CancelSync) = cmd_rx.try_recv() {
+                            if cancel_requested(&cmd_rx, &mut deferred) {
                                 let _ = event_tx
                                     .send(BgEvent::SyncMessage("Photo sync cancelled".into()));
                                 break;
@@ -1406,7 +1493,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                         let temp_dir = make_transcode_temp_dir();
 
                         for (i, file) in files.iter().enumerate() {
-                            if let Ok(BgCommand::CancelSync) = cmd_rx.try_recv() {
+                            if cancel_requested(&cmd_rx, &mut deferred) {
                                 let _ = event_tx
                                     .send(BgEvent::SyncMessage("Video sync cancelled".into()));
                                 break;
@@ -1540,6 +1627,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                             // still join this run instead of being lost.
                             cancelled |= drain_sync_commands(
                                 &cmd_rx,
+                                &mut deferred,
                                 &event_tx,
                                 &mut sync_queue,
                                 &mut total,
@@ -1561,6 +1649,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
 
                             cancelled |= drain_sync_commands(
                                 &cmd_rx,
+                                &mut deferred,
                                 &event_tx,
                                 &mut sync_queue,
                                 &mut total,
@@ -1934,6 +2023,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                 BgCommand::SeparateStems {
                     gen,
                     track_path,
+                    track_id,
                     engine_command,
                     recipe,
                     model,
@@ -2014,6 +2104,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                                     &SeparationJob {
                                         gen,
                                         track_path: &track_path,
+                                        track_id,
                                         layout: recipe.layout(),
                                         cache_id: &cache_id,
                                         cache_dir: &cache_dir,
@@ -2145,7 +2236,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                 }
                 BgCommand::SeparateStemsBatch {
                     gen,
-                    track_paths,
+                    tracks,
                     engine_command,
                     recipe,
                     model,
@@ -2157,7 +2248,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                     let tx = event_tx.clone();
                     thread::spawn(move || {
                         let _guard = jobs.acquire();
-                        let total = track_paths.len();
+                        let total = tracks.len();
                         let bail = |failed: usize, cancelled: bool| {
                             let _ = tx.send(BgEvent::StemBatchDone {
                                 gen,
@@ -2203,7 +2294,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                         run_stem_batch(
                             &StemBatchJob {
                                 gen,
-                                track_paths: &track_paths,
+                                tracks: &tracks,
                                 layout: recipe.layout(),
                                 cache_id: &recipe.cache_id(&model),
                                 cache_dir: &cache_dir,
@@ -2269,40 +2360,7 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                     diff,
                     music_dir,
                     fingerprint,
-                } => {
-                    let (results, rename_map) = zytunes::tag_ops::apply_release_diff(&diff);
-                    // Collect every src/dest path so the surgical re-read
-                    // covers both the original locations (now stale) and the
-                    // post-rename locations (now fresh).
-                    let mut paths: Vec<std::path::PathBuf> = Vec::new();
-                    for track in &diff.tracks {
-                        paths.push(track.src_path.clone());
-                    }
-                    for new in rename_map.values() {
-                        paths.push(new.clone());
-                    }
-                    let _ = event_tx.send(BgEvent::TagsApplied {
-                        token,
-                        results,
-                        rename_map,
-                    });
-
-                    let log_tx = event_tx.clone();
-                    let scan_log: zytunes::cache::Logger = std::sync::Arc::new(move |msg: &str| {
-                        let _ = log_tx.send(BgEvent::SyncMessage(msg.to_string()));
-                    });
-                    let lib_result = zytunes::dirlib::DirectoryLibrary::reread_paths(
-                        &music_dir,
-                        &paths,
-                        fingerprint,
-                        &scan_log,
-                    )
-                    .map(|l| Box::new(l) as Box<dyn zytunes::library::MusicLibrary + Send>);
-                    let _ = event_tx.send(BgEvent::LibraryRereadComplete {
-                        token,
-                        result: lib_result,
-                    });
-                }
+                } => run_tag_apply(token, &diff, &music_dir, fingerprint, &event_tx),
                 BgCommand::AcoustIdLookup {
                     token,
                     fingerprint,
@@ -2383,6 +2441,33 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                     }
                     let _ = event_tx.send(BgEvent::MbRecordingReleases { token, result });
                 }
+                BgCommand::ScanInbox {
+                    inbox,
+                    dismissed,
+                    fingerprint,
+                    create_dir,
+                } => {
+                    if create_dir {
+                        if let Err(e) = std::fs::create_dir_all(&inbox) {
+                            let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                                "inbox: could not create {} ({e}); create it by hand to drop music there",
+                                inbox.display()
+                            )));
+                        }
+                    }
+                    // Tag read only. Chromaprint stays off this thread — the
+                    // worker also serves Connect, sync, and CD detection.
+                    let tracks = zytunes::library_layout::scan_inbox(&inbox, &dismissed, false);
+                    let needs_fp = fingerprint
+                        && tracks
+                            .iter()
+                            .any(|t| t.acoustic_id.is_none() && t.location.is_some());
+                    if needs_fp {
+                        spawn_inbox_fingerprints(tracks, &event_tx);
+                    } else {
+                        let _ = event_tx.send(BgEvent::InboxScanned { tracks });
+                    }
+                }
             }
         }
     });
@@ -2436,7 +2521,11 @@ fn run_mb_search_releases_with_log(
     )));
     let _ = log.send(BgEvent::SyncMessage(format!("tag-manager: URL={}", url)));
     client
-        .search_releases(artist, album, 12)
+        .search_releases(artist, album, 12, |fallback| {
+            let _ = log.send(BgEvent::SyncMessage(format!(
+                "tag-manager: 0 hits, retrying as Various Artists: {fallback}"
+            )));
+        })
         .map(|r| r.releases)
         .map_err(|e| e.to_string())
 }
@@ -3041,12 +3130,83 @@ impl StemJobs {
     }
 }
 
+/// The whole of [`BgCommand::ApplyTagDiff`]: write tags, move files and
+/// their track IDs, report ([`BgEvent::TagsApplied`]),
+/// then re-read the touched paths ([`BgEvent::LibraryRereadComplete`]).
+pub(crate) fn run_tag_apply(
+    token: u64,
+    diff: &zytunes::tag_ops::ReleaseTagDiff,
+    music_dir: &str,
+    fingerprint: bool,
+    event_tx: &mpsc::Sender<BgEvent>,
+) {
+    let root = std::path::Path::new(music_dir);
+    let log_tx = event_tx.clone();
+    let scan_log: zytunes::cache::Logger = std::sync::Arc::new(move |msg: &str| {
+        let _ = log_tx.send(BgEvent::SyncMessage(msg.to_string()));
+    });
+    // Track IDs move with the files in the same call, before anything
+    // reads the library at the new paths.
+    let outcome = zytunes::tag_ops::apply_and_record_moves(diff, music_dir, &scan_log);
+    // A dest that was already held is never replaced: the file went
+    // beside it. Say where, so the duplicate can be found.
+    for track in &diff.tracks {
+        let landed = outcome.rename_map.get(&track.src_path);
+        if let (Some(landed), Some(dest)) = (landed, track.dest_path.as_ref()) {
+            if landed.file_name() != dest.file_name() {
+                let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                    "tag-manager: {} is already in the library; filed {} beside it as {}",
+                    dest.display(),
+                    track.src_path.display(),
+                    landed.display()
+                )));
+            }
+        }
+    }
+    for e in &outcome.sidecar_errors {
+        let _ = event_tx.send(BgEvent::SyncMessage(format!(
+            "tag-manager: a file beside the music was left behind: {e}"
+        )));
+    }
+    let ids_unsaved = outcome.ids_unsaved.clone();
+    let paths = outcome.reread_paths(diff, root);
+    let vacated = outcome.vacated();
+    let refused = outcome.refused;
+    let _ = event_tx.send(BgEvent::TagsApplied {
+        token,
+        results: outcome.results,
+        rename_map: outcome.rename_map,
+    });
+    if let Some(why) = ids_unsaved {
+        let _ = event_tx.send(BgEvent::TrackIdsUnsaved(why));
+    }
+
+    // A refused apply touched nothing, and its reread would fail on the
+    // same registry and send the app into a full reload for a no-op.
+    let lib_result = if refused {
+        Ok(None)
+    } else {
+        zytunes::dirlib::DirectoryLibrary::reread_paths_after(
+            music_dir,
+            &paths,
+            &vacated,
+            fingerprint,
+            &scan_log,
+        )
+        .map(|l| Some(Box::new(l) as Box<dyn zytunes::library::MusicLibrary + Send>))
+    };
+    let _ = event_tx.send(BgEvent::LibraryRereadComplete {
+        token,
+        result: lib_result,
+    });
+}
+
 /// One album batch — the whole batch is ONE worker job (one supersede
 /// token), so an interactive `SeparateStems` cancels it as a unit and
 /// the app re-dispatches the remainder afterwards.
 struct StemBatchJob<'a> {
     gen: u64,
-    track_paths: &'a [String],
+    tracks: &'a [zytunes::stems::StemTrack],
     layout: &'static [zytunes::stems::StemKind],
     cache_id: &'a str,
     cache_dir: &'a std::path::Path,
@@ -3067,7 +3227,7 @@ fn run_stem_batch(
 ) {
     let StemBatchJob {
         gen,
-        track_paths,
+        tracks,
         layout,
         cache_id,
         cache_dir,
@@ -3077,10 +3237,11 @@ fn run_stem_batch(
     let log: zytunes::cache::Logger = Arc::new(move |msg: &str| {
         let _ = log_tx.send(BgEvent::SyncMessage(format!("[stems] {msg}")));
     });
-    let total = track_paths.len();
+    let total = tracks.len();
     let (mut separated, mut skipped, mut failed) = (0usize, 0usize, 0usize);
     let mut was_cancelled = false;
-    for (i, track) in track_paths.iter().enumerate() {
+    for (i, zytunes::stems::StemTrack { id, path: track }) in tracks.iter().enumerate() {
+        let id = *id;
         if cancelled() {
             was_cancelled = true;
             break;
@@ -3093,12 +3254,12 @@ fn run_stem_batch(
             pct: None,
         });
         let source = std::path::Path::new(track);
-        if cached_stems(cache_dir, source, cache_id, layout, &log).is_some() {
+        if cached_stems(cache_dir, id, source, cache_id, layout, &log).is_some() {
             skipped += 1;
             continue;
         }
         log(&format!("batch {current}/{total}: separating {track}"));
-        let work_dir = cache_dir.join("work").join(stem_cache_key(track, cache_id));
+        let work_dir = cache_dir.join("work").join(stem_cache_key(id, cache_id));
         let _ = std::fs::remove_dir_all(&work_dir);
         let progress_tx = event_tx.clone();
         let on_progress = move |pct: u8| {
@@ -3113,7 +3274,7 @@ fn run_stem_batch(
         let outcome = separator.separate(source, &work_dir, cancelled, &on_progress, &on_line);
         match outcome {
             Ok(produced) => {
-                match store_stems(cache_dir, source, cache_id, &produced, max_bytes, &log) {
+                match store_stems(cache_dir, id, source, cache_id, &produced, max_bytes, &log) {
                     Ok(_) => separated += 1,
                     Err(e) => {
                         failed += 1;
@@ -3148,6 +3309,8 @@ fn run_stem_batch(
 struct SeparationJob<'a> {
     gen: u64,
     track_path: &'a str,
+    /// Keys the cache entry; see [`zytunes::stems::StemTrack::id`].
+    track_id: u64,
     /// Ordered stems the recipe produces — cache lookups validate
     /// against this exact file set.
     layout: &'static [zytunes::stems::StemKind],
@@ -3243,6 +3406,7 @@ fn run_separation(
     let SeparationJob {
         gen,
         track_path,
+        track_id,
         layout,
         cache_id,
         cache_dir,
@@ -3259,7 +3423,7 @@ fn run_separation(
     // being a hit, never a re-separation. No-op after the first sweep.
     zytunes::stems::migrate_legacy_stem_entries(cache_dir, &log);
 
-    if let Some(stems) = cached_stems(cache_dir, source, cache_id, layout, &log) {
+    if let Some(stems) = cached_stems(cache_dir, track_id, source, cache_id, layout, &log) {
         let _ = event_tx.send(BgEvent::StemsReady {
             gen,
             track_path: track_path.to_string(),
@@ -3273,7 +3437,7 @@ fn run_separation(
     // output must never look like a cache).
     let work_dir = cache_dir
         .join("work")
-        .join(stem_cache_key(track_path, cache_id));
+        .join(stem_cache_key(track_id, cache_id));
     let _ = std::fs::remove_dir_all(&work_dir);
 
     let progress_tx = event_tx.clone();
@@ -3288,7 +3452,9 @@ fn run_separation(
     let outcome = separator.separate(source, &work_dir, cancelled, &on_progress, &on_line);
     let terminal = match outcome {
         Ok(produced) => {
-            match store_stems(cache_dir, source, cache_id, &produced, max_bytes, &log) {
+            match store_stems(
+                cache_dir, track_id, source, cache_id, &produced, max_bytes, &log,
+            ) {
                 Ok(stems) => BgEvent::StemsReady {
                     gen,
                     track_path: track_path.to_string(),
@@ -3419,7 +3585,9 @@ mod tests {
             }]))
             .unwrap();
 
-        let cancelled = drain_sync_commands(&cmd_rx, &event_tx, &mut queue, &mut total);
+        let mut deferred = std::collections::VecDeque::new();
+        let cancelled =
+            drain_sync_commands(&cmd_rx, &mut deferred, &event_tx, &mut queue, &mut total);
 
         assert!(!cancelled);
         assert_eq!(queue.len(), 1, "append must extend an already-empty queue");
@@ -3442,7 +3610,9 @@ mod tests {
         cmd_tx.send(BgCommand::AppendSyncQueue(vec![])).unwrap();
         cmd_tx.send(BgCommand::CancelSync).unwrap();
 
-        let cancelled = drain_sync_commands(&cmd_rx, &event_tx, &mut queue, &mut total);
+        let mut deferred = std::collections::VecDeque::new();
+        let cancelled =
+            drain_sync_commands(&cmd_rx, &mut deferred, &event_tx, &mut queue, &mut total);
 
         assert!(cancelled, "CancelSync must be reported");
         assert!(queue.is_empty(), "empty appends must not enqueue anything");
@@ -3451,6 +3621,39 @@ mod tests {
             event_rx.try_recv().is_err(),
             "empty appends must not log a splice message"
         );
+    }
+
+    #[test]
+    fn commands_read_during_a_sync_are_kept_for_after_it() {
+        // An inbox scan or a tag apply sent while a sync runs used to be
+        // read and dropped. The app then waited forever for its answer.
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (event_tx, _event_rx) = mpsc::channel();
+        let mut queue: std::collections::VecDeque<SyncItem> = std::collections::VecDeque::new();
+        let mut total = 1usize;
+        let mut deferred = std::collections::VecDeque::new();
+
+        cmd_tx.send(BgCommand::CancelRip).unwrap();
+        cmd_tx.send(BgCommand::CancelSync).unwrap();
+        cmd_tx.send(BgCommand::Disconnect).unwrap();
+        assert!(drain_sync_commands(
+            &cmd_rx,
+            &mut deferred,
+            &event_tx,
+            &mut queue,
+            &mut total
+        ));
+        cmd_tx.send(BgCommand::CancelRip).unwrap();
+        assert!(!cancel_requested(&cmd_rx, &mut deferred));
+
+        assert!(matches!(
+            deferred.make_contiguous(),
+            [
+                BgCommand::CancelRip,
+                BgCommand::Disconnect,
+                BgCommand::CancelRip
+            ]
+        ));
     }
 
     #[test]
@@ -3598,18 +3801,24 @@ mod tests {
             std::fs::write(p, b"warm").unwrap();
         }
         let log = zytunes::cache::default_logger();
-        zytunes::stems::store_stems(&cache, &a, "m", &produced, u64::MAX, &log).unwrap();
+        zytunes::stems::store_stems(&cache, 1, &a, "m", &produced, u64::MAX, &log).unwrap();
 
         let (event_tx, event_rx) = mpsc::channel();
         let sep = FakeSeparator::ok();
         let tracks = vec![
-            a.to_string_lossy().into_owned(),
-            b.to_string_lossy().into_owned(),
+            zytunes::stems::StemTrack {
+                id: 1,
+                path: a.to_string_lossy().into_owned(),
+            },
+            zytunes::stems::StemTrack {
+                id: 2,
+                path: b.to_string_lossy().into_owned(),
+            },
         ];
         run_stem_batch(
             &StemBatchJob {
                 gen: 3,
-                track_paths: &tracks,
+                tracks: &tracks,
                 layout: zytunes::stems::SIX_STEM_LAYOUT,
                 cache_id: "m",
                 cache_dir: &cache,
@@ -3647,6 +3856,7 @@ mod tests {
         // Track B's stems landed in the cache.
         assert!(zytunes::stems::cached_stems(
             &cache,
+            2,
             &b,
             "m",
             zytunes::stems::SIX_STEM_LAYOUT,
@@ -3664,11 +3874,14 @@ mod tests {
         std::fs::write(&a, b"mp3").unwrap();
         let (event_tx, event_rx) = mpsc::channel();
         let sep = FakeSeparator::ok();
-        let tracks = vec![a.to_string_lossy().into_owned()];
+        let tracks = vec![zytunes::stems::StemTrack {
+            id: 1,
+            path: a.to_string_lossy().into_owned(),
+        }];
         run_stem_batch(
             &StemBatchJob {
                 gen: 4,
-                track_paths: &tracks,
+                tracks: &tracks,
                 layout: zytunes::stems::SIX_STEM_LAYOUT,
                 cache_id: "m",
                 cache_dir: &cache,
@@ -3707,6 +3920,7 @@ mod tests {
             &SeparationJob {
                 gen: 7,
                 track_path: &track,
+                track_id: 9,
                 layout: zytunes::stems::SIX_STEM_LAYOUT,
                 cache_id: "m",
                 cache_dir: &cache,
@@ -3741,6 +3955,7 @@ mod tests {
             &SeparationJob {
                 gen: 8,
                 track_path: &track,
+                track_id: 9,
                 layout: zytunes::stems::SIX_STEM_LAYOUT,
                 cache_id: "m",
                 cache_dir: &cache,
@@ -3773,6 +3988,7 @@ mod tests {
             &SeparationJob {
                 gen: 7,
                 track_path: &source.to_string_lossy(),
+                track_id: 9,
                 layout: zytunes::stems::SIX_STEM_LAYOUT,
                 cache_id: "m",
                 cache_dir: &dir.join("cache"),
@@ -3809,6 +4025,7 @@ mod tests {
             &SeparationJob {
                 gen: 7,
                 track_path: &source.to_string_lossy(),
+                track_id: 9,
                 layout: zytunes::stems::SIX_STEM_LAYOUT,
                 cache_id: "m",
                 cache_dir: &dir.join("cache"),

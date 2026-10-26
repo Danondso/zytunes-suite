@@ -71,6 +71,29 @@ impl App {
         self.handle_global_key(key, cmd_tx, audio_tx)
     }
 
+    /// Some modal or text input currently claims the keyboard. Mirrors the
+    /// guards of the `handle_*_key` cascade in [`Self::handle_key`] — a new
+    /// modal added there belongs here too. Anything that opens an overlay
+    /// on its own (the inbox poll) checks this first, so it never lands
+    /// under the user's fingers mid-keystroke.
+    pub(crate) fn modal_open(&self) -> bool {
+        self.import_overlay.is_some()
+            || self.playlist_name_input.is_some()
+            || self.generation_form.is_some()
+            || self.add_to_playlist_picker.is_some()
+            || self.pending_playlist_delete.is_some()
+            || self.search_active
+            || self.show_theme_picker
+            || self.stem_panel.is_some()
+            || self.pending_cache_clear
+            || self.stems.consent.is_some()
+            || self.stem_bulk_confirm.is_some()
+            || self.pending_removal.is_some()
+            || self.show_help
+            || self.tag_manager.is_some()
+            || self.show_track_info
+    }
+
     /// Engine-install consent overlay (opened by `M` when no stem engine
     /// is found and `[stems]` provisioning is auto). A real modal: it
     /// claims every key while open.
@@ -519,6 +542,11 @@ impl App {
             {
                 self.open_tag_manager(cmd_tx);
             }
+            KeyCode::Char('F')
+                if self.browse_mode == BrowseMode::Library && self.library.is_some() =>
+            {
+                self.start_file_and_enrich(cmd_tx);
+            }
             KeyCode::Char('M') => {
                 // On an album sidebar entry (Library browse), M means
                 // "pre-warm this whole album" — or cancels the batch
@@ -819,7 +847,7 @@ impl App {
 
     /// `L` — dump the sync log to `/tmp/zytunes-log.txt` and copy the
     /// path to the system clipboard.
-    fn dump_log_to_file(&mut self) {
+    pub(crate) fn dump_log_to_file(&mut self) {
         let path = std::path::PathBuf::from("/tmp/zytunes-log.txt");
         let content = self.sync.log.join("\n");
         match std::fs::write(&path, &content) {

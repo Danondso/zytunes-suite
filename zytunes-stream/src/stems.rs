@@ -237,11 +237,14 @@ impl StemHub {
         }
     }
 
-    fn cached(&self, source: &Path) -> bool {
+    /// `id` is the library track ID, which keys the cache entry (the
+    /// same key the TUI uses, so both share one split per track).
+    fn cached(&self, id: u64, source: &Path) -> bool {
         let log = log();
         migrate_legacy_stem_entries(&self.settings.cache_dir, &log);
         cached_stems(
             &self.settings.cache_dir,
+            id,
             source,
             &self.settings.cache_id(),
             self.settings.recipe.layout(),
@@ -251,7 +254,7 @@ impl StemHub {
     }
 
     pub fn status(&self, id: u64, source: &Path) -> StemSetDto {
-        if self.cached(source) {
+        if self.cached(id, source) {
             return self.dto(id, StemJobStatus::Ready, None, None);
         }
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -268,7 +271,7 @@ impl StemHub {
     }
 
     pub fn start(&self, id: u64, source: PathBuf) -> StemSetDto {
-        if self.cached(&source) {
+        if self.cached(id, &source) {
             return self.dto(id, StemJobStatus::Ready, None, None);
         }
         {
@@ -324,14 +327,14 @@ impl StemHub {
             migrate_legacy_stem_entries(&settings.cache_dir, &log);
             let cache_id = settings.cache_id();
             let layout = settings.recipe.layout();
-            if cached_stems(&settings.cache_dir, &source, &cache_id, layout, &log).is_some() {
+            if cached_stems(&settings.cache_dir, id, &source, &cache_id, layout, &log).is_some() {
                 clear_job_if(&inner, &cancel);
                 return;
             }
             let work_dir = settings
                 .cache_dir
                 .join("work")
-                .join(stem_cache_key(&source.to_string_lossy(), &cache_id));
+                .join(stem_cache_key(id, &cache_id));
             let _ = std::fs::remove_dir_all(&work_dir);
             let on_progress = {
                 let progress = Arc::clone(&progress);
@@ -345,6 +348,7 @@ impl StemHub {
                 Ok(produced) => {
                     if let Err(e) = store_stems(
                         &settings.cache_dir,
+                        id,
                         &source,
                         &cache_id,
                         &produced,
@@ -378,18 +382,18 @@ impl StemHub {
         self.status(id, source)
     }
 
-    pub fn stem_path(&self, source: &Path, kind: StemKind) -> Option<PathBuf> {
-        if !self.cached(source) {
+    pub fn stem_path(&self, id: u64, source: &Path, kind: StemKind) -> Option<PathBuf> {
+        if !self.cached(id, source) {
             return None;
         }
         let layout = self.settings.recipe.layout();
         if !layout.contains(&kind) {
             return None;
         }
-        let entry = self.settings.cache_dir.join(stem_cache_key(
-            &source.to_string_lossy(),
-            &self.settings.cache_id(),
-        ));
+        let entry = self
+            .settings
+            .cache_dir
+            .join(stem_cache_key(id, &self.settings.cache_id()));
         let path = entry.join(format!("{}.{STEM_EXT}", kind.file_stem()));
         path.is_file().then_some(path)
     }
