@@ -1656,6 +1656,16 @@ enum MoveFailure {
 /// itself refuses to take an occupied name ([`move_no_replace`]), and the
 /// next name is tried.
 fn move_to_free_name(src: &Path, dest: &Path) -> Result<PathBuf, String> {
+    move_to_free_name_with(src, dest, &move_no_replace)
+}
+
+/// [`move_to_free_name`] with the move itself passed in, so a test can lose
+/// the race for a name on purpose.
+fn move_to_free_name_with(
+    src: &Path,
+    dest: &Path,
+    mover: &dyn Fn(&Path, &Path) -> Result<(), MoveFailure>,
+) -> Result<PathBuf, String> {
     // A name only stays taken because something keeps winning the race
     // for it; this is a bound on a loop that cannot otherwise end.
     for _ in 0..64 {
@@ -1665,7 +1675,7 @@ fn move_to_free_name(src: &Path, dest: &Path) -> Result<PathBuf, String> {
             return Ok(landing);
         }
         refuse_relative_symlink(src, &landing)?;
-        match move_no_replace(src, &landing) {
+        match mover(src, &landing) {
             Ok(()) => return Ok(landing),
             Err(MoveFailure::Taken) => {}
             Err(MoveFailure::Failed(e)) => return Err(e),
@@ -1681,6 +1691,18 @@ fn move_to_free_name(src: &Path, dest: &Path) -> Result<PathBuf, String> {
 /// without hard links) the bytes are copied beside `dest` and flushed to
 /// disk before `src` is removed.
 fn move_no_replace(src: &Path, dest: &Path) -> Result<(), MoveFailure> {
+    move_no_replace_with(src, dest, &hard_link)
+}
+
+/// A hard-link function, swappable so a test can stand in for a volume
+/// that has none.
+type LinkFn<'a> = &'a dyn Fn(&Path, &Path) -> std::io::Result<()>;
+
+fn hard_link(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::hard_link(from, to)
+}
+
+fn move_no_replace_with(src: &Path, dest: &Path, link: LinkFn) -> Result<(), MoveFailure> {
     use std::io::ErrorKind;
     let fail = |what: &str, e: std::io::Error| {
         MoveFailure::Failed(format!(
@@ -1693,10 +1715,10 @@ fn move_no_replace(src: &Path, dest: &Path) -> Result<(), MoveFailure> {
         std::fs::create_dir_all(parent)
             .map_err(|e| MoveFailure::Failed(format!("mkdir {}: {e}", parent.display())))?;
     }
-    match std::fs::hard_link(src, dest) {
+    match link(src, dest) {
         Ok(()) => {}
         Err(e) if e.kind() == ErrorKind::AlreadyExists => return Err(MoveFailure::Taken),
-        Err(_) => copy_no_replace(src, dest)?,
+        Err(_) => copy_no_replace_with(src, dest, link)?,
     }
     // The file is now at both names. If `src` cannot be removed the move
     // did not happen: take the new name back out, so there is not a
@@ -1709,7 +1731,7 @@ fn move_no_replace(src: &Path, dest: &Path) -> Result<(), MoveFailure> {
 
 /// [`move_no_replace`] without hard links: copy to a staged name beside
 /// `dest`, flush it, then give it its name only if nobody has it.
-fn copy_no_replace(src: &Path, dest: &Path) -> Result<(), MoveFailure> {
+fn copy_no_replace_with(src: &Path, dest: &Path, link: LinkFn) -> Result<(), MoveFailure> {
     use std::io::ErrorKind;
     let mut staged = dest.as_os_str().to_owned();
     staged.push(".");
@@ -1732,7 +1754,7 @@ fn copy_no_replace(src: &Path, dest: &Path) -> Result<(), MoveFailure> {
     // Link, not rename: a rename would replace a file that turned up
     // while the copy ran. A volume with no hard links at all (FAT) gets
     // the rename, after a last look at the name.
-    let named = match std::fs::hard_link(&staged, dest) {
+    let named = match link(&staged, dest) {
         Ok(()) => std::fs::remove_file(&staged),
         Err(e) if e.kind() == ErrorKind::AlreadyExists => {
             let _ = std::fs::remove_file(&staged);
@@ -4323,6 +4345,98 @@ mod tests {
         assert!(dest.exists() && numbered(&dest, 2).exists() && numbered(&dest, 3).exists());
     }
 
+    fn no_hard_links(_: &Path, _: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    }
+
+    #[test]
+    fn a_name_taken_after_it_was_chosen_sends_the_file_to_the_next_number() {
+        let dir = fresh_dir("race-lost");
+        let dest = dir.join("01 - Track.wav");
+        let src = dir.join("in.wav");
+        write_sine_wav(&src, 1);
+        let incoming = std::fs::read(&src).unwrap();
+        let racer = std::cell::Cell::new(false);
+        // Someone files onto the free name between the look and the move.
+        let mover = |s: &Path, d: &Path| {
+            if !racer.replace(true) {
+                std::fs::write(d, b"the racer").unwrap();
+            }
+            move_no_replace(s, d)
+        };
+
+        let landed = move_to_free_name_with(&src, &dest, &mover).unwrap();
+
+        assert_eq!(landed, numbered(&dest, 2));
+        assert_eq!(std::fs::read(&landed).unwrap(), incoming);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"the racer");
+        assert!(!src.exists());
+    }
+
+    #[test]
+    fn a_name_that_keeps_being_taken_gives_up_and_keeps_the_file() {
+        let dir = fresh_dir("race-forever");
+        let (src, dest) = (dir.join("in.wav"), dir.join("01 - Track.wav"));
+        write_sine_wav(&src, 1);
+        let mover = |_: &Path, _: &Path| Err(MoveFailure::Taken);
+
+        let err = move_to_free_name_with(&src, &dest, &mover).unwrap_err();
+
+        assert!(err.contains("no free name"), "{err}");
+        assert!(src.exists());
+    }
+
+    #[test]
+    fn a_volume_without_hard_links_still_gets_the_file() {
+        let dir = fresh_dir("no-links-moves");
+        let (src, dest) = (dir.join("a.wav"), dir.join("sub").join("b.wav"));
+        write_sine_wav(&src, 1);
+        let bytes = std::fs::read(&src).unwrap();
+
+        assert!(move_no_replace_with(&src, &dest, &no_hard_links).is_ok());
+
+        assert_eq!(std::fs::read(&dest).unwrap(), bytes);
+        assert!(!src.exists());
+        assert!(!dir.join("sub").join("b.wav.zytunes-part").exists());
+    }
+
+    #[test]
+    fn a_volume_without_hard_links_still_does_not_replace() {
+        let dir = fresh_dir("no-links-taken");
+        let (src, dest) = (dir.join("a.wav"), dir.join("b.wav"));
+        write_sine_wav(&src, 1);
+        write_sine_wav(&dest, 2);
+        let (mine, theirs) = (std::fs::read(&src).unwrap(), std::fs::read(&dest).unwrap());
+
+        assert!(matches!(
+            move_no_replace_with(&src, &dest, &no_hard_links),
+            Err(MoveFailure::Taken)
+        ));
+        assert_eq!(std::fs::read(&src).unwrap(), mine);
+        assert_eq!(std::fs::read(&dest).unwrap(), theirs);
+        assert!(!dir.join("b.wav.zytunes-part").exists());
+    }
+
+    #[test]
+    fn a_staged_copy_is_flushed_and_complete_before_it_is_named() {
+        // The fsync itself cannot be observed from a test; what can be is
+        // that the name only ever points at the whole file: the link sees
+        // the staged copy already at full length.
+        let dir = fresh_dir("staged-complete");
+        let (src, dest) = (dir.join("a.wav"), dir.join("b.wav"));
+        write_sine_wav(&src, 2);
+        let want = std::fs::metadata(&src).unwrap().len();
+        let seen = std::cell::Cell::new(0);
+        let link = |staged: &Path, to: &Path| {
+            seen.set(std::fs::metadata(staged).unwrap().len());
+            std::fs::hard_link(staged, to)
+        };
+
+        assert!(copy_no_replace_with(&src, &dest, &link).is_ok());
+
+        assert_eq!(seen.get(), want);
+    }
+
     #[test]
     fn move_no_replace_refuses_a_taken_name_and_touches_neither_file() {
         // The retry in `move_to_free_name` leans on this: a name that was
@@ -4371,7 +4485,7 @@ mod tests {
             .set_modified(long_ago)
             .unwrap();
 
-        assert!(copy_no_replace(&src, &dest).is_ok());
+        assert!(copy_no_replace_with(&src, &dest, &hard_link).is_ok());
 
         assert_eq!(std::fs::read(&dest).unwrap(), std::fs::read(&src).unwrap());
         let moved = std::fs::metadata(&dest).unwrap().modified().unwrap();
@@ -4391,7 +4505,7 @@ mod tests {
         let theirs = std::fs::read(&dest).unwrap();
 
         assert!(matches!(
-            copy_no_replace(&src, &dest),
+            copy_no_replace_with(&src, &dest, &hard_link),
             Err(MoveFailure::Taken)
         ));
         assert_eq!(std::fs::read(&dest).unwrap(), theirs);
