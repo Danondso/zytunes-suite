@@ -945,6 +945,12 @@ pub(crate) fn apply_release_diff(diff: &ReleaseTagDiff, library_root: &Path) -> 
         );
     }
 
+    let landing_dirs: std::collections::BTreeSet<&Path> =
+        rename_map.values().filter_map(|p| p.parent()).collect();
+    for dir in landing_dirs {
+        sweep_stale_staged(dir);
+    }
+
     let sidecar_errors = carry_sidecars(&rename_map, library_root);
 
     ApplyOutcome {
@@ -956,10 +962,14 @@ pub(crate) fn apply_release_diff(diff: &ReleaseTagDiff, library_root: &Path) -> 
     }
 }
 
+/// Extension of the copy a cross-device move stages beside its dest.
+const STAGED_EXTENSION: &str = "zytunes-part";
+
 /// Extensions a writer gives a file it has not finished (browsers,
 /// rsync, aria2, qBittorrent, our own rip): the writer will rename it
 /// when it is done, so it is left where the writer expects it.
 const IN_PROGRESS: &[&str] = &[
+    STAGED_EXTENSION,
     "part",
     "partial",
     "crdownload",
@@ -1450,16 +1460,18 @@ fn same_inode(a: &Path, b: &Path) -> bool {
 /// A source that already is one of those siblings stays where it is, so
 /// filing an album that holds a numbered copy again does not walk the
 /// copy up to `(3)`.
-fn landing_path(src: &Path, dest: &Path) -> PathBuf {
+///
+/// `None` only if every number up to `u32::MAX` is taken.
+fn landing_path(src: &Path, dest: &Path) -> Option<PathBuf> {
     if !dest_is_held(src, dest) {
-        return dest.to_path_buf();
+        return Some(dest.to_path_buf());
     }
     let stem = dest
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
     let ext = dest.extension().map(|e| e.to_string_lossy().into_owned());
-    (2u32..)
+    (2..=u32::MAX)
         .map(|n| {
             dest.with_file_name(match &ext {
                 Some(ext) => format!("{stem} ({n}).{ext}"),
@@ -1473,7 +1485,6 @@ fn landing_path(src: &Path, dest: &Path) -> PathBuf {
                 (!candidate.exists()).then_some(candidate)
             }
         })
-        .expect("a free numbered name exists")
 }
 
 /// Move `src` towards `dest` and return where it landed (see
@@ -1548,6 +1559,9 @@ fn refuse_relative_symlink(src: &Path, landing: &Path) -> Result<(), String> {
 #[derive(Default)]
 struct FolderSpelling {
     settled: HashMap<PathBuf, std::ffi::OsString>,
+    /// The folders in each directory asked about, listed once: the library
+    /// root is asked about for every new artist.
+    listings: HashMap<PathBuf, Vec<std::ffi::OsString>>,
 }
 
 impl FolderSpelling {
@@ -1565,38 +1579,65 @@ impl FolderSpelling {
         let mut built = library_root.to_path_buf();
         for component in folders.components() {
             let name = match component {
-                std::path::Component::Normal(want) => self
-                    .settled
-                    .entry(built.join(want))
-                    .or_insert_with(|| {
-                        sole_case_variant(&built, want).unwrap_or_else(|| want.to_owned())
-                    })
-                    .clone(),
+                std::path::Component::Normal(want) => self.spell(&built, want),
                 other => other.as_os_str().to_owned(),
             };
             built.push(name);
         }
         built.join(file)
     }
+
+    /// How the folder `want` in `dir` is spelled on disk.
+    fn spell(&mut self, dir: &Path, want: &std::ffi::OsStr) -> std::ffi::OsString {
+        let key = dir.join(want);
+        if let Some(name) = self.settled.get(&key) {
+            return name.clone();
+        }
+        let listing = self
+            .listings
+            .entry(dir.to_path_buf())
+            .or_insert_with(|| folders_in(dir));
+        let name = sole_case_variant(listing, want).unwrap_or_else(|| want.to_owned());
+        // A folder the apply is about to create is as good as listed, or a
+        // later track asking for another case of it would make a second.
+        if !listing.contains(&name) {
+            listing.push(name.clone());
+        }
+        self.settled.insert(key, name.clone());
+        name
+    }
 }
 
-/// The one folder in `dir` whose name is `want` in another ASCII case.
-/// `None` when `want` itself is there (the folders are separate entries
-/// and the file is moved into the canonical one), when nothing matches,
-/// or when several spellings do and none is the obvious one to retitle.
-fn sole_case_variant(dir: &Path, want: &std::ffi::OsStr) -> Option<std::ffi::OsString> {
+/// The names of the folders in `dir` (none if it cannot be read).
+fn folders_in(dir: &Path) -> Vec<std::ffi::OsString> {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.file_name())
+        .collect()
+}
+
+/// The one folder among `folders` whose name is `want` in another ASCII
+/// case. `None` when `want` itself is there (the folders are separate
+/// entries and the file is moved into the canonical one), when nothing
+/// matches, or when several spellings do and none is the obvious one.
+fn sole_case_variant(
+    folders: &[std::ffi::OsString],
+    want: &std::ffi::OsStr,
+) -> Option<std::ffi::OsString> {
     let want_text = want.to_string_lossy();
     let mut variant = None;
-    for entry in std::fs::read_dir(dir).ok()?.flatten() {
-        let name = entry.file_name();
+    for name in folders {
         if name == want {
             return None;
         }
         if name.to_string_lossy().eq_ignore_ascii_case(&want_text) {
-            if variant.is_some() || !entry.path().is_dir() {
+            if variant.is_some() {
                 return None;
             }
-            variant = Some(name);
+            variant = Some(name.clone());
         }
     }
     variant
@@ -1618,7 +1659,8 @@ fn move_to_free_name(src: &Path, dest: &Path) -> Result<PathBuf, String> {
     // A name only stays taken because something keeps winning the race
     // for it; this is a bound on a loop that cannot otherwise end.
     for _ in 0..64 {
-        let landing = landing_path(src, dest);
+        let landing = landing_path(src, dest)
+            .ok_or_else(|| format!("no free name for {}", dest.display()))?;
         if landing == src {
             return Ok(landing);
         }
@@ -1670,7 +1712,8 @@ fn move_no_replace(src: &Path, dest: &Path) -> Result<(), MoveFailure> {
 fn copy_no_replace(src: &Path, dest: &Path) -> Result<(), MoveFailure> {
     use std::io::ErrorKind;
     let mut staged = dest.as_os_str().to_owned();
-    staged.push(".zytunes-part");
+    staged.push(".");
+    staged.push(STAGED_EXTENSION);
     let staged = PathBuf::from(staged);
     let fail = |e: std::io::Error| {
         let _ = std::fs::remove_file(&staged);
@@ -1701,7 +1744,46 @@ fn copy_no_replace(src: &Path, dest: &Path) -> Result<(), MoveFailure> {
         }
         Err(_) => std::fs::rename(&staged, dest),
     };
-    named.map_err(fail)
+    named.map_err(fail)?;
+    // `copy` stamps the copy with the time it was made. The stem cache and
+    // the library scan fingerprint a file by (mtime, size), so a moved
+    // file with a new mtime would be separated and rescanned again. Done
+    // after the file has its name: until then the staged name's age is
+    // what `sweep_stale_staged` goes by.
+    if let Ok(modified) = std::fs::metadata(src).and_then(|m| m.modified()) {
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .open(dest)
+            .and_then(|f| f.set_modified(modified));
+    }
+    Ok(())
+}
+
+/// How long a staged copy may sit before it is taken for a crash's
+/// leftover rather than a copy still running.
+const STAGED_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Remove the staged copies ([`copy_no_replace`]) a crash left in `dir`.
+/// A move that died between the copy and the naming leaves
+/// `Song.flac.zytunes-part` behind; nothing else would ever look for it.
+fn sweep_stale_staged(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let stale = path.extension().is_some_and(|e| e == STAGED_EXTENSION)
+            && entry
+                .metadata()
+                .ok()
+                .filter(|m| m.is_file())
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > STAGED_MAX_AGE);
+        if stale {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4239,6 +4321,147 @@ mod tests {
             assert_eq!(out.rename_map.get(&src), Some(&numbered(&dest, n)));
         }
         assert!(dest.exists() && numbered(&dest, 2).exists() && numbered(&dest, 3).exists());
+    }
+
+    #[test]
+    fn move_no_replace_refuses_a_taken_name_and_touches_neither_file() {
+        // The retry in `move_to_free_name` leans on this: a name that was
+        // free when looked at and is taken by the time of the move.
+        let dir = fresh_dir("no-replace-taken");
+        let (src, dest) = (dir.join("a.wav"), dir.join("b.wav"));
+        write_sine_wav(&src, 1);
+        write_sine_wav(&dest, 2);
+        let (mine, theirs) = (std::fs::read(&src).unwrap(), std::fs::read(&dest).unwrap());
+
+        assert!(matches!(
+            move_no_replace(&src, &dest),
+            Err(MoveFailure::Taken)
+        ));
+        assert_eq!(std::fs::read(&src).unwrap(), mine);
+        assert_eq!(std::fs::read(&dest).unwrap(), theirs);
+    }
+
+    #[test]
+    fn move_to_free_name_skips_every_taken_number() {
+        let dir = fresh_dir("free-name-skips");
+        let dest = dir.join("01 - Track.wav");
+        let src = dir.join("in.wav");
+        write_sine_wav(&src, 1);
+        let incoming = std::fs::read(&src).unwrap();
+        write_sine_wav(&dest, 2);
+        write_sine_wav(&numbered(&dest, 2), 3);
+
+        let landed = move_to_free_name(&src, &dest).unwrap();
+
+        assert_eq!(landed, numbered(&dest, 3));
+        assert_eq!(std::fs::read(&landed).unwrap(), incoming);
+        assert!(!src.exists());
+    }
+
+    #[test]
+    fn a_staged_copy_keeps_the_sources_mtime_and_leaves_no_staging_file() {
+        let dir = fresh_dir("staged-copy");
+        let (src, dest) = (dir.join("a.wav"), dir.join("b.wav"));
+        write_sine_wav(&src, 1);
+        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(86_400 * 30);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&src)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+
+        assert!(copy_no_replace(&src, &dest).is_ok());
+
+        assert_eq!(std::fs::read(&dest).unwrap(), std::fs::read(&src).unwrap());
+        let moved = std::fs::metadata(&dest).unwrap().modified().unwrap();
+        let drift = moved
+            .duration_since(long_ago)
+            .unwrap_or_else(|e| e.duration());
+        assert!(drift < std::time::Duration::from_secs(2), "{drift:?}");
+        assert!(!dir.join("b.wav.zytunes-part").exists());
+    }
+
+    #[test]
+    fn a_staged_copy_does_not_take_a_name_that_turned_up() {
+        let dir = fresh_dir("staged-copy-taken");
+        let (src, dest) = (dir.join("a.wav"), dir.join("b.wav"));
+        write_sine_wav(&src, 1);
+        write_sine_wav(&dest, 2);
+        let theirs = std::fs::read(&dest).unwrap();
+
+        assert!(matches!(
+            copy_no_replace(&src, &dest),
+            Err(MoveFailure::Taken)
+        ));
+        assert_eq!(std::fs::read(&dest).unwrap(), theirs);
+        assert!(!dir.join("b.wav.zytunes-part").exists());
+    }
+
+    #[test]
+    fn only_old_staged_copies_are_swept() {
+        let dir = fresh_dir("sweep-staged");
+        let (old, fresh, other) = (
+            dir.join("Old.flac.zytunes-part"),
+            dir.join("New.flac.zytunes-part"),
+            dir.join("cover.jpg"),
+        );
+        for p in [&old, &fresh, &other] {
+            std::fs::write(p, b"x").unwrap();
+        }
+        let stale = std::time::SystemTime::now() - STAGED_MAX_AGE * 2;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(stale)
+            .unwrap();
+        // An old file of any other kind is not ours to remove.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&other)
+            .unwrap()
+            .set_modified(stale)
+            .unwrap();
+
+        sweep_stale_staged(&dir);
+
+        assert!(!old.exists(), "the crash's leftover goes");
+        assert!(fresh.exists(), "a copy that may still be running stays");
+        assert!(other.exists());
+    }
+
+    #[test]
+    fn a_later_track_asking_for_another_case_of_a_new_folder_joins_it() {
+        // Neither spelling is on disk yet: the first track creates one and
+        // the second must land in it, not in a second folder that differs
+        // by case.
+        let dir = fresh_dir("spelling-new-folder");
+        std::fs::create_dir_all(dir.join("Other")).unwrap();
+        let mut folders = FolderSpelling::default();
+
+        let first = folders.adopt(&dir.join("Artist").join("Album").join("01.wav"), &dir);
+        let second = folders.adopt(&dir.join("ARTIST").join("Album").join("02.wav"), &dir);
+
+        assert_eq!(first, dir.join("Artist").join("Album").join("01.wav"));
+        assert_eq!(second, dir.join("Artist").join("Album").join("02.wav"));
+    }
+
+    #[test]
+    fn a_folder_on_disk_keeps_its_spelling() {
+        let dir = fresh_dir("spelling-on-disk");
+        std::fs::create_dir_all(dir.join("alice in chains")).unwrap();
+        let mut folders = FolderSpelling::default();
+
+        let dest = folders.adopt(
+            &dir.join("Alice In Chains").join("Dirt").join("01.wav"),
+            &dir,
+        );
+
+        assert_eq!(
+            dest,
+            dir.join("alice in chains").join("Dirt").join("01.wav")
+        );
     }
 
     #[test]
