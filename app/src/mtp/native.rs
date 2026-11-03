@@ -49,6 +49,10 @@ const MICROSOFT_VENDOR_ID: u16 = 0x045e;
 
 /// MTP object format codes.
 const ASSOCIATION_FORMAT: u16 = 0x3001;
+/// Root library folder on the device (matches `caps.music_root = "/Music"` and
+/// the trusted path's `find_library_roots`). Plain-MTP imports nest under it so
+/// the host-side device view enumerates them.
+const MUSIC_ROOT_FOLDER: &str = "Music";
 const FORMAT_MP3: u16 = 0x3009;
 const FORMAT_WMA: u16 = 0xB901;
 const FORMAT_AAC: u16 = 0xB903;
@@ -1099,10 +1103,14 @@ impl NativeSession {
 
         // Folder names are organizational only — the shell reads tags from the
         // file — so sanitise to a filesystem-safe subset and never let them be
-        // empty.
+        // empty. Nest under the device's music root ("Music") so the host-side
+        // device view (collect_all_tracks walks `caps.music_root`) and the
+        // trusted import path agree on where tracks live; the Zune shell scans
+        // the whole filesystem either way, so playback is unaffected.
         let artist_dir = sanitize_folder_name(&artist);
         let album_dir = sanitize_folder_name(&album);
-        let artist_folder = self.find_or_create_folder_plain(MTP_ROOT, &artist_dir)?;
+        let music_folder = self.find_or_create_folder_plain(MTP_ROOT, MUSIC_ROOT_FOLDER)?;
+        let artist_folder = self.find_or_create_folder_plain(music_folder, &artist_dir)?;
         let album_folder = self.find_or_create_folder_plain(artist_folder, &album_dir)?;
 
         let format = detect_format(filename);
