@@ -30,6 +30,18 @@ fn is_fatal_libusb_error(err: &RusbError) -> bool {
     matches!(err, RusbError::NoDevice)
 }
 
+/// Whether to issue a USB bus reset on open. Off by default (a reset
+/// re-enumerates the port and staleds the handle on Linux); opt in with
+/// `ZYTUNES_USB_RESET=1` for a device stuck in cold suspend.
+fn usb_reset_opt_in() -> bool {
+    std::env::var("ZYTUNES_USB_RESET")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
 /// USB transport using libusb (via rusb) for bulk I/O.
 pub struct LibusbTransport {
     handle: rusb::DeviceHandle<rusb::Context>,
@@ -71,14 +83,25 @@ impl LibusbTransport {
         // This is a no-op if no kernel driver is bound.
         let _ = handle.set_auto_detach_kernel_driver(true);
 
-        // Reset the device to wake it from USB suspend.
-        // On macOS, this is done via USBDeviceSuspend(dev, 0). On Linux,
-        // a USB reset achieves the same effect — the Zune needs to be woken
-        // before it will respond to MTP commands.
-        let _ = handle.reset();
+        // Do NOT reset the device by default. On Linux `libusb_reset_device`
+        // re-enumerates the port, which leaves this freshly-opened handle stale
+        // — the very first bulk write then times out even though the device is
+        // awake and answering (aft-mtp-cli, which never resets, talks fine).
+        // A reset also failed to revive a genuinely hung responder in testing,
+        // so it buys nothing and actively breaks the common awake case. Keep it
+        // behind an opt-in for the rare cold-suspend scenario.
+        if usb_reset_opt_in() {
+            let _ = handle.reset();
+        }
 
-        // Set configuration (use config 1, matching IOKit backend).
-        let _ = handle.set_active_configuration(1);
+        // Set configuration 1 only if the device isn't already there. Issuing
+        // SET_CONFIGURATION on an already-configured device re-initialises its
+        // endpoints (and on Linux can leave the bulk OUT pipe unresponsive for
+        // seconds), which wedged the very first write while aft-mtp-cli — which
+        // leaves the existing config alone — talked fine.
+        if handle.active_configuration().unwrap_or(0) != 1 {
+            let _ = handle.set_active_configuration(1);
+        }
 
         // Probe OS descriptors to match aft-mtp-cli's initialization sequence.
         Self::probe_os_descriptors(&handle);
@@ -148,6 +171,11 @@ impl LibusbTransport {
         handle.claim_interface(interface_number).map_err(|e| {
             MtpError::Usb(format!("Failed to claim interface {interface_number}: {e}"))
         })?;
+
+        // Clear any stale halt on the bulk pipes left by a previous aborted
+        // session, so the first transfer starts from a known-good state.
+        let _ = handle.clear_halt(endpoint_in);
+        let _ = handle.clear_halt(endpoint_out);
 
         Ok(LibusbTransport {
             handle,
