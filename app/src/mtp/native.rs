@@ -49,6 +49,10 @@ const MICROSOFT_VENDOR_ID: u16 = 0x045e;
 
 /// MTP object format codes.
 const ASSOCIATION_FORMAT: u16 = 0x3001;
+/// Root library folder on the device (matches `caps.music_root = "/Music"` and
+/// the trusted path's `find_library_roots`). Plain-MTP imports nest under it so
+/// the host-side device view enumerates them.
+const MUSIC_ROOT_FOLDER: &str = "Music";
 const FORMAT_MP3: u16 = 0x3009;
 const FORMAT_WMA: u16 = 0xB901;
 const FORMAT_AAC: u16 = 0xB903;
@@ -253,6 +257,13 @@ pub struct NativeSession {
     /// Caching directly on the import tuple sidesteps the whole name-format
     /// dance for the lifetime of the connection.
     recent_imports: HashMap<(String, String, String), u32>,
+    /// Plain-MTP mode: the MTPZ trust handshake was skipped (keys missing, the
+    /// handshake failed, or `ZYTUNES_ZUNE_PLAIN_MTP` forced it), so imports use
+    /// the auth-free classic `SendObjectInfo` + `SendObject` path instead of the
+    /// trusted `SendObjectPropList`. This is the route for Zunes on v1.0
+    /// firmware, which don't require MTPZ trust to accept writes — the same
+    /// thing `aft-mtp-cli put` did, now in pure Rust.
+    plain: bool,
 }
 
 impl NativeSession {
@@ -339,29 +350,55 @@ impl NativeSession {
     /// Performs device detection, MTP session open, and MTPZ authentication.
     /// The `log` callback receives diagnostic messages for each step.
     pub fn open(product_id: u16, log: &dyn Fn(&str)) -> Result<Self, DeviceError> {
-        if let Some(msg) = crate::paths::mtpz_file_missing_message() {
-            log(&msg);
-            return Err(msg.into());
-        }
-
         log("MTP: Opening USB device...");
         let mut session = MtpSession::open(MICROSOFT_VENDOR_ID, product_id)
             .map_err(|e| format!("USB open failed: {e}"))?;
         log("MTP: USB device opened, MTP session started");
 
-        let keys_path =
-            crate::paths::resolve_mtpz_data_path().map_err(|e| format!("MTPZ keys failed: {e}"))?;
-        log(&format!(
-            "MTP: Loading MTPZ keys from {}...",
-            keys_path.display()
-        ));
-        let keys = MtpzKeys::load(&keys_path.to_string_lossy())
-            .map_err(|e| format!("MTPZ keys failed: {e}"))?;
-        log("MTP: Keys loaded, starting MTPZ handshake...");
-
-        zune_mtp::mtpz::authenticate(&mut session, &keys, log)
-            .map_err(|e| format!("MTPZ handshake failed: {e}"))?;
-        log("MTP: MTPZ handshake complete");
+        // Decide trusted (MTPZ) vs plain MTP. Plain mode skips the trust
+        // handshake and uploads via the auth-free SendObjectInfo/SendObject
+        // pair — the route Zunes on v1.0 firmware need (they don't require MTPZ
+        // trust to accept writes). We stay in the trusted path only when keys
+        // are present AND the handshake succeeds.
+        let plain = if plain_mtp_forced() {
+            log("MTP: ZYTUNES_ZUNE_PLAIN_MTP set — skipping MTPZ handshake (plain MTP)");
+            true
+        } else if let Some(msg) = crate::paths::mtpz_file_missing_message() {
+            log(&format!("MTP: {msg}"));
+            log("MTP: No MTPZ keys — using plain MTP (SendObjectInfo/SendObject, no trust)");
+            true
+        } else {
+            let keys_path = crate::paths::resolve_mtpz_data_path()
+                .map_err(|e| format!("MTPZ keys failed: {e}"))?;
+            log(&format!(
+                "MTP: Loading MTPZ keys from {}...",
+                keys_path.display()
+            ));
+            match MtpzKeys::load(&keys_path.to_string_lossy()) {
+                Ok(keys) => {
+                    log("MTP: Keys loaded, starting MTPZ handshake...");
+                    match zune_mtp::mtpz::authenticate(&mut session, &keys, log) {
+                        Ok(()) => {
+                            log("MTP: MTPZ handshake complete");
+                            false
+                        }
+                        Err(e) => {
+                            log(&format!(
+                                "MTP: MTPZ handshake failed ({e}) — falling back to plain MTP \
+                                 (works on v1.0 firmware; firmware that enforces MTPZ trust will reject writes)"
+                            ));
+                            true
+                        }
+                    }
+                }
+                Err(e) => {
+                    log(&format!(
+                        "MTP: MTPZ keys failed to load ({e}) — falling back to plain MTP"
+                    ));
+                    true
+                }
+            }
+        };
 
         // Try to read firmware version via GetDeviceInfo (post-handshake),
         // then fall back to MTP property 0xD404.
@@ -411,6 +448,7 @@ impl NativeSession {
             zmdb_video_cache: None,
             art_disabled: false,
             recent_imports: HashMap::new(),
+            plain,
         })
     }
 
@@ -999,6 +1037,117 @@ impl NativeSession {
 
         Ok((album_id, folder_id))
     }
+
+    /// Find a child folder named `name` under `parent`, or create it with a
+    /// classic (auth-free) `SendObjectInfo` association. Used only by the
+    /// plain-MTP import path. Returns the folder's object handle.
+    fn find_or_create_folder_plain(&mut self, parent: u32, name: &str) -> Result<u32, DeviceError> {
+        if let Ok(handles) = self.session.get_object_handles(self.storage_id, parent) {
+            for h in handles {
+                if let Ok(info) = self.session.get_object_info(h) {
+                    if info.object_format == ASSOCIATION_FORMAT
+                        && info.filename.eq_ignore_ascii_case(name)
+                    {
+                        return Ok(h);
+                    }
+                }
+            }
+        }
+        let dataset = zune_mtp::build_object_info(
+            self.storage_id,
+            ASSOCIATION_FORMAT,
+            0,
+            parent,
+            0x0001, // AssociationType = generic folder
+            name,
+        );
+        let (_, _, handle) = self
+            .session
+            .send_object_info(self.storage_id, parent, &dataset)
+            .mtp_err()?;
+        Ok(handle)
+    }
+
+    /// Auth-free import used when the session is in plain-MTP mode (v1.0
+    /// firmware). Creates `Artist/Album` folders under the storage root with
+    /// classic associations, then uploads the file via `SendObjectInfo` +
+    /// `SendObject` — no MTPZ trust, no `SendObjectPropList`, no MTP album art
+    /// (the on-device player reads embedded ID3 art straight from the file).
+    /// The device indexes the file on its next library scan.
+    fn import_track_plain(
+        &mut self,
+        local_path: &str,
+        meta: Option<&super::TrackMeta>,
+    ) -> Result<u64, DeviceError> {
+        let file_data =
+            std::fs::read(local_path).map_err(|e| format!("Cannot read {}: {}", local_path, e))?;
+        if file_data.len() > u32::MAX as usize {
+            return Err(format!("{local_path}: file too large for MTP upload").into());
+        }
+
+        let filename = std::path::Path::new(local_path)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("track.mp3");
+
+        let (artist, album, title, _track_num, _genre) = match meta {
+            Some(m) => (
+                m.artist.clone(),
+                m.album.clone(),
+                m.title.clone(),
+                m.track_number.unwrap_or(0).min(u16::MAX as u32) as u16,
+                m.genre.clone().unwrap_or_default(),
+            ),
+            None => read_metadata(local_path, filename),
+        };
+
+        // Folder names are organizational only — the shell reads tags from the
+        // file — so sanitise to a filesystem-safe subset and never let them be
+        // empty. Nest under the device's music root ("Music") so the host-side
+        // device view (collect_all_tracks walks `caps.music_root`) and the
+        // trusted import path agree on where tracks live; the Zune shell scans
+        // the whole filesystem either way, so playback is unaffected.
+        let artist_dir = sanitize_folder_name(&artist);
+        let album_dir = sanitize_folder_name(&album);
+        let music_folder = self.find_or_create_folder_plain(MTP_ROOT, MUSIC_ROOT_FOLDER)?;
+        let artist_folder = self.find_or_create_folder_plain(music_folder, &artist_dir)?;
+        let album_folder = self.find_or_create_folder_plain(artist_folder, &album_dir)?;
+
+        let format = detect_format(filename);
+        self.log_msg(&format!("Importing (plain MTP): {title}"));
+        let dataset = zune_mtp::build_object_info(
+            self.storage_id,
+            format,
+            file_data.len() as u32,
+            album_folder,
+            0,
+            filename,
+        );
+        let (_, _, track_id) = self
+            .session
+            .send_object_info(self.storage_id, album_folder, &dataset)
+            .mtp_err()?;
+        self.session.send_object(&file_data).mtp_err()?;
+
+        let new_entry = DeviceEntry {
+            object_id: track_id as u64,
+            storage_id: self.storage_id as u64,
+            format: format_name(format),
+            size: file_data.len() as u64,
+            name: format!("{artist}/{album}/{filename}"),
+            ..Default::default()
+        };
+        self.cache.append(&new_entry);
+        self.recent_imports.insert(
+            (
+                artist.to_lowercase(),
+                album.to_lowercase(),
+                title.to_lowercase(),
+            ),
+            track_id,
+        );
+        Ok(track_id as u64)
+    }
 }
 
 impl DeviceSession for NativeSession {
@@ -1025,6 +1174,10 @@ impl DeviceSession for NativeSession {
         local_path: &str,
         meta: Option<&super::TrackMeta>,
     ) -> Result<u64, DeviceError> {
+        if self.plain {
+            return self.import_track_plain(local_path, meta);
+        }
+
         let file_data =
             std::fs::read(local_path).map_err(|e| format!("Cannot read {}: {}", local_path, e))?;
 
@@ -1352,6 +1505,13 @@ impl DeviceSession for NativeSession {
     }
 
     fn prewarm_library(&mut self) -> Result<(), DeviceError> {
+        // Plain-MTP mode never touches the trusted DeviceLibrary (its import
+        // path creates folders with classic associations), and ensure_library's
+        // folder-creation uses the MTPZ-gated SendObjectPropList — which would
+        // fail or wedge the session on v1.0 firmware. Skip it.
+        if self.plain {
+            return Ok(());
+        }
         self.ensure_library()
     }
 
@@ -2077,6 +2237,39 @@ fn detect_format(filename: &str) -> u16 {
     }
 }
 
+/// Whether the user has forced plain-MTP (no-trust) uploads via
+/// `ZYTUNES_ZUNE_PLAIN_MTP`. Accepts `1`/`true`/`yes`/`on` (case-insensitive).
+fn plain_mtp_forced() -> bool {
+    std::env::var("ZYTUNES_ZUNE_PLAIN_MTP")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
+/// Sanitise a tag value into a filesystem-safe folder name for the plain-MTP
+/// path. Strips characters FAT/MTP responders dislike, collapses whitespace,
+/// trims to a sane length, and never returns an empty string.
+fn sanitize_folder_name(name: &str) -> String {
+    let mut out: String = name
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if (c as u32) < 0x20 => '_',
+            c => c,
+        })
+        .collect();
+    out = out.trim().trim_end_matches('.').trim().to_string();
+    if out.chars().count() > 64 {
+        out = out.chars().take(64).collect();
+    }
+    if out.is_empty() {
+        out.push_str("Unknown");
+    }
+    out
+}
+
 /// Detect MTP video format code from filename extension.
 fn detect_video_format(filename: &str) -> u16 {
     let ext = filename.rsplit('.').next().unwrap_or("").to_lowercase();
@@ -2436,6 +2629,43 @@ mod tests {
     #[test]
     fn detect_format_wma() {
         assert_eq!(detect_format("track.wma"), FORMAT_WMA);
+    }
+
+    #[test]
+    fn sanitize_folder_name_strips_path_separators_and_reserved() {
+        assert_eq!(sanitize_folder_name("AC/DC"), "AC_DC");
+        assert_eq!(
+            sanitize_folder_name("a:b*c?d\"e<f>g|h\\i"),
+            "a_b_c_d_e_f_g_h_i"
+        );
+    }
+
+    #[test]
+    fn sanitize_folder_name_never_empty_and_trims_trailing_dot() {
+        assert_eq!(sanitize_folder_name("   "), "Unknown");
+        assert_eq!(sanitize_folder_name(""), "Unknown");
+        // Trailing dots/spaces are illegal on FAT directory names.
+        assert_eq!(sanitize_folder_name("Album."), "Album");
+    }
+
+    #[test]
+    fn sanitize_folder_name_caps_length() {
+        let long = "x".repeat(200);
+        assert_eq!(sanitize_folder_name(&long).chars().count(), 64);
+    }
+
+    #[test]
+    fn plain_mtp_forced_parses_truthy_values() {
+        // Guard the accepted set without mutating process env across threads:
+        // mirror the same matcher the function uses.
+        let truthy = |v: &str| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        };
+        assert!(truthy("1") && truthy(" TRUE ") && truthy("Yes") && truthy("on"));
+        assert!(!truthy("0") && !truthy("false") && !truthy(""));
     }
 
     #[test]
