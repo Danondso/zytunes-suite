@@ -6,10 +6,9 @@
 //! miss; the resulting FLACs land in the cache via [`store_stems`].
 //!
 //! A [`RecipeKind`] names a pipeline: `demucs` (single [`DemucsCli`]
-//! pass), or the audio-separator recipes `hq` / `sw` / `hq-harmony` (a
-//! [`CascadeSeparator`] executing [`RecipePass`] slices — Roformer
-//! vocals + demucs band, a single 6-stem Roformer, or the karaoke
-//! lead/backing split). Each recipe declares an ordered stem *layout*
+//! pass), or the audio-separator recipes `sw` / `hq-harmony` (a
+//! [`CascadeSeparator`] executing [`RecipePass`] slices — a single 6-stem
+//! Roformer, optionally followed by the karaoke lead/backing split). Each recipe declares an ordered stem *layout*
 //! that drives filenames, UI cells, digit keys, and gain indices alike.
 //!
 //! Shelling out mirrors the ffmpeg precedent (video-sync, CD rip): the
@@ -44,14 +43,11 @@ pub const MAX_STEMS: usize = 8;
 pub enum RecipeKind {
     /// The original single-pass demucs separation (default).
     Demucs,
-    /// BS-Roformer vocals + `htdemucs_6s` band cascade via
-    /// audio-separator — same six stems, audibly better vocals.
-    Hq,
     /// Single-pass jarredou BS-RoFormer-SW via audio-separator — same
-    /// six stems as `demucs`/`hq`, stronger guitar/piano than
-    /// `htdemucs_6s`.
+    /// six stems as `demucs`, better on every one. Also what the retired
+    /// `hq` config value now selects (see [`FromStr`](std::str::FromStr)).
     Sw,
-    /// The `hq` cascade plus a Mel-Roformer karaoke pass splitting the
+    /// BS-RoFormer-SW plus a Mel-Roformer karaoke pass splitting its
     /// vocals into lead + backing (seven stems).
     HqHarmony,
 }
@@ -61,9 +57,7 @@ impl RecipeKind {
     pub fn engine(self) -> provision::EngineKind {
         match self {
             RecipeKind::Demucs => provision::EngineKind::Demucs,
-            RecipeKind::Hq | RecipeKind::Sw | RecipeKind::HqHarmony => {
-                provision::EngineKind::AudioSeparator
-            }
+            RecipeKind::Sw | RecipeKind::HqHarmony => provision::EngineKind::AudioSeparator,
         }
     }
 
@@ -75,9 +69,8 @@ impl RecipeKind {
     pub fn cache_id(self, demucs_model: &str) -> String {
         match self {
             RecipeKind::Demucs => demucs_model.to_string(),
-            RecipeKind::Hq => "hq/v1".to_string(),
             RecipeKind::Sw => "sw/v1".to_string(),
-            RecipeKind::HqHarmony => "hq-harmony/v1".to_string(),
+            RecipeKind::HqHarmony => "hq-harmony/v2".to_string(),
         }
     }
 
@@ -85,7 +78,7 @@ impl RecipeKind {
     /// truth for UI cells, digit keys, gain indices, and stem filenames.
     pub fn layout(self) -> &'static [StemKind] {
         match self {
-            RecipeKind::Demucs | RecipeKind::Hq | RecipeKind::Sw => SIX_STEM_LAYOUT,
+            RecipeKind::Demucs | RecipeKind::Sw => SIX_STEM_LAYOUT,
             RecipeKind::HqHarmony => HARMONY_STEM_LAYOUT,
         }
     }
@@ -94,7 +87,6 @@ impl RecipeKind {
     pub fn config_value(self) -> &'static str {
         match self {
             RecipeKind::Demucs => "demucs",
-            RecipeKind::Hq => "hq",
             RecipeKind::Sw => "sw",
             RecipeKind::HqHarmony => "hq-harmony",
         }
@@ -102,12 +94,8 @@ impl RecipeKind {
 }
 
 /// Every recipe, in the order the settings panel lists them.
-pub const ALL_RECIPES: [RecipeKind; 4] = [
-    RecipeKind::Demucs,
-    RecipeKind::Hq,
-    RecipeKind::Sw,
-    RecipeKind::HqHarmony,
-];
+pub const ALL_RECIPES: [RecipeKind; 3] =
+    [RecipeKind::Demucs, RecipeKind::Sw, RecipeKind::HqHarmony];
 
 impl std::fmt::Display for RecipeKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -121,8 +109,10 @@ impl std::str::FromStr for RecipeKind {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "demucs" => Ok(RecipeKind::Demucs),
-            "hq" => Ok(RecipeKind::Hq),
-            "sw" => Ok(RecipeKind::Sw),
+            // `hq` was the ep_317 → htdemucs_6s cascade until SW beat it on
+            // every stem; it now resolves to the recipe that replaced it so
+            // existing configs keep working.
+            "sw" | "hq" => Ok(RecipeKind::Sw),
             "hq-harmony" => Ok(RecipeKind::HqHarmony),
             other => Err(other.to_string()),
         }
@@ -496,11 +486,8 @@ impl StemSeparator for DemucsCli {
     }
 }
 
-/// The demucs 6-source model as audio-separator names it.
-pub const AUDIO_SEPARATOR_HTDEMUCS_MODEL: &str = "htdemucs_6s.yaml";
-
 /// Shell-out to `python-audio-separator`'s `audio-separator` CLI — the
-/// engine behind the `hq`/`sw`/`hq-harmony` recipes. One invocation per model
+/// engine behind the `sw`/`hq-harmony` recipes. One invocation per model
 /// pass; `--custom_output_names` makes every pass emit our canonical
 /// stem filenames directly into `--output_dir`, so there is no
 /// engine-layout dance like demucs' model/track subdirectories.
@@ -524,18 +511,13 @@ pub fn default_model_file_dir() -> Option<PathBuf> {
 /// Every model file a current recipe can reference. Derived from the same
 /// pinned constants the recipes are built on, so a checkpoint swap
 /// automatically retires the old file for [`prune_model_cache`].
-pub fn pinned_model_files() -> [&'static str; 4] {
-    [
-        AUDIO_SEPARATOR_HTDEMUCS_MODEL,
-        BS_ROFORMER_VOCALS_MODEL,
-        MEL_ROFORMER_KARAOKE_MODEL,
-        BS_ROFORMER_SW_MODEL,
-    ]
+pub fn pinned_model_files() -> [&'static str; 2] {
+    [MEL_ROFORMER_KARAOKE_MODEL, BS_ROFORMER_SW_MODEL]
 }
 
 /// Evict retired model checkpoints from `model_dir`.
 ///
-/// A checkpoint swap (bumping [`BS_ROFORMER_VOCALS_MODEL`] etc.) orphans
+/// A checkpoint swap (bumping [`MEL_ROFORMER_KARAOKE_MODEL`] etc.) orphans
 /// the previous 0.2–1 GB file forever — nothing else walks this dir. The
 /// policy is pinned-set cleanup rather than LRU: Roformer checkpoints are
 /// pinned constants, not user config, so a `.ckpt` whose filename is not
@@ -546,11 +528,11 @@ pub fn pinned_model_files() -> [&'static str; 4] {
 /// (demucs weight segments, registry json, download locks) whose names
 /// we don't control, and deleting those would force silent re-downloads.
 ///
-/// Retirement only covers `.ckpt` models. If the yaml-named
-/// [`AUDIO_SEPARATOR_HTDEMUCS_MODEL`] is ever swapped, the old yaml and
-/// its hash-named demucs weight segments are NOT reclaimed — hash-named
-/// weights can't be attributed to a model by this policy, so a future
-/// model bump must clean those up by other means.
+/// Retirement only covers `.ckpt` models. The yaml-named `htdemucs_6s`
+/// model the retired `hq` cascade used is NOT reclaimed: its yaml and
+/// hash-named demucs weight segments can't be attributed to a model by
+/// this policy, so they stay (tens of MB) until the user clears the
+/// model cache.
 ///
 /// Also sweeps abandoned downloads. audio-separator (≥ 0.48.0) streams a
 /// checkpoint to `{file}.{pid}.partial` and renames it into place; its
@@ -663,11 +645,8 @@ pub const PARTIAL_DOWNLOAD_GRACE: std::time::Duration = std::time::Duration::fro
 /// want on disk (e.g. `"vocals"`), serialized as the JSON
 /// `--custom_output_names` expects. FLAC output matches [`STEM_EXT`].
 ///
-/// Every pass also pins the inference-cost knobs ([`MDXC_OVERLAP`],
-/// [`DEMUCS_SHIFTS`]) rather than inheriting engine defaults. Both
-/// flags are architecture-scoped in audio-separator, so passing them on
-/// every pass is harmless: Roformer passes ignore the demucs knob and
-/// vice versa.
+/// Every pass also pins [`MDXC_OVERLAP`] rather than inheriting the
+/// checkpoint's YAML default.
 pub fn build_audio_separator_args(
     model: &str,
     out_dir: &Path,
@@ -693,8 +672,6 @@ pub fn build_audio_separator_args(
         serde_json::Value::Object(names).to_string(),
         "--mdxc_overlap".into(),
         MDXC_OVERLAP.to_string(),
-        "--demucs_shifts".into(),
-        DEMUCS_SHIFTS.to_string(),
     ]
 }
 
@@ -702,40 +679,29 @@ pub fn build_audio_separator_args(
 ///
 /// Since audio-separator 0.47.0 an unset `--mdxc_overlap` falls back to
 /// each checkpoint's YAML `inference.num_overlap` (`step = chunk_size /
-/// overlap`). Our ep_317 and karaoke checkpoints declare 4, which
-/// upstream's own README notes costs several times the forward passes
-/// of 0.46.x — on CPU that made `hq` and `hq-harmony` markedly slower
-/// when we pinned 0.47.0. Upstream's suggested escape is 2; published
-/// community scores put the quality cost at a few hundredths of a dB.
-/// BS-RoFormer-SW already declares 2, so `sw` is unchanged.
+/// overlap`). Our karaoke checkpoint declares 4 (as did the retired
+/// ep_317 vocals model), which upstream's own README notes costs
+/// several times the forward passes of 0.46.x — on CPU that made the
+/// harmony recipe markedly slower when we pinned 0.47.0. Upstream's
+/// suggested escape is 2; published community scores put the quality
+/// cost at a few hundredths of a dB. BS-RoFormer-SW already declares 2.
 ///
 /// Not part of [`RecipeKind::cache_id`]: entries separated at the old
 /// overlap are at least as good, so they stay valid.
 pub const MDXC_OVERLAP: u8 = 2;
 
-/// Random-shift predictions for the htdemucs_6s pass. audio-separator
-/// defaults to 2 (two full inference passes); the plain `demucs` CLI
-/// the `demucs` recipe drives defaults to 1, so 1 keeps the `hq`
-/// recipe's band pass at parity with it at half the cost.
-pub const DEMUCS_SHIFTS: u8 = 1;
-
-/// The BS-Roformer vocals/instrumental checkpoint the `hq` recipes pin.
-/// Community-consensus best vocal model; also audio-separator's own
-/// default. Swapping it requires bumping the recipe version in
-/// [`RecipeKind::cache_id`] so cached mixes re-separate.
-pub const BS_ROFORMER_VOCALS_MODEL: &str = "model_bs_roformer_ep_317_sdr_12.9755.ckpt";
-
 /// The Mel-Roformer karaoke checkpoint (aufr33/viperx) that splits an
 /// isolated vocal take into lead + backing. Fed pass 1's full vocals —
 /// on vocals-only input its "Instrumental" output IS the backing
-/// vocals. Candidate for an A/B swap against the becruily karaoke model
-/// once live listening tests run; swapping bumps the recipe version.
+/// vocals. Swap candidate: `bs_roformer_karaoke_frazer_becruily.ckpt`
+/// (204 MB, ~+0.7 dB lead SDR on full mixes), pending a listening test
+/// on vocals-only input; swapping bumps the recipe version.
 pub const MEL_ROFORMER_KARAOKE_MODEL: &str =
     "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt";
 
 /// The jarredou BS-RoFormer-SW 6-stem checkpoint. One pass produces
-/// the same six stems as demucs/`hq`, with stronger guitar/piano than
-/// `htdemucs_6s`. audio-separator's registry name (not the upstream
+/// the same six stems as demucs, better on every published score than
+/// `htdemucs_6s` and the retired ep_317 → htdemucs cascade. audio-separator's registry name (not the upstream
 /// `BS-Rofo-SW-Fixed.ckpt` filename). Swapping it bumps
 /// [`RecipeKind::cache_id`].
 pub const BS_ROFORMER_SW_MODEL: &str = "BS-Roformer-SW.ckpt";
@@ -766,70 +732,34 @@ pub struct RecipePass {
     pub label: &'static str,
 }
 
-/// The `hq` recipe: BS-Roformer pulls vocals off the source, then
-/// htdemucs_6s separates the band from the devocalized instrumental —
-/// the community-standard cascade. Pass 2's own vocals output is
-/// near-silence by construction and maps to a discard name so it can't
-/// clobber the real vocals stem.
-pub fn hq_recipe_passes() -> &'static [RecipePass] {
+/// The `hq-harmony` recipe: BS-RoFormer-SW over the source with its
+/// vocals routed to an intermediate, then split into lead + backing by
+/// the karaoke model. SW beats the old ep_317 → htdemucs_6s cascade on
+/// every published stem (vocals, bass, drums, guitar, piano) in one
+/// pass instead of two — see `docs/stem-model-updates-research.md`.
+/// Window weights assume the SW pass dominates on CPU; tune against
+/// live timings.
+pub fn hq_harmony_recipe_passes() -> &'static [RecipePass] {
     static PASSES: [RecipePass; 2] = [
         RecipePass {
-            model: BS_ROFORMER_VOCALS_MODEL,
+            model: BS_ROFORMER_SW_MODEL,
             input: PassInput::Source,
-            output_names: &[("Vocals", "vocals"), ("Instrumental", "instrumental")],
-            window: (0, 45),
-            label: "vocals (BS-Roformer)",
-        },
-        RecipePass {
-            model: AUDIO_SEPARATOR_HTDEMUCS_MODEL,
-            input: PassInput::Produced("instrumental"),
             output_names: &[
-                ("Vocals", "band_vocals"),
+                ("Vocals", "vocals_full"),
                 ("Drums", "drums"),
                 ("Bass", "bass"),
                 ("Guitar", "guitar"),
                 ("Piano", "piano"),
                 ("Other", "other"),
             ],
-            window: (45, 100),
-            label: "band (htdemucs_6s over the instrumental)",
-        },
-    ];
-    &PASSES
-}
-
-/// The `hq-harmony` recipe: the hq cascade with the vocal take routed
-/// to an intermediate, then split into lead + backing by the karaoke
-/// model. Window weights assume the two Roformer passes dominate on
-/// CPU; tune against live timings.
-pub fn hq_harmony_recipe_passes() -> &'static [RecipePass] {
-    static PASSES: [RecipePass; 3] = [
-        RecipePass {
-            model: BS_ROFORMER_VOCALS_MODEL,
-            input: PassInput::Source,
-            output_names: &[("Vocals", "vocals_full"), ("Instrumental", "instrumental")],
-            window: (0, 35),
-            label: "vocals (BS-Roformer)",
-        },
-        RecipePass {
-            model: AUDIO_SEPARATOR_HTDEMUCS_MODEL,
-            input: PassInput::Produced("instrumental"),
-            output_names: &[
-                ("Vocals", "band_vocals"),
-                ("Drums", "drums"),
-                ("Bass", "bass"),
-                ("Guitar", "guitar"),
-                ("Piano", "piano"),
-                ("Other", "other"),
-            ],
-            window: (35, 70),
-            label: "band (htdemucs_6s over the instrumental)",
+            window: (0, 60),
+            label: "6-stem (BS-RoFormer-SW)",
         },
         RecipePass {
             model: MEL_ROFORMER_KARAOKE_MODEL,
             input: PassInput::Produced("vocals_full"),
             output_names: &[("Vocals", "lead"), ("Instrumental", "backing")],
-            window: (70, 100),
+            window: (60, 100),
             label: "lead/backing split (Mel-Roformer karaoke)",
         },
     ];
@@ -837,7 +767,7 @@ pub fn hq_harmony_recipe_passes() -> &'static [RecipePass] {
 }
 
 /// The `sw` recipe: jarredou BS-RoFormer-SW over the source in one
-/// pass. Same six-stem layout as `demucs`/`hq`; any extra engine
+/// pass. Same six-stem layout as `demucs`; any extra engine
 /// output (e.g. an Instrumental mix) is left in the work dir and
 /// discarded with it.
 pub fn sw_recipe_passes() -> &'static [RecipePass] {
@@ -914,7 +844,7 @@ pub struct CascadeSeparator {
 }
 
 /// Build the separator a recipe drives: `DemucsCli` for the demucs
-/// recipe, a `CascadeSeparator` over audio-separator for the hq recipes.
+/// recipe, a `CascadeSeparator` over audio-separator for the Roformer recipes.
 /// `Err` carries a user-visible message. Shared by the TUI worker and
 /// `zytunes-serve` so a checkpoint / layout change cannot drift.
 pub fn recipe_separator(
@@ -928,7 +858,7 @@ pub fn recipe_separator(
             model: demucs_model.to_string(),
             layout: recipe.layout(),
         }),
-        RecipeKind::Hq | RecipeKind::Sw | RecipeKind::HqHarmony => {
+        RecipeKind::Sw | RecipeKind::HqHarmony => {
             let model_file_dir = default_model_file_dir()
                 .ok_or_else(|| "cannot resolve $HOME for the model cache".to_string())?;
             Box::new(CascadeSeparator {
@@ -938,8 +868,7 @@ pub fn recipe_separator(
                 },
                 passes: match recipe {
                     RecipeKind::HqHarmony => hq_harmony_recipe_passes(),
-                    RecipeKind::Sw => sw_recipe_passes(),
-                    _ => hq_recipe_passes(),
+                    _ => sw_recipe_passes(),
                 },
                 layout: recipe.layout(),
             })
@@ -1061,7 +990,7 @@ pub fn stem_cache_key(source_path: &str, cache_id: &str) -> String {
 /// just wrote. No shipped cache id contains a dot, so nothing regresses.
 ///
 /// The mapping is lossy, so distinct raw ids can share a dirname (a
-/// demucs `model = "hq-v1"` collides with the `hq` recipe's `"hq/v1"`).
+/// demucs `model = "sw-v1"` collides with the `sw` recipe's `"sw/v1"`).
 /// That is thrash, not corruption: `cached_stems` checks the raw
 /// `meta.model`, so the colliding configs evict each other on every flip
 /// but the wrong stems are never served.
@@ -1428,7 +1357,6 @@ mod tests {
     fn recipe_parses_config_values_and_rejects_unknown() {
         for (value, kind) in [
             ("demucs", RecipeKind::Demucs),
-            ("hq", RecipeKind::Hq),
             ("sw", RecipeKind::Sw),
             ("hq-harmony", RecipeKind::HqHarmony),
         ] {
@@ -1436,6 +1364,10 @@ mod tests {
             // Display round-trips to the config value.
             assert_eq!(kind.to_string(), value);
         }
+        // The retired `hq` cascade resolves to the recipe that replaced it,
+        // so an existing `recipe = "hq"` config keeps working; it is never
+        // written back (Display gives "sw").
+        assert_eq!("hq".parse::<RecipeKind>(), Ok(RecipeKind::Sw));
         assert!("roformer".parse::<RecipeKind>().is_err());
         assert!("".parse::<RecipeKind>().is_err());
     }
@@ -1444,7 +1376,6 @@ mod tests {
     fn recipe_engine_mapping() {
         use crate::stems::provision::EngineKind;
         assert_eq!(RecipeKind::Demucs.engine(), EngineKind::Demucs);
-        assert_eq!(RecipeKind::Hq.engine(), EngineKind::AudioSeparator);
         assert_eq!(RecipeKind::Sw.engine(), EngineKind::AudioSeparator);
         assert_eq!(RecipeKind::HqHarmony.engine(), EngineKind::AudioSeparator);
     }
@@ -1457,23 +1388,18 @@ mod tests {
         assert_eq!(RecipeKind::Demucs.cache_id("htdemucs_6s"), "htdemucs_6s");
         assert_eq!(RecipeKind::Demucs.cache_id("htdemucs"), "htdemucs");
         // Multi-pass recipes carry an explicit version so a checkpoint
-        // swap can force re-separation by bumping it.
-        assert_eq!(RecipeKind::Hq.cache_id("htdemucs_6s"), "hq/v1");
+        // swap can force re-separation by bumping it. hq-harmony is v2:
+        // its band and vocals now come from SW, not the ep_317 cascade.
         assert_eq!(RecipeKind::Sw.cache_id("htdemucs_6s"), "sw/v1");
         assert_eq!(
             RecipeKind::HqHarmony.cache_id("htdemucs_6s"),
-            "hq-harmony/v1"
+            "hq-harmony/v2"
         );
         // Distinct recipes must never collide in the cache.
-        let ids = [
-            RecipeKind::Demucs.cache_id("htdemucs_6s"),
-            RecipeKind::Hq.cache_id("htdemucs_6s"),
-            RecipeKind::Sw.cache_id("htdemucs_6s"),
-            RecipeKind::HqHarmony.cache_id("htdemucs_6s"),
-        ];
+        let ids = ALL_RECIPES.map(|r| r.cache_id("htdemucs_6s"));
         assert_eq!(
             ids.iter().collect::<std::collections::HashSet<_>>().len(),
-            4
+            ALL_RECIPES.len()
         );
     }
 
@@ -1788,14 +1714,16 @@ mod tests {
 
     #[test]
     fn pinned_model_files_names_every_recipe_checkpoint() {
+        // Derived from the recipes themselves: a model a pass references
+        // but the pinned set forgets would be evicted as "retired" after
+        // every run and silently re-downloaded on the next.
         let pinned = pinned_model_files();
-        for name in [
-            AUDIO_SEPARATOR_HTDEMUCS_MODEL,
-            BS_ROFORMER_VOCALS_MODEL,
-            MEL_ROFORMER_KARAOKE_MODEL,
-            BS_ROFORMER_SW_MODEL,
-        ] {
-            assert!(pinned.contains(&name), "{name} must be in the pinned set");
+        for pass in sw_recipe_passes().iter().chain(hq_harmony_recipe_passes()) {
+            assert!(
+                pinned.contains(&pass.model),
+                "{} must be in the pinned set",
+                pass.model
+            );
         }
     }
 
@@ -1805,10 +1733,10 @@ mod tests {
         let dir = root.join("models");
         std::fs::create_dir_all(&dir).unwrap();
         // Currently pinned checkpoint + its engine-downloaded config.
-        std::fs::write(dir.join(BS_ROFORMER_VOCALS_MODEL), b"pinned").unwrap();
+        std::fs::write(dir.join(BS_ROFORMER_SW_MODEL), b"pinned").unwrap();
         let pinned_yaml = format!(
             "{}.yaml",
-            Path::new(BS_ROFORMER_VOCALS_MODEL)
+            Path::new(BS_ROFORMER_SW_MODEL)
                 .file_stem()
                 .unwrap()
                 .to_str()
@@ -1827,7 +1755,7 @@ mod tests {
 
         prune_model_cache(&dir, &pinned_model_files(), &default_logger());
 
-        assert!(dir.join(BS_ROFORMER_VOCALS_MODEL).exists(), "pinned stays");
+        assert!(dir.join(BS_ROFORMER_SW_MODEL).exists(), "pinned stays");
         assert!(dir.join(&pinned_yaml).exists(), "pinned sidecar stays");
         assert!(
             !dir.join("old_roformer_sdr_1.0.ckpt").exists(),
@@ -1869,29 +1797,27 @@ mod tests {
 
     #[test]
     fn prune_model_cache_never_retires_a_pinned_stem() {
-        // AUDIO_SEPARATOR_HTDEMUCS_MODEL is pinned by its *yaml* name. A
+        // A model pinned by its *yaml* name (as htdemucs_6s once was). A
         // stray non-pinned same-stem .ckpt must not mark that stem
         // retired — the sweep would otherwise take the live model's
         // sidecars with it, forcing a silent re-download. Leaking the
         // stray file is the safe outcome.
+        const YAML_PINNED: &str = "htdemucs_6s.yaml";
         let root = temp_root("model-prune-pinned-stem");
         let dir = root.join("models");
         std::fs::create_dir_all(&dir).unwrap();
-        let stem = Path::new(AUDIO_SEPARATOR_HTDEMUCS_MODEL)
+        let stem = Path::new(YAML_PINNED)
             .file_stem()
             .unwrap()
             .to_str()
             .unwrap();
-        std::fs::write(dir.join(AUDIO_SEPARATOR_HTDEMUCS_MODEL), b"pinned").unwrap();
+        std::fs::write(dir.join(YAML_PINNED), b"pinned").unwrap();
         std::fs::write(dir.join(format!("{stem}.ckpt")), b"stray").unwrap();
         std::fs::write(dir.join(format!("{stem}.json")), b"engine-cfg").unwrap();
 
-        prune_model_cache(&dir, &pinned_model_files(), &default_logger());
+        prune_model_cache(&dir, &[YAML_PINNED], &default_logger());
 
-        assert!(
-            dir.join(AUDIO_SEPARATOR_HTDEMUCS_MODEL).exists(),
-            "pinned yaml stays"
-        );
+        assert!(dir.join(YAML_PINNED).exists(), "pinned yaml stays");
         assert!(
             dir.join(format!("{stem}.ckpt")).exists(),
             "stray same-stem ckpt is leaked, not retired"
@@ -2005,11 +1931,10 @@ mod tests {
             ("--output_dir", "/tmp/out"),
             ("--output_format", "flac"),
             ("--model_file_dir", "/cache/models"),
-            // Pinned cost knobs: dropping either silently reverts to the
-            // engine defaults (YAML overlap 4 / shifts 2), multiplying
-            // CPU separation time.
+            // Pinned cost knob: dropping it silently reverts to the
+            // checkpoint's YAML overlap (4 on the karaoke model),
+            // multiplying CPU separation time.
             ("--mdxc_overlap", "2"),
-            ("--demucs_shifts", "1"),
         ] {
             assert!(
                 args.windows(2).any(|w| w[0] == flag && w[1] == value),
@@ -2048,7 +1973,6 @@ mod tests {
         assert!(HARMONY_STEM_LAYOUT.len() <= MAX_STEMS);
 
         assert_eq!(RecipeKind::Demucs.layout(), SIX_STEM_LAYOUT);
-        assert_eq!(RecipeKind::Hq.layout(), SIX_STEM_LAYOUT);
         assert_eq!(RecipeKind::Sw.layout(), SIX_STEM_LAYOUT);
         assert_eq!(RecipeKind::HqHarmony.layout(), HARMONY_STEM_LAYOUT);
 
@@ -2067,23 +1991,24 @@ mod tests {
     #[test]
     fn harmony_passes_produce_exactly_the_harmony_layout() {
         let passes = hq_harmony_recipe_passes();
-        assert_eq!(passes.len(), 3, "vocals, band, karaoke");
+        assert_eq!(passes.len(), 2, "SW 6-stem, then karaoke");
 
-        // Pass 1 extracts the full vocal take to an INTERMEDIATE name —
-        // the harmony layout has no plain "vocals" stem to collide with.
+        // Pass 1 is SW over the source; its vocals go to an INTERMEDIATE
+        // name — the harmony layout has no plain "vocals" stem.
         assert!(matches!(passes[0].input, PassInput::Source));
+        assert_eq!(passes[0].model, BS_ROFORMER_SW_MODEL);
         assert!(passes[0]
             .output_names
             .iter()
-            .any(|(_, v)| *v == "vocals_full"));
+            .any(|(k, v)| *k == "Vocals" && *v == "vocals_full"));
 
-        // Pass 3 splits that take into lead + backing with the pinned
+        // Pass 2 splits that take into lead + backing with the pinned
         // karaoke checkpoint.
         assert!(matches!(
-            passes[2].input,
+            passes[1].input,
             PassInput::Produced("vocals_full")
         ));
-        assert_eq!(passes[2].model, MEL_ROFORMER_KARAOKE_MODEL);
+        assert_eq!(passes[1].model, MEL_ROFORMER_KARAOKE_MODEL);
 
         // Union of outputs covers the harmony layout exactly once.
         for kind in HARMONY_STEM_LAYOUT {
@@ -2098,8 +2023,7 @@ mod tests {
         // Windows tile 0..=100.
         assert_eq!(passes[0].window.0, 0);
         assert_eq!(passes[0].window.1, passes[1].window.0);
-        assert_eq!(passes[1].window.1, passes[2].window.0);
-        assert_eq!(passes[2].window.1, 100);
+        assert_eq!(passes[1].window.1, 100);
     }
 
     #[test]
@@ -2149,58 +2073,6 @@ mod tests {
         // there is no vocals.flac in a harmony entry.
         assert!(cached_stems(&cache, &source, "hq-harmony/v1", SIX_STEM_LAYOUT, &log).is_none());
         let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn hq_passes_produce_exactly_the_six_canonical_stems() {
-        let passes = hq_recipe_passes();
-        assert_eq!(passes.len(), 2, "vocals pass + band pass");
-
-        // Pass 1: BS-Roformer over the source, producing the vocals stem
-        // and the intermediate the band pass consumes.
-        assert!(matches!(passes[0].input, PassInput::Source));
-        assert_eq!(passes[0].model, BS_ROFORMER_VOCALS_MODEL);
-        assert!(passes[0]
-            .output_names
-            .iter()
-            .any(|(k, v)| *k == "Vocals" && *v == "vocals"));
-        assert!(passes[0]
-            .output_names
-            .iter()
-            .any(|(_, v)| *v == "instrumental"));
-
-        // Pass 2: htdemucs_6s over pass 1's instrumental.
-        assert!(matches!(
-            passes[1].input,
-            PassInput::Produced("instrumental")
-        ));
-        assert_eq!(passes[1].model, AUDIO_SEPARATOR_HTDEMUCS_MODEL);
-        // Its vocals output is residue (the input is already devocalized)
-        // and must NOT overwrite pass 1's real vocals stem.
-        let band_vocals = passes[1]
-            .output_names
-            .iter()
-            .find(|(k, _)| *k == "Vocals")
-            .expect("pass 2 must name its vocals output somewhere");
-        assert_ne!(
-            band_vocals.1, "vocals",
-            "residue may not clobber the real stem"
-        );
-
-        // Union of all pass outputs covers every canonical stem exactly once.
-        for kind in SIX_STEM_LAYOUT {
-            let count = passes
-                .iter()
-                .flat_map(|p| p.output_names.iter())
-                .filter(|(_, v)| *v == kind.file_stem())
-                .count();
-            assert_eq!(count, 1, "{kind:?} must be produced exactly once");
-        }
-
-        // Progress windows tile 0..=100 without gaps or overlap.
-        assert_eq!(passes[0].window.0, 0);
-        assert_eq!(passes[0].window.1, passes[1].window.0);
-        assert_eq!(passes[1].window.1, 100);
     }
 
     #[test]
@@ -2266,8 +2138,8 @@ mod tests {
                 command: write_stub_audio_separator(&root),
                 model_file_dir: root.join("models"),
             },
-            passes: hq_recipe_passes(),
-            layout: SIX_STEM_LAYOUT,
+            passes: hq_harmony_recipe_passes(),
+            layout: HARMONY_STEM_LAYOUT,
         };
         let ticks = std::sync::Mutex::new(Vec::new());
         let lines = std::sync::Mutex::new(Vec::new());
@@ -2281,14 +2153,14 @@ mod tests {
             )
             .expect("stub cascade succeeds");
         assert!(set.all_exist());
-        assert_eq!(set.paths[0], out_dir.join("vocals.flac"));
+        assert_eq!(set.paths[0], out_dir.join("lead.flac"));
 
-        // The stub emits a 50% tick per pass: windowed into (0,45) that
-        // is 22, into (45,100) it is 72. Ticks must be monotone within
+        // The stub emits a 50% tick per pass: windowed into (0,60) that
+        // is 30, into (60,100) it is 80. Ticks must be monotone within
         // the run and end at 100.
         let ticks = ticks.into_inner().unwrap();
-        assert!(ticks.contains(&22), "pass-1 windowed tick: {ticks:?}");
-        assert!(ticks.contains(&72), "pass-2 windowed tick: {ticks:?}");
+        assert!(ticks.contains(&30), "pass-1 windowed tick: {ticks:?}");
+        assert!(ticks.contains(&80), "pass-2 windowed tick: {ticks:?}");
         assert_eq!(*ticks.last().unwrap(), 100);
         assert!(
             ticks.windows(2).all(|w| w[0] <= w[1]),
@@ -2311,7 +2183,7 @@ mod tests {
         let src = root.join("song.flac");
         std::fs::write(&src, b"flac").unwrap();
         // Stub writes nothing: pass 1 "succeeds" but produces no
-        // instrumental, so pass 2's input is missing — the error must
+        // vocals_full, so pass 2's input is missing — the error must
         // name that file, not a generic engine failure.
         let script = root.join("audio-separator");
         std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
@@ -2321,8 +2193,8 @@ mod tests {
                 command: script,
                 model_file_dir: root.join("models"),
             },
-            passes: hq_recipe_passes(),
-            layout: SIX_STEM_LAYOUT,
+            passes: hq_harmony_recipe_passes(),
+            layout: HARMONY_STEM_LAYOUT,
         };
         let err = sep
             .separate(&src, &root.join("work"), &|| false, &|_| {}, &|_| {})
@@ -2330,7 +2202,7 @@ mod tests {
         match err {
             StemError::MissingOutput(p) => {
                 assert!(
-                    p.to_string_lossy().contains("instrumental"),
+                    p.to_string_lossy().contains("vocals_full"),
                     "should name the missing intermediate: {p:?}"
                 )
             }

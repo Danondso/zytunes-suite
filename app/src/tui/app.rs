@@ -12188,7 +12188,7 @@ mod tests {
     #[test]
     fn stem_panel_opens_on_the_configured_recipe_and_wraps() {
         let mut app = stem_panel_app();
-        app.stems_cfg.recipe = Some("hq".into());
+        app.stems_cfg.recipe = Some("sw".into());
         app.open_stem_panel();
         assert_eq!(
             app.stem_panel.as_ref().unwrap().selected,
@@ -12209,10 +12209,10 @@ mod tests {
     fn stem_panel_confirm_updates_recipe_in_memory_and_closes() {
         let mut app = stem_panel_app();
         app.open_stem_panel();
-        app.stem_panel_move(1); // demucs → hq
+        app.stem_panel_move(1); // demucs → sw
         let persisted = app.stem_panel_confirm_in_memory();
-        assert_eq!(persisted.as_deref(), Some("hq"));
-        assert_eq!(app.stems_cfg.recipe.as_deref(), Some("hq"));
+        assert_eq!(persisted.as_deref(), Some("sw"));
+        assert_eq!(app.stems_cfg.recipe.as_deref(), Some("sw"));
         assert!(app.stem_panel.is_none(), "panel closes on confirm");
     }
 
@@ -12238,7 +12238,7 @@ mod tests {
             ))
         };
         app.open_stem_panel();
-        app.stem_panel_move(1); // hq → audio-separator
+        app.stem_panel_move(1); // sw → audio-separator
         app.stem_panel_request_uninstall();
         assert!(app.stem_panel.as_ref().unwrap().confirm_uninstall);
         app.stem_panel_uninstall(false);
@@ -12581,13 +12581,13 @@ mod tests {
         // dispatch_separation re-reading config logged the unknown-recipe
         // warning twice per M-press. End-to-end: config recipe → command.
         let mut app = stem_playing_app("/lib/song.mp3");
-        app.stems_cfg.recipe = Some("hq".into());
+        app.stems_cfg.recipe = Some("hq-harmony".into());
         app.stem_engine_finder = |_, _| Some(std::path::PathBuf::from("/bin/engine"));
         app.press_stem_mode();
         assert!(matches!(
             app.pending_bg_commands.as_slice(),
             [BgCommand::SeparateStems {
-                recipe: zytunes::stems::RecipeKind::Hq,
+                recipe: zytunes::stems::RecipeKind::HqHarmony,
                 ..
             }]
         ));
@@ -12624,11 +12624,11 @@ mod tests {
     }
 
     #[test]
-    fn hq_consent_offers_the_pinned_audio_separator_package() {
-        // No engine in the test env, recipe = hq: the consent modal must
+    fn sw_consent_offers_the_pinned_audio_separator_package() {
+        // No engine in the test env, recipe = sw: the consent modal must
         // name the audio-separator install, not demucs.
         let mut app = stem_playing_app("/lib/song.mp3");
-        app.stems_cfg.recipe = Some("hq".into());
+        app.stems_cfg.recipe = Some("sw".into());
         app.press_stem_mode();
         let consent = app.stems.consent.as_ref().expect("consent modal");
         assert_eq!(

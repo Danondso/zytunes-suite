@@ -119,10 +119,9 @@ pub struct StemsConfig {
     /// or somewhere easy to reach when you want to grab the separated
     /// stems by hand. A blank string behaves like unset.
     pub cache_dir: Option<String>,
-    /// Separation recipe: `"demucs"` (default), `"hq"` (the Roformer
-    /// vocals / demucs band cascade), `"sw"` (single-pass 6-stem
-    /// BS-RoFormer-SW), or `"hq-harmony"` (adds lead/backing vocal
-    /// stems). Its `cache_id` is recorded in each
+    /// Separation recipe: `"demucs"` (default), `"sw"` (single-pass
+    /// 6-stem BS-RoFormer-SW), or `"hq-harmony"` (SW plus lead/backing
+    /// vocal stems). The retired `"hq"` cascade still parses, as `sw`. Its `cache_id` is recorded in each
     /// stem-cache entry's metadata, so switching recipes re-separates on
     /// next use (the entry directory itself is keyed by source path
     /// alone — see todos.md for per-recipe coexistence).
@@ -608,7 +607,8 @@ cache_max_gb = 25
 
         for (raw, kind) in [
             ("demucs", zytunes::stems::RecipeKind::Demucs),
-            ("hq", zytunes::stems::RecipeKind::Hq),
+            // Retired cascade: an existing `recipe = "hq"` now runs sw.
+            ("hq", zytunes::stems::RecipeKind::Sw),
             ("sw", zytunes::stems::RecipeKind::Sw),
             ("hq-harmony", zytunes::stems::RecipeKind::HqHarmony),
         ] {
