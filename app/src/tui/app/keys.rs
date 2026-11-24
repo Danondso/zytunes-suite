@@ -107,32 +107,24 @@ impl App {
         true
     }
 
-    /// While stem playback is Active, digit keys `1..=layout.len()` (6 or
-    /// 7 per the active recipe layout) toggle stems — they normally
-    /// switch sidebar modes / jump panels. Everything else falls through:
-    /// digits beyond the layout (key `7` under six-stem layouts) keep
-    /// their global meaning, and `M` in the global map exits stem mode.
-    /// Claiming is additionally gated on the strip being visible: with
-    /// the player panel hidden (`P` force-hidden, or a terminal too short
-    /// for it), `1`/`2` silently mutating invisible stems read as the
-    /// sidebar keys going dead.
+    /// While stem playback is Active, digit keys toggle the stem strip's
+    /// cells — they normally switch sidebar modes / jump panels. `1..=9`
+    /// address the top-level cells (a split source like lead/backing
+    /// vocals is one cell), or the parts of the group `0` expanded; `0`
+    /// cycles which group is expanded. Everything else falls through:
+    /// a digit with no cell behind it keeps its global meaning, `0` does
+    /// too when the layout has no groups, and `M` in the global map
+    /// exits stem mode. Claiming is additionally gated on the strip
+    /// being visible: with the player panel hidden (`P` force-hidden, or
+    /// a terminal too short for it), `1`/`2` silently mutating invisible
+    /// stems read as the sidebar keys going dead.
     fn handle_stem_key(&mut self, key: KeyEvent) -> bool {
         if self.stems.status != super::StemStatus::Active || !self.stem_strip_visible() {
             return false;
         }
         match key.code {
-            KeyCode::Char(c @ '1'..='8') => {
-                // Claim only digits inside the active layout: key 7
-                // toggles the harmony layout's 7th stem but must fall
-                // through to global handling under a six-stem layout.
-                let index = c as usize - '1' as usize;
-                if index < self.stems.layout.map_or(0, |l| l.len()) {
-                    self.toggle_stem(index);
-                    true
-                } else {
-                    false
-                }
-            }
+            KeyCode::Char('0') => self.cycle_stem_group(),
+            KeyCode::Char(c @ '1'..='9') => self.press_stem_digit(c as usize - '1' as usize),
             _ => false,
         }
     }

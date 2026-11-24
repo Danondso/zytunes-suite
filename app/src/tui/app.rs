@@ -428,6 +428,10 @@ pub struct StemState {
     /// Ordered stems of the ACTIVE set — the recipe layout the strip
     /// renders and the digit keys claim against. `None` outside Active.
     pub layout: Option<&'static [zytunes::stems::StemKind]>,
+    /// Strip cell (an index into [`zytunes::stems::strip_cells`] of
+    /// `layout`) whose group is expanded so the digits reach its parts;
+    /// `None` = collapsed. Cycled by `0`.
+    pub expanded: Option<usize>,
     /// Library path of the track the current status refers to.
     pub for_path: Option<String>,
     /// Path awaiting separation once provisioning completes.
@@ -451,6 +455,7 @@ impl Default for StemState {
             gains: None,
             enabled: [true; zytunes::stems::MAX_STEMS],
             layout: None,
+            expanded: None,
             for_path: None,
             pending_path: None,
             consent: None,
@@ -467,6 +472,7 @@ impl StemState {
         self.gains = None;
         self.enabled = [true; zytunes::stems::MAX_STEMS];
         self.layout = None;
+        self.expanded = None;
         self.for_path = None;
     }
 }
@@ -3910,14 +3916,88 @@ impl App {
     /// Bounded by the active layout, not the capacity — index 6 exists
     /// under harmony but not under the six-stem layouts.
     pub fn toggle_stem(&mut self, index: usize) {
+        if let Some(&on) = self.stems.enabled.get(index) {
+            self.set_stem(index, !on);
+        }
+    }
+
+    /// Set stem `index` audible or muted (UI mirror + mixer gain). No-op
+    /// outside Active or past the active layout.
+    fn set_stem(&mut self, index: usize, on: bool) {
         let stem_count = self.stems.layout.map_or(0, |l| l.len());
         if self.stems.status != StemStatus::Active || index >= stem_count {
             return;
         }
-        self.stems.enabled[index] = !self.stems.enabled[index];
+        self.stems.enabled[index] = on;
         if let Some(ref gains) = self.stems.gains {
-            zytunes::stems::set_stem_gain(gains, index, self.stems.enabled[index]);
+            zytunes::stems::set_stem_gain(gains, index, on);
         }
+    }
+
+    /// Top-level strip cells of the active layout (empty outside Active).
+    pub fn stem_cells(&self) -> Vec<zytunes::stems::StemCell> {
+        self.stems
+            .layout
+            .map(zytunes::stems::strip_cells)
+            .unwrap_or_default()
+    }
+
+    /// The expanded group's cell, if one is open and still valid.
+    pub fn expanded_stem_cell(&self) -> Option<zytunes::stems::StemCell> {
+        let cell = self.stem_cells().into_iter().nth(self.stems.expanded?)?;
+        matches!(cell, zytunes::stems::StemCell::Group { .. }).then_some(cell)
+    }
+
+    /// Digit key `n` (0-based) while stems are Active. Collapsed, it
+    /// toggles top-level cell `n` — a group mutes all its parts when any
+    /// is audible, else unmutes them all. Expanded, it toggles part `n`
+    /// of the open group. Returns `false` when nothing sits at `n`, so
+    /// the key keeps its global meaning.
+    pub fn press_stem_digit(&mut self, n: usize) -> bool {
+        if self.stems.status != StemStatus::Active {
+            return false;
+        }
+        if let Some(cell) = self.expanded_stem_cell() {
+            let parts = cell.members();
+            if n >= parts.len() {
+                return false;
+            }
+            self.toggle_stem(parts.start + n);
+            return true;
+        }
+        let Some(cell) = self.stem_cells().into_iter().nth(n) else {
+            return false;
+        };
+        let parts = cell.members();
+        let any_on = parts.clone().any(|i| self.stems.enabled[i]);
+        for i in parts {
+            self.set_stem(i, !any_on);
+        }
+        true
+    }
+
+    /// `0`: step the expanded group — collapsed → first group → next
+    /// group → … → collapsed. Returns `false` when the layout has no
+    /// groups (nothing to expand; the key falls through).
+    pub fn cycle_stem_group(&mut self) -> bool {
+        if self.stems.status != StemStatus::Active {
+            return false;
+        }
+        let groups: Vec<usize> = self
+            .stem_cells()
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| matches!(c, zytunes::stems::StemCell::Group { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        if groups.is_empty() {
+            return false;
+        }
+        self.stems.expanded = match self.stems.expanded {
+            None => Some(groups[0]),
+            Some(open) => groups.iter().copied().find(|&g| g > open),
+        };
+        true
     }
 
     /// Library path of the track that is playing right now, if any.
@@ -11977,20 +12057,25 @@ mod tests {
 
     #[test]
     fn stem_keys_claim_range_follows_active_layout() {
-        // Harmony layout: key 7 toggles stem 6; key 8 falls through.
+        // Harmony layout collapses to six cells: lead + backing are one
+        // Vocals cell, so key 1 toggles both and key 7 falls through.
         let mut app = stem_playing_app("/lib/song.mp3");
         app.last_term_height = 40;
         app.stems.status = StemStatus::Active;
         app.stems.layout = Some(zytunes::stems::HARMONY_STEM_LAYOUT);
         app.stems.gains = Some(zytunes::stems::new_stem_gains(&[true; 7]));
         app.stems.enabled = [true; zytunes::stems::MAX_STEMS];
-        stem_key(&mut app, KeyCode::Char('7'));
-        assert!(!app.stems.enabled[6], "key 7 toggles the 7th stem");
+        stem_key(&mut app, KeyCode::Char('1'));
+        assert!(
+            !app.stems.enabled[0] && !app.stems.enabled[1],
+            "key 1 mutes the whole vocals group"
+        );
+        assert!(app.stems.enabled[2], "drums untouched");
         let before = app.stems.enabled;
-        stem_key(&mut app, KeyCode::Char('8'));
-        assert_eq!(app.stems.enabled, before, "key 8 is beyond the layout");
+        stem_key(&mut app, KeyCode::Char('7'));
+        assert_eq!(app.stems.enabled, before, "no seventh cell to claim");
 
-        // Six-stem layout: key 7 must fall through to global handling.
+        // Six-stem layout: key 7 and key 0 both fall through.
         let mut app = stem_playing_app("/lib/song.mp3");
         app.last_term_height = 40;
         app.stems.status = StemStatus::Active;
@@ -12002,6 +12087,77 @@ mod tests {
             app.stems.enabled[6],
             "key 7 unclaimed under a 6-stem layout"
         );
+        assert!(!app.cycle_stem_group(), "no groups: 0 has nothing to open");
+        assert_eq!(app.stems.expanded, None);
+    }
+
+    #[test]
+    fn zero_expands_a_group_so_digits_reach_its_parts() {
+        let mut app = stem_playing_app("/lib/song.mp3");
+        app.last_term_height = 40;
+        app.stems.status = StemStatus::Active;
+        app.stems.layout = Some(zytunes::stems::HARMONY_STEM_LAYOUT);
+        app.stems.gains = Some(zytunes::stems::new_stem_gains(&[true; 7]));
+        app.stems.enabled = [true; zytunes::stems::MAX_STEMS];
+
+        // 0 opens the vocals group: key 1 is now lead alone, key 2
+        // backing, and key 3 (no third part) falls through.
+        stem_key(&mut app, KeyCode::Char('0'));
+        assert_eq!(app.stems.expanded, Some(0));
+        stem_key(&mut app, KeyCode::Char('1'));
+        assert!(!app.stems.enabled[0], "lead muted");
+        assert!(app.stems.enabled[1], "backing untouched");
+        let gains = app.stems.gains.clone().unwrap();
+        assert_eq!(zytunes::stems::stem_gain(&gains, 0), 0.0, "mixer follows");
+        let before = app.stems.enabled;
+        stem_key(&mut app, KeyCode::Char('3'));
+        assert_eq!(app.stems.enabled, before, "past the group's parts");
+
+        // 0 again: only one group, so it collapses. With lead muted and
+        // backing audible the group is partial — key 1 mutes the rest
+        // (any audible part means the cell reads as on).
+        stem_key(&mut app, KeyCode::Char('0'));
+        assert_eq!(app.stems.expanded, None);
+        stem_key(&mut app, KeyCode::Char('1'));
+        assert!(!app.stems.enabled[0] && !app.stems.enabled[1]);
+        stem_key(&mut app, KeyCode::Char('1'));
+        assert!(
+            app.stems.enabled[0] && app.stems.enabled[1],
+            "all muted: key 1 unmutes every part"
+        );
+    }
+
+    #[test]
+    fn zero_cycles_through_every_group_then_collapses() {
+        use zytunes::stems::StemKind;
+        static LAYOUT: [StemKind; 7] = [
+            StemKind::LeadVocals,
+            StemKind::BackingVocals,
+            StemKind::Kick,
+            StemKind::Snare,
+            StemKind::Toms,
+            StemKind::Cymbals,
+            StemKind::Bass,
+        ];
+        let mut app = stem_playing_app("/lib/song.mp3");
+        app.stems.status = StemStatus::Active;
+        app.stems.layout = Some(&LAYOUT);
+        app.stems.gains = Some(zytunes::stems::new_stem_gains(&[true; 7]));
+        app.stems.enabled = [true; zytunes::stems::MAX_STEMS];
+
+        let mut seen = vec![app.stems.expanded];
+        for _ in 0..3 {
+            assert!(app.cycle_stem_group());
+            seen.push(app.stems.expanded);
+        }
+        assert_eq!(seen, [None, Some(0), Some(1), None]);
+
+        // Drums open: key 4 is the fourth drum part (cymbals, index 5).
+        app.cycle_stem_group();
+        app.cycle_stem_group();
+        assert!(app.press_stem_digit(3));
+        assert!(!app.stems.enabled[5]);
+        assert!(!app.press_stem_digit(4), "drums have four parts");
     }
 
     #[test]
