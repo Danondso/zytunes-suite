@@ -608,6 +608,12 @@ pub fn prune_model_cache(model_dir: &Path, pinned: &[&str], log: &Logger) {
 /// maps the model's stem names (e.g. `"Vocals"`) to the file stems we
 /// want on disk (e.g. `"vocals"`), serialized as the JSON
 /// `--custom_output_names` expects. FLAC output matches [`STEM_EXT`].
+///
+/// Every pass also pins the inference-cost knobs ([`MDXC_OVERLAP`],
+/// [`DEMUCS_SHIFTS`]) rather than inheriting engine defaults. Both
+/// flags are architecture-scoped in audio-separator, so passing them on
+/// every pass is harmless: Roformer passes ignore the demucs knob and
+/// vice versa.
 pub fn build_audio_separator_args(
     model: &str,
     out_dir: &Path,
@@ -631,8 +637,33 @@ pub fn build_audio_separator_args(
         model_file_dir.to_string_lossy().into_owned(),
         "--custom_output_names".into(),
         serde_json::Value::Object(names).to_string(),
+        "--mdxc_overlap".into(),
+        MDXC_OVERLAP.to_string(),
+        "--demucs_shifts".into(),
+        DEMUCS_SHIFTS.to_string(),
     ]
 }
+
+/// Overlapping prediction windows for Roformer (MDXC-arch) passes.
+///
+/// Since audio-separator 0.47.0 an unset `--mdxc_overlap` falls back to
+/// each checkpoint's YAML `inference.num_overlap` (`step = chunk_size /
+/// overlap`). Our ep_317 and karaoke checkpoints declare 4, which
+/// upstream's own README notes costs several times the forward passes
+/// of 0.46.x — on CPU that made `hq` and `hq-harmony` markedly slower
+/// when we pinned 0.47.0. Upstream's suggested escape is 2; published
+/// community scores put the quality cost at a few hundredths of a dB.
+/// BS-RoFormer-SW already declares 2, so `sw` is unchanged.
+///
+/// Not part of [`RecipeKind::cache_id`]: entries separated at the old
+/// overlap are at least as good, so they stay valid.
+pub const MDXC_OVERLAP: u8 = 2;
+
+/// Random-shift predictions for the htdemucs_6s pass. audio-separator
+/// defaults to 2 (two full inference passes); the plain `demucs` CLI
+/// the `demucs` recipe drives defaults to 1, so 1 keeps the `hq`
+/// recipe's band pass at parity with it at half the cost.
+pub const DEMUCS_SHIFTS: u8 = 1;
 
 /// The BS-Roformer vocals/instrumental checkpoint the `hq` recipes pin.
 /// Community-consensus best vocal model; also audio-separator's own
@@ -1882,6 +1913,11 @@ mod tests {
             ("--output_dir", "/tmp/out"),
             ("--output_format", "flac"),
             ("--model_file_dir", "/cache/models"),
+            // Pinned cost knobs: dropping either silently reverts to the
+            // engine defaults (YAML overlap 4 / shifts 2), multiplying
+            // CPU separation time.
+            ("--mdxc_overlap", "2"),
+            ("--demucs_shifts", "1"),
         ] {
             assert!(
                 args.windows(2).any(|w| w[0] == flag && w[1] == value),
