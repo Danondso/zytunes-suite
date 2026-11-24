@@ -19,7 +19,15 @@ use std::path::{Path, PathBuf};
 /// (`--custom_output_names` JSON, `--model_file_dir`, stem-name keys)
 /// is verified against this exact version — bump deliberately, never
 /// let it float.
-pub const AUDIO_SEPARATOR_VERSION: &str = "0.47.0";
+pub const AUDIO_SEPARATOR_VERSION: &str = "0.48.0";
+
+/// demucs release the managed install pins. Upstream moved from the
+/// archived `facebookresearch/demucs` to `adefossez/demucs` and resumed
+/// releases (4.1.0, July 2026), so an unpinned spec can drift again.
+/// 4.1.0 keeps the `-n`/`--flac`/`-o` argv and `<model>/<track>/`
+/// output layout we drive, but writes `--flac` output through ffmpeg
+/// (4.0.x used torchaudio) — see [`crate::stems::DemucsCli`].
+pub const DEMUCS_VERSION: &str = "4.1.0";
 
 /// A stem-engine executable zytunes knows how to drive. Which engine a
 /// recipe needs comes from [`crate::stems::RecipeKind::engine`]; this
@@ -45,15 +53,14 @@ impl EngineKind {
     }
 
     /// uv package spec installed when `[stems] package` is unset.
-    /// demucs is unpinned (upstream is frozen; nothing can drift);
-    /// audio-separator is version-pinned so its CLI contract can't
-    /// change under us, with the extra selecting the onnxruntime
+    /// Both engines are version-pinned so their CLI contracts can't
+    /// change under us; audio-separator's extra selects the onnxruntime
     /// flavor — torch itself is a core dependency either way, which is
     /// why the CPU index pin in [`build_install_command`] applies to
     /// both engines.
     pub fn default_package(self, gpu: bool) -> String {
         match self {
-            EngineKind::Demucs => "demucs".to_string(),
+            EngineKind::Demucs => format!("demucs=={DEMUCS_VERSION}"),
             EngineKind::AudioSeparator => format!(
                 "audio-separator[{}]=={AUDIO_SEPARATOR_VERSION}",
                 if gpu { "gpu" } else { "cpu" }
@@ -529,9 +536,11 @@ mod tests {
         assert_eq!(EngineKind::Demucs.exe_name(), "demucs");
         assert_eq!(EngineKind::AudioSeparator.exe_name(), "audio-separator");
 
-        // demucs installs unpinned (upstream is frozen; nothing drifts).
-        assert_eq!(EngineKind::Demucs.default_package(false), "demucs");
-        assert_eq!(EngineKind::Demucs.default_package(true), "demucs");
+        // demucs is maintained again upstream, so it is pinned too; it
+        // has no CPU/GPU extra (the torch index decides that).
+        let demucs = format!("demucs=={DEMUCS_VERSION}");
+        assert_eq!(EngineKind::Demucs.default_package(false), demucs);
+        assert_eq!(EngineKind::Demucs.default_package(true), demucs);
         // audio-separator is version-pinned so the argv/JSON contract
         // can't drift under us, and the extra picks the onnxruntime
         // flavor (torch itself is a core dep either way).

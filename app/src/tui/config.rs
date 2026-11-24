@@ -529,7 +529,7 @@ music_dir = "/home/user/Music"
         assert_eq!(
             cfg.stems
                 .resolved_package(zytunes::stems::provision::EngineKind::Demucs),
-            "demucs"
+            zytunes::stems::provision::EngineKind::Demucs.default_package(false)
         );
         assert_eq!(cfg.stems.model(), "htdemucs_6s");
         assert!(!cfg.stems.gpu());
@@ -650,11 +650,17 @@ cache_max_gb = 25
             cfg.stems.resolved_package(EngineKind::AudioSeparator),
             "audio-separator[gpu]==0.44.3"
         );
-        assert_eq!(cfg.stems.resolved_package(EngineKind::Demucs), "demucs");
+        assert_eq!(
+            cfg.stems.resolved_package(EngineKind::Demucs),
+            EngineKind::Demucs.default_package(false)
+        );
 
         // Unset: each engine's default, honoring the gpu flag.
         let cfg = Config::default();
-        assert_eq!(cfg.stems.resolved_package(EngineKind::Demucs), "demucs");
+        assert_eq!(
+            cfg.stems.resolved_package(EngineKind::Demucs),
+            EngineKind::Demucs.default_package(false)
+        );
         assert_eq!(
             cfg.stems.resolved_package(EngineKind::AudioSeparator),
             EngineKind::AudioSeparator.default_package(false)

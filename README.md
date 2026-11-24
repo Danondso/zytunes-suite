@@ -350,12 +350,12 @@ Custom [Claude Code](https://claude.ai/code) slash commands live in `.claude/com
 ```
 brew install libusb            # required
 brew install libdiscid         # required for CD detection / import (libdiscid is LGPL, dynamically linked)
-brew install ffmpeg            # required for `video-sync` and CD ripping; optional for TUI playback of WMA files
+brew install ffmpeg            # required for `video-sync`, CD ripping, and stem separation; optional for TUI playback of WMA files
 ```
 
 On Debian/Ubuntu: `apt install libusb-1.0-0-dev libdiscid-dev ffmpeg`.
 
-Stem-split playback (`M` in the TUI) additionally needs a Python engine: `demucs` for the default recipe, or [`audio-separator`](https://github.com/nomadkaraoke/python-audio-separator) for the `hq`/`sw`/`hq-harmony` recipes. You don't have to preinstall either — on first use zytunes offers a one-time managed install via [`uv`](https://docs.astral.sh/uv/) — but an existing install works too: point `[stems] command` in `~/.config/zytunes/config.toml` at the engine binary. Roformer model checkpoints download automatically on first separation into `~/.cache/zytunes/models/`.
+Stem-split playback (`M` in the TUI) additionally needs a Python engine: `demucs` for the default recipe, or [`audio-separator`](https://github.com/nomadkaraoke/python-audio-separator) for the `hq`/`sw`/`hq-harmony` recipes. You don't have to preinstall either — on first use zytunes offers a one-time managed install via [`uv`](https://docs.astral.sh/uv/) — but an existing install works too: point `[stems] command` in `~/.config/zytunes/config.toml` at the engine binary. Both engines need `ffmpeg` on PATH to separate (audio-separator decodes through it; demucs ≥ 4.1 writes its FLAC stems through it) — already-cached stems play without it. The managed install pins `demucs==4.1.0` and `audio-separator==0.48.0`. Roformer model checkpoints download automatically on first separation into `~/.cache/zytunes/models/`.
 
 ### Zune authentication
 

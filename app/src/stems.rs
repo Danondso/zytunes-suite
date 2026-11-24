@@ -360,6 +360,28 @@ pub trait StemSeparator {
         progress: &dyn Fn(u8),
         on_line: &dyn Fn(&str),
     ) -> Result<StemSet, StemError>;
+
+    /// Host prerequisites a real separation needs beyond the engine
+    /// itself, checked only on a cache miss (cached stems play without
+    /// any of them). The `Err` string is shown to the user verbatim.
+    /// Default: none.
+    fn preflight(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// Both engines shell out to ffmpeg: audio-separator decodes and writes
+/// every format through it, and demucs ≥ 4.1 writes `--flac` output
+/// through it. Without it the engine dies minutes into a run with a
+/// Python traceback; this turns that into one clear message up front.
+fn require_ffmpeg() -> Result<(), String> {
+    if crate::transcode::check_ffmpeg_available() {
+        Ok(())
+    } else {
+        Err("ffmpeg not found on PATH — stem separation needs it. \
+             Install ffmpeg and press M again."
+            .to_string())
+    }
 }
 
 /// Shell-out to the `demucs` CLI (or a compatible fork — the binary and
@@ -426,6 +448,10 @@ impl StemSeparator for DemucsCli {
     fn available(&self) -> Result<(), String> {
         // `--help` is argparse-only (no torch import) so this stays fast.
         probe_engine(&self.command, "--help")
+    }
+
+    fn preflight(&self) -> Result<(), String> {
+        require_ffmpeg()
     }
 
     fn separate(
@@ -525,6 +551,14 @@ pub fn pinned_model_files() -> [&'static str; 4] {
 /// its hash-named demucs weight segments are NOT reclaimed — hash-named
 /// weights can't be attributed to a model by this policy, so a future
 /// model bump must clean those up by other means.
+///
+/// Also sweeps abandoned downloads. audio-separator (≥ 0.48.0) streams a
+/// checkpoint to `{file}.{pid}.partial` and renames it into place; its
+/// own cleanup is a Python `finally`, which never runs when a cancel
+/// SIGKILLs the engine's process group — so a 0.2–1.7 GB partial would
+/// otherwise leak forever. Only partials idle for
+/// [`PARTIAL_DOWNLOAD_GRACE`] go: a live download (another job, or
+/// `zytunes-serve` sharing the dir) keeps touching its file.
 pub fn prune_model_cache(model_dir: &Path, pinned: &[&str], log: &Logger) {
     let Ok(entries) = std::fs::read_dir(model_dir) else {
         return;
@@ -540,6 +574,30 @@ pub fn prune_model_cache(model_dir: &Path, pinned: &[&str], log: &Logger) {
             .and_then(|e| e.to_str())
             .is_some_and(|e| e.eq_ignore_ascii_case(ext))
     };
+    let evict = |path: &Path, what: &str| {
+        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        match std::fs::remove_file(path) {
+            Ok(()) => log(&format!(
+                "model cache: evicted {what} {} ({:.1} MB)",
+                path.display(),
+                size as f64 / (1024.0 * 1024.0)
+            )),
+            Err(e) => log(&format!(
+                "model cache: failed to evict {}: {e}",
+                path.display()
+            )),
+        }
+    };
+
+    for path in files.iter().filter(|p| has_ext(p, "partial")) {
+        let idle = std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok());
+        if idle.is_some_and(|d| d >= PARTIAL_DOWNLOAD_GRACE) {
+            evict(path, "abandoned download");
+        }
+    }
 
     // Stems owned by pinned files are never retire-able: a stray
     // non-pinned `htdemucs_6s.ckpt` beside the pinned `htdemucs_6s.yaml`
@@ -589,20 +647,16 @@ pub fn prune_model_cache(model_dir: &Path, pinned: &[&str], log: &Logger) {
         {
             continue;
         }
-        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        match std::fs::remove_file(path) {
-            Ok(()) => log(&format!(
-                "model cache: evicted retired {} ({:.1} MB)",
-                path.display(),
-                size as f64 / (1024.0 * 1024.0)
-            )),
-            Err(e) => log(&format!(
-                "model cache: failed to evict {}: {e}",
-                path.display()
-            )),
-        }
+        evict(path, "retired");
     }
 }
+
+/// How long an audio-separator `*.partial` download must sit untouched
+/// before [`prune_model_cache`] treats it as abandoned. A live download
+/// rewrites its file continuously, so ten idle minutes means the
+/// writer is gone (cancelled, crashed, or the machine slept mid-fetch
+/// and the next run starts a fresh `{pid}` partial anyway).
+pub const PARTIAL_DOWNLOAD_GRACE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 /// Build the audio-separator argv for one model pass. `output_names`
 /// maps the model's stem names (e.g. `"Vocals"`) to the file stems we
@@ -896,6 +950,10 @@ pub fn recipe_separator(
 impl StemSeparator for CascadeSeparator {
     fn available(&self) -> Result<(), String> {
         self.engine.available()
+    }
+
+    fn preflight(&self) -> Result<(), String> {
+        require_ffmpeg()
     }
 
     fn separate(
@@ -1841,6 +1899,40 @@ mod tests {
         assert!(
             dir.join(format!("{stem}.json")).exists(),
             "live model's sidecar survives"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prune_model_cache_sweeps_only_stale_partial_downloads() {
+        // A SIGKILLed download leaves `{file}.{pid}.partial` behind; a
+        // live one (another job, zytunes-serve) is still being written.
+        let root = temp_root("model-prune-partial");
+        let dir = root.join("models");
+        std::fs::create_dir_all(&dir).unwrap();
+        let stale = dir.join(format!("{BS_ROFORMER_SW_MODEL}.4242.partial"));
+        let live = dir.join(format!("{MEL_ROFORMER_KARAOKE_MODEL}.4343.partial"));
+        std::fs::write(&stale, b"half a checkpoint").unwrap();
+        std::fs::write(&live, b"still downloading").unwrap();
+        std::fs::write(dir.join(BS_ROFORMER_SW_MODEL), b"pinned").unwrap();
+        let past = std::time::SystemTime::now()
+            - PARTIAL_DOWNLOAD_GRACE
+            - std::time::Duration::from_secs(1);
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+
+        prune_model_cache(&dir, &pinned_model_files(), &default_logger());
+
+        assert!(!stale.exists(), "abandoned partial evicted");
+        assert!(live.exists(), "in-flight partial left alone");
+        assert!(
+            dir.join(BS_ROFORMER_SW_MODEL).exists(),
+            "the completed checkpoint it would have become stays"
         );
 
         let _ = std::fs::remove_dir_all(&root);

@@ -3268,6 +3268,16 @@ fn run_separation(
         return;
     }
 
+    if let Err(error) = separator.preflight() {
+        let _ = event_tx.send(BgEvent::StemsFailed {
+            gen,
+            track_path: track_path.to_string(),
+            error,
+            cancelled: false,
+        });
+        return;
+    }
+
     // Work dir keyed like the cache entry so concurrent runs on different
     // tracks can't collide; removed whatever the outcome (partial demucs
     // output must never look like a cache).
@@ -3480,6 +3490,8 @@ mod tests {
     struct FakeSeparator {
         calls: std::cell::Cell<usize>,
         outcome: Result<(), StemError>,
+        /// `Some` makes [`StemSeparator::preflight`] fail with it.
+        preflight_err: Option<&'static str>,
     }
 
     impl FakeSeparator {
@@ -3487,6 +3499,7 @@ mod tests {
             FakeSeparator {
                 calls: std::cell::Cell::new(0),
                 outcome: Ok(()),
+                preflight_err: None,
             }
         }
     }
@@ -3494,6 +3507,9 @@ mod tests {
     impl StemSeparator for FakeSeparator {
         fn available(&self) -> Result<(), String> {
             Ok(())
+        }
+        fn preflight(&self) -> Result<(), String> {
+            self.preflight_err.map_or(Ok(()), |e| Err(e.to_string()))
         }
         fn separate(
             &self,
@@ -3756,6 +3772,49 @@ mod tests {
     }
 
     #[test]
+    fn run_separation_preflight_gates_misses_but_not_cache_hits() {
+        let dir = fresh_dir("stems-run-preflight");
+        let cache = dir.join("cache");
+        let source = dir.join("song.mp3");
+        std::fs::write(&source, b"mp3").unwrap();
+        let track = source.to_string_lossy().into_owned();
+        let job = |gen| SeparationJob {
+            gen,
+            track_path: &track,
+            layout: zytunes::stems::SIX_STEM_LAYOUT,
+            cache_id: "m",
+            cache_dir: &cache,
+            max_bytes: u64::MAX,
+        };
+        let (event_tx, event_rx) = mpsc::channel();
+        let no_ffmpeg = FakeSeparator {
+            preflight_err: Some("ffmpeg not found"),
+            ..FakeSeparator::ok()
+        };
+
+        // Miss + failed preflight: one clear failure, engine never run.
+        run_separation(&job(1), &no_ffmpeg, &|| false, &event_tx);
+        let (_, terminal) = stem_events(&event_rx);
+        match terminal {
+            Some(BgEvent::StemsFailed {
+                error, cancelled, ..
+            }) => {
+                assert!(!cancelled);
+                assert_eq!(error, "ffmpeg not found");
+            }
+            _ => panic!("expected StemsFailed"),
+        }
+        assert_eq!(no_ffmpeg.calls.get(), 0, "engine must not start");
+
+        // Once cached, the same track plays without the prerequisite.
+        run_separation(&job(2), &FakeSeparator::ok(), &|| false, &event_tx);
+        let _ = stem_events(&event_rx);
+        run_separation(&job(3), &no_ffmpeg, &|| false, &event_tx);
+        let (_, terminal) = stem_events(&event_rx);
+        assert!(matches!(terminal, Some(BgEvent::StemsReady { .. })));
+    }
+
+    #[test]
     fn run_separation_failure_reports_error_not_cancel() {
         let dir = fresh_dir("stems-run-fail");
         let source = dir.join("song.mp3");
@@ -3767,6 +3826,7 @@ mod tests {
                 exit_code: Some(1),
                 stderr: String::new(),
             }),
+            preflight_err: None,
         };
 
         run_separation(
@@ -3803,6 +3863,7 @@ mod tests {
         let sep = FakeSeparator {
             calls: std::cell::Cell::new(0),
             outcome: Err(StemError::Cancelled),
+            preflight_err: None,
         };
 
         run_separation(
