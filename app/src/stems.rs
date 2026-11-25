@@ -92,6 +92,19 @@ impl RecipeKind {
         }
     }
 
+    /// The audio-separator passes this recipe runs, in order; `None` for
+    /// the demucs recipe, which drives the demucs CLI instead. Exhaustive
+    /// on purpose: a new recipe must say which passes it runs rather
+    /// than silently inheriting another recipe's.
+    pub fn passes(self) -> Option<&'static [RecipePass]> {
+        match self {
+            RecipeKind::Demucs => None,
+            RecipeKind::Sw => Some(sw_recipe_passes()),
+            RecipeKind::HqHarmony => Some(hq_harmony_recipe_passes()),
+            RecipeKind::Full => Some(full_recipe_passes()),
+        }
+    }
+
     /// The `[stems] recipe` config value (also the `Display` form).
     pub fn config_value(self) -> &'static str {
         match self {
@@ -879,8 +892,9 @@ pub const MEL_ROFORMER_KARAOKE_MODEL: &str =
 
 /// The jarredou BS-RoFormer-SW 6-stem checkpoint. One pass produces
 /// the same six stems as demucs, better on every published score than
-/// `htdemucs_6s` and the retired ep_317 → htdemucs cascade. audio-separator's registry name (not the upstream
-/// `BS-Rofo-SW-Fixed.ckpt` filename). Swapping it bumps
+/// `htdemucs_6s` and the retired ep_317 → htdemucs cascade. The name
+/// is audio-separator's registry name, not the upstream
+/// `BS-Rofo-SW-Fixed.ckpt` filename. Swapping it bumps
 /// [`RecipeKind::cache_id`].
 pub const BS_ROFORMER_SW_MODEL: &str = "BS-Roformer-SW.ckpt";
 
@@ -1126,11 +1140,9 @@ pub fn recipe_separator(
         RecipeKind::Sw | RecipeKind::HqHarmony | RecipeKind::Full => {
             let model_file_dir = default_model_file_dir()
                 .ok_or_else(|| "cannot resolve $HOME for the model cache".to_string())?;
-            let passes = match recipe {
-                RecipeKind::HqHarmony => hq_harmony_recipe_passes(),
-                RecipeKind::Full => full_recipe_passes(),
-                _ => sw_recipe_passes(),
-            };
+            let passes = recipe
+                .passes()
+                .expect("every audio-separator recipe declares its passes");
             Box::new(CascadeSeparator {
                 engine: AudioSeparatorCli {
                     command,
@@ -1652,6 +1664,14 @@ mod tests {
         assert_eq!(RecipeKind::Sw.engine(), EngineKind::AudioSeparator);
         assert_eq!(RecipeKind::HqHarmony.engine(), EngineKind::AudioSeparator);
         assert_eq!(RecipeKind::Full.engine(), EngineKind::AudioSeparator);
+        // Exactly the audio-separator recipes declare passes.
+        for recipe in ALL_RECIPES {
+            assert_eq!(
+                recipe.passes().is_some(),
+                recipe.engine() == EngineKind::AudioSeparator,
+                "{recipe}"
+            );
+        }
     }
 
     #[test]
@@ -1994,11 +2014,7 @@ mod tests {
         // but the pinned set forgets would be evicted as "retired" after
         // every run and silently re-downloaded on the next.
         let pinned = pinned_model_files();
-        for pass in sw_recipe_passes()
-            .iter()
-            .chain(hq_harmony_recipe_passes())
-            .chain(full_recipe_passes())
-        {
+        for pass in ALL_RECIPES.iter().filter_map(|r| r.passes()).flatten() {
             assert!(
                 pinned.contains(&pass.model),
                 "{} must be in the pinned set",
