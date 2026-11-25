@@ -152,7 +152,8 @@
 
 # "demucs" (default, six stems) | "sw" (six stems, BS-RoFormer-SW) |
 # "hq-harmony" (seven stems: sw + lead/backing) |
-# "full" (ten stems: sw + lead/backing + kick/snare/toms/cymbals; GPU advised).
+# "full" (14 stems: crowd + sw + lead/male/female vocals + kick/snare/toms/
+# hi-hat/ride/crash; GPU advised).
 # Legacy "hq" runs "sw".
 # Unknown values log and fall back to demucs. Cache is per (track, recipe).
 # recipe = "demucs"

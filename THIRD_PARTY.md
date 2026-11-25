@@ -62,7 +62,8 @@ managed install) and invoked by path.
 
 The model checkpoints the `sw`/`hq-harmony`/`full` recipes reference
 (jarredou BS-RoFormer-SW; the Mel-Roformer karaoke model by aufr33/viperx;
-the MDX23C DrumSep model by aufr33 and jarredou) are community-trained weights fetched by audio-separator
+the MDX23C DrumSep model by aufr33 and jarredou; the Mel-Roformer crowd model
+by aufr33/viperx; Sucial's BS-Roformer chorus male/female model) are community-trained weights fetched by audio-separator
 from its model registry on first separation — zytunes never distributes
 them, and every download happens behind the same explicit consent as the
 engine install.
