@@ -3080,6 +3080,10 @@ fn run_stem_batch(
     let total = track_paths.len();
     let (mut separated, mut skipped, mut failed) = (0usize, 0usize, 0usize);
     let mut was_cancelled = false;
+    // Checked once, on the first miss: a fully cached album plays without
+    // ffmpeg, and a missing one fails every miss without spawning the
+    // engine per track.
+    let mut preflight: Option<Result<(), String>> = None;
     for (i, track) in track_paths.iter().enumerate() {
         if cancelled() {
             was_cancelled = true;
@@ -3095,6 +3099,14 @@ fn run_stem_batch(
         let source = std::path::Path::new(track);
         if cached_stems(cache_dir, source, cache_id, layout, &log).is_some() {
             skipped += 1;
+            continue;
+        }
+        let first_check = preflight.is_none();
+        if let Err(e) = preflight.get_or_insert_with(|| separator.preflight()) {
+            if first_check {
+                log(&format!("batch: {e}"));
+            }
+            failed += 1;
             continue;
         }
         log(&format!("batch {current}/{total}: separating {track}"));
@@ -3669,6 +3681,57 @@ mod tests {
             &log
         )
         .is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stem_batch_failed_preflight_fails_misses_without_running_the_engine() {
+        let dir = fresh_dir("stems-batch-preflight");
+        let cache = dir.join("cache");
+        let a = dir.join("a.mp3");
+        let b = dir.join("b.mp3");
+        std::fs::write(&a, b"mp3a").unwrap();
+        std::fs::write(&b, b"mp3b").unwrap();
+        let (event_tx, event_rx) = mpsc::channel();
+        let sep = FakeSeparator {
+            preflight_err: Some("ffmpeg not found"),
+            ..FakeSeparator::ok()
+        };
+        let tracks = vec![
+            a.to_string_lossy().into_owned(),
+            b.to_string_lossy().into_owned(),
+        ];
+        run_stem_batch(
+            &StemBatchJob {
+                gen: 5,
+                track_paths: &tracks,
+                layout: zytunes::stems::SIX_STEM_LAYOUT,
+                cache_id: "m",
+                cache_dir: &cache,
+                max_bytes: u64::MAX,
+            },
+            &sep,
+            &|| false,
+            &event_tx,
+        );
+        assert_eq!(sep.calls.get(), 0, "engine never spawned");
+        let events: Vec<BgEvent> = event_rx.try_iter().collect();
+        let ffmpeg_lines = events
+            .iter()
+            .filter(|ev| matches!(ev, BgEvent::SyncMessage(m) if m.contains("ffmpeg not found")))
+            .count();
+        assert_eq!(ffmpeg_lines, 1, "the reason is logged once, not per track");
+        let done = events.iter().find_map(|ev| match ev {
+            BgEvent::StemBatchDone {
+                separated,
+                skipped,
+                failed,
+                cancelled,
+                ..
+            } => Some((*separated, *skipped, *failed, *cancelled)),
+            _ => None,
+        });
+        assert_eq!(done, Some((0, 0, 2, false)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
