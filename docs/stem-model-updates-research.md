@@ -7,6 +7,14 @@ Baseline: `AUDIO_SEPARATOR_VERSION = "0.47.0"`; recipes `demucs`, `hq`
 (ep_317 → htdemucs_6s), `sw` (BS-Roformer-SW), `hq-harmony` (hq +
 aufr33/viperx karaoke on the vocals).
 
+> **Status (2026-11-25).** The research below is as written on 2026-11-24.
+> What shipped differs from the original recommendations in a few places;
+> §8 is the authoritative record of what each PR in the stack does. In
+> short: `hq` was folded into `sw` (the config value still parses), the
+> `--demucs_shifts` pin was added and then dropped once no
+> audio-separator pass ran demucs, and `full` grew from ten stems to
+> fourteen (crowd, male/female backing, separate hi-hat/ride/crash).
+
 **How to read the numbers.** SDR is only comparable within one table or
 benchmark. Unless marked otherwise, figures come from the **MVSep
 Multisong** leaderboard (100 tracks × 60 s,
@@ -158,7 +166,8 @@ document, so its numbers are kept apart.
    - Pin `demucs==4.1.0` the way we pin audio-separator, so the argv contract can't drift.
    - Update the stale claims in `docs/stem-quality-upgrade-plan.md` §1 and in `stems/provision.rs`.
 
-7. **New stem types available today (deferred, needs a layout decision).**
+7. **New stem types available today.** *(Shipped: DrumSep in `full`,
+   with `MAX_STEMS` raised to 16 and a grouped strip — see §8.)*
    - `MDX23C-DrumSep-aufr33-jarredou.ckpt` (registry, 438 MB) splits drums into kick/snare/toms/hh/ride/crash.
    - DrumSep5 leaderboard: kick 14.53, snare 9.78, toms 10.59
      (https://mvsep.com/quality_checker/leaderboard/drumsep5/?sort=kick).
@@ -375,20 +384,28 @@ Practical reading, as engineering judgement rather than legal advice:
 
 Decision: more stems is a goal, so `MAX_STEMS = 8` is no longer a hard
 limit and drum sub-stems move from "deferred" to the top of the plan.
-The work ships as a `gh stack` on `main`, one PR per layer, bottom first:
+The work ships as `gh stack` #46 on `main`, one PR per layer, bottom
+first. This table records what each layer actually does:
 
-| # | Branch | Scope | Release |
-|---|---|---|---|
-| 1 | `research/stem-updates` | This document | `docs:` |
-| 2 | `stems/cpu-overlap` | Pass `--mdxc_overlap 2` and `--demucs_shifts 1` in `build_audio_separator_args` (TL;DR #2) | `perf:` |
-| 3 | `stems/audio-separator-0.48` | Bump `AUDIO_SEPARATOR_VERSION` to 0.48.0; sweep `*.partial` downloads in `prune_model_cache`; pin `demucs==4.1.0`; fix the stale "archived" claims | `fix:` |
-| 4 | `stems/sw-recipes` | `hq` becomes a single SW pass; `hq-harmony` becomes SW → karaoke on SW's vocals; cache ids `hq/v2`, `hq-harmony/v2`. Karaoke swap to `bs_roformer_karaoke_frazer_becruily.ckpt` lands here only if it passes a listening test | `feat:` |
-| 5 | `stems/raise-cap` | `MAX_STEMS` 8 → 16; new `StemKind`s; grouped stem strip (keys 1–6 toggle top-level stems, an expand key switches the digits to a split group's parts); README keybindings | `feat:` |
-| 6 | `stems/full-recipe` | `full` recipe: SW → karaoke on vocals → `MDX23C-DrumSep-aufr33-jarredou.ckpt` on drums; hi-hat/ride/crash summed to one `cymbals` stem at stage time (10 stems); larger cache default or a visible cap for `full`; README + config docs | `feat:` |
+| # | Branch | PR | Scope as shipped | Release |
+|---|---|---|---|---|
+| 1 | `research/stem-updates` | #40 | This document | `docs:` |
+| 2 | `stems/cpu-overlap` | #41 | Pass `--mdxc_overlap 2` and `--demucs_shifts 1` in `build_audio_separator_args` (TL;DR #2). The shifts pin is removed again in layer 4 | `perf:` |
+| 3 | `stems/audio-separator-0.48` | #42 | Bump `AUDIO_SEPARATOR_VERSION` to 0.48.0; sweep `*.partial` downloads idle 10 min in `prune_model_cache`; pin `demucs==4.1.0`; `StemSeparator::preflight` checks for ffmpeg on a cache miss; fix the stale "archived" claims | `fix:` |
+| 4 | `stems/sw-recipes` | #43 | `hq` is retired: `recipe = "hq"` parses as `sw`, and the panel lists `demucs` / `sw` / `hq-harmony`. `hq-harmony` becomes SW → karaoke on SW's vocals (cache `hq-harmony/v2`). ep_317 and htdemucs_6s leave the pinned set, so `--demucs_shifts` goes too. The karaoke swap did not land (no listening test yet) | `feat:` |
+| 5 | `stems/raise-cap` | #44 | `MAX_STEMS` 8 → 16; new `StemKind`s; grouped stem strip: a split source is one cell, `◐` when partly audible, and `0` cycles the expanded group so the digits reach its parts (`Tab` was taken by panel cycling) | `feat:` |
+| 6 | `stems/full-recipe` | #45 | Ten-stem `full`: SW → karaoke on vocals → DrumSep on drums, hi-hat/ride/crash summed to `cymbals` by an ffmpeg `amix` mixdown; the bulk-split size estimate scales with stem count. Superseded by layer 7 | `feat:` |
+| 7 | `stems/full-14` | #47 | Fourteen-stem `full` (cache `full/v2`): Mel-Roformer crowd on the source first, SW on the crowd-free mix, karaoke, Sucial's chorus male/female model on the backing, DrumSep with hi-hat/ride/crash kept separate. The mixdown step is removed. Seven strip cells; Crowd is key 7 | `feat:` |
+
+Considered and dropped: lead/rhythm guitar (no published model; a
+mid/side approximation was offered and declined), woodwinds (old UVR
+VR-arch model), and dry vocal + reverb.
 
 Later, outside the stack: the jarredou 5-stem DrumSep (not in the
 registry — first check whether audio-separator loads unregistered
-checkpoints), and a licence/author line on the install-consent screen.
+checkpoints), the karaoke swap to `bs_roformer_karaoke_frazer_becruily.ckpt`
+pending a listening test on vocals-only input, and a licence/author
+line on the install-consent screen.
 
 ## Sources
 
