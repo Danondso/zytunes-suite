@@ -1116,8 +1116,8 @@ impl CascadeSeparator {
     }
 }
 
-/// The ffmpeg executable mixdowns run — the same PATH lookup
-/// [`require_ffmpeg`] probes.
+/// The ffmpeg executable mixdowns run — the same PATH lookup the
+/// separators' `preflight` probes.
 pub const FFMPEG: &str = "ffmpeg";
 
 /// Build the separator a recipe drives: `DemucsCli` for the demucs
