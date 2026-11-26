@@ -27,7 +27,15 @@ rodio = { version = "0.22", default-features = true, features = [
     "symphonia-aac", "symphonia-isomp4", "symphonia-alac",
     "symphonia-flac", "symphonia-vorbis", "symphonia-wav", "symphonia-mp3",
 ] }
-symphonia = { version = "0.5", features = ["all"] }
+# Our own decode path (transcode, fingerprint). rodio still pulls symphonia
+# 0.5 for playback with only the codec features it enables above. Formats
+# match what the library scans (dirlib::AUDIO_EXTENSIONS); `all` would add
+# CAF and MKV, which nothing here opens. `opt-simd` stays off: its FFT path
+# changes AAC/Vorbis output in the last float bits, which moves transcodes.
+symphonia = { version = "0.6", default-features = false, features = [
+    "aac", "adpcm", "alac", "flac", "mp1", "mp2", "mp3", "pcm", "vorbis",
+    "aiff", "isomp4", "ogg", "wav", "all-meta",
+] }
 rusty-chromaprint = "0.3"
 base64 = "0.22"
 rayon = "1"
