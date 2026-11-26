@@ -19,12 +19,13 @@ use lofty::probe::Probe;
 use lofty::tag::{ItemValue, Tag, TagType};
 
 use crate::cd::metadata::{
-    probe_by_content, ripped_track_destination, save_tag, set_string, set_unknown_string,
+    probe_by_content, ripped_track_destination, save_tag, set_picard_field, set_string,
 };
 use crate::library::Track;
 use crate::musicbrainz::{
     canonical_album_artist, render_artist_credit, Medium, Release, Track as MbTrack,
 };
+use crate::picard_keys::PicardField;
 
 /// Tag-side values the library `Track` schema doesn't model — but the diff
 /// still wants to surface. Read directly from the audio file once per
@@ -84,7 +85,6 @@ fn read_on_disk_extras(path: &Path) -> OnDiskExtras {
 /// Pull the Picard-style fields out of one tag, whatever the container
 /// spelled them as (see [`crate::picard_keys`]).
 fn extras_from_tag(tag: &Tag) -> OnDiskExtras {
-    use crate::picard_keys::PicardField;
     let media = tag
         .get_string(&ItemKey::OriginalMediaType)
         .map(|s| s.to_string());
@@ -115,7 +115,7 @@ fn extras_from_tag(tag: &Tag) -> OnDiskExtras {
             &mut musicbrainz_album_packaging
         } else if PicardField::ReleaseCountry.matches(name) {
             &mut release_country
-        } else if crate::picard_keys::strip_freeform_prefix(name).eq_ignore_ascii_case("SCRIPT") {
+        } else if PicardField::Script.matches(name) {
             &mut script
         } else if PicardField::AcoustidFingerprint.matches(name) {
             &mut acoustid_fingerprint
@@ -582,7 +582,7 @@ fn build_track_fields(
         .map(str::to_lowercase);
     push(
         FieldKind::Picard,
-        "MUSICBRAINZ_ALBUMTYPE",
+        PicardField::AlbumType.canonical(),
         extras.musicbrainz_album_type.clone(),
         album_type,
     );
@@ -595,25 +595,25 @@ fn build_track_fields(
     // Release-level Picard TXXX fields.
     push(
         FieldKind::Picard,
-        "MUSICBRAINZ_ALBUMSTATUS",
+        PicardField::AlbumStatus.canonical(),
         extras.musicbrainz_album_status.clone(),
         release.status.as_deref().map(str::to_lowercase),
     );
     push(
         FieldKind::Picard,
-        "MUSICBRAINZ_ALBUMPACKAGING",
+        PicardField::AlbumPackaging.canonical(),
         extras.musicbrainz_album_packaging.clone(),
         release.packaging.clone(),
     );
     push(
         FieldKind::Picard,
-        "RELEASECOUNTRY",
+        PicardField::ReleaseCountry.canonical(),
         extras.release_country.clone(),
         release.country.clone(),
     );
     push(
         FieldKind::Picard,
-        "SCRIPT",
+        PicardField::Script.canonical(),
         extras.script.clone(),
         release
             .text_representation
@@ -719,7 +719,7 @@ fn build_track_fields(
         let enabled = on_disk.as_deref() != Some(uuid);
         fields.push(FieldDiff {
             kind: FieldKind::Picard,
-            name: "ACOUSTID_ID",
+            name: PicardField::AcoustidId.canonical(),
             current: on_disk,
             proposed: Some(uuid.to_string()),
             enabled,
@@ -739,7 +739,7 @@ fn build_track_fields(
         let enabled = on_disk.as_deref() != Some(fp);
         fields.push(FieldDiff {
             kind: FieldKind::Picard,
-            name: "ACOUSTID_FINGERPRINT",
+            name: PicardField::AcoustidFingerprint.canonical(),
             current: on_disk,
             proposed: Some(fp.to_string()),
             enabled,
@@ -1380,7 +1380,10 @@ fn apply_field(tag: &mut Tag, field: &FieldDiff) {
         // tag key is `Genre` so lofty writes it as TCON (ID3v2) / `\xa9gen`
         // (M4A) / `GENRE` (vorbis) — the standard genre frame across formats.
         (FieldKind::Identity, "Genre") => set_string(tag, ItemKey::Genre, value),
-        (FieldKind::Picard, name) => set_unknown_string(tag, name, value),
+        (FieldKind::Picard, name) => match PicardField::from_canonical(name) {
+            Some(field) => set_picard_field(tag, field, value),
+            None => debug_assert!(false, "Picard row with no PicardField: {name}"),
+        },
         // Filename is handled separately in phase 2; safety net only.
         (FieldKind::Filename, _) => {}
         _ => {
@@ -2305,47 +2308,48 @@ mod tests {
         (dir, path)
     }
 
-    #[test]
-    fn null_language_repair_never_displaces_a_valid_comment() {
+    /// Write `comments` (language, text; all with an empty description),
+    /// then null out the language of the one whose text is `corrupt`, save
+    /// through `save_tag`, and return the comments read back.
+    fn comments_after_null_language_repair(
+        name: &str,
+        comments: &[(&[u8; 3], &str)],
+        corrupt: &str,
+    ) -> Vec<(Vec<u8>, String)> {
         use lofty::id3::v2::{CommentFrame, Frame, Id3v2Tag};
         use lofty::tag::TagExt;
         use lofty::TextEncoding;
-        let dir = fresh_dir("null-lang-keep");
+        let dir = fresh_dir(name);
         let path = dir.join("song.wav");
         write_sine_wav(&path, 1);
-        // Two well-formed comments with the same (empty) description, then
-        // one of them gets the null language some taggers write.
         let mut id3 = Id3v2Tag::default();
-        let comment = |lang: &[u8; 3], text: &str| {
-            Frame::Comment(CommentFrame::new(
+        for (lang, text) in comments {
+            id3.insert(Frame::Comment(CommentFrame::new(
                 TextEncoding::UTF8,
-                *lang,
+                **lang,
                 String::new(),
-                text.into(),
-            ))
-        };
-        id3.insert(comment(b"eng", "Electro House"));
-        id3.insert(comment(b"XXX", "Purchased at Beatport.com"));
+                (*text).into(),
+            )));
+        }
         id3.set_title("First".into());
         id3.save_to_path(&path, lofty::config::WriteOptions::default())
             .unwrap();
         let mut bytes = std::fs::read(&path).unwrap();
-        let electro = bytes
-            .windows(13)
-            .position(|w| w == b"Electro House")
+        let text_at = bytes
+            .windows(corrupt.len())
+            .position(|w| w == corrupt.as_bytes())
             .unwrap();
-        let at = bytes[..electro]
+        let at = bytes[..text_at]
             .windows(4)
             .rposition(|w| w == b"COMM")
             .unwrap();
-        assert_eq!(&bytes[at + 11..at + 14], b"eng");
         bytes[at + 11..at + 14].copy_from_slice(&[0, 0, 0]);
         std::fs::write(&path, bytes).unwrap();
 
         let tagged = probe_by_content(&path).unwrap();
         save_tag(&tagged, TagType::Id3v2, &path).unwrap();
 
-        let after: Vec<(Vec<u8>, String)> = Id3v2Tag::from(
+        let mut after: Vec<(Vec<u8>, String)> = Id3v2Tag::from(
             probe_by_content(&path)
                 .unwrap()
                 .tag(TagType::Id3v2)
@@ -2355,13 +2359,51 @@ mod tests {
         .comments()
         .map(|c| (c.language.to_vec(), c.content.clone()))
         .collect();
-        assert!(
-            after.iter().all(|(lang, _)| lang == b"XXX"),
-            "every comment is writable now: {after:?}"
+        after.sort();
+        let _ = std::fs::remove_dir_all(&dir);
+        after
+    }
+
+    #[test]
+    fn null_language_repair_never_drops_comment_text() {
+        // The repaired frame wants the `XXX` slot, which a different
+        // comment already holds: both texts must survive the save.
+        let after = comments_after_null_language_repair(
+            "null-lang-keep",
+            &[
+                (b"eng", "Electro House"),
+                (b"XXX", "Purchased at Beatport.com"),
+            ],
+            "Electro House",
         );
         assert!(
-            after.iter().any(|(_, c)| c == "Purchased at Beatport.com"),
-            "the valid comment is kept: {after:?}"
+            after
+                .iter()
+                .all(|(lang, _)| lang.iter().all(u8::is_ascii_alphabetic)),
+            "every comment is writable now: {after:?}"
+        );
+        let mut texts: Vec<&str> = after.iter().map(|(_, t)| t.as_str()).collect();
+        texts.sort_unstable();
+        assert_eq!(
+            texts,
+            vec!["Electro House", "Purchased at Beatport.com"],
+            "no comment text is lost: {after:?}"
+        );
+    }
+
+    #[test]
+    fn null_language_repair_dedupes_identical_text() {
+        // The malformed frame is a byte-for-byte copy of the valid one
+        // already in its slot: keeping both would only duplicate it.
+        let after = comments_after_null_language_repair(
+            "null-lang-dedupe",
+            &[(b"eng", "Same Text"), (b"XXX", "Same Text")],
+            "Same Text",
+        );
+        assert_eq!(
+            after,
+            vec![(b"XXX".to_vec(), "Same Text".to_string())],
+            "an identical malformed copy is dropped, the text kept once"
         );
     }
 
@@ -3246,7 +3288,7 @@ mod tests {
             Some("old-uuid")
         );
 
-        set_unknown_string(&mut tag, "ACOUSTID_ID", "new-uuid");
+        set_picard_field(&mut tag, PicardField::AcoustidId, "new-uuid");
         let copies: Vec<(&str, Option<&str>)> = tag
             .items()
             .filter_map(|i| match i.key() {

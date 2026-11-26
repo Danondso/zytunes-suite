@@ -26,10 +26,6 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
-/// Tag key names Picard / fpcalc write for the Chromaprint fingerprint. Both
-/// ID3 `TXXX:Acoustid Fingerprint` and Vorbis `ACOUSTID_FINGERPRINT` surface
-/// as `ItemKey::Unknown(name)` in lofty 0.22 — there's no dedicated variant —
-/// so we match on the stored name case-insensitively.
 /// Seconds of audio to feed the fingerprinter. Chromaprint's AcoustID-default
 /// (Test2) configuration summarises the first ~2 minutes of a track; decoding
 /// further is wasted I/O that doesn't change the fingerprint.
