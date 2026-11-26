@@ -144,11 +144,15 @@ impl TrackIds {
     /// error, a newer schema, another root). The caller must not save over
     /// it: it is the only record of every moved track's ID, and one failed
     /// read must not cost them all. A file that does not parse is moved
-    /// aside to `.corrupt` and reads as empty, so IDs persist again.
-    fn load_from(file: &Path, root: &str, log: &Logger) -> Option<Self> {
+    /// aside to `.corrupt` and reads as empty, so IDs persist again; the
+    /// second value then names where it went, for a caller that must not
+    /// act on the empty stand-in ([`with_writable_registry`]).
+    fn load_from(file: &Path, root: &str, log: &Logger) -> Option<(Self, Option<PathBuf>)> {
         let data = match std::fs::read(file) {
             Ok(d) => d,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(Self::default()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Some((Self::default(), None));
+            }
             Err(e) => {
                 log(&format!(
                     "zytunes: track-ids: read {} failed: {e}",
@@ -167,7 +171,9 @@ impl TrackIds {
                     data.len(),
                     aside.display()
                 ));
-                return std::fs::rename(file, &aside).ok().map(|()| Self::default());
+                return std::fs::rename(file, &aside)
+                    .ok()
+                    .map(|()| (Self::default(), Some(aside)));
             }
         };
         if parsed.schema_version != SCHEMA_VERSION || parsed.root != root {
@@ -180,11 +186,14 @@ impl TrackIds {
             return None;
         }
         let used = parsed.ids.values().copied().collect();
-        Some(Self {
-            by_path: parsed.ids,
-            used,
-            dirty: false,
-        })
+        Some((
+            Self {
+                by_path: parsed.ids,
+                used,
+                dirty: false,
+            },
+            None,
+        ))
     }
 
     fn try_save_to(&self, file: &Path, root: &str) -> Result<(), String> {
@@ -209,8 +218,9 @@ impl TrackIds {
 /// [`hash_path`] of `path` unless `used` (the IDs other tracks hold)
 /// contains that value, then the first free salted hash. A scan that
 /// cannot read the registry resolves IDs with this too, so a new file at
-/// a moved track's old path never takes the moved track's ID.
-pub(crate) fn unused_id(path: &Path, used: &HashSet<u64>) -> u64 {
+/// a moved track's old path never takes the moved track's ID, and the
+/// TUI keys the stem split of a file outside the library with it.
+pub fn unused_id(path: &Path, used: &HashSet<u64>) -> u64 {
     let base = hash_path(path);
     if !used.contains(&base) {
         return base;
@@ -295,6 +305,14 @@ fn with_registry_file<R>(
 /// that fails (a full disk, a cache dir gone read-only), and `f` is not
 /// run. The second value is the save after `f`, which the caller has to
 /// report: by then the files have moved.
+///
+/// `Err` too, with `f` not run, when there is no registry file to prove
+/// (HOME unset: the moves could never be recorded) and on the run that
+/// sets an unparseable registry aside (the empty stand-in knows none of
+/// the moved tracks' IDs; the next run starts from it knowingly).
+///
+/// The cross-process lock is held for all of `f`, so a `zytunes-serve`
+/// scan waits out a whole apply (and says so in its log).
 pub fn with_writable_registry<R>(
     root: &str,
     log: &Logger,
@@ -312,16 +330,28 @@ fn read_modify_write<R>(
     prove_writable: bool,
     f: impl FnOnce(&mut TrackIds) -> R,
 ) -> Result<(R, Result<(), String>), String> {
+    if prove_writable && file.is_none() {
+        return Err(
+            "there is no track-ID registry to record the moves in (HOME unset); nothing is moved"
+                .to_string(),
+        );
+    }
     let _held = file.and_then(|file| lock_registry_file(file, log));
-    let mut ids = match file {
+    let (mut ids, set_aside) = match file {
         Some(file) => TrackIds::load_from(file, root, log).ok_or_else(|| {
             format!(
                 "the track-ID registry {} cannot be used (see the log); it is left as it is",
                 file.display()
             )
         })?,
-        None => TrackIds::default(),
+        None => (TrackIds::default(), None),
     };
+    if let (true, Some(aside)) = (prove_writable, &set_aside) {
+        return Err(format!(
+            "the track-ID registry did not parse and was moved to {}; nothing is moved this time (the next filing starts from an empty registry)",
+            aside.display()
+        ));
+    }
     if let (true, Some(file)) = (prove_writable, file) {
         ids.try_save_to(file, root).map_err(|e| {
             format!(
@@ -385,20 +415,32 @@ fn lock_registry_file(file: &Path, log: &Logger) -> Option<std::fs::File> {
         )),
         Err(std::fs::TryLockError::Error(e)) => return unlocked(e),
     }
+    // A filing holds the lock for its whole apply, so a `zytunes-serve`
+    // starting up can sit here a while: say when it is over, too.
+    let waited = std::time::Instant::now();
     match lock.lock() {
-        Ok(()) => Some(lock),
+        Ok(()) => {
+            log(&format!(
+                "zytunes: track-ids: {} is free after {:.1}s",
+                file.display(),
+                waited.elapsed().as_secs_f32()
+            ));
+            Some(lock)
+        }
         Err(e) => unlocked(e),
     }
 }
 
 /// Rewrite the registry of `root` as a newer build would have, so this
-/// build cannot use it. Tests stand in for the bad day (`pub` so the
-/// TUI's tests can too; not part of the API).
+/// build cannot use it. Tests stand in for the bad day. Public only so
+/// the TUI binary's tests can reach it; does nothing without a HOME.
 #[doc(hidden)]
 pub fn mark_newer_schema(root: &str) {
     let _guard = registry_lock();
     let root = normalised_root(root);
-    let file = registry_path(&root).expect("HOME set");
+    let Some(file) = registry_path(&root) else {
+        return;
+    };
     let ids = std::fs::read(&file)
         .ok()
         .and_then(|data| serde_json::from_slice::<OnDisk>(&data).ok())
@@ -409,13 +451,15 @@ pub fn mark_newer_schema(root: &str) {
         root,
         ids,
     };
-    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-    std::fs::write(&file, serde_json::to_vec(&newer).unwrap()).unwrap();
+    if let (Some(parent), Ok(data)) = (file.parent(), serde_json::to_vec(&newer)) {
+        let _ = std::fs::create_dir_all(parent);
+        let _ = std::fs::write(&file, data);
+    }
 }
 
 /// Delete the registry of `root`. Tests reuse temp-dir names across runs,
 /// and a registry left by an earlier run would hand out that run's IDs.
-/// `pub` for the TUI's tests; not part of the API.
+/// Public only so the TUI binary's tests can reach it.
 #[doc(hidden)]
 pub fn forget(root: &str) {
     let _guard = registry_lock();
@@ -427,10 +471,9 @@ pub fn forget(root: &str) {
 
 /// Make every save of the registry of `root` fail (a folder sits where
 /// the writer stages its temp file) while it still reads: a full disk,
-/// a cache dir gone read-only. [`forget`] undoes it. `pub` for the TUI's
-/// tests; not part of the API.
-#[doc(hidden)]
-pub fn block_saves(root: &str) {
+/// a cache dir gone read-only. [`forget`] undoes it.
+#[cfg(test)]
+pub(crate) fn block_saves(root: &str) {
     let _guard = registry_lock();
     let file = registry_path(&normalised_root(root)).expect("HOME set");
     std::fs::create_dir_all(file.with_extension("json.tmp")).unwrap();
@@ -708,9 +751,49 @@ mod tests {
             std::fs::read(dir.join("track-ids.json.corrupt")).unwrap(),
             b"{ not json"
         );
-        let reloaded = TrackIds::load_from(&file, "/music", &log).unwrap();
+        let reloaded = TrackIds::load_from(&file, "/music", &log).unwrap().0;
         assert!(reloaded.get(&p("/music/a.mp3")).is_some());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_apply_does_not_run_on_the_run_that_sets_a_bad_registry_aside() {
+        // The registry no longer parses. A scan can go on from empty, but
+        // an apply moving files on the strength of that empty stand-in
+        // would record the moves against IDs that are not the tracks'.
+        let dir = std::env::temp_dir().join(format!(
+            "zytunes-track-ids-bad-apply-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("track-ids.json");
+        let log = default_logger();
+        std::fs::write(&file, b"{ not json").unwrap();
+        let ran = std::cell::Cell::new(false);
+
+        let err = read_modify_write(Some(&file), "/music", &log, true, |_| ran.set(true))
+            .expect_err("refused");
+
+        assert!(!ran.get(), "the apply ran against the stand-in");
+        assert!(err.contains("track-ids.json.corrupt"), "{err}");
+        assert!(dir.join("track-ids.json.corrupt").exists());
+        // The next run starts from empty knowingly, and goes ahead.
+        assert!(read_modify_write(Some(&file), "/music", &log, true, |_| ()).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_apply_does_not_run_with_no_registry_file() {
+        // HOME unset: there is nowhere to record a move, so a move made
+        // now would cost the track its ID at the next scan. A scan (no
+        // proof asked) still runs.
+        let log = default_logger();
+        let ran = std::cell::Cell::new(false);
+        let out = read_modify_write(None, "/music", &log, true, |_| ran.set(true));
+        assert!(out.is_err_and(|e| e.contains("HOME unset")));
+        assert!(!ran.get());
+        assert!(read_modify_write(None, "/music", &log, false, |_| ()).is_ok());
     }
 
     #[test]
@@ -727,7 +810,7 @@ mod tests {
         assert!(ids.dirty);
         ids.save_to(&file, "/music", &log);
 
-        let mut loaded = TrackIds::load_from(&file, "/music", &log).unwrap();
+        let (mut loaded, _) = TrackIds::load_from(&file, "/music", &log).unwrap();
         assert!(!loaded.dirty, "a fresh load has nothing to save");
         assert_eq!(loaded.get(&p("/music/new.mp3")), Some(id));
         assert_eq!(loaded.get(&p("/music/old.mp3")), Some(newcomer));

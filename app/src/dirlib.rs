@@ -222,29 +222,9 @@ impl DirectoryLibrary {
                 (options.log)(&format!(
                     "zytunes: {why}; this scan keeps the track IDs the cache has"
                 ));
-                // A file the cache knows keeps its ID; one it does not is
-                // hashed as the registry would, salted away from an ID a
-                // moved track holds (a fresh file at its old path).
-                let keyed: Vec<(String, Option<u64>)> = walk
-                    .files
-                    .iter()
-                    .map(|p| {
-                        let key = p.to_string_lossy().into_owned();
-                        let id = cached.get(&key).map(|entry| entry.track.id);
-                        (key, id)
-                    })
-                    .collect();
-                let mut used: HashSet<u64> = keyed.iter().filter_map(|(_, id)| *id).collect();
-                let ids = keyed
+                let ids = ids_from_cache(walk.files.iter().map(PathBuf::as_path), &cached)
                     .into_iter()
-                    .map(|(key, id)| {
-                        let id = id.unwrap_or_else(|| {
-                            let id = crate::track_ids::unused_id(Path::new(&key), &used);
-                            used.insert(id);
-                            id
-                        });
-                        (key, id)
-                    })
+                    .map(|(p, id)| (p.to_string_lossy().into_owned(), id))
                     .collect();
                 (walk, ids)
             });
@@ -511,17 +491,11 @@ impl DirectoryLibrary {
             log(&format!(
                 "zytunes: {why}; this reread keeps the track IDs the cache has"
             ));
-            let mut used: HashSet<u64> = cached.values().map(|entry| entry.track.id).collect();
-            let mut ids: HashMap<PathBuf, u64> = HashMap::new();
-            for p in paths.iter().filter(|p| p.is_file()) {
-                let known = cached.get(p.to_string_lossy().as_ref());
-                let id = known
-                    .map(|entry| entry.track.id)
-                    .unwrap_or_else(|| crate::track_ids::unused_id(p, &used));
-                used.insert(id);
-                ids.entry(p.clone()).or_insert(id);
-            }
-            ids
+            let files = paths.iter().map(PathBuf::as_path).filter(|p| p.is_file());
+            ids_from_cache(files, &cached)
+                .into_iter()
+                .map(|(p, id)| (p.to_path_buf(), id))
+                .collect()
         });
 
         for p in paths {
@@ -849,6 +823,34 @@ pub(crate) fn is_audio_file(path: &Path) -> bool {
 /// Hash of a path. This is the ID a file gets the first time it is seen,
 /// NOT the ID of whatever is at `path` now: a moved file keeps its first
 /// ID. Ask [`crate::track_ids`] (or the library) for a track's ID.
+/// Each of `paths` with its ID, for a scan or reread that cannot use the
+/// registry today. A file the cache knows keeps the ID it has there; one
+/// it does not is hashed as the registry would, salted past every ID the
+/// cache holds (a moved track keeps the hash of the path it left, and a
+/// fresh file at that path must not share it). A path listed twice gets
+/// one ID.
+fn ids_from_cache<'a>(
+    paths: impl Iterator<Item = &'a Path>,
+    cached: &HashMap<String, crate::cache::CachedFile>,
+) -> Vec<(&'a Path, u64)> {
+    let mut used: HashSet<u64> = cached.values().map(|entry| entry.track.id).collect();
+    let mut seen: HashMap<&Path, u64> = HashMap::new();
+    paths
+        .filter_map(|p| {
+            if seen.contains_key(p) {
+                return None;
+            }
+            let id = cached
+                .get(p.to_string_lossy().as_ref())
+                .map(|entry| entry.track.id)
+                .unwrap_or_else(|| crate::track_ids::unused_id(p, &used));
+            used.insert(id);
+            seen.insert(p, id);
+            Some((p, id))
+        })
+        .collect()
+}
+
 pub fn hash_path(path: &Path) -> u64 {
     let mut hasher = DefaultHasher::new();
     path.to_string_lossy().hash(&mut hasher);
@@ -1116,12 +1118,7 @@ impl MusicLibrary for DirectoryLibrary {
                     .get(&ak)
                     .copied()
                     .expect("album artist is a grouping_artist");
-                let album = spellings
-                    .into_iter()
-                    .max_by(|(a, na), (b, nb)| na.cmp(nb).then_with(|| (*a).cmp(*b)))
-                    .map(|(s, _)| s)
-                    .expect("non-empty album spelling group");
-                (artist, album)
+                (artist, crate::library::preferred_ascii_spelling(spellings))
             })
             .collect();
         albums.sort_by(|a, b| {
@@ -1203,6 +1200,35 @@ impl MusicLibrary for DirectoryLibrary {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn without_the_registry_a_new_file_never_takes_a_cached_tracks_id() {
+        // The cache knows `/m/A/01.mp3` under the hash of `/m/old.mp3`,
+        // the path it was first seen at before a filing moved it. A new
+        // file now at `/m/old.mp3` must get another ID; a file the cache
+        // knows keeps its own; a path listed twice gets one ID.
+        let cached_file = |id: u64| crate::cache::CachedFile {
+            fingerprint: crate::cache::FileFingerprint {
+                mtime_secs: 0,
+                size: 0,
+            },
+            track: Track {
+                id,
+                ..Default::default()
+            },
+            fingerprint_failed: false,
+        };
+        let (old, moved) = (Path::new("/m/old.mp3"), Path::new("/m/A/01.mp3"));
+        let cached: HashMap<String, crate::cache::CachedFile> =
+            [("/m/A/01.mp3".to_string(), cached_file(hash_path(old)))].into();
+
+        let ids = ids_from_cache([moved, old, old].into_iter(), &cached);
+
+        assert_eq!(ids.len(), 2, "{ids:?}");
+        assert_eq!(ids[0], (moved, hash_path(old)));
+        assert_eq!(ids[1].0, old);
+        assert_ne!(ids[1].1, hash_path(old));
+    }
 
     #[test]
     fn scan_empty_directory() {

@@ -19,12 +19,13 @@ use lofty::probe::Probe;
 use lofty::tag::{ItemValue, Tag, TagType};
 
 use crate::cd::metadata::{
-    probe_by_content, ripped_track_destination, save_tag, set_string, set_unknown_string,
+    probe_by_content, ripped_track_destination, save_tag, set_picard_field, set_string,
 };
 use crate::library::Track;
 use crate::musicbrainz::{
     canonical_album_artist, render_artist_credit, Medium, Release, Track as MbTrack,
 };
+use crate::picard_keys::PicardField;
 
 /// Tag-side values the library `Track` schema doesn't model — but the diff
 /// still wants to surface. Read directly from the audio file once per
@@ -84,7 +85,6 @@ fn read_on_disk_extras(path: &Path) -> OnDiskExtras {
 /// Pull the Picard-style fields out of one tag, whatever the container
 /// spelled them as (see [`crate::picard_keys`]).
 fn extras_from_tag(tag: &Tag) -> OnDiskExtras {
-    use crate::picard_keys::PicardField;
     let media = tag
         .get_string(&ItemKey::OriginalMediaType)
         .map(|s| s.to_string());
@@ -115,7 +115,7 @@ fn extras_from_tag(tag: &Tag) -> OnDiskExtras {
             &mut musicbrainz_album_packaging
         } else if PicardField::ReleaseCountry.matches(name) {
             &mut release_country
-        } else if crate::picard_keys::strip_freeform_prefix(name).eq_ignore_ascii_case("SCRIPT") {
+        } else if PicardField::Script.matches(name) {
             &mut script
         } else if PicardField::AcoustidFingerprint.matches(name) {
             &mut acoustid_fingerprint
@@ -582,7 +582,7 @@ fn build_track_fields(
         .map(str::to_lowercase);
     push(
         FieldKind::Picard,
-        "MUSICBRAINZ_ALBUMTYPE",
+        PicardField::AlbumType.canonical(),
         extras.musicbrainz_album_type.clone(),
         album_type,
     );
@@ -595,25 +595,25 @@ fn build_track_fields(
     // Release-level Picard TXXX fields.
     push(
         FieldKind::Picard,
-        "MUSICBRAINZ_ALBUMSTATUS",
+        PicardField::AlbumStatus.canonical(),
         extras.musicbrainz_album_status.clone(),
         release.status.as_deref().map(str::to_lowercase),
     );
     push(
         FieldKind::Picard,
-        "MUSICBRAINZ_ALBUMPACKAGING",
+        PicardField::AlbumPackaging.canonical(),
         extras.musicbrainz_album_packaging.clone(),
         release.packaging.clone(),
     );
     push(
         FieldKind::Picard,
-        "RELEASECOUNTRY",
+        PicardField::ReleaseCountry.canonical(),
         extras.release_country.clone(),
         release.country.clone(),
     );
     push(
         FieldKind::Picard,
-        "SCRIPT",
+        PicardField::Script.canonical(),
         extras.script.clone(),
         release
             .text_representation
@@ -719,7 +719,7 @@ fn build_track_fields(
         let enabled = on_disk.as_deref() != Some(uuid);
         fields.push(FieldDiff {
             kind: FieldKind::Picard,
-            name: "ACOUSTID_ID",
+            name: PicardField::AcoustidId.canonical(),
             current: on_disk,
             proposed: Some(uuid.to_string()),
             enabled,
@@ -739,7 +739,7 @@ fn build_track_fields(
         let enabled = on_disk.as_deref() != Some(fp);
         fields.push(FieldDiff {
             kind: FieldKind::Picard,
-            name: "ACOUSTID_FINGERPRINT",
+            name: PicardField::AcoustidFingerprint.canonical(),
             current: on_disk,
             proposed: Some(fp.to_string()),
             enabled,
@@ -1315,10 +1315,9 @@ fn write_then_swap(tmp: &Path, src: &Path, to_apply: &[&FieldDiff]) -> Result<()
     save_tag(&tagged, tag_type, tmp).map_err(|e| format!("{e} (source {})", src.display()))?;
     // fsync the temp's contents before swapping it in — otherwise a power
     // loss between rename and writeback can leave a renamed-but-empty file
-    // on ext4/xfs.
-    if let Ok(f) = std::fs::OpenOptions::new().read(true).open(tmp) {
-        let _ = f.sync_all();
-    }
+    // on ext4/xfs. A failed flush is a failed save: swapping in a temp
+    // that may not be on disk is the very risk the temp exists to avoid.
+    sync_file(tmp).map_err(|e| format!("tag-save: fsync {}: {e}", tmp.display()))?;
     std::fs::rename(tmp, src).map_err(|e| {
         format!(
             "tag-save: rename {} -> {}: {e}",
@@ -1381,7 +1380,10 @@ fn apply_field(tag: &mut Tag, field: &FieldDiff) {
         // tag key is `Genre` so lofty writes it as TCON (ID3v2) / `\xa9gen`
         // (M4A) / `GENRE` (vorbis) — the standard genre frame across formats.
         (FieldKind::Identity, "Genre") => set_string(tag, ItemKey::Genre, value),
-        (FieldKind::Picard, name) => set_unknown_string(tag, name, value),
+        (FieldKind::Picard, name) => match PicardField::from_canonical(name) {
+            Some(field) => set_picard_field(tag, field, value),
+            None => debug_assert!(false, "Picard row with no PicardField: {name}"),
+        },
         // Filename is handled separately in phase 2; safety net only.
         (FieldKind::Filename, _) => {}
         _ => {
@@ -1551,7 +1553,8 @@ fn refuse_relative_symlink(src: &Path, landing: &Path) -> Result<(), String> {
 }
 
 /// The folder spellings already on disk, so a file is filed into the
-/// folder that is there instead of a second one that differs by case.
+/// folder that is there instead of a second one that differs by case
+/// or Unicode normalization form.
 /// Folders are never renamed: that would move every album in them, the
 /// ones outside the diff included. Answers are kept for the apply, since
 /// every track of an album asks about the same folders and the first
@@ -1620,20 +1623,23 @@ fn folders_in(dir: &Path) -> Vec<std::ffi::OsString> {
 }
 
 /// The one folder among `folders` whose name is `want` in another ASCII
-/// case. `None` when `want` itself is there (the folders are separate
-/// entries and the file is moved into the canonical one), when nothing
-/// matches, or when several spellings do and none is the obvious one.
+/// case or another Unicode normalization form (`Beyoncé` typed as one
+/// precomposed `é` or as `e` + combining accent: macOS hands out the
+/// second, most taggers write the first). `None` when `want` itself is
+/// there (the folders are separate entries and the file is moved into
+/// the canonical one), when nothing matches, or when several spellings
+/// do and none is the obvious one.
 fn sole_case_variant(
     folders: &[std::ffi::OsString],
     want: &std::ffi::OsStr,
 ) -> Option<std::ffi::OsString> {
-    let want_text = want.to_string_lossy();
+    let want_key = spelling_key(want);
     let mut variant = None;
     for name in folders {
         if name == want {
             return None;
         }
-        if name.to_string_lossy().eq_ignore_ascii_case(&want_text) {
+        if spelling_key(name).eq_ignore_ascii_case(&want_key) {
             if variant.is_some() {
                 return None;
             }
@@ -1641,6 +1647,12 @@ fn sole_case_variant(
         }
     }
     variant
+}
+
+/// `name` in NFC, so two normalization forms of one name compare equal.
+fn spelling_key(name: &std::ffi::OsStr) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    name.to_string_lossy().nfc().collect()
 }
 
 /// Why a no-replace move did not happen.
@@ -1689,7 +1701,9 @@ fn move_to_free_name_with(
 /// is taken) and only then unlinked from `src`, so an existing file is
 /// never replaced. Where that cannot be done (another filesystem, one
 /// without hard links) the bytes are copied beside `dest` and flushed to
-/// disk before `src` is removed.
+/// disk before `src` is removed. Either way the dest folder is flushed
+/// too before `src` goes: until then the new name itself may exist only
+/// in memory, and a power cut would lose the only copy.
 fn move_no_replace(src: &Path, dest: &Path) -> Result<(), MoveFailure> {
     move_no_replace_with(src, dest, &hard_link)
 }
@@ -1698,11 +1712,52 @@ fn move_no_replace(src: &Path, dest: &Path) -> Result<(), MoveFailure> {
 /// that has none.
 type LinkFn<'a> = &'a dyn Fn(&Path, &Path) -> std::io::Result<()>;
 
+/// A folder-flush function, swappable so a test can see when it runs.
+type SyncDirFn<'a> = &'a dyn Fn(&Path) -> std::io::Result<()>;
+
 fn hard_link(from: &Path, to: &Path) -> std::io::Result<()> {
     std::fs::hard_link(from, to)
 }
 
+/// Flush `path`'s contents (and its metadata, the mtime included) to disk.
+fn sync_file(path: &Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+/// Flush the entries of the folder `dir`, so a name made in it survives
+/// a power cut. A filesystem that cannot flush a folder on its own
+/// (some FUSE and network mounts answer `EINVAL`) has nothing more to
+/// give, and is not a failed move.
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    match std::fs::File::open(dir)?.sync_all() {
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            Ok(())
+        }
+        other => other,
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
+}
+
 fn move_no_replace_with(src: &Path, dest: &Path, link: LinkFn) -> Result<(), MoveFailure> {
+    move_no_replace_io(src, dest, link, &sync_dir)
+}
+
+fn move_no_replace_io(
+    src: &Path,
+    dest: &Path,
+    link: LinkFn,
+    sync_dir: SyncDirFn,
+) -> Result<(), MoveFailure> {
     use std::io::ErrorKind;
     let fail = |what: &str, e: std::io::Error| {
         MoveFailure::Failed(format!(
@@ -1720,13 +1775,20 @@ fn move_no_replace_with(src: &Path, dest: &Path, link: LinkFn) -> Result<(), Mov
         Err(e) if e.kind() == ErrorKind::AlreadyExists => return Err(MoveFailure::Taken),
         Err(_) => copy_no_replace_with(src, dest, link)?,
     }
-    // The file is now at both names. If `src` cannot be removed the move
-    // did not happen: take the new name back out, so there is not a
-    // second file the library has no record of.
-    std::fs::remove_file(src).map_err(|e| {
+    // The file is now at both names. If the new name cannot be made
+    // durable, or `src` cannot be removed, the move did not happen: take
+    // the new name back out, so there is not a second file the library
+    // has no record of. On the copy path `src` is on another volume, so
+    // nothing orders its removal after the dest folder's writeback but
+    // this flush.
+    let undo = |what: &str, e: std::io::Error| {
         let _ = std::fs::remove_file(dest);
-        fail("rename cleanup of", e)
-    })
+        fail(what, e)
+    };
+    if let Some(parent) = dest.parent() {
+        sync_dir(parent).map_err(|e| undo("fsync dest folder for", e))?;
+    }
+    std::fs::remove_file(src).map_err(|e| undo("rename cleanup of", e))
 }
 
 /// [`move_no_replace`] without hard links: copy to a staged name beside
@@ -1748,9 +1810,7 @@ fn copy_no_replace_with(src: &Path, dest: &Path, link: LinkFn) -> Result<(), Mov
     std::fs::copy(src, &staged).map_err(fail)?;
     // Without this the data can still be in memory when `src` goes, and
     // a power cut leaves a short file under the final name.
-    std::fs::File::open(&staged)
-        .and_then(|f| f.sync_all())
-        .map_err(fail)?;
+    sync_file(&staged).map_err(fail)?;
     // Link, not rename: a rename would replace a file that turned up
     // while the copy ran. A volume with no hard links at all (FAT) gets
     // the rename, after a last look at the name.
@@ -1771,12 +1831,13 @@ fn copy_no_replace_with(src: &Path, dest: &Path, link: LinkFn) -> Result<(), Mov
     // the library scan fingerprint a file by (mtime, size), so a moved
     // file with a new mtime would be separated and rescanned again. Done
     // after the file has its name: until then the staged name's age is
-    // what `sweep_stale_staged` goes by.
+    // what `sweep_stale_staged` goes by. Flushed with it, so the mtime is
+    // as durable as the bytes by the time `src` goes.
     if let Ok(modified) = std::fs::metadata(src).and_then(|m| m.modified()) {
         let _ = std::fs::OpenOptions::new()
             .write(true)
             .open(dest)
-            .and_then(|f| f.set_modified(modified));
+            .and_then(|f| f.set_modified(modified).and_then(|()| f.sync_all()));
     }
     Ok(())
 }
@@ -2247,47 +2308,48 @@ mod tests {
         (dir, path)
     }
 
-    #[test]
-    fn null_language_repair_never_displaces_a_valid_comment() {
+    /// Write `comments` (language, text; all with an empty description),
+    /// then null out the language of the one whose text is `corrupt`, save
+    /// through `save_tag`, and return the comments read back.
+    fn comments_after_null_language_repair(
+        name: &str,
+        comments: &[(&[u8; 3], &str)],
+        corrupt: &str,
+    ) -> Vec<(Vec<u8>, String)> {
         use lofty::id3::v2::{CommentFrame, Frame, Id3v2Tag};
         use lofty::tag::TagExt;
         use lofty::TextEncoding;
-        let dir = fresh_dir("null-lang-keep");
+        let dir = fresh_dir(name);
         let path = dir.join("song.wav");
         write_sine_wav(&path, 1);
-        // Two well-formed comments with the same (empty) description, then
-        // one of them gets the null language some taggers write.
         let mut id3 = Id3v2Tag::default();
-        let comment = |lang: &[u8; 3], text: &str| {
-            Frame::Comment(CommentFrame::new(
+        for (lang, text) in comments {
+            id3.insert(Frame::Comment(CommentFrame::new(
                 TextEncoding::UTF8,
-                *lang,
+                **lang,
                 String::new(),
-                text.into(),
-            ))
-        };
-        id3.insert(comment(b"eng", "Electro House"));
-        id3.insert(comment(b"XXX", "Purchased at Beatport.com"));
+                (*text).into(),
+            )));
+        }
         id3.set_title("First".into());
         id3.save_to_path(&path, lofty::config::WriteOptions::default())
             .unwrap();
         let mut bytes = std::fs::read(&path).unwrap();
-        let electro = bytes
-            .windows(13)
-            .position(|w| w == b"Electro House")
+        let text_at = bytes
+            .windows(corrupt.len())
+            .position(|w| w == corrupt.as_bytes())
             .unwrap();
-        let at = bytes[..electro]
+        let at = bytes[..text_at]
             .windows(4)
             .rposition(|w| w == b"COMM")
             .unwrap();
-        assert_eq!(&bytes[at + 11..at + 14], b"eng");
         bytes[at + 11..at + 14].copy_from_slice(&[0, 0, 0]);
         std::fs::write(&path, bytes).unwrap();
 
         let tagged = probe_by_content(&path).unwrap();
         save_tag(&tagged, TagType::Id3v2, &path).unwrap();
 
-        let after: Vec<(Vec<u8>, String)> = Id3v2Tag::from(
+        let mut after: Vec<(Vec<u8>, String)> = Id3v2Tag::from(
             probe_by_content(&path)
                 .unwrap()
                 .tag(TagType::Id3v2)
@@ -2297,13 +2359,51 @@ mod tests {
         .comments()
         .map(|c| (c.language.to_vec(), c.content.clone()))
         .collect();
-        assert!(
-            after.iter().all(|(lang, _)| lang == b"XXX"),
-            "every comment is writable now: {after:?}"
+        after.sort();
+        let _ = std::fs::remove_dir_all(&dir);
+        after
+    }
+
+    #[test]
+    fn null_language_repair_never_drops_comment_text() {
+        // The repaired frame wants the `XXX` slot, which a different
+        // comment already holds: both texts must survive the save.
+        let after = comments_after_null_language_repair(
+            "null-lang-keep",
+            &[
+                (b"eng", "Electro House"),
+                (b"XXX", "Purchased at Beatport.com"),
+            ],
+            "Electro House",
         );
         assert!(
-            after.iter().any(|(_, c)| c == "Purchased at Beatport.com"),
-            "the valid comment is kept: {after:?}"
+            after
+                .iter()
+                .all(|(lang, _)| lang.iter().all(u8::is_ascii_alphabetic)),
+            "every comment is writable now: {after:?}"
+        );
+        let mut texts: Vec<&str> = after.iter().map(|(_, t)| t.as_str()).collect();
+        texts.sort_unstable();
+        assert_eq!(
+            texts,
+            vec!["Electro House", "Purchased at Beatport.com"],
+            "no comment text is lost: {after:?}"
+        );
+    }
+
+    #[test]
+    fn null_language_repair_dedupes_identical_text() {
+        // The malformed frame is a byte-for-byte copy of the valid one
+        // already in its slot: keeping both would only duplicate it.
+        let after = comments_after_null_language_repair(
+            "null-lang-dedupe",
+            &[(b"eng", "Same Text"), (b"XXX", "Same Text")],
+            "Same Text",
+        );
+        assert_eq!(
+            after,
+            vec![(b"XXX".to_vec(), "Same Text".to_string())],
+            "an identical malformed copy is dropped, the text kept once"
         );
     }
 
@@ -3188,7 +3288,7 @@ mod tests {
             Some("old-uuid")
         );
 
-        set_unknown_string(&mut tag, "ACOUSTID_ID", "new-uuid");
+        set_picard_field(&mut tag, PicardField::AcoustidId, "new-uuid");
         let copies: Vec<(&str, Option<&str>)> = tag
             .items()
             .filter_map(|i| match i.key() {
@@ -4460,6 +4560,67 @@ mod tests {
     }
 
     #[test]
+    fn a_cross_device_move_flushes_the_dest_folder_before_the_source_goes() {
+        // On the copy path the source is on another volume: once it is
+        // unlinked, the dest folder's entry is the only record of the
+        // file. It has to be on disk first, mtime and all.
+        let dir = fresh_dir("cross-device-dirsync");
+        let (src, dest) = (dir.join("a.wav"), dir.join("sub").join("b.wav"));
+        write_sine_wav(&src, 1);
+        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(86_400 * 30);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&src)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+        let synced = std::cell::RefCell::new(Vec::new());
+        let sync = |d: &Path| {
+            let dest_mtime = std::fs::metadata(&dest).and_then(|m| m.modified()).ok();
+            synced
+                .borrow_mut()
+                .push((d.to_path_buf(), src.exists(), dest_mtime));
+            Ok(())
+        };
+
+        assert!(move_no_replace_io(&src, &dest, &no_hard_links, &sync).is_ok());
+
+        let synced = synced.into_inner();
+        assert_eq!(synced.len(), 1, "{synced:?}");
+        let (folder, src_still_there, dest_mtime) = &synced[0];
+        assert_eq!(folder, &dir.join("sub"));
+        assert!(
+            src_still_there,
+            "the source went before the dest was flushed"
+        );
+        let drift = dest_mtime
+            .expect("the dest has its name when its folder is flushed")
+            .duration_since(long_ago)
+            .unwrap_or_else(|e| e.duration());
+        assert!(
+            drift < std::time::Duration::from_secs(2),
+            "mtime set after the flush: {drift:?}"
+        );
+        assert!(!src.exists());
+    }
+
+    #[test]
+    fn a_dest_folder_that_cannot_be_flushed_keeps_the_source() {
+        let dir = fresh_dir("dirsync-fails");
+        let (src, dest) = (dir.join("a.wav"), dir.join("b.wav"));
+        write_sine_wav(&src, 1);
+        let bytes = std::fs::read(&src).unwrap();
+        let sync = |_: &Path| Err(std::io::Error::other("disk gone"));
+
+        for link in [&hard_link as LinkFn, &no_hard_links] {
+            let out = move_no_replace_io(&src, &dest, link, &sync);
+            assert!(matches!(out, Err(MoveFailure::Failed(ref e)) if e.contains("disk gone")));
+            assert_eq!(std::fs::read(&src).unwrap(), bytes);
+            assert!(!dest.exists(), "no second, unrecorded copy is left");
+        }
+    }
+
+    #[test]
     fn move_no_replace_refuses_a_taken_name_and_touches_neither_file() {
         // The retry in `move_to_free_name` leans on this: a name that was
         // free when looked at and is taken by the time of the move.
@@ -4581,6 +4742,24 @@ mod tests {
 
         assert_eq!(first, dir.join("Artist").join("Album").join("01.wav"));
         assert_eq!(second, dir.join("Artist").join("Album").join("02.wav"));
+    }
+
+    #[test]
+    fn a_folder_in_another_unicode_form_is_reused() {
+        // The folder was made by a tool writing NFD (`e` + U+0301); the
+        // release spells the name NFC (`é`). One artist, one folder. Case
+        // folding still applies on top.
+        let dir = fresh_dir("spelling-nfd");
+        let (nfc, nfd) = ("Beyonc\u{e9}", "beyonce\u{301}");
+        if names_collide(&dir, nfd, nfc) {
+            return;
+        }
+        std::fs::create_dir_all(dir.join(nfd)).unwrap();
+        let mut folders = FolderSpelling::default();
+
+        let dest = folders.adopt(&dir.join(nfc).join("Lemonade").join("01.wav"), &dir);
+
+        assert_eq!(dest, dir.join(nfd).join("Lemonade").join("01.wav"));
     }
 
     #[test]

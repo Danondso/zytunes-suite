@@ -653,10 +653,8 @@ pub fn canonical_album_artist(credits: &[ArtistCredit]) -> String {
     let kept = match credits.iter().position(has_featuring_join) {
         // No featuring join: the whole credit is the album artist.
         None => credits,
-        // The join sits on the first credit: that artist, without the guest.
-        Some(0) => &credits[..1],
-        // `A & B feat. C`: keep every credit up to and including the one
-        // whose join phrase introduces the guest.
+        // Keep every credit up to and including the one whose join phrase
+        // introduces the guest (`A feat. B` → `A`, `A & B feat. C` → `A & B`).
         Some(feat_at) => &credits[..=feat_at],
     };
     join_entity_names(kept)
@@ -664,6 +662,8 @@ pub fn canonical_album_artist(credits: &[ArtistCredit]) -> String {
 
 /// Join credits on each artist entity's own name, not the per-release
 /// "credited as" spelling, so one artist does not land in two folders.
+/// See [`primary_credit_name`]: this changes rip folders and the
+/// ALBUMARTIST tag for any release credited under an alias.
 fn join_entity_names(credits: &[ArtistCredit]) -> String {
     let mut out = String::new();
     for (i, ac) in credits.iter().enumerate() {
@@ -677,6 +677,11 @@ fn join_entity_names(credits: &[ArtistCredit]) -> String {
     out.trim().to_string()
 }
 
+/// The artist's MusicBrainz primary name (`artist.name`), falling back to
+/// the release's credited-as name (`name`) only when the entity is absent
+/// or blank. A release credited to "alice in chains" therefore files and
+/// tags as "Alice In Chains" — the album artist follows the entity, not
+/// how this particular release spelled it.
 fn primary_credit_name(ac: &ArtistCredit) -> &str {
     ac.artist
         .as_ref()
@@ -686,11 +691,17 @@ fn primary_credit_name(ac: &ArtistCredit) -> &str {
         .unwrap_or(ac.name.trim())
 }
 
-/// This credit's join phrase introduces a featured guest.
+/// This credit's join phrase introduces a featured guest: one of its
+/// words is `feat`, `featuring`, or `ft` (with or without a trailing
+/// period, any case). Whole words only, so a phrase merely containing
+/// those letters (`" after "`, `" defeats "`) stays a collaboration.
 fn has_featuring_join(credit: &ArtistCredit) -> bool {
     credit.joinphrase.as_deref().is_some_and(|j| {
-        let l = j.to_ascii_lowercase();
-        l.contains("feat") || l.contains("ft.") || l.contains("ft ")
+        j.split(|c: char| !c.is_alphanumeric()).any(|w| {
+            ["feat", "featuring", "ft"]
+                .iter()
+                .any(|k| w.eq_ignore_ascii_case(k))
+        })
     })
 }
 
@@ -1038,6 +1049,44 @@ mod tests {
             "Daft Punk feat. Pharrell Williams"
         );
         assert_eq!(canonical_album_artist(&credits), "Daft Punk");
+    }
+
+    #[test]
+    fn featuring_join_matches_whole_words_only() {
+        let join = |j: &str| ArtistCredit {
+            name: "A".into(),
+            joinphrase: Some(j.into()),
+            artist: None,
+        };
+        for feat in [
+            " feat. ",
+            " Feat ",
+            " FEATURING ",
+            " ft. ",
+            " Ft ",
+            " (feat. ",
+            ", ft. ",
+        ] {
+            assert!(has_featuring_join(&join(feat)), "{feat:?} is featuring");
+        }
+        for collab in [
+            " with ",
+            " & ",
+            " vs. ",
+            " and ",
+            ", ",
+            " x ",
+            " after ",
+            " defeats ",
+            " featurette ",
+            " left ",
+            " soft ",
+        ] {
+            assert!(
+                !has_featuring_join(&join(collab)),
+                "{collab:?} is not featuring"
+            );
+        }
     }
 
     #[test]

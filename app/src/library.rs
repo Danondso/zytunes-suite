@@ -176,7 +176,10 @@ pub fn cmp_ignore_ascii_case(a: &str, b: &str) -> std::cmp::Ordering {
         .cmp(b.bytes().map(|c| c.to_ascii_lowercase()))
 }
 
-fn preferred_ascii_spelling(spellings: HashMap<&str, usize>) -> &str {
+/// The most common spelling in one ASCII-case group (`spelling → count`),
+/// ties broken by byte order so the pick is stable. Panics on an empty
+/// group: every caller builds groups from at least one spelling.
+pub(crate) fn preferred_ascii_spelling(spellings: HashMap<&str, usize>) -> &str {
     spellings
         .into_iter()
         .max_by(|(a, na), (b, nb)| na.cmp(nb).then_with(|| (*a).cmp(*b)))
