@@ -3731,19 +3731,32 @@ impl App {
     /// library track's ID, which stays the same when the file moves. The
     /// playing track's own ID is asked first, since right after a filing
     /// apply the library can still list the track at its old path. A file
-    /// with no library track falls back to the hash of its path.
+    /// with no library track falls back to the hash of its path, salted
+    /// past every ID a library track holds: a track moved away from this
+    /// path still holds that hash, and a split stored under it would
+    /// overwrite the moved track's.
     fn stem_track_id(&self, path: &str) -> u64 {
         let playing = self
             .now_playing
             .as_ref()
             .filter(|_| self.playing_track_path().as_deref() == Some(path))
             .and_then(|np| np.track_id);
-        playing
-            .or_else(|| {
-                let lib = self.library.as_deref()?;
-                lib.track_by_location(path).map(|t| t.id)
-            })
-            .unwrap_or_else(|| zytunes::dirlib::hash_path(std::path::Path::new(path)))
+        if let Some(id) = playing {
+            return id;
+        }
+        let path = std::path::Path::new(path);
+        let Some(lib) = self.library.as_deref() else {
+            return zytunes::dirlib::hash_path(path);
+        };
+        let location = path.to_string_lossy();
+        let mut used = std::collections::HashSet::new();
+        for track in lib.all_tracks() {
+            if track.location.as_deref() == Some(location.as_ref()) {
+                return track.id;
+            }
+            used.insert(track.id);
+        }
+        zytunes::track_ids::unused_id(path, &used)
     }
 
     // -- Stem settings panel (`o`) --
@@ -12061,6 +12074,35 @@ mod tests {
             "device view must not block stems for a playing library track"
         );
         assert_eq!(app.stems.pending_path.as_deref(), Some("/lib/song.mp3"));
+    }
+
+    #[test]
+    fn an_untracked_file_never_takes_a_moved_tracks_stem_key() {
+        // A filing moved a track out of `/lib/old.mp3`; it keeps the hash
+        // of that path as its ID. A new file now at the old path, not yet
+        // in the library, must not key its split on that ID, or storing
+        // it would overwrite the moved track's stems.
+        let old = "/lib/old.mp3";
+        let moved_id = zytunes::dirlib::hash_path(std::path::Path::new(old));
+        let mut app = stem_playing_app("/lib/song.mp3");
+        app.library = Some(Box::new(VecLibrary {
+            tracks: vec![zytunes::library::Track {
+                id: moved_id,
+                name: "Moved".into(),
+                location: Some("/lib/Artist/Album/01 - Moved.mp3".into()),
+                ..Default::default()
+            }],
+        }));
+
+        let id = app.stem_track_id(old);
+
+        assert_ne!(id, moved_id);
+        assert_eq!(app.stem_track_id(old), id, "and it is stable");
+        assert_eq!(
+            app.stem_track_id("/lib/Artist/Album/01 - Moved.mp3"),
+            moved_id,
+            "a library track keeps its own ID"
+        );
     }
 
     #[test]

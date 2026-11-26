@@ -218,8 +218,9 @@ impl TrackIds {
 /// [`hash_path`] of `path` unless `used` (the IDs other tracks hold)
 /// contains that value, then the first free salted hash. A scan that
 /// cannot read the registry resolves IDs with this too, so a new file at
-/// a moved track's old path never takes the moved track's ID.
-pub(crate) fn unused_id(path: &Path, used: &HashSet<u64>) -> u64 {
+/// a moved track's old path never takes the moved track's ID, and the
+/// TUI keys the stem split of a file outside the library with it.
+pub fn unused_id(path: &Path, used: &HashSet<u64>) -> u64 {
     let base = hash_path(path);
     if !used.contains(&base) {
         return base;
