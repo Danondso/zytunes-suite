@@ -68,8 +68,8 @@ if let (Some(api_key), Some(fp)) = (&cfg.acoustid_api_key, &fingerprint) {
 }
 ```
 
-Where `tag_acoustid_uuid` writes `ItemKey::Unknown("ACOUSTID_ID")` (Picard's
-canonical name; matches what dirlib's scanner would need to read it back).
+Where `tag_acoustid_uuid` writes through `PicardField::AcoustidId.write`
+(`src/picard_keys.rs`), which spells it the way Picard does per container.
 
 Cancellation: check `cancel.load()` before the HTTP call. The call itself is
 ~1-2 s — not worth threading a cancel token through `ureq` mid-request.
@@ -96,7 +96,7 @@ pub acoustid_id: Option<String>,
 ```
 
 And in `src/dirlib.rs` near the existing `read_embedded_fingerprint` call (line
-~415), read `ItemKey::Unknown("ACOUSTID_ID")` the same way. Bump
+~415), read it with `PicardField::AcoustidId.read` the same way. Bump
 `CACHE_SCHEMA_VERSION` in `src/cache.rs` — the field addition would silently
 None on stale cache entries otherwise (existing convention; see
 `src/cache.rs` header comment).
