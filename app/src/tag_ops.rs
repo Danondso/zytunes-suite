@@ -215,14 +215,6 @@ impl ReleaseTagDiff {
             .iter()
             .any(|t| t.fields.iter().any(|f| f.enabled))
     }
-
-    /// Any field whose on-disk value differs from MusicBrainz, whether or
-    /// not the user left it enabled. False means the tags already match.
-    pub fn has_any_change(&self) -> bool {
-        self.tracks
-            .iter()
-            .any(|t| t.fields.iter().any(|f| f.current != f.proposed))
-    }
 }
 
 /// Build a diff for an album or single track, pairing library tracks to MB
