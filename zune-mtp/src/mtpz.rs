@@ -502,4 +502,95 @@ mod tests {
         let result = MtpzKeys::cmac(&key, &msg).unwrap();
         assert_eq!(hex::encode(&result), "070a16b46b4d4144f79bdd9dd04a287c");
     }
+
+    const RFC4493_KEY: &str = "2b7e151628aed2a6abf7158809cf4f3c";
+    const RFC4493_MSG_64: &str = "6bc1bee22e409f96e93d7e117393172a\
+                                  ae2d8a571e03ac9c9eb76fac45af8e51\
+                                  30c81c46a35ce411e5fbc1191a0a52ef\
+                                  f69f2445df4f9b17ad2b417be66c3710";
+
+    #[test]
+    fn cmac_rfc4493_empty_message() {
+        // RFC 4493 Example 1: Mlen = 0 (exercises the K2 / padded-last-block path)
+        let key = hex::decode(RFC4493_KEY).unwrap();
+        let result = MtpzKeys::cmac(&key, &[]).unwrap();
+        assert_eq!(hex::encode(&result), "bb1d6929e95937287fa37d129b756746");
+    }
+
+    #[test]
+    fn cmac_rfc4493_partial_last_block() {
+        // RFC 4493 Example 3: Mlen = 40 (two full blocks + a padded partial one)
+        let key = hex::decode(RFC4493_KEY).unwrap();
+        let msg = hex::decode(&RFC4493_MSG_64[..80]).unwrap();
+        let result = MtpzKeys::cmac(&key, &msg).unwrap();
+        assert_eq!(hex::encode(&result), "dfa66747de9ae63030ca32611497c827");
+    }
+
+    #[test]
+    fn cmac_rfc4493_four_blocks() {
+        // RFC 4493 Example 4: Mlen = 64
+        let key = hex::decode(RFC4493_KEY).unwrap();
+        let msg = hex::decode(RFC4493_MSG_64).unwrap();
+        let result = MtpzKeys::cmac(&key, &msg).unwrap();
+        assert_eq!(hex::encode(&result), "51f0bebf7e3b9d92fc49741779363cfe");
+    }
+
+    #[test]
+    fn sign_session_request_matches_openssl() {
+        // Verified against:
+        // printf '\xcd\xcd\xcd\xcd' | openssl mac -macopt cipher:AES-128-CBC \
+        //     -macopt hexkey:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd CMAC
+        // => A5F8220CD215E4BC5010890D0EA6716F
+        let key = vec![0xCDu8; 32];
+        let words = MtpzKeys::sign_session_request(&key).unwrap();
+        assert_eq!(words, [0xA5F8220C, 0xD215E4BC, 0x5010890D, 0x0EA6716F]);
+    }
+
+    #[test]
+    fn aes_decrypt_nist_sp800_38a_cbc() {
+        // NIST SP 800-38A F.2.2 CBC-AES128.Decrypt. The vector uses
+        // IV = 000102..0f while aes_decrypt always uses a zero IV, so the
+        // first plaintext block comes out XORed with the NIST IV; every
+        // later block chains off the previous ciphertext and is unaffected.
+        let key = hex::decode(RFC4493_KEY).unwrap();
+        let ciphertext = hex::decode(
+            "7649abac8119b246cee98e9b12e9197d\
+             5086cb9b507219ee95db113a917678b2\
+             73bed6b8e3c1743b7116e69e22229516\
+             3ff1caa1681fac09120eca307586e1a7",
+        )
+        .unwrap();
+        let mut expected = hex::decode(RFC4493_MSG_64).unwrap();
+        for (i, b) in expected[..16].iter_mut().enumerate() {
+            *b ^= i as u8;
+        }
+        let result = MtpzKeys::aes_decrypt(&key, &ciphertext).unwrap();
+        assert_eq!(hex::encode(result), hex::encode(expected));
+    }
+
+    #[test]
+    fn aes_decrypt_rejects_partial_block() {
+        // NoPadding: input that is not a whole number of blocks is an error,
+        // never a silently truncated or padded plaintext.
+        let key = [0x42u8; 16];
+        assert!(MtpzKeys::aes_decrypt(&key, &[0u8; 15]).is_err());
+        assert!(MtpzKeys::aes_decrypt(&key, &[0u8; 17]).is_err());
+    }
+
+    #[test]
+    fn aes_decrypt_empty_input() {
+        let key = [0x42u8; 16];
+        assert_eq!(MtpzKeys::aes_decrypt(&key, &[]).unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn hkdf_sha1_known_answer() {
+        // SHA1(msg || be32(0)) || SHA1(msg || be32(1)), computed with Python hashlib
+        let result = MtpzKeys::hkdf(b"test message", 32);
+        assert_eq!(
+            hex::encode(result),
+            "aa6f8b6818c235d339cc3096f3a35f2738fb02cd\
+             903252aed6142ec8f38003cc78c6fee23f3fa201"
+        );
+    }
 }
