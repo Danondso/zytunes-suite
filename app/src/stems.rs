@@ -52,6 +52,10 @@ pub enum RecipeKind {
     /// BS-RoFormer-SW plus a Mel-Roformer karaoke pass splitting its
     /// vocals into lead + backing (seven stems).
     HqHarmony,
+    /// BS-RoFormer-SW with both its vocals (karaoke: lead + backing)
+    /// and its drums (DrumSep: kick / snare / toms / cymbals) split —
+    /// ten stems, three passes plus a cymbal mixdown.
+    Full,
 }
 
 impl RecipeKind {
@@ -59,7 +63,9 @@ impl RecipeKind {
     pub fn engine(self) -> provision::EngineKind {
         match self {
             RecipeKind::Demucs => provision::EngineKind::Demucs,
-            RecipeKind::Sw | RecipeKind::HqHarmony => provision::EngineKind::AudioSeparator,
+            RecipeKind::Sw | RecipeKind::HqHarmony | RecipeKind::Full => {
+                provision::EngineKind::AudioSeparator
+            }
         }
     }
 
@@ -73,6 +79,7 @@ impl RecipeKind {
             RecipeKind::Demucs => demucs_model.to_string(),
             RecipeKind::Sw => "sw/v1".to_string(),
             RecipeKind::HqHarmony => "hq-harmony/v2".to_string(),
+            RecipeKind::Full => "full/v1".to_string(),
         }
     }
 
@@ -82,6 +89,7 @@ impl RecipeKind {
         match self {
             RecipeKind::Demucs | RecipeKind::Sw => SIX_STEM_LAYOUT,
             RecipeKind::HqHarmony => HARMONY_STEM_LAYOUT,
+            RecipeKind::Full => FULL_STEM_LAYOUT,
         }
     }
 
@@ -91,13 +99,18 @@ impl RecipeKind {
             RecipeKind::Demucs => "demucs",
             RecipeKind::Sw => "sw",
             RecipeKind::HqHarmony => "hq-harmony",
+            RecipeKind::Full => "full",
         }
     }
 }
 
 /// Every recipe, in the order the settings panel lists them.
-pub const ALL_RECIPES: [RecipeKind; 3] =
-    [RecipeKind::Demucs, RecipeKind::Sw, RecipeKind::HqHarmony];
+pub const ALL_RECIPES: [RecipeKind; 4] = [
+    RecipeKind::Demucs,
+    RecipeKind::Sw,
+    RecipeKind::HqHarmony,
+    RecipeKind::Full,
+];
 
 impl std::fmt::Display for RecipeKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -116,6 +129,7 @@ impl std::str::FromStr for RecipeKind {
             // existing configs keep working.
             "sw" | "hq" => Ok(RecipeKind::Sw),
             "hq-harmony" => Ok(RecipeKind::HqHarmony),
+            "full" => Ok(RecipeKind::Full),
             other => Err(other.to_string()),
         }
     }
@@ -148,6 +162,22 @@ pub enum StemKind {
     Piano,
     Other,
 }
+
+/// The ten-stem `full` order: vocals split into lead + backing, drums
+/// into kick / snare / toms / cymbals, then the band. Each group's
+/// parts stay adjacent so [`strip_cells`] folds them into one cell.
+pub const FULL_STEM_LAYOUT: &[StemKind] = &[
+    StemKind::LeadVocals,
+    StemKind::BackingVocals,
+    StemKind::Kick,
+    StemKind::Snare,
+    StemKind::Toms,
+    StemKind::Cymbals,
+    StemKind::Bass,
+    StemKind::Guitar,
+    StemKind::Piano,
+    StemKind::Other,
+];
 
 /// A source a recipe split into parts. On the stem strip a group's
 /// parts fold into one top-level cell (toggling all of them at once)
@@ -615,8 +645,12 @@ pub fn default_model_file_dir() -> Option<PathBuf> {
 /// Every model file a current recipe can reference. Derived from the same
 /// pinned constants the recipes are built on, so a checkpoint swap
 /// automatically retires the old file for [`prune_model_cache`].
-pub fn pinned_model_files() -> [&'static str; 2] {
-    [MEL_ROFORMER_KARAOKE_MODEL, BS_ROFORMER_SW_MODEL]
+pub fn pinned_model_files() -> [&'static str; 3] {
+    [
+        MEL_ROFORMER_KARAOKE_MODEL,
+        BS_ROFORMER_SW_MODEL,
+        MDX23C_DRUMSEP_MODEL,
+    ]
 }
 
 /// Evict retired model checkpoints from `model_dir`.
@@ -810,6 +844,12 @@ pub const MEL_ROFORMER_KARAOKE_MODEL: &str =
 /// [`RecipeKind::cache_id`].
 pub const BS_ROFORMER_SW_MODEL: &str = "BS-Roformer-SW.ckpt";
 
+/// The aufr33/jarredou MDX23C drum-part checkpoint (438 MB): drums in,
+/// kick / snare / toms / hh / ride / crash out (its registry stem
+/// names). DrumSep5 leaderboard: kick 14.53, snare 9.78, toms 10.59,
+/// hi-hat 3.18 dB SDR — hence the cymbal mixdown in the `full` recipe.
+pub const MDX23C_DRUMSEP_MODEL: &str = "MDX23C-DrumSep-aufr33-jarredou.ckpt";
+
 /// What feeds a [`RecipePass`]: the original source track, or a file an
 /// earlier pass produced into the work dir (named by file stem).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -834,6 +874,41 @@ pub struct RecipePass {
     pub window: (u8, u8),
     /// Human label for the per-pass log line.
     pub label: &'static str,
+}
+
+/// A post-pass step that sums produced files into one stem — e.g. the
+/// drum-part model's hi-hat, ride, and crash into `cymbals`, whose
+/// parts separate too poorly (hi-hat ~3 dB SDR) to be worth their own
+/// toggles. Runs through ffmpeg, which every separation already needs.
+pub struct Mixdown {
+    /// File stems (in the work dir) to sum.
+    pub inputs: &'static [&'static str],
+    /// File stem to write.
+    pub output: &'static str,
+}
+
+/// ffmpeg argv summing `inputs` into `output` sample-for-sample.
+/// `normalize=0` makes `amix` a true sum (its default divides by the
+/// input count, which would leave the mixdown quieter than its parts);
+/// `duration=longest` keeps the full length if one part ends early.
+/// `normalize` needs FFmpeg ≥ 4.4.
+pub fn build_mixdown_args(inputs: &[PathBuf], output: &Path) -> Vec<String> {
+    let mut args: Vec<String> = ["-hide_banner", "-loglevel", "error", "-nostdin", "-y"]
+        .map(String::from)
+        .to_vec();
+    for input in inputs {
+        args.push("-i".into());
+        args.push(input.to_string_lossy().into_owned());
+    }
+    args.push("-filter_complex".into());
+    args.push(format!(
+        "amix=inputs={}:duration=longest:normalize=0",
+        inputs.len()
+    ));
+    args.push("-c:a".into());
+    args.push(STEM_EXT.into());
+    args.push(output.to_string_lossy().into_owned());
+    args
 }
 
 /// The `hq-harmony` recipe: BS-RoFormer-SW over the source with its
@@ -868,6 +943,63 @@ pub fn hq_harmony_recipe_passes() -> &'static [RecipePass] {
         },
     ];
     &PASSES
+}
+
+/// The `full` recipe: BS-RoFormer-SW over the source, then the karaoke
+/// model on its vocals and the drum-part model on its drums, so both
+/// the vocals and the drums arrive split. SW's vocals and drums go to
+/// intermediates — the full layout has neither as a stem of its own.
+/// The SW pass dominates on CPU; the two part passes run on
+/// single-source input and the windows assume they cost about the same.
+pub fn full_recipe_passes() -> &'static [RecipePass] {
+    static PASSES: [RecipePass; 3] = [
+        RecipePass {
+            model: BS_ROFORMER_SW_MODEL,
+            input: PassInput::Source,
+            output_names: &[
+                ("Vocals", "vocals_full"),
+                ("Drums", "drums_full"),
+                ("Bass", "bass"),
+                ("Guitar", "guitar"),
+                ("Piano", "piano"),
+                ("Other", "other"),
+            ],
+            window: (0, 50),
+            label: "6-stem (BS-RoFormer-SW)",
+        },
+        RecipePass {
+            model: MEL_ROFORMER_KARAOKE_MODEL,
+            input: PassInput::Produced("vocals_full"),
+            output_names: &[("Vocals", "lead"), ("Instrumental", "backing")],
+            window: (50, 75),
+            label: "lead/backing split (Mel-Roformer karaoke)",
+        },
+        RecipePass {
+            model: MDX23C_DRUMSEP_MODEL,
+            input: PassInput::Produced("drums_full"),
+            output_names: &[
+                ("kick", "kick"),
+                ("snare", "snare"),
+                ("toms", "toms"),
+                ("hh", "hh"),
+                ("ride", "ride"),
+                ("crash", "crash"),
+            ],
+            window: (75, 100),
+            label: "drum parts (MDX23C DrumSep)",
+        },
+    ];
+    &PASSES
+}
+
+/// The `full` recipe's post-pass step: hi-hat, ride, and crash summed
+/// into one `cymbals` stem.
+pub fn full_recipe_mixdowns() -> &'static [Mixdown] {
+    static MIXDOWNS: [Mixdown; 1] = [Mixdown {
+        inputs: &["hh", "ride", "crash"],
+        output: "cymbals",
+    }];
+    &MIXDOWNS
 }
 
 /// The `sw` recipe: jarredou BS-RoFormer-SW over the source in one
@@ -943,9 +1075,50 @@ impl AudioSeparatorCli {
 pub struct CascadeSeparator {
     pub engine: AudioSeparatorCli,
     pub passes: &'static [RecipePass],
+    /// Steps run after every pass, in order.
+    pub mixdowns: &'static [Mixdown],
+    /// ffmpeg executable the mixdowns run ([`FFMPEG`] on PATH outside
+    /// tests).
+    pub ffmpeg: PathBuf,
     /// Stem order of the final set — the recipe's layout.
     pub layout: &'static [StemKind],
 }
+
+impl CascadeSeparator {
+    /// Sum one [`Mixdown`]'s inputs with ffmpeg, under the same
+    /// cancel / process-group handling as the engine passes.
+    fn run_mixdown(
+        &self,
+        mixdown: &Mixdown,
+        out_dir: &Path,
+        hooks: &EngineHooks<'_>,
+    ) -> Result<(), StemError> {
+        let inputs: Vec<PathBuf> = mixdown
+            .inputs
+            .iter()
+            .map(|s| out_dir.join(format!("{s}.{STEM_EXT}")))
+            .collect();
+        if let Some(missing) = inputs.iter().find(|p| !p.is_file()) {
+            return Err(StemError::MissingOutput(missing.clone()));
+        }
+        let output = out_dir.join(format!("{}.{STEM_EXT}", mixdown.output));
+        let mut cmd = std::process::Command::new(&self.ffmpeg);
+        cmd.args(build_mixdown_args(&inputs, &output));
+        match run_engine_process(&mut cmd, hooks) {
+            Err(e) => Err(StemError::Spawn(e)),
+            Ok(EngineOutcome::Cancelled) => Err(StemError::Cancelled),
+            Ok(EngineOutcome::Failed { exit_code, tail }) => Err(StemError::EngineFailed {
+                exit_code,
+                stderr: tail,
+            }),
+            Ok(EngineOutcome::Success) => Ok(()),
+        }
+    }
+}
+
+/// The ffmpeg executable mixdowns run — the same PATH lookup the
+/// separators' `preflight` probes.
+pub const FFMPEG: &str = "ffmpeg";
 
 /// Build the separator a recipe drives: `DemucsCli` for the demucs
 /// recipe, a `CascadeSeparator` over audio-separator for the Roformer recipes.
@@ -962,18 +1135,22 @@ pub fn recipe_separator(
             model: demucs_model.to_string(),
             layout: recipe.layout(),
         }),
-        RecipeKind::Sw | RecipeKind::HqHarmony => {
+        RecipeKind::Sw | RecipeKind::HqHarmony | RecipeKind::Full => {
             let model_file_dir = default_model_file_dir()
                 .ok_or_else(|| "cannot resolve $HOME for the model cache".to_string())?;
+            let (passes, mixdowns) = match recipe {
+                RecipeKind::HqHarmony => (hq_harmony_recipe_passes(), &[][..]),
+                RecipeKind::Full => (full_recipe_passes(), full_recipe_mixdowns()),
+                _ => (sw_recipe_passes(), &[][..]),
+            };
             Box::new(CascadeSeparator {
                 engine: AudioSeparatorCli {
                     command,
                     model_file_dir,
                 },
-                passes: match recipe {
-                    RecipeKind::HqHarmony => hq_harmony_recipe_passes(),
-                    _ => sw_recipe_passes(),
-                },
+                passes,
+                mixdowns,
+                ffmpeg: PathBuf::from(FFMPEG),
                 layout: recipe.layout(),
             })
         }
@@ -1031,6 +1208,22 @@ impl StemSeparator for CascadeSeparator {
                 },
             )?;
             progress(hi);
+        }
+        for mixdown in self.mixdowns {
+            on_line(&format!(
+                "mixdown: {} = {}",
+                mixdown.output,
+                mixdown.inputs.join(" + ")
+            ));
+            self.run_mixdown(
+                mixdown,
+                out_dir,
+                &EngineHooks {
+                    cancelled,
+                    on_progress: None,
+                    on_line,
+                },
+            )?;
         }
         let set = StemSet::from_layout(out_dir, STEM_EXT, self.layout);
         for p in &set.paths {
@@ -1187,9 +1380,14 @@ pub fn stem_cache_contains(
         && StemSet::from_layout(&entry_dir, STEM_EXT, layout).all_exist()
 }
 
-/// Rough on-disk size of one separated track (six/seven FLACs) for the
-/// bulk-confirm projection — real entries run ~150-250 MB.
-pub const EST_STEM_BYTES_PER_TRACK: u64 = 220 * 1024 * 1024;
+/// Rough on-disk size of one track's stems under `layout`, for the
+/// bulk-confirm projection: ~33 MB per FLAC stem of a typical track
+/// (six-stem entries run ~150–250 MB), so a ten-stem `full` split
+/// projects proportionally larger instead of undercounting.
+pub fn est_stem_bytes_per_track(layout: &[StemKind]) -> u64 {
+    const PER_STEM: u64 = 33 * 1024 * 1024;
+    PER_STEM * layout.len() as u64
+}
 
 /// Total bytes of regular files under `dir`, recursively. Used by the
 /// stem settings panel (cache-size display), the uninstall flow's
@@ -1463,6 +1661,7 @@ mod tests {
             ("demucs", RecipeKind::Demucs),
             ("sw", RecipeKind::Sw),
             ("hq-harmony", RecipeKind::HqHarmony),
+            ("full", RecipeKind::Full),
         ] {
             assert_eq!(value.parse::<RecipeKind>(), Ok(kind));
             // Display round-trips to the config value.
@@ -1482,6 +1681,7 @@ mod tests {
         assert_eq!(RecipeKind::Demucs.engine(), EngineKind::Demucs);
         assert_eq!(RecipeKind::Sw.engine(), EngineKind::AudioSeparator);
         assert_eq!(RecipeKind::HqHarmony.engine(), EngineKind::AudioSeparator);
+        assert_eq!(RecipeKind::Full.engine(), EngineKind::AudioSeparator);
     }
 
     #[test]
@@ -1499,6 +1699,7 @@ mod tests {
             RecipeKind::HqHarmony.cache_id("htdemucs_6s"),
             "hq-harmony/v2"
         );
+        assert_eq!(RecipeKind::Full.cache_id("htdemucs_6s"), "full/v1");
         // Distinct recipes must never collide in the cache.
         let ids = ALL_RECIPES.map(|r| r.cache_id("htdemucs_6s"));
         assert_eq!(
@@ -1822,7 +2023,11 @@ mod tests {
         // but the pinned set forgets would be evicted as "retired" after
         // every run and silently re-downloaded on the next.
         let pinned = pinned_model_files();
-        for pass in sw_recipe_passes().iter().chain(hq_harmony_recipe_passes()) {
+        for pass in sw_recipe_passes()
+            .iter()
+            .chain(hq_harmony_recipe_passes())
+            .chain(full_recipe_passes())
+        {
             assert!(
                 pinned.contains(&pass.model),
                 "{} must be in the pinned set",
@@ -2306,6 +2511,8 @@ mod tests {
                 model_file_dir: root.join("models"),
             },
             passes: hq_harmony_recipe_passes(),
+            mixdowns: &[],
+            ffmpeg: PathBuf::from(FFMPEG),
             layout: HARMONY_STEM_LAYOUT,
         };
         let ticks = std::sync::Mutex::new(Vec::new());
@@ -2342,6 +2549,162 @@ mod tests {
     }
 
     #[test]
+    fn full_recipe_produces_exactly_the_full_layout() {
+        let passes = full_recipe_passes();
+        let mixdowns = full_recipe_mixdowns();
+        assert_eq!(passes.len(), 3, "SW, karaoke, DrumSep");
+        assert_eq!(passes[0].model, BS_ROFORMER_SW_MODEL);
+        assert!(matches!(
+            passes[1].input,
+            PassInput::Produced("vocals_full")
+        ));
+        assert_eq!(passes[1].model, MEL_ROFORMER_KARAOKE_MODEL);
+        assert!(matches!(passes[2].input, PassInput::Produced("drums_full")));
+        assert_eq!(passes[2].model, MDX23C_DRUMSEP_MODEL);
+
+        // Every mixdown input is something a pass produced.
+        let produced: Vec<&str> = passes
+            .iter()
+            .flat_map(|p| p.output_names.iter().map(|(_, f)| *f))
+            .collect();
+        for m in mixdowns {
+            for input in m.inputs {
+                assert!(produced.contains(input), "{input} never produced");
+            }
+        }
+
+        // Pass outputs plus mixdown outputs cover the layout exactly once.
+        for kind in FULL_STEM_LAYOUT {
+            let count = produced
+                .iter()
+                .copied()
+                .chain(mixdowns.iter().map(|m| m.output))
+                .filter(|f| *f == kind.file_stem())
+                .count();
+            assert_eq!(count, 1, "{kind:?} must be produced exactly once");
+        }
+        assert_eq!(RecipeKind::Full.layout(), FULL_STEM_LAYOUT);
+        assert_eq!(FULL_STEM_LAYOUT.len(), 10);
+
+        // The collapsed strip still reads as six cells.
+        assert_eq!(strip_cells(FULL_STEM_LAYOUT).len(), 6);
+
+        // Windows tile 0..=100.
+        assert_eq!(passes[0].window.0, 0);
+        for w in passes.windows(2) {
+            assert_eq!(w[0].window.1, w[1].window.0);
+        }
+        assert_eq!(passes[2].window.1, 100);
+    }
+
+    #[test]
+    fn mixdown_args_sum_without_normalizing() {
+        let inputs = [PathBuf::from("/w/hh.flac"), PathBuf::from("/w/ride.flac")];
+        let args = build_mixdown_args(&inputs, Path::new("/w/cymbals.flac"));
+        let inputs_seen: Vec<&str> = args
+            .windows(2)
+            .filter(|w| w[0] == "-i")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(inputs_seen, ["/w/hh.flac", "/w/ride.flac"]);
+        let filter = args
+            .windows(2)
+            .find(|w| w[0] == "-filter_complex")
+            .map(|w| w[1].as_str());
+        assert_eq!(filter, Some("amix=inputs=2:duration=longest:normalize=0"));
+        assert!(
+            args.contains(&"-nostdin".to_string()),
+            "never reads the TTY"
+        );
+        assert_eq!(args.last().unwrap(), "/w/cymbals.flac");
+    }
+
+    /// A stub `ffmpeg` that writes its last argument (the output path).
+    #[cfg(unix)]
+    fn write_stub_ffmpeg(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("ffmpeg");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\n: > \"$last\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn full_cascade_runs_passes_then_mixdown() {
+        let _lock = process::lock_driver_tests();
+        let root = temp_root("cascade-full");
+        let src = root.join("song.flac");
+        std::fs::write(&src, b"flac").unwrap();
+        let out_dir = root.join("work");
+        let sep = CascadeSeparator {
+            engine: AudioSeparatorCli {
+                command: write_stub_audio_separator(&root),
+                model_file_dir: root.join("models"),
+            },
+            passes: full_recipe_passes(),
+            mixdowns: full_recipe_mixdowns(),
+            ffmpeg: write_stub_ffmpeg(&root),
+            layout: FULL_STEM_LAYOUT,
+        };
+        let lines = std::sync::Mutex::new(Vec::new());
+        let set = sep
+            .separate(&src, &out_dir, &|| false, &|_| {}, &|l: &str| {
+                lines.lock().unwrap().push(l.to_string())
+            })
+            .expect("stub full cascade succeeds");
+        assert!(set.all_exist(), "all ten stems on disk");
+        assert_eq!(set.paths[5], out_dir.join("cymbals.flac"));
+        let lines = lines.into_inner().unwrap();
+        assert!(lines.iter().any(|l| l.contains("pass 3/3")), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("mixdown: cymbals = hh + ride + crash")),
+            "{lines:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn mixdown_missing_input_names_the_file() {
+        let _lock = process::lock_driver_tests();
+        let root = temp_root("mixdown-missing");
+        let out_dir = root.join("work");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        std::fs::write(out_dir.join("hh.flac"), b"").unwrap();
+        let sep = CascadeSeparator {
+            engine: AudioSeparatorCli {
+                command: PathBuf::from("/nonexistent"),
+                model_file_dir: root.join("models"),
+            },
+            passes: &[],
+            mixdowns: full_recipe_mixdowns(),
+            ffmpeg: write_stub_ffmpeg(&root),
+            layout: FULL_STEM_LAYOUT,
+        };
+        let err = sep
+            .separate(
+                &root.join("song.flac"),
+                &out_dir,
+                &|| false,
+                &|_| {},
+                &|_| {},
+            )
+            .unwrap_err();
+        match err {
+            StemError::MissingOutput(p) => assert!(p.ends_with("ride.flac"), "{p:?}"),
+            other => panic!("expected MissingOutput, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     #[cfg(unix)]
     fn cascade_missing_intermediate_is_missing_output_error() {
         use std::os::unix::fs::PermissionsExt;
@@ -2361,6 +2724,8 @@ mod tests {
                 model_file_dir: root.join("models"),
             },
             passes: hq_harmony_recipe_passes(),
+            mixdowns: &[],
+            ffmpeg: PathBuf::from(FFMPEG),
             layout: HARMONY_STEM_LAYOUT,
         };
         let err = sep

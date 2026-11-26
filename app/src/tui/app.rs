@@ -3528,8 +3528,8 @@ impl App {
             .as_deref()
             .map(zytunes::stems::stem_cache_used_bytes)
             .unwrap_or(0);
-        let projected_bytes =
-            zytunes::stems::EST_STEM_BYTES_PER_TRACK * (track_paths.len() - cached) as u64;
+        let projected_bytes = zytunes::stems::est_stem_bytes_per_track(recipe.layout())
+            * (track_paths.len() - cached) as u64;
         self.stem_bulk_confirm = Some(StemBulkConfirm {
             artist,
             album,

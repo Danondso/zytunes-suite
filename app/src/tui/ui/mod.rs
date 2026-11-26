@@ -2455,6 +2455,7 @@ fn recipe_cost_hint(recipe: zytunes::stems::RecipeKind) -> &'static str {
         RecipeKind::Demucs => "1 pass — fastest on CPU",
         RecipeKind::Sw => "1 pass, 6-stem Roformer — slow on CPU",
         RecipeKind::HqHarmony => "2 passes + 2 checkpoints on first use — slow on CPU",
+        RecipeKind::Full => "3 passes + 3 checkpoints on first use — GPU recommended",
     }
 }
 

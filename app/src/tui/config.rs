@@ -120,8 +120,9 @@ pub struct StemsConfig {
     /// stems by hand. A blank string behaves like unset.
     pub cache_dir: Option<String>,
     /// Separation recipe: `"demucs"` (default), `"sw"` (single-pass
-    /// 6-stem BS-RoFormer-SW), or `"hq-harmony"` (SW plus lead/backing
-    /// vocal stems). The retired `"hq"` cascade still parses, as `sw`. Its `cache_id` is recorded in each
+    /// 6-stem BS-RoFormer-SW), `"hq-harmony"` (SW plus lead/backing
+    /// vocal stems), or `"full"` (SW with split vocals and drum parts).
+    /// The retired `"hq"` cascade still parses, as `sw`. Its `cache_id` is recorded in each
     /// stem-cache entry's metadata, so switching recipes re-separates on
     /// next use (the entry directory itself is keyed by source path
     /// alone — see todos.md for per-recipe coexistence).
