@@ -1550,7 +1550,8 @@ fn refuse_relative_symlink(src: &Path, landing: &Path) -> Result<(), String> {
 }
 
 /// The folder spellings already on disk, so a file is filed into the
-/// folder that is there instead of a second one that differs by case.
+/// folder that is there instead of a second one that differs by case
+/// or Unicode normalization form.
 /// Folders are never renamed: that would move every album in them, the
 /// ones outside the diff included. Answers are kept for the apply, since
 /// every track of an album asks about the same folders and the first
@@ -1619,20 +1620,23 @@ fn folders_in(dir: &Path) -> Vec<std::ffi::OsString> {
 }
 
 /// The one folder among `folders` whose name is `want` in another ASCII
-/// case. `None` when `want` itself is there (the folders are separate
-/// entries and the file is moved into the canonical one), when nothing
-/// matches, or when several spellings do and none is the obvious one.
+/// case or another Unicode normalization form (`Beyoncé` typed as one
+/// precomposed `é` or as `e` + combining accent: macOS hands out the
+/// second, most taggers write the first). `None` when `want` itself is
+/// there (the folders are separate entries and the file is moved into
+/// the canonical one), when nothing matches, or when several spellings
+/// do and none is the obvious one.
 fn sole_case_variant(
     folders: &[std::ffi::OsString],
     want: &std::ffi::OsStr,
 ) -> Option<std::ffi::OsString> {
-    let want_text = want.to_string_lossy();
+    let want_key = spelling_key(want);
     let mut variant = None;
     for name in folders {
         if name == want {
             return None;
         }
-        if name.to_string_lossy().eq_ignore_ascii_case(&want_text) {
+        if spelling_key(name).eq_ignore_ascii_case(&want_key) {
             if variant.is_some() {
                 return None;
             }
@@ -1640,6 +1644,12 @@ fn sole_case_variant(
         }
     }
     variant
+}
+
+/// `name` in NFC, so two normalization forms of one name compare equal.
+fn spelling_key(name: &std::ffi::OsStr) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    name.to_string_lossy().nfc().collect()
 }
 
 /// Why a no-replace move did not happen.
@@ -4690,6 +4700,24 @@ mod tests {
 
         assert_eq!(first, dir.join("Artist").join("Album").join("01.wav"));
         assert_eq!(second, dir.join("Artist").join("Album").join("02.wav"));
+    }
+
+    #[test]
+    fn a_folder_in_another_unicode_form_is_reused() {
+        // The folder was made by a tool writing NFD (`e` + U+0301); the
+        // release spells the name NFC (`é`). One artist, one folder. Case
+        // folding still applies on top.
+        let dir = fresh_dir("spelling-nfd");
+        let (nfc, nfd) = ("Beyonc\u{e9}", "beyonce\u{301}");
+        if names_collide(&dir, nfd, nfc) {
+            return;
+        }
+        std::fs::create_dir_all(dir.join(nfd)).unwrap();
+        let mut folders = FolderSpelling::default();
+
+        let dest = folders.adopt(&dir.join(nfc).join("Lemonade").join("01.wav"), &dir);
+
+        assert_eq!(dest, dir.join(nfd).join("Lemonade").join("01.wav"));
     }
 
     #[test]
