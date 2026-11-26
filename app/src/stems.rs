@@ -31,8 +31,10 @@ use process::{run_engine_process, EngineHooks, EngineOutcome};
 
 /// Capacity ceiling for per-stem state (gains, enabled flags). Fixed so
 /// the lock-free `[AtomicU32; MAX_STEMS]` gains array never reallocates;
-/// recipes occupy `layout().len()` slots and the rest idle muted.
-pub const MAX_STEMS: usize = 8;
+/// recipes occupy `layout().len()` slots and the rest idle muted. 16
+/// leaves headroom over the largest layout (ten stems: lead/backing,
+/// four drum parts, and the band).
+pub const MAX_STEMS: usize = 16;
 
 /// A named, versioned separation pipeline — the unit `[stems] recipe`
 /// selects. A recipe decides which engine runs ([`RecipeKind::engine`]),
@@ -135,10 +137,81 @@ pub enum StemKind {
     /// Backing vocals / harmonies.
     BackingVocals,
     Drums,
+    /// Drum parts, for recipes that split [`StemKind::Drums`] further.
+    Kick,
+    Snare,
+    Toms,
+    /// Hi-hat, ride, and crash summed into one stem.
+    Cymbals,
     Bass,
     Guitar,
     Piano,
     Other,
+}
+
+/// A source a recipe split into parts. On the stem strip a group's
+/// parts fold into one top-level cell (toggling all of them at once)
+/// that `0` expands so the digits reach each part — see
+/// [`strip_cells`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StemGroup {
+    Vocals,
+    Drums,
+}
+
+impl StemGroup {
+    /// Three-character label for the group's collapsed strip cell —
+    /// the same label the unsplit stem uses, so a split recipe's
+    /// collapsed strip reads exactly like the six-stem one.
+    pub fn short_label(self) -> &'static str {
+        match self {
+            StemGroup::Vocals => StemKind::Vocals.short_label(),
+            StemGroup::Drums => StemKind::Drums.short_label(),
+        }
+    }
+}
+
+/// One top-level cell of the stem strip, addressed by its digit key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StemCell {
+    /// A stem that stands alone, by layout index.
+    Single(usize),
+    /// A group's parts, a contiguous run of layout indices.
+    Group {
+        group: StemGroup,
+        members: std::ops::Range<usize>,
+    },
+}
+
+impl StemCell {
+    /// The layout indices this cell toggles.
+    pub fn members(&self) -> std::ops::Range<usize> {
+        match self {
+            StemCell::Single(i) => *i..*i + 1,
+            StemCell::Group { members, .. } => members.clone(),
+        }
+    }
+}
+
+/// Fold a layout into top-level strip cells: consecutive stems of the
+/// same [`StemGroup`] become one [`StemCell::Group`], everything else a
+/// [`StemCell::Single`]. Layouts keep each group's parts adjacent
+/// (pinned by a test), so a group is always one contiguous range.
+pub fn strip_cells(layout: &[StemKind]) -> Vec<StemCell> {
+    let mut cells: Vec<StemCell> = Vec::new();
+    for (i, kind) in layout.iter().enumerate() {
+        match (kind.group(), cells.last_mut()) {
+            (Some(g), Some(StemCell::Group { group, members })) if *group == g => {
+                members.end = i + 1;
+            }
+            (Some(group), _) => cells.push(StemCell::Group {
+                group,
+                members: i..i + 1,
+            }),
+            (None, _) => cells.push(StemCell::Single(i)),
+        }
+    }
+    cells
 }
 
 /// The classic six-source order every demucs-family separation uses.
@@ -164,6 +237,22 @@ pub const HARMONY_STEM_LAYOUT: &[StemKind] = &[
 ];
 
 impl StemKind {
+    /// Every kind, for lookups that invert the tables below.
+    pub const ALL: [StemKind; 12] = [
+        StemKind::Vocals,
+        StemKind::LeadVocals,
+        StemKind::BackingVocals,
+        StemKind::Drums,
+        StemKind::Kick,
+        StemKind::Snare,
+        StemKind::Toms,
+        StemKind::Cymbals,
+        StemKind::Bass,
+        StemKind::Guitar,
+        StemKind::Piano,
+        StemKind::Other,
+    ];
+
     /// The filename (sans extension) this stem is stored as.
     pub fn file_stem(self) -> &'static str {
         match self {
@@ -171,6 +260,10 @@ impl StemKind {
             StemKind::LeadVocals => "lead",
             StemKind::BackingVocals => "backing",
             StemKind::Drums => "drums",
+            StemKind::Kick => "kick",
+            StemKind::Snare => "snare",
+            StemKind::Toms => "toms",
+            StemKind::Cymbals => "cymbals",
             StemKind::Bass => "bass",
             StemKind::Guitar => "guitar",
             StemKind::Piano => "piano",
@@ -185,6 +278,10 @@ impl StemKind {
             StemKind::LeadVocals => "Lead Vocals",
             StemKind::BackingVocals => "Backing Vocals",
             StemKind::Drums => "Drums",
+            StemKind::Kick => "Kick",
+            StemKind::Snare => "Snare",
+            StemKind::Toms => "Toms",
+            StemKind::Cymbals => "Cymbals",
             StemKind::Bass => "Bass",
             StemKind::Guitar => "Guitar",
             StemKind::Piano => "Piano",
@@ -200,6 +297,10 @@ impl StemKind {
             StemKind::LeadVocals => "LdV",
             StemKind::BackingVocals => "BkV",
             StemKind::Drums => "Drm",
+            StemKind::Kick => "Kck",
+            StemKind::Snare => "Snr",
+            StemKind::Toms => "Tom",
+            StemKind::Cymbals => "Cym",
             StemKind::Bass => "Bas",
             StemKind::Guitar => "Gtr",
             StemKind::Piano => "Pno",
@@ -207,20 +308,23 @@ impl StemKind {
         }
     }
 
+    /// The group this stem is a part of, if a recipe split its source.
+    /// The unsplit [`StemKind::Vocals`] / [`StemKind::Drums`] are
+    /// standalone cells, not groups.
+    pub fn group(self) -> Option<StemGroup> {
+        match self {
+            StemKind::LeadVocals | StemKind::BackingVocals => Some(StemGroup::Vocals),
+            StemKind::Kick | StemKind::Snare | StemKind::Toms | StemKind::Cymbals => {
+                Some(StemGroup::Drums)
+            }
+            _ => None,
+        }
+    }
+
     /// Inverse of [`StemKind::file_stem`] — the URL slug / cache filename
     /// without extension (`"lead"` → `LeadVocals`).
     pub fn from_file_stem(name: &str) -> Option<Self> {
-        match name {
-            "vocals" => Some(StemKind::Vocals),
-            "lead" => Some(StemKind::LeadVocals),
-            "backing" => Some(StemKind::BackingVocals),
-            "drums" => Some(StemKind::Drums),
-            "bass" => Some(StemKind::Bass),
-            "guitar" => Some(StemKind::Guitar),
-            "piano" => Some(StemKind::Piano),
-            "other" => Some(StemKind::Other),
-            _ => None,
-        }
+        Self::ALL.into_iter().find(|k| k.file_stem() == name)
     }
 }
 
@@ -1986,6 +2090,69 @@ mod tests {
         }
         assert_eq!(seen.len(), 8, "8 distinct kinds across both layouts");
         assert!(StemKind::from_file_stem("vocals-lead").is_none());
+
+        // Every kind, used in a layout yet or not, round-trips its slug
+        // and fits the strip's 3-char cell.
+        let mut slugs = std::collections::HashSet::new();
+        for kind in StemKind::ALL {
+            assert_eq!(kind.short_label().chars().count(), 3, "{kind:?}");
+            assert_eq!(StemKind::from_file_stem(kind.file_stem()), Some(kind));
+            assert!(slugs.insert(kind.file_stem()), "{kind:?} slug unique");
+        }
+    }
+
+    #[test]
+    fn strip_cells_fold_group_parts_into_one_cell() {
+        // No groups: one cell per stem, in layout order.
+        assert_eq!(
+            strip_cells(SIX_STEM_LAYOUT),
+            (0..6).map(StemCell::Single).collect::<Vec<_>>()
+        );
+
+        // Harmony: lead + backing fold into one Vocals cell, so the
+        // collapsed strip has the same six cells as the unsplit layout.
+        let cells = strip_cells(HARMONY_STEM_LAYOUT);
+        assert_eq!(cells.len(), 6);
+        assert_eq!(
+            cells[0],
+            StemCell::Group {
+                group: StemGroup::Vocals,
+                members: 0..2
+            }
+        );
+        assert_eq!(cells[1], StemCell::Single(2), "drums follow the group");
+
+        // Two groups, one standalone between them.
+        let layout = [
+            StemKind::LeadVocals,
+            StemKind::BackingVocals,
+            StemKind::Kick,
+            StemKind::Snare,
+            StemKind::Toms,
+            StemKind::Cymbals,
+            StemKind::Bass,
+        ];
+        let cells = strip_cells(&layout);
+        assert_eq!(cells.len(), 3);
+        assert_eq!(cells[1].members(), 2..6);
+        assert_eq!(cells[2], StemCell::Single(6));
+        assert_eq!(cells[2].members(), 6..7);
+    }
+
+    #[test]
+    fn recipe_layouts_keep_group_parts_adjacent() {
+        // strip_cells assumes a group's parts are contiguous; a layout
+        // that interleaved them would split one group into two cells.
+        for recipe in ALL_RECIPES {
+            let layout = recipe.layout();
+            let mut seen = std::collections::HashSet::new();
+            for cell in strip_cells(layout) {
+                if let StemCell::Group { group, .. } = cell {
+                    assert!(seen.insert(group), "{recipe}: {group:?} split in two");
+                }
+            }
+            assert!(layout.len() <= MAX_STEMS, "{recipe} exceeds MAX_STEMS");
+        }
     }
 
     #[test]

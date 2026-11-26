@@ -444,6 +444,7 @@ impl App {
             return;
         }
 
+        self.stems.expanded = None;
         self.stems.enabled = [true; zytunes::stems::MAX_STEMS];
         let gains = zytunes::stems::new_stem_gains(&self.stems.enabled[..stems.layout.len()]);
         self.stems.layout = Some(stems.layout);
@@ -458,10 +459,15 @@ impl App {
         });
         self.stems.gains = Some(gains);
         self.stems.status = StemStatus::Active;
+        let cells = self.stem_cells();
+        let groups = cells
+            .iter()
+            .any(|c| matches!(c, zytunes::stems::StemCell::Group { .. }));
         self.set_toast(
             format!(
-                "Stem mode — 1-{} toggle stems, M exits",
-                self.stems.layout.map_or(6, |l| l.len())
+                "Stem mode — 1-{} toggle stems{}, M exits",
+                cells.len(),
+                if groups { ", 0 opens split parts" } else { "" }
             ),
             false,
         );

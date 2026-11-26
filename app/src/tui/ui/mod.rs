@@ -2263,11 +2263,8 @@ fn draw_now_playing(f: &mut Frame, app: &App, np: &NowPlaying, area: Rect, art_w
     }
 }
 
-/// One-line stem status for the now-playing panel. `Active` renders one
-/// toggle cell per stem in the active layout (`[1 Voc ●]`, filled =
-/// audible / hollow = muted), dropping the labels when the strip is
-/// narrower than the full form needs (66 cols for six stems, 76 for
-/// seven).
+/// One-line stem status for the now-playing panel: install / separating
+/// progress, or the Active toggle cells ([`stem_strip_cells`]).
 fn stem_strip_line(app: &App, width: u16) -> Paragraph<'static> {
     let t = app.theme();
     let header = Span::styled(
@@ -2289,34 +2286,99 @@ fn stem_strip_line(app: &App, width: u16) -> Paragraph<'static> {
             },
             Style::default().fg(t.progress_bar),
         )),
-        StemStatus::Active => {
-            let layout = app.stems.layout.unwrap_or(zytunes::stems::SIX_STEM_LAYOUT);
-            // The wide form is the 7-cell " STEMS " header plus one
-            // 10-cell `[N Lbl ●] ` per stem, minus the last trailing
-            // space: 6 + 10·len (66 for six stems — the pre-layout
-            // constant — and 76 for harmony's seven).
-            let wide = width >= 6 + 10 * layout.len() as u16;
-            for (i, kind) in layout.iter().enumerate() {
-                let on = app.stems.enabled[i];
-                let dot = if on { "●" } else { "○" };
-                let cell = if wide {
-                    format!("[{} {} {}] ", i + 1, kind.short_label(), dot)
-                } else {
-                    format!("[{}{}]", i + 1, dot)
-                };
-                let style = if on {
-                    Style::default()
-                        .fg(t.success_text)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(t.dim_text)
-                };
-                spans.push(Span::styled(cell, style));
-            }
-        }
+        StemStatus::Active => spans.extend(stem_strip_cells(app, width)),
         StemStatus::Off => {}
     }
     Paragraph::new(Line::from(spans))
+}
+
+/// The Active strip's toggle cells. Collapsed, one cell per top-level
+/// [`zytunes::stems::StemCell`] — a split source (lead/backing vocals,
+/// drum parts) shows as its parent's label with a half dot when only
+/// some parts are audible, and a dim `0▸` hint says it can open.
+/// Expanded, the open group's label leads and its parts take the
+/// digits. Each wide cell is `[N Lbl ●] ` (10 cols); the narrow form
+/// drops labels when the strip can't fit them.
+fn stem_strip_cells(app: &App, width: u16) -> Vec<Span<'static>> {
+    use zytunes::stems::StemCell;
+    let t = app.theme();
+    let layout = app.stems.layout.unwrap_or(zytunes::stems::SIX_STEM_LAYOUT);
+    let enabled = &app.stems.enabled;
+    let on_style = Style::default()
+        .fg(t.success_text)
+        .add_modifier(Modifier::BOLD);
+    let off_style = Style::default().fg(t.dim_text);
+
+    // One cell per digit, plus the lead-in and hint around them.
+    struct Cell {
+        label: &'static str,
+        /// Audible parts of `total`.
+        on: usize,
+        total: usize,
+    }
+    let (prefix, cells, hint): (Option<String>, Vec<Cell>, &str) = match app.expanded_stem_cell() {
+        Some(StemCell::Group { group, members }) => (
+            Some(format!("{}▸ ", group.short_label())),
+            members
+                .map(|i| Cell {
+                    label: layout[i].short_label(),
+                    on: enabled[i] as usize,
+                    total: 1,
+                })
+                .collect(),
+            " 0 next",
+        ),
+        _ => {
+            let cells = app.stem_cells();
+            let has_groups = cells.iter().any(|c| matches!(c, StemCell::Group { .. }));
+            let cells = cells
+                .iter()
+                .map(|cell| {
+                    let label = match cell {
+                        StemCell::Single(i) => layout[*i].short_label(),
+                        StemCell::Group { group, .. } => group.short_label(),
+                    };
+                    let parts = cell.members();
+                    Cell {
+                        label,
+                        on: parts.clone().filter(|&i| enabled[i]).count(),
+                        total: parts.len(),
+                    }
+                })
+                .collect();
+            (None, cells, if has_groups { " 0▸ parts" } else { "" })
+        }
+    };
+
+    // The 7-col " STEMS " header plus 10 per cell, minus the last
+    // trailing space: 66 for six cells, the pre-grouping constant.
+    let extras = prefix.as_deref().map_or(0, |p| p.chars().count()) + hint.chars().count();
+    let wide = width as usize >= 6 + 10 * cells.len() + extras;
+
+    let mut spans = Vec::new();
+    if let Some(p) = prefix {
+        spans.push(Span::styled(p, on_style));
+    }
+    for (n, Cell { label, on, total }) in cells.into_iter().enumerate() {
+        let dot = match on {
+            0 => "○",
+            _ if on == total => "●",
+            _ => "◐",
+        };
+        let cell = if wide {
+            format!("[{} {label} {dot}] ", n + 1)
+        } else {
+            format!("[{}{dot}]", n + 1)
+        };
+        spans.push(Span::styled(
+            cell,
+            if on > 0 { on_style } else { off_style },
+        ));
+    }
+    if !hint.is_empty() {
+        spans.push(Span::styled(hint, off_style));
+    }
+    spans
 }
 
 /// Consent modal for the one-time stem-engine install (`M` with no
@@ -2759,20 +2821,28 @@ fn draw_help_overlay(f: &mut Frame, app: &App) {
 
     f.render_widget(Clear, rect);
 
-    // The stem digit range tracks the active layout (or, before any split,
-    // the configured recipe's) — a static "1-7" would advertise a key that
-    // falls through to nothing under the six-stem layouts.
-    let stem_count = app
+    // The stem digit range tracks the active layout's strip cells (or,
+    // before any split, the configured recipe's) — advertising a digit
+    // with no cell behind it would name a key that falls through.
+    let stem_layout = app
         .stems
         .layout
-        .map(|l| l.len())
-        .or_else(|| app.stems_cfg.recipe_kind().ok().map(|r| r.layout().len()))
-        .unwrap_or(6);
-    let stem_toggle_line = if stem_count >= 7 {
-        "  1-7         Toggle stems while the strip is on screen"
-    } else {
-        "  1-6         Toggle stems while the strip is on screen"
-    };
+        .or_else(|| app.stems_cfg.recipe_kind().ok().map(|r| r.layout()))
+        .unwrap_or(zytunes::stems::SIX_STEM_LAYOUT);
+    let stem_cells = zytunes::stems::strip_cells(stem_layout);
+    let stem_toggle_line = format!(
+        "  1-{}         Toggle stems while the strip is on screen{}",
+        stem_cells.len(),
+        if stem_cells
+            .iter()
+            .any(|c| matches!(c, zytunes::stems::StemCell::Group { .. }))
+        {
+            "; 0 opens split parts"
+        } else {
+            ""
+        }
+    );
+    let stem_toggle_line = stem_toggle_line.as_str();
     let help_text = vec![
         "",
         "  Navigation",
@@ -4830,5 +4900,45 @@ mod tests {
                 (m.device_width, m.sidebar_width, m.album_width, m.keys_width)
             );
         }
+    }
+
+    #[test]
+    fn stem_strip_folds_groups_and_expands_on_zero() {
+        use crate::app::{App, StemStatus};
+        let strip = |app: &App| -> String {
+            stem_strip_cells(app, 200)
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect()
+        };
+        let mut app = App::new();
+        app.stems.status = StemStatus::Active;
+        app.stems.layout = Some(zytunes::stems::HARMONY_STEM_LAYOUT);
+        app.stems.gains = Some(zytunes::stems::new_stem_gains(&[true; 7]));
+        app.stems.enabled = [true; zytunes::stems::MAX_STEMS];
+
+        // Collapsed: lead + backing read as one Vocals cell, six cells
+        // total, with the hint that 0 opens them.
+        let s = strip(&app);
+        assert!(s.starts_with("[1 Voc ●] [2 Drm ●]"), "{s}");
+        assert!(!s.contains("[7"), "{s}");
+        assert!(s.ends_with("0▸ parts"), "{s}");
+
+        // Backing muted: the group cell is partial.
+        app.stems.enabled[1] = false;
+        assert!(strip(&app).starts_with("[1 Voc ◐]"));
+
+        // Expanded: the group's label leads and its parts take the digits.
+        app.cycle_stem_group();
+        let s = strip(&app);
+        assert!(s.starts_with("Voc▸ [1 LdV ●] [2 BkV ○]"), "{s}");
+        assert!(s.ends_with("0 next"), "{s}");
+
+        // Six-stem layout: no groups, no hint.
+        app.stems.expanded = None;
+        app.stems.layout = Some(zytunes::stems::SIX_STEM_LAYOUT);
+        let s = strip(&app);
+        assert!(s.starts_with("[1 Voc"), "{s}");
+        assert!(!s.contains('▸'), "{s}");
     }
 }
