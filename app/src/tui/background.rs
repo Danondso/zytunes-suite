@@ -4456,12 +4456,10 @@ mod tests {
             tagged.insert_tag(Tag::new(tag_type));
         }
         let tag = tagged.primary_tag_mut().unwrap();
-        let pic = Picture::new_unchecked(
-            PictureType::CoverFront,
-            Some(MimeType::Jpeg),
-            None,
-            jpeg_bytes,
-        );
+        let pic = Picture::unchecked(jpeg_bytes)
+            .pic_type(PictureType::CoverFront)
+            .mime_type(MimeType::Jpeg)
+            .build();
         tag.push_picture(pic);
         tag.save_to_path(path, lofty::config::WriteOptions::default())
             .unwrap();

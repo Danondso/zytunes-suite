@@ -2569,12 +2569,10 @@ mod tests {
         }
         let tag = tagged.primary_tag_mut().unwrap();
         tag.set_artist("Test Artist".to_string());
-        let pic = Picture::new_unchecked(
-            PictureType::CoverFront,
-            Some(MimeType::Jpeg),
-            None,
-            art_data,
-        );
+        let pic = Picture::unchecked(art_data)
+            .pic_type(PictureType::CoverFront)
+            .mime_type(MimeType::Jpeg)
+            .build();
         tag.push_picture(pic);
         tag.save_to_path(path, lofty::config::WriteOptions::default())
             .unwrap();

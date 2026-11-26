@@ -20,18 +20,21 @@
 //!   the user later re-scans. The library `Track` struct has a seventh
 //!   field (`mb_work_id`) but MB doesn't surface it on release lookup,
 //!   so we don't write it here.
-//! - Picard-compatible Unknown-keyed tags (no lofty enum variant):
-//!   MUSICBRAINZ_ALBUMSTATUS, MUSICBRAINZ_ALBUMTYPE, RELEASECOUNTRY,
-//!   MUSICBRAINZ_ALBUMPACKAGING, SCRIPT. ASIN is skipped — see comment
-//!   in `write_release_identifiers`.
+//! - Picard's user-defined fields, spelled per container (see
+//!   `crate::picard_keys`): MUSICBRAINZ_ALBUMSTATUS, MUSICBRAINZ_ALBUMTYPE,
+//!   RELEASECOUNTRY, MUSICBRAINZ_ALBUMPACKAGING, SCRIPT. ASIN is skipped —
+//!   see comment in `write_release_identifiers`.
 //!
 //! The exact tag container is chosen by lofty based on the file extension.
 
 use std::path::Path;
 
+use lofty::ape::ApeTag;
 use lofty::config::{ParseOptions, WriteOptions};
 use lofty::file::{AudioFile, TaggedFile, TaggedFileExt};
 use lofty::id3::v2::Id3v2Tag;
+use lofty::iff::wav::RiffInfoList;
+use lofty::ogg::tag::VorbisComments;
 use lofty::probe::Probe;
 use lofty::tag::{ItemKey, ItemValue, Tag, TagExt, TagItem, TagType};
 
@@ -70,7 +73,7 @@ pub fn tag_ripped_file(
     let mut tagged = probe_by_content(path)?;
 
     // Promote WAV's primary from RIFF INFO to ID3v2. RIFF INFO uses 4-char
-    // FourCC keys and silently drops both Unknown-keyed Picard tags and
+    // FourCC keys and has no slot for Picard's user-defined fields or for
     // several ItemKey variants (ISRC, Barcode, etc.). Picard does the
     // same promotion for its own WAV writes.
     let tag_type = match tagged.primary_tag_type() {
@@ -166,10 +169,9 @@ pub fn tag_ripped_file(
 
 /// Write the edited tag of `tagged` back to `path`.
 ///
-/// ID3v2 goes through the concrete `Id3v2Tag`: lofty's generic-tag writer
-/// has no frame for the MusicBrainz recording ID and drops it, while the
-/// owned conversion emits the `UFID` frame Picard writes (and its reader
-/// maps back). A file that also carries an ID3v1 tag gets that tag brought
+/// ID3v2 goes through the concrete `Id3v2Tag` so its comment and lyrics
+/// frames can be repaired before the write (see
+/// [`repair_frame_languages`]). A file that also carries an ID3v1 tag gets that tag brought
 /// up to date with the edited ID3v2 (see [`merged_id3v1`]) so a reader that
 /// falls back to it does not see the pre-edit title; no ID3v1 is added
 /// where there was none.
@@ -188,6 +190,21 @@ pub(crate) fn save_tag(tagged: &TaggedFile, tag_type: TagType, path: &Path) -> R
                     None => Ok(()),
                 })
         }
+        // lofty keeps the fields it has no key for (Picard's
+        // `MUSICBRAINZ_ALBUMSTATUS`, any other tagger's custom comment) in
+        // a companion of the generic tag, and its generic Vorbis, APE and
+        // RIFF INFO writers skip that companion: saving the generic tag
+        // erased every such field from the file. The concrete tag carries
+        // them. ID3v2 (above) and MP4 writers include the companion.
+        Some(tag) if tag_type == TagType::VorbisComments => {
+            VorbisComments::from(tag.clone()).save_to_path(path, WriteOptions::default())
+        }
+        Some(tag) if tag_type == TagType::Ape => {
+            ApeTag::from(tag.clone()).save_to_path(path, WriteOptions::default())
+        }
+        Some(tag) if tag_type == TagType::RiffInfo => {
+            RiffInfoList::from(tag.clone()).save_to_path(path, WriteOptions::default())
+        }
         _ => tagged.save_to_path(path, WriteOptions::default()),
     };
     saved.map_err(|e| format!("lofty save failed on {}: {e}", path.display()))
@@ -204,7 +221,7 @@ fn merged_id3v1(existing: &Tag, edited: &Tag) -> lofty::id3::v1::Id3v1Tag {
     use lofty::id3::v1::Id3v1Tag;
     // ID3v1 stores genre as an index into a fixed list. An ID3v2 genre
     // outside that list clears the slot instead of leaving a stale one.
-    let edited_has_genre = edited.get_string(&ItemKey::Genre).is_some();
+    let edited_has_genre = edited.get_string(ItemKey::Genre).is_some();
     let edited = Id3v1Tag::from(edited.clone());
     let mut v1 = Id3v1Tag::from(existing.clone());
     if edited.title.is_some() {
@@ -277,14 +294,14 @@ fn repair_frame_languages(id3: &mut Id3v2Tag) {
             if is_comment {
                 id3.comments()
                     .find(|h| &h.language == lang && h.description == desc)
-                    .map(|h| h.content.clone())
+                    .map(|h| h.content.to_string())
             } else {
                 id3.unsync_text()
                     .find(|h| &h.language == lang && h.description == desc)
-                    .map(|h| h.content.clone())
+                    .map(|h| h.content.to_string())
             }
         };
-        let original = description.clone();
+        let original = description.to_string();
         let mut slots = [*b"XXX", *b"und"]
             .into_iter()
             .map(|lang| (lang, original.clone()))
@@ -296,7 +313,7 @@ fn repair_frame_languages(id3: &mut Id3v2Tag) {
                 Some(_) => continue,
                 None => {
                     *language = lang;
-                    *description = desc;
+                    *description = desc.into();
                     break false;
                 }
             }
@@ -343,9 +360,9 @@ fn write_release_identifiers(
     }
 
     if let Some(tr) = release.text_representation.as_ref() {
-        // Script has no ID3v2 enum-variant mapping — Picard writes it as
-        // a TXXX:SCRIPT user-defined text frame, which `set_picard_field`
-        // emits via the `Unknown` path that bypasses the format check.
+        // Script has no ID3v2 mapping in lofty — Picard writes it as a
+        // TXXX:SCRIPT user-defined text frame, which `set_picard_field`
+        // emits.
         if let Some(script) = tr.script.as_deref() {
             set_picard_field(tag, PicardField::Script, script);
         }
@@ -358,12 +375,10 @@ fn write_release_identifiers(
     // Writing under these names so a user opening the ripped file in
     // Picard sees populated fields and Picard does not re-fetch.
     //
-    // Limitation: lofty's abstract `Tag::insert_unchecked` parses any
-    // exactly-4-char `ItemKey::Unknown` name as a literal ID3v2 frame ID,
-    // which it then rejects if the name isn't a known frame. That makes
-    // it impossible to write Picard's `TXXX:ASIN` via this path — Picard
-    // reaches `Id3v2Tag::insert_user_text` directly. We skip ASIN; our
-    // library scanner doesn't read it, and Picard can re-fetch from MB.
+    // ASIN is skipped: our library scanner doesn't read it, and Picard can
+    // re-fetch it from MB. (It was first skipped because lofty 0.22 read a
+    // 4-char unknown key as an ID3v2 frame ID; `PicardField::write` goes
+    // through `TXXX` directly and would not hit that.)
     // Picard stores status and type lowercase ("official", "single");
     // matching it keeps the tag-manager diff quiet on ripped files.
     if let Some(status) = release.status.as_deref() {
@@ -388,41 +403,21 @@ pub(crate) fn set_string(tag: &mut Tag, key: ItemKey, value: &str) {
     if value.is_empty() {
         return;
     }
-    let item = TagItem::new(key, ItemValue::Text(value.to_string()));
-    // The recording ID has no static ID3v2 key: lofty's writer turns the
-    // text into a `UFID` frame (owner `http://musicbrainz.org`, what Picard
-    // writes) as a special case. The checked `insert` looks the mapping up
-    // first, finds none, and silently drops the item — so every re-open
-    // proposed the id again. Skip the check; the writer knows this key.
-    if matches!(item.key(), ItemKey::MusicBrainzRecordingId) {
-        tag.insert_unchecked(item);
-    } else {
-        tag.insert(item);
-    }
+    // The checked insert drops a key the container has no mapping for.
+    // The MusicBrainz recording ID maps in every container lofty writes
+    // here (ID3v2 stores it as Picard's `UFID` frame).
+    tag.insert(TagItem::new(key, ItemValue::Text(value.to_string())));
 }
 
 /// Write one of the Picard-style fields (see [`crate::picard_keys`]).
 ///
-/// The key actually written follows the container, and every other
+/// The key actually written follows the container (TXXX in ID3v2, the
+/// named comment in Vorbis, the freeform atom in MP4), and every other
 /// spelling of the same field is removed first so a Picard-tagged MP3
-/// does not end up with two differently named copies. `SCRIPT` has a
-/// lofty key outside ID3v2 and goes through that.
-///
-/// `Tag::insert` verifies a static ItemKey↔TagType mapping exists and
-/// silently drops `ItemKey::Unknown`; `insert_unchecked` skips the check
-/// and lofty's per-format writer routes the item through TXXX (ID3v2) /
-/// the named comment (Vorbis) / the freeform atom (MP4).
+/// does not end up with two differently named copies. See
+/// [`PicardField::write`].
 pub(crate) fn set_picard_field(tag: &mut Tag, field: PicardField, value: &str) {
-    if value.is_empty() {
-        return;
-    }
-    tag.retain(|i| !matches!(i.key(), ItemKey::Unknown(k) if field.matches(k)));
-    match field.item_key(tag.tag_type()) {
-        key @ ItemKey::Unknown(_) => {
-            tag.insert_unchecked(TagItem::new(key, ItemValue::Text(value.to_string())));
-        }
-        key => set_string(tag, key, value),
-    }
+    field.write(tag, value);
 }
 
 /// Write a Chromaprint fingerprint into the file's tag as `ACOUSTID_FINGERPRINT`.
@@ -647,24 +642,20 @@ mod tests {
     fn read_text(path: &Path, key: &ItemKey) -> Option<String> {
         let tagged = lofty::probe::read_from_path(path).unwrap();
         let tag = tagged.tag(TagType::Id3v2)?;
-        tag.get(key)
+        tag.get(*key)
             .and_then(|i| i.value().text())
             .map(|s| s.to_string())
     }
 
+    /// A user-defined field (TXXX description in these WAV tests) by its
+    /// exact spelling.
     fn read_unknown(path: &Path, name: &str) -> Option<String> {
         let tagged = lofty::probe::read_from_path(path).unwrap();
         let tag = tagged.tag(TagType::Id3v2)?;
-        for item in tag.items() {
-            if let ItemKey::Unknown(k) = item.key() {
-                if k == name {
-                    if let ItemValue::Text(v) = item.value() {
-                        return Some(v.clone());
-                    }
-                }
-            }
-        }
-        None
+        crate::picard_keys::user_fields(tag)
+            .into_iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v)
     }
 
     fn medium_with(position: u32, format: &str) -> Medium {
@@ -962,8 +953,10 @@ mod tests {
             read_text(&path, &ItemKey::CatalogNumber).as_deref(),
             Some("SHVL 804")
         );
+        // ID3v2 keeps label and publisher in one frame, TPUB, which lofty
+        // 0.25 reads back as `Publisher` (0.22 reported it as `Label`).
         assert_eq!(
-            read_text(&path, &ItemKey::Label).as_deref(),
+            read_text(&path, &ItemKey::Publisher).as_deref(),
             Some("Harvest")
         );
     }
@@ -1020,11 +1013,9 @@ mod tests {
     }
 
     #[test]
-    fn tags_skips_asin_due_to_lofty_4char_unknown_limitation() {
-        // ASIN is exactly 4 chars — lofty parses ItemKey::Unknown("ASIN")
-        // as a literal ID3v2 frame ID and rejects on save. Documenting the
-        // skip with a test so a future lofty upgrade or refactor doesn't
-        // silently re-introduce broken ASIN writes.
+    fn tags_skips_asin() {
+        // ASIN is deliberately not written (see write_release_identifiers):
+        // the scanner never reads it and Picard can re-fetch it.
         let path = write_test_wav("asin-skipped");
         let mut rel = release("Album", "Artist", None);
         rel.asin = Some("B000002UAS".into());
@@ -1100,21 +1091,21 @@ mod tests {
             .tag(TagType::Id3v2)
             .expect("id3v2 tag landed on the .part file");
         assert_eq!(
-            tag.get(&ItemKey::TrackTitle)
+            tag.get(ItemKey::TrackTitle)
                 .and_then(|i| i.value().text())
                 .map(str::to_string)
                 .as_deref(),
             Some("T")
         );
         assert_eq!(
-            tag.get(&ItemKey::AlbumTitle)
+            tag.get(ItemKey::AlbumTitle)
                 .and_then(|i| i.value().text())
                 .map(str::to_string)
                 .as_deref(),
             Some("Album")
         );
         assert_eq!(
-            tag.get(&ItemKey::MusicBrainzTrackId)
+            tag.get(ItemKey::MusicBrainzTrackId)
                 .and_then(|i| i.value().text())
                 .map(str::to_string)
                 .as_deref(),

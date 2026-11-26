@@ -21,7 +21,7 @@ zune-mtp = { path = "../zune-mtp" }
 ipod-db = { path = "../ipod-db" }
 id3 = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
-lofty = "0.22"
+lofty = "0.25"
 mp3lame-encoder = "0.2"
 rodio = { version = "0.22", default-features = true, features = [
     "symphonia-aac", "symphonia-isomp4", "symphonia-alac",

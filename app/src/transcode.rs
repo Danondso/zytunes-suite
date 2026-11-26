@@ -1750,12 +1750,10 @@ mod tests {
             }
             let tag = tagged.primary_tag_mut().unwrap();
             tag.set_artist("Art Artist".to_string());
-            let pic = Picture::new_unchecked(
-                PictureType::CoverFront,
-                Some(MimeType::Jpeg),
-                None,
-                big_art,
-            );
+            let pic = Picture::unchecked(big_art)
+                .pic_type(PictureType::CoverFront)
+                .mime_type(MimeType::Jpeg)
+                .build();
             tag.push_picture(pic);
             tag.save_to_path(&wav_path, lofty::config::WriteOptions::default())
                 .unwrap();
