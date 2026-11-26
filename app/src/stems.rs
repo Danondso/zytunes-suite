@@ -1626,6 +1626,12 @@ mod tests {
     use super::*;
     use crate::cache::default_logger;
 
+    /// The track ID a file with no registry entry gets, the key every
+    /// cache test stores and looks its source up under.
+    fn id_of(source: &Path) -> u64 {
+        crate::dirlib::hash_path(source)
+    }
+
     fn temp_root(tag: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
             "zytunes-stems-{tag}-{}-{}",
@@ -1800,7 +1806,7 @@ mod tests {
         let (source, produced_demucs) = fake_separation(&root, b"mp3data");
         store_stems(
             &cache,
-            crate::dirlib::hash_path(&source),
+            id_of(&source),
             &source,
             "htdemucs_6s",
             &produced_demucs,
@@ -1820,7 +1826,7 @@ mod tests {
         }
         store_stems(
             &cache,
-            crate::dirlib::hash_path(&source),
+            id_of(&source),
             &source,
             "hq/v1",
             &produced_hq,
@@ -1831,7 +1837,7 @@ mod tests {
 
         let demucs_hit = cached_stems(
             &cache,
-            crate::dirlib::hash_path(&source),
+            id_of(&source),
             &source,
             "htdemucs_6s",
             SIX_STEM_LAYOUT,
@@ -1840,7 +1846,7 @@ mod tests {
         .expect("demucs entry survives the hq store");
         let hq_hit = cached_stems(
             &cache,
-            crate::dirlib::hash_path(&source),
+            id_of(&source),
             &source,
             "hq/v1",
             SIX_STEM_LAYOUT,
@@ -1934,7 +1940,7 @@ mod tests {
 
         // Simulate a pre-recipe-key entry: bare 16-hex dirname holding a
         // valid meta + full six-stem file set.
-        let new_key = stem_cache_key(crate::dirlib::hash_path(&source), "htdemucs_6s");
+        let new_key = stem_cache_key(id_of(&source), "htdemucs_6s");
         let legacy_name = &new_key[..16];
         let legacy_dir = cache.join(legacy_name);
         std::fs::create_dir_all(&legacy_dir).unwrap();
@@ -1957,7 +1963,7 @@ mod tests {
         assert!(cache.join(&new_key).exists(), "renamed, not re-separated");
         let hit = cached_stems(
             &cache,
-            crate::dirlib::hash_path(&source),
+            id_of(&source),
             &source,
             "htdemucs_6s",
             SIX_STEM_LAYOUT,
@@ -1985,7 +1991,7 @@ mod tests {
         let (source, produced) = fake_separation(&root, b"mp3data");
         store_stems(
             &cache,
-            crate::dirlib::hash_path(&source),
+            id_of(&source),
             &source,
             "m",
             &produced,
@@ -1993,7 +1999,7 @@ mod tests {
             &log,
         )
         .unwrap();
-        let new_key = stem_cache_key(crate::dirlib::hash_path(&source), "m");
+        let new_key = stem_cache_key(id_of(&source), "m");
         let superseded = cache.join(&new_key[..16]);
         std::fs::create_dir_all(&superseded).unwrap();
         write_meta(
@@ -2023,7 +2029,7 @@ mod tests {
 
         let stored = store_stems(
             &cache,
-            crate::dirlib::hash_path(&source),
+            id_of(&source),
             &source,
             "htdemucs_6s",
             &produced,
@@ -2037,7 +2043,7 @@ mod tests {
 
         let hit = cached_stems(
             &cache,
-            crate::dirlib::hash_path(&source),
+            id_of(&source),
             &source,
             "htdemucs_6s",
             SIX_STEM_LAYOUT,
@@ -2057,7 +2063,7 @@ mod tests {
         let log = default_logger();
         store_stems(
             &cache,
-            crate::dirlib::hash_path(&source),
+            id_of(&source),
             &source,
             "htdemucs_6s",
             &produced,
@@ -2071,7 +2077,7 @@ mod tests {
         // the key level before the meta comparison is reached.
         assert!(cached_stems(
             &cache,
-            crate::dirlib::hash_path(&source),
+            id_of(&source),
             &source,
             "htdemucs",
             SIX_STEM_LAYOUT,
@@ -2083,7 +2089,7 @@ mod tests {
         std::fs::write(&source, b"mp3data-but-longer").unwrap();
         assert!(cached_stems(
             &cache,
-            crate::dirlib::hash_path(&source),
+            id_of(&source),
             &source,
             "htdemucs_6s",
             SIX_STEM_LAYOUT,
@@ -2105,7 +2111,7 @@ mod tests {
         let log = default_logger();
         store_stems(
             &cache,
-            crate::dirlib::hash_path(&source),
+            id_of(&source),
             &source,
             "hq/v1",
             &produced,
@@ -2115,14 +2121,14 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            stem_cache_key(crate::dirlib::hash_path(&source), "hq/v1"),
-            stem_cache_key(crate::dirlib::hash_path(&source), "hq-v1"),
+            stem_cache_key(id_of(&source), "hq/v1"),
+            stem_cache_key(id_of(&source), "hq-v1"),
             "precondition: the two ids collide on one dirname"
         );
         assert!(
             cached_stems(
                 &cache,
-                crate::dirlib::hash_path(&source),
+                id_of(&source),
                 &source,
                 "hq-v1",
                 SIX_STEM_LAYOUT,
@@ -2134,7 +2140,7 @@ mod tests {
         assert!(
             cached_stems(
                 &cache,
-                crate::dirlib::hash_path(&source),
+                id_of(&source),
                 &source,
                 "hq/v1",
                 SIX_STEM_LAYOUT,
@@ -2155,7 +2161,7 @@ mod tests {
         let log = default_logger();
         let stored = store_stems(
             &cache,
-            crate::dirlib::hash_path(&source),
+            id_of(&source),
             &source,
             "htdemucs_6s",
             &produced,
@@ -2167,7 +2173,7 @@ mod tests {
         std::fs::remove_file(&stored.paths[3]).unwrap();
         assert!(cached_stems(
             &cache,
-            crate::dirlib::hash_path(&source),
+            id_of(&source),
             &source,
             "htdemucs_6s",
             SIX_STEM_LAYOUT,
@@ -2195,7 +2201,7 @@ mod tests {
             let (source, produced) = fake_separation(&temp_root(name), b"x");
             store_stems(
                 &cache,
-                crate::dirlib::hash_path(&source),
+                id_of(&source),
                 &source,
                 "m",
                 &produced,
@@ -2203,7 +2209,7 @@ mod tests {
                 &log,
             )
             .unwrap();
-            keys.push(stem_cache_key(crate::dirlib::hash_path(&source), "m"));
+            keys.push(stem_cache_key(id_of(&source), "m"));
             std::thread::sleep(std::time::Duration::from_millis(1100));
         }
 
@@ -2409,7 +2415,7 @@ mod tests {
         let (source, produced) = fake_separation(&root, b"v1");
         store_stems(
             &cache,
-            crate::dirlib::hash_path(&source),
+            id_of(&source),
             &source,
             "m",
             &produced,
@@ -2428,7 +2434,7 @@ mod tests {
         }
         let stored = store_stems(
             &cache,
-            crate::dirlib::hash_path(&source),
+            id_of(&source),
             &source,
             "m",
             &produced2,
@@ -2439,15 +2445,8 @@ mod tests {
         assert!(stored.all_exist());
         assert_eq!(std::fs::read(&stored.paths[0]).unwrap(), b"newflac");
 
-        let hit = cached_stems(
-            &cache,
-            crate::dirlib::hash_path(&source),
-            &source,
-            "m",
-            SIX_STEM_LAYOUT,
-            &log,
-        )
-        .expect("fresh entry hits");
+        let hit = cached_stems(&cache, id_of(&source), &source, "m", SIX_STEM_LAYOUT, &log)
+            .expect("fresh entry hits");
         assert_eq!(hit, stored);
 
         let _ = std::fs::remove_dir_all(&root);
@@ -2663,7 +2662,7 @@ mod tests {
 
         let stored = store_stems(
             &cache,
-            crate::dirlib::hash_path(&source),
+            id_of(&source),
             &source,
             "hq-harmony/v1",
             &produced,
@@ -2676,7 +2675,7 @@ mod tests {
 
         let hit = cached_stems(
             &cache,
-            crate::dirlib::hash_path(&source),
+            id_of(&source),
             &source,
             "hq-harmony/v1",
             HARMONY_STEM_LAYOUT,
@@ -2689,7 +2688,7 @@ mod tests {
         // there is no vocals.flac in a harmony entry.
         assert!(cached_stems(
             &cache,
-            crate::dirlib::hash_path(&source),
+            id_of(&source),
             &source,
             "hq-harmony/v1",
             SIX_STEM_LAYOUT,
