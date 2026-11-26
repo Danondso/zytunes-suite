@@ -3,7 +3,7 @@ use crate::session::MtpSession;
 use crate::MtpError;
 
 use aes::Aes128;
-use cipher::{BlockDecryptMut, KeyIvInit};
+use cipher::{BlockModeDecrypt, KeyInit, KeyIvInit};
 use cmac::{Cmac, Mac};
 use num_bigint::BigUint;
 
@@ -153,14 +153,15 @@ impl MtpzKeys {
         }
         let iv = [0u8; 16];
         let mut buf = data.to_vec();
-        Aes128CbcDec::new(key.into(), &iv.into())
-            .decrypt_padded_mut::<cipher::block_padding::NoPadding>(&mut buf)
+        Aes128CbcDec::new_from_slices(key, &iv)
+            .map_err(|e| MtpError::Crypto(format!("AES-CBC init: {e}")))?
+            .decrypt_padded::<cipher::block_padding::NoPadding>(&mut buf)
             .map_err(|e| MtpError::Crypto(format!("AES decrypt failed: {e}")))?;
         Ok(buf)
     }
 
     fn cmac(key: &[u8], data: &[u8]) -> Result<Vec<u8>, MtpError> {
-        let mut mac = <Cmac<Aes128> as Mac>::new_from_slice(key)
+        let mut mac = <Cmac<Aes128> as KeyInit>::new_from_slice(key)
             .map_err(|e| MtpError::Crypto(format!("CMAC init: {e}")))?;
         mac.update(data);
         Ok(mac.finalize().into_bytes().to_vec())
