@@ -85,10 +85,16 @@ fn ipod_usb_label(pid: Option<u16>) -> String {
 /// Drain every command pending on `cmd_rx` during a sync run: appended
 /// items are spliced onto the back of `sync_queue` (bumping `total`), and
 /// `CancelSync` is reported via the return value. Any other command goes
-/// onto `deferred`, which the worker loop runs once the sync is over.
-/// Dropping them left the app waiting for an answer that never came: an
-/// inbox scan that stayed "in flight" for the rest of the session, or a
-/// tag apply whose overlay sat in Applying with every key ignored.
+/// onto `deferred` ([`defer`]), which the worker loop runs once the sync
+/// is over. Dropping them left the app waiting for an answer that never
+/// came: a tag apply whose overlay sat in Applying with every key
+/// ignored, or a CD detection that stayed "in flight" for the rest of
+/// the session.
+///
+/// Deferred commands replay late, in the order they came, after however
+/// long the sync took: an album-art load answers for an album the user
+/// may have scrolled past, a detection reports the drive as it is then.
+/// Each still gets its answer, which is what the app waits on.
 ///
 /// The sync loop must call this *before* its queue-empty exit check, not
 /// after popping an item: an `AppendSyncQueue` sent while the final track
@@ -117,10 +123,28 @@ fn drain_sync_commands(
                 *total += more.len();
                 sync_queue.extend(more);
             }
-            other => deferred.push_back(other),
+            other => defer(deferred, other),
         }
     }
     cancelled
+}
+
+/// Keep `cmd` for after the running job. Repeats that would only redo the
+/// same work are folded: an album-art load for an album already waiting
+/// (scrolling back and forth during a long sync asks for it again),
+/// and a `Connect` straight after another. A `Connect` after anything
+/// else is kept: `Connect, Disconnect, Connect` must end connected.
+fn defer(deferred: &mut std::collections::VecDeque<BgCommand>, cmd: BgCommand) {
+    let repeat = match &cmd {
+        BgCommand::LoadAlbumArt { key, .. } => deferred
+            .iter()
+            .any(|d| matches!(d, BgCommand::LoadAlbumArt { key: k, .. } if k == key)),
+        BgCommand::Connect => matches!(deferred.back(), Some(BgCommand::Connect)),
+        _ => false,
+    };
+    if !repeat {
+        deferred.push_back(cmd);
+    }
 }
 
 /// Whether a `CancelSync` is pending, for the loops that take no other
@@ -134,7 +158,7 @@ fn cancel_requested(
     while let Ok(cmd) = cmd_rx.try_recv() {
         match cmd {
             BgCommand::CancelSync => cancelled = true,
-            other => deferred.push_back(other),
+            other => defer(deferred, other),
         }
     }
     cancelled
@@ -3568,8 +3592,40 @@ mod tests {
     }
 
     #[test]
+    fn repeats_deferred_during_a_sync_are_folded_but_order_is_kept() {
+        let art = |key: &str| BgCommand::LoadAlbumArt {
+            key: key.into(),
+            artist: String::new(),
+            album: String::new(),
+            paths: Vec::new(),
+        };
+        let mut deferred = std::collections::VecDeque::new();
+        for cmd in [
+            art("a"),
+            BgCommand::Connect,
+            BgCommand::Connect,
+            art("b"),
+            art("a"),
+            BgCommand::Disconnect,
+            BgCommand::Connect,
+        ] {
+            defer(&mut deferred, cmd);
+        }
+        assert!(matches!(
+            deferred.make_contiguous(),
+            [
+                BgCommand::LoadAlbumArt { key: a, .. },
+                BgCommand::Connect,
+                BgCommand::LoadAlbumArt { key: b, .. },
+                BgCommand::Disconnect,
+                BgCommand::Connect,
+            ] if a == "a" && b == "b"
+        ));
+    }
+
+    #[test]
     fn commands_read_during_a_sync_are_kept_for_after_it() {
-        // An inbox scan or a tag apply sent while a sync runs used to be
+        // A tag apply or a CD detection sent while a sync runs used to be
         // read and dropped. The app then waited forever for its answer.
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (event_tx, _event_rx) = mpsc::channel();
