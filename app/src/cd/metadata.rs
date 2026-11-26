@@ -35,6 +35,7 @@ use lofty::id3::v2::Id3v2Tag;
 use lofty::probe::Probe;
 use lofty::tag::{ItemKey, ItemValue, Tag, TagExt, TagItem, TagType};
 
+use crate::library_layout::sanitise_filename_component;
 use crate::musicbrainz::{
     canonical_album_artist, render_artist_credit, Medium, Release, Track as MbTrack,
 };
@@ -490,33 +491,6 @@ pub fn ripped_track_destination(
     dest_dir.join(artist).join(album).join(filename)
 }
 
-/// Replace filesystem-hostile characters in a filename component. Keeps
-/// the result identifiable (doesn't aggressively transliterate) while
-/// ensuring it can land on macOS/Linux/Windows-via-network mounts.
-fn sanitise_filename_component(s: &str) -> String {
-    let trimmed = s.trim();
-    if trimmed.is_empty() {
-        return "Unknown".to_string();
-    }
-    let mut out = String::with_capacity(trimmed.len());
-    for c in trimmed.chars() {
-        match c {
-            '/' | '\\' | '\0' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => out.push('_'),
-            c if (c as u32) < 0x20 => {} // strip controls
-            c => out.push(c),
-        }
-    }
-    // Trailing dots/spaces break Windows path resolution on shared mounts.
-    while out.ends_with('.') || out.ends_with(' ') {
-        out.pop();
-    }
-    if out.is_empty() {
-        "Unknown".to_string()
-    } else {
-        out
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -588,40 +562,6 @@ mod tests {
             "mp3",
         );
         assert!(dest.to_string_lossy().contains("01 - T.mp3"));
-    }
-
-    #[test]
-    fn sanitise_filename_replaces_path_separators() {
-        assert_eq!(sanitise_filename_component("AC/DC"), "AC_DC");
-        assert_eq!(sanitise_filename_component("a:b"), "a_b");
-        assert_eq!(sanitise_filename_component("Foo?Bar*"), "Foo_Bar_");
-    }
-
-    #[test]
-    fn sanitise_filename_strips_controls() {
-        assert_eq!(sanitise_filename_component("a\x01b\x02c"), "abc");
-    }
-
-    #[test]
-    fn sanitise_filename_falls_back_for_empty_input() {
-        assert_eq!(sanitise_filename_component(""), "Unknown");
-        assert_eq!(sanitise_filename_component("   "), "Unknown");
-        // Input that decays to empty after stripping (only control chars).
-        assert_eq!(sanitise_filename_component("\x01\x02\x03"), "Unknown");
-    }
-
-    #[test]
-    fn sanitise_filename_replaces_but_keeps_slash_only_input() {
-        // "///" becomes "___" — the caller's input was nonsense but we
-        // preserve the structural shape rather than wiping to "Unknown".
-        assert_eq!(sanitise_filename_component("///"), "___");
-    }
-
-    #[test]
-    fn sanitise_filename_strips_trailing_dots_and_spaces() {
-        // Windows network mounts choke on these.
-        assert_eq!(sanitise_filename_component("Foo..."), "Foo");
-        assert_eq!(sanitise_filename_component("Foo   "), "Foo");
     }
 
     #[test]

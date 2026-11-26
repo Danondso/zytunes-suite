@@ -1,5 +1,7 @@
 //! Music library trait and shared `Track` type.
 
+use std::collections::HashMap;
+
 /// A track in the music library.
 ///
 /// All `Option` fields use `#[serde(default, skip_serializing_if =
@@ -144,15 +146,55 @@ impl Track {
     }
 }
 
+/// Collapse strings that differ only by ASCII case, keeping the most
+/// common original spelling (ties: lexicographic). Sorted case-insensitively.
+///
+/// Lookups (`artist_tracks`, …) already use `eq_ignore_ascii_case`, so a
+/// case-sensitive unique list produces duplicate sidebar rows that show
+/// the same tracks — `Alice in Chains` vs `Alice In Chains`.
+pub fn collapse_ascii_case<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
+    let mut groups: HashMap<String, HashMap<&'a str, usize>> = HashMap::new();
+    for name in names {
+        *groups
+            .entry(name.to_ascii_lowercase())
+            .or_default()
+            .entry(name)
+            .or_insert(0) += 1;
+    }
+    let mut out: Vec<&str> = groups.into_values().map(preferred_ascii_spelling).collect();
+    out.sort_by(|a, b| cmp_ignore_ascii_case(a, b).then_with(|| (*a).cmp(*b)));
+    out
+}
+
+/// Ordering of `a.to_ascii_lowercase()` against `b.to_ascii_lowercase()`
+/// without building either string. Sort comparators run O(n log n) times;
+/// allocating two Strings per call made every sidebar refresh a heap
+/// storm on a large library.
+pub fn cmp_ignore_ascii_case(a: &str, b: &str) -> std::cmp::Ordering {
+    a.bytes()
+        .map(|c| c.to_ascii_lowercase())
+        .cmp(b.bytes().map(|c| c.to_ascii_lowercase()))
+}
+
+fn preferred_ascii_spelling(spellings: HashMap<&str, usize>) -> &str {
+    spellings
+        .into_iter()
+        .max_by(|(a, na), (b, nb)| na.cmp(nb).then_with(|| (*a).cmp(*b)))
+        .map(|(s, _)| s)
+        .expect("non-empty spelling group")
+}
+
 /// Trait abstracting a music library backend.
 ///
 /// The track-returning methods yield `Box<dyn Iterator>` so streaming callers
 /// (sidebar population, stats passes) don't force an intermediate `Vec` —
 /// callers that want materialized state `.collect()` themselves.
 pub trait MusicLibrary {
-    /// All unique artist names, sorted.
+    /// Unique artist names, sorted. ASCII-case variants collapse to the
+    /// most common original spelling.
     fn artists(&self) -> Vec<&str>;
-    /// All unique (artist, album) pairs, sorted.
+    /// Unique `(artist, album)` pairs, sorted. ASCII-case variants of either
+    /// half collapse the same way as [`Self::artists`].
     fn albums(&self) -> Vec<(&str, &str)>;
     /// All tracks by a given artist (case-insensitive).
     fn artist_tracks<'a>(&'a self, artist: &str) -> Box<dyn Iterator<Item = &'a Track> + 'a>;
@@ -172,10 +214,17 @@ pub trait MusicLibrary {
     fn all_tracks(&self) -> Box<dyn Iterator<Item = &Track> + '_>;
     /// The music folder path, if known.
     fn music_folder(&self) -> Option<&str>;
-    /// Look up a track by its stable path-hash id. Default walks `all_tracks`;
+    /// Look up a track by its stable id. Default walks `all_tracks`;
     /// backends keyed by id should override for O(1).
     fn track_by_id(&self, id: u64) -> Option<&Track> {
         self.all_tracks().find(|t| t.id == id)
+    }
+    /// Look up a track by the file it is read from. A track's id says
+    /// nothing about its path (see `track_ids`), so this walks
+    /// `all_tracks`; fine at play start, too slow per frame.
+    fn track_by_location(&self, location: &str) -> Option<&Track> {
+        self.all_tracks()
+            .find(|t| t.location.as_deref() == Some(location))
     }
 
     /// Fill in Chromaprint ids computed after the library was already shown.
@@ -183,4 +232,60 @@ pub trait MusicLibrary {
     /// Existing ids are left alone. The default is a no-op so backends that
     /// do not participate in background fingerprinting stay unchanged.
     fn apply_acoustic_ids(&mut self, _updates: &[(u64, String)]) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cmp_ignore_ascii_case, collapse_ascii_case};
+
+    #[test]
+    fn cmp_ignore_ascii_case_orders_like_lowercased_strings() {
+        let samples = [
+            "alice",
+            "Alice",
+            "ALICE",
+            "Alice in Chains",
+            "alice In chains",
+            "Björk",
+            "björk",
+            "Zebra",
+            "aardvark",
+            "",
+            "a",
+            "B",
+            "𝐺𝑂𝑅𝐸",
+            "Gore",
+            "10cc",
+            "2Pac",
+        ];
+        for a in samples {
+            for b in samples {
+                assert_eq!(
+                    cmp_ignore_ascii_case(a, b),
+                    a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()),
+                    "{a:?} vs {b:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn collapse_ascii_case_keeps_most_common_spelling() {
+        let names = [
+            "Alice In Chains",
+            "Alice in Chains",
+            "Alice in Chains",
+            "Alice in Chains",
+        ];
+        assert_eq!(collapse_ascii_case(names), vec!["Alice in Chains"]);
+    }
+
+    #[test]
+    fn collapse_ascii_case_keeps_distinct_artists() {
+        let names = ["Radiohead", "Radiohead", "radiohead", "Alice in Chains"];
+        assert_eq!(
+            collapse_ascii_case(names),
+            vec!["Alice in Chains", "Radiohead"]
+        );
+    }
 }

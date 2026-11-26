@@ -59,7 +59,7 @@ It does **not** install Python engines. Press `M` once in the TUI to provision d
 
 ## API
 
-JSON is snake_case. Track ids are directory-library path hashes, serialized as **decimal strings** so Dart/JS keep the full `u64`. URL paths still use the digits: `/tracks/42/stream`.
+JSON is snake_case. Track ids are the directory library's stable ids (a track keeps its id when its file is moved or retitled by the TUI), serialized as **decimal strings** so Dart/JS keep the full `u64`. URL paths still use the digits: `/tracks/42/stream`.
 
 | Method | Path | Notes |
 |--------|------|-------|

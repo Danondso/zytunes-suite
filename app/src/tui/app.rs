@@ -376,7 +376,7 @@ pub struct StemPanel {
 pub struct StemBulkConfirm {
     pub artist: String,
     pub album: String,
-    pub track_paths: Vec<String>,
+    pub tracks: Vec<zytunes::stems::StemTrack>,
     /// Recipe parsed once when the modal opened — accept and dispatch
     /// reuse it instead of re-parsing (and re-logging) per call.
     pub recipe: zytunes::stems::RecipeKind,
@@ -398,7 +398,8 @@ pub struct StemBatchState {
     /// ignored (mirrors `StemState::job_gen`).
     pub gen: u64,
     pub album: String,
-    pub track_paths: Vec<String>,
+    /// Each track's ID (its cache key) and where its file is now.
+    pub tracks: Vec<zytunes::stems::StemTrack>,
     /// 1-indexed track the worker is on.
     pub current: usize,
     pub total: usize,
@@ -2841,7 +2842,7 @@ impl App {
     fn handle_library_reread_complete(
         &mut self,
         token: u64,
-        result: Result<Box<dyn MusicLibrary + Send>, String>,
+        result: Result<Option<Box<dyn MusicLibrary + Send>>, String>,
     ) {
         // Token-match decides whether the *currently open* overlay (if any)
         // gets its anchor rewritten / phase advanced. The library swap on
@@ -2853,15 +2854,24 @@ impl App {
             .is_some_and(|o| o.accepts_token(token));
         match result {
             Ok(lib) => {
-                self.library = Some(lib);
-                self.refresh_track_info_lib();
-                self.rebuild_artist_device_status();
-                self.refresh_sidebar();
+                // `None`: the apply was refused whole and the disk is as
+                // it was, so the library the app has is still right, and
+                // the selection must not follow names never written.
+                let reread = lib.is_some();
+                if let Some(lib) = lib {
+                    self.library = Some(lib);
+                    self.refresh_track_info_lib();
+                    self.rebuild_artist_device_status();
+                    self.refresh_sidebar();
+                }
                 if overlay_matches {
-                    // Rewrite the anchor's album/track name to the proposed
-                    // target so post-rename navigation finds the renamed row.
-                    self.rewrite_anchor_post_rename();
-                    self.restore_selection_anchor();
+                    if reread {
+                        // Rewrite the anchor's album/track name to the
+                        // proposed target so post-rename navigation finds
+                        // the renamed row.
+                        self.rewrite_anchor_post_rename();
+                        self.restore_selection_anchor();
+                    }
                     if let Some(overlay) = self.tag_manager.as_mut() {
                         overlay.phase = TagManagerPhase::Done;
                     }
@@ -3496,11 +3506,16 @@ impl App {
         let Some(lib) = &self.library else {
             return;
         };
-        let track_paths: Vec<String> = lib
+        let tracks: Vec<zytunes::stems::StemTrack> = lib
             .album_tracks_by_artist(&artist, &album)
-            .filter_map(|t| t.location.clone())
+            .filter_map(|t| {
+                Some(zytunes::stems::StemTrack {
+                    id: t.id,
+                    path: t.location.clone()?,
+                })
+            })
             .collect();
-        if track_paths.is_empty() {
+        if tracks.is_empty() {
             self.set_toast("No file paths for this album".into(), true);
             return;
         }
@@ -3511,12 +3526,13 @@ impl App {
         let cached = cache_dir
             .as_deref()
             .map(|d| {
-                track_paths
+                tracks
                     .iter()
-                    .filter(|p| {
+                    .filter(|t| {
                         zytunes::stems::stem_cache_contains(
                             d,
-                            std::path::Path::new(p.as_str()),
+                            t.id,
+                            std::path::Path::new(t.path.as_str()),
                             &cache_id,
                             layout,
                         )
@@ -3529,11 +3545,11 @@ impl App {
             .map(zytunes::stems::stem_cache_used_bytes)
             .unwrap_or(0);
         let projected_bytes = zytunes::stems::est_stem_bytes_per_track(recipe.layout())
-            * (track_paths.len() - cached) as u64;
+            * (tracks.len() - cached) as u64;
         self.stem_bulk_confirm = Some(StemBulkConfirm {
             artist,
             album,
-            track_paths,
+            tracks,
             recipe,
             cached,
             projected_bytes,
@@ -3562,8 +3578,8 @@ impl App {
             );
             return;
         }
-        let total = confirm.track_paths.len();
-        self.dispatch_stem_batch(confirm.album, confirm.track_paths, confirm.recipe, 0);
+        let total = confirm.tracks.len();
+        self.dispatch_stem_batch(confirm.album, confirm.tracks, confirm.recipe, 0);
         self.set_toast(
             format!("Separating {total} track(s) in the background…"),
             false,
@@ -3579,7 +3595,7 @@ impl App {
     fn dispatch_stem_batch(
         &mut self,
         album: String,
-        track_paths: Vec<String>,
+        tracks: Vec<zytunes::stems::StemTrack>,
         recipe: zytunes::stems::RecipeKind,
         separated_so_far: usize,
     ) {
@@ -3587,18 +3603,18 @@ impl App {
         self.pending_bg_commands
             .push(BgCommand::SeparateStemsBatch {
                 gen: self.stem_batch_gen,
-                track_paths: track_paths.clone(),
+                tracks: tracks.clone(),
                 engine_command: self.stems_cfg.command_path(),
                 recipe,
                 model: self.stems_cfg.model(),
                 cache_max_bytes: self.stems_cfg.cache_max_bytes(),
                 cache_dir: self.stems_cfg.stem_cache_dir(),
             });
-        let total = track_paths.len();
+        let total = tracks.len();
         self.stems_batch = Some(StemBatchState {
             gen: self.stem_batch_gen,
             album,
-            track_paths,
+            tracks,
             current: 0,
             total,
             pct: None,
@@ -3636,7 +3652,7 @@ impl App {
             .push(format!("[stems] resuming album batch: {}", batch.album));
         self.dispatch_stem_batch(
             batch.album,
-            batch.track_paths,
+            batch.tracks,
             batch.recipe,
             batch.separated_so_far,
         );
@@ -3701,6 +3717,7 @@ impl App {
         self.stems.for_path = Some(path.clone());
         self.pending_bg_commands.push(BgCommand::SeparateStems {
             gen: self.stems.job_gen,
+            track_id: self.stem_track_id(&path),
             track_path: path,
             engine_command: self.stems_cfg.command_path(),
             recipe,
@@ -3708,6 +3725,25 @@ impl App {
             cache_max_bytes: self.stems_cfg.cache_max_bytes(),
             cache_dir: self.stems_cfg.stem_cache_dir(),
         });
+    }
+
+    /// The ID a stem cache entry for the file at `path` is keyed on: the
+    /// library track's ID, which stays the same when the file moves. The
+    /// playing track's own ID is asked first, since right after a filing
+    /// apply the library can still list the track at its old path. A file
+    /// with no library track falls back to the hash of its path.
+    fn stem_track_id(&self, path: &str) -> u64 {
+        let playing = self
+            .now_playing
+            .as_ref()
+            .filter(|_| self.playing_track_path().as_deref() == Some(path))
+            .and_then(|np| np.track_id);
+        playing
+            .or_else(|| {
+                let lib = self.library.as_deref()?;
+                lib.track_by_location(path).map(|t| t.id)
+            })
+            .unwrap_or_else(|| zytunes::dirlib::hash_path(std::path::Path::new(path)))
     }
 
     // -- Stem settings panel (`o`) --
@@ -12037,6 +12073,7 @@ mod tests {
             [BgCommand::SeparateStems {
                 gen,
                 track_path,
+                track_id,
                 engine_command,
                 recipe,
                 model,
@@ -12045,6 +12082,11 @@ mod tests {
             }] => {
                 assert_eq!(*gen, app.stems.job_gen, "command carries the new gen");
                 assert_eq!(track_path, "/lib/song.mp3");
+                assert_eq!(
+                    *track_id,
+                    zytunes::dirlib::hash_path(std::path::Path::new("/lib/song.mp3")),
+                    "a playing file with no library track is keyed on the hash of its path"
+                );
                 assert!(engine_command.is_none(), "no [stems] command configured");
                 assert_eq!(*recipe, zytunes::stems::RecipeKind::Demucs);
                 assert_eq!(model, "htdemucs_6s");
@@ -12323,8 +12365,8 @@ mod tests {
     /// sidebar, and hermetic stem config/discovery.
     fn bulk_stem_app() -> App {
         let mut app = stem_playing_app("/lib/song.mp3");
-        let mk = |name: &str, loc: &str| zytunes::library::Track {
-            id: 1,
+        let mk = |id: u64, name: &str, loc: &str| zytunes::library::Track {
+            id,
             name: name.into(),
             artist: "Artist".into(),
             album: "Album".into(),
@@ -12332,7 +12374,7 @@ mod tests {
             ..Default::default()
         };
         app.library = Some(Box::new(VecLibrary {
-            tracks: vec![mk("One", "/lib/one.mp3"), mk("Two", "/lib/two.mp3")],
+            tracks: vec![mk(1, "One", "/lib/one.mp3"), mk(2, "Two", "/lib/two.mp3")],
         }));
         app.sidebar_items = vec![SidebarEntry::Album {
             artist: "Artist".into(),
@@ -12567,7 +12609,7 @@ mod tests {
         app.press_stem_mode_on_album();
         let confirm = app.stem_bulk_confirm.as_ref().expect("confirm modal opens");
         assert_eq!(confirm.album, "Album");
-        assert_eq!(confirm.track_paths.len(), 2);
+        assert_eq!(confirm.tracks.len(), 2);
         assert_eq!(confirm.cached, 0, "fake paths are never cached");
         assert!(confirm.projected_bytes > 0);
     }
@@ -12595,7 +12637,7 @@ mod tests {
         assert!(!batch.suspended);
         assert!(matches!(
             app.pending_bg_commands.as_slice(),
-            [BgCommand::SeparateStemsBatch { track_paths, .. }] if track_paths.len() == 2
+            [BgCommand::SeparateStemsBatch { tracks, .. }] if tracks.len() == 2
         ));
     }
 
