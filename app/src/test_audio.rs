@@ -60,3 +60,31 @@ fn write_pcm_wav(path: &Path, seconds: u32, channels: u16, sample: impl Fn(u32, 
     }
     f.write_all(&pcm).unwrap();
 }
+
+/// A one-second MP3 encoded by ffmpeg under the temp dir, or `None` when
+/// ffmpeg is not installed (the caller skips). MP3 is the container with
+/// ID3v1 as a secondary tag; the WAV helpers cannot stand in for it.
+pub(crate) fn ffmpeg_mp3(stem: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::temp_dir().join(format!("zytunes-{stem}-{}.mp3", std::process::id()));
+    let _ = fs::remove_file(&path);
+    let out = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=1",
+            "-q:a",
+            "9",
+        ])
+        .arg(&path)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        eprintln!("ffmpeg cannot encode mp3 here; skipping");
+        return None;
+    }
+    Some(path)
+}

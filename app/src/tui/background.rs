@@ -2436,7 +2436,11 @@ fn run_mb_search_releases_with_log(
     )));
     let _ = log.send(BgEvent::SyncMessage(format!("tag-manager: URL={}", url)));
     client
-        .search_releases(artist, album, 12)
+        .search_releases(artist, album, 12, |fallback| {
+            let _ = log.send(BgEvent::SyncMessage(format!(
+                "tag-manager: 0 hits, retrying as Various Artists: {fallback}"
+            )));
+        })
         .map(|r| r.releases)
         .map_err(|e| e.to_string())
 }

@@ -12,17 +12,19 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use lofty::config::{ParseOptions, WriteOptions};
-use lofty::file::{AudioFile, TaggedFileExt};
+use lofty::config::ParseOptions;
+use lofty::file::TaggedFileExt;
 use lofty::prelude::ItemKey;
 use lofty::probe::Probe;
 use lofty::tag::{ItemValue, Tag, TagType};
 
 use crate::cd::metadata::{
-    probe_by_content, ripped_track_destination, set_string, set_unknown_string,
+    probe_by_content, ripped_track_destination, save_tag, set_string, set_unknown_string,
 };
 use crate::library::Track;
-use crate::musicbrainz::{render_artist_credit, Medium, Release, Track as MbTrack};
+use crate::musicbrainz::{
+    canonical_album_artist, render_artist_credit, Medium, Release, Track as MbTrack,
+};
 
 /// Tag-side values the library `Track` schema doesn't model — but the diff
 /// still wants to surface. Read directly from the audio file once per
@@ -48,6 +50,9 @@ struct OnDiskExtras {
     /// `Probe::open` + `read()`, and on a 20-track release that doubled
     /// the file-open count for no benefit.
     acoustid_fingerprint: Option<String>,
+    /// The AcoustID track UUID (Picard's `ACOUSTID_ID`), so a file that
+    /// already carries it does not show the row as a change on every open.
+    acoustid_id: Option<String>,
 }
 
 fn read_on_disk_extras(path: &Path) -> OnDiskExtras {
@@ -73,19 +78,25 @@ fn read_on_disk_extras(path: &Path) -> OnDiskExtras {
     let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) else {
         return OnDiskExtras::default();
     };
+    extras_from_tag(tag)
+}
+
+/// Pull the Picard-style fields out of one tag, whatever the container
+/// spelled them as (see [`crate::picard_keys`]).
+fn extras_from_tag(tag: &Tag) -> OnDiskExtras {
+    use crate::picard_keys::PicardField;
     let media = tag
         .get_string(&ItemKey::OriginalMediaType)
         .map(|s| s.to_string());
-    // Picard TXXX fields are stored as `ItemKey::Unknown(description)`.
-    // Match case-insensitively because some legacy taggers used title-cased
-    // descriptions ("MusicBrainz Album Type" vs "MUSICBRAINZ_ALBUMTYPE")
-    // and lofty surfaces both verbatim.
+    // lofty knows SCRIPT in every container; older files may still carry
+    // it under an unknown key.
+    let mut script = tag.get_string(&ItemKey::Script).map(|s| s.to_string());
     let mut musicbrainz_album_type = None;
     let mut musicbrainz_album_status = None;
     let mut musicbrainz_album_packaging = None;
     let mut release_country = None;
-    let mut script = None;
     let mut acoustid_fingerprint = None;
+    let mut acoustid_id = None;
     for item in tag.items() {
         let ItemKey::Unknown(name) = item.key() else {
             continue;
@@ -96,28 +107,20 @@ fn read_on_disk_extras(path: &Path) -> OnDiskExtras {
         if value.is_empty() {
             continue;
         }
-        let slot = if name.eq_ignore_ascii_case("MUSICBRAINZ_ALBUMTYPE")
-            || name.eq_ignore_ascii_case("MusicBrainz Album Type")
-        {
+        let slot = if PicardField::AlbumType.matches(name) {
             &mut musicbrainz_album_type
-        } else if name.eq_ignore_ascii_case("MUSICBRAINZ_ALBUMSTATUS")
-            || name.eq_ignore_ascii_case("MusicBrainz Album Status")
-        {
+        } else if PicardField::AlbumStatus.matches(name) {
             &mut musicbrainz_album_status
-        } else if name.eq_ignore_ascii_case("MUSICBRAINZ_ALBUMPACKAGING")
-            || name.eq_ignore_ascii_case("MusicBrainz Album Packaging")
-        {
+        } else if PicardField::AlbumPackaging.matches(name) {
             &mut musicbrainz_album_packaging
-        } else if name.eq_ignore_ascii_case("RELEASECOUNTRY")
-            || name.eq_ignore_ascii_case("MusicBrainz Album Release Country")
-        {
+        } else if PicardField::ReleaseCountry.matches(name) {
             &mut release_country
-        } else if name.eq_ignore_ascii_case("SCRIPT") {
+        } else if crate::picard_keys::strip_freeform_prefix(name).eq_ignore_ascii_case("SCRIPT") {
             &mut script
-        } else if name.eq_ignore_ascii_case("ACOUSTID_FINGERPRINT")
-            || name.eq_ignore_ascii_case("Acoustid Fingerprint")
-        {
+        } else if PicardField::AcoustidFingerprint.matches(name) {
             &mut acoustid_fingerprint
+        } else if PicardField::AcoustidId.matches(name) {
+            &mut acoustid_id
         } else {
             continue;
         };
@@ -133,6 +136,7 @@ fn read_on_disk_extras(path: &Path) -> OnDiskExtras {
         release_country,
         script,
         acoustid_fingerprint,
+        acoustid_id,
     }
 }
 
@@ -199,6 +203,14 @@ impl ReleaseTagDiff {
             .iter()
             .any(|t| t.fields.iter().any(|f| f.enabled))
     }
+
+    /// Any field whose on-disk value differs from MusicBrainz, whether or
+    /// not the user left it enabled. False means the tags already match.
+    pub fn has_any_change(&self) -> bool {
+        self.tracks
+            .iter()
+            .any(|t| t.fields.iter().any(|f| f.current != f.proposed))
+    }
 }
 
 /// Build a diff for an album or single track, pairing library tracks to MB
@@ -224,7 +236,7 @@ pub fn build_release_diff(
         Some(release.media.len() as u32)
     };
 
-    let mut out: Vec<TrackTagDiff> = Vec::new();
+    let mut out: Vec<((u32, u32), TrackTagDiff)> = Vec::new();
     for lib in library_tracks {
         let location = match lib.location.as_deref() {
             Some(p) => PathBuf::from(p),
@@ -270,13 +282,20 @@ pub fn build_release_diff(
 
         let dest_path = proposed_filename.filter(|p| p != &location);
 
-        out.push(TrackTagDiff {
-            src_path: location,
-            dest_path,
-            library_id: lib.id,
-            fields,
-        });
+        out.push((
+            (medium.position.unwrap_or(0), position),
+            TrackTagDiff {
+                src_path: location,
+                dest_path,
+                library_id: lib.id,
+                fields,
+            },
+        ));
     }
+    // The library hands tracks over in hash order; list them the way the
+    // release does (disc, then track), and keep that stable for ties.
+    out.sort_by_key(|(order, _)| *order);
+    let out: Vec<TrackTagDiff> = out.into_iter().map(|(_, t)| t).collect();
 
     ReleaseTagDiff {
         release_mbid: release.id.clone(),
@@ -327,7 +346,8 @@ fn release_summary(release: &Release) -> String {
 ///   1. `mb_track_id` equality (when both sides carry one).
 ///   2. `disc_number` + `track_number` equality.
 ///   3. `track_number` equality on any medium (fallback when the library
-///      track doesn't carry a disc number).
+///      track doesn't carry a disc number). When more than one medium has
+///      that track number, a title match (step 4) is preferred.
 ///   4. Title equality, case-insensitive — across every medium.
 fn pair_to_mb_track_across_media<'a>(
     lib: &Track,
@@ -351,26 +371,37 @@ fn pair_to_mb_track_across_media<'a>(
             }
         }
     }
-    // 3. Track-number fallback, any medium. Ambiguous on multi-disc releases
-    // when the lib side has no disc — accept the first hit and move on.
+    let by_title = || {
+        media.iter().find_map(|medium| {
+            medium
+                .tracks
+                .iter()
+                .find(|m| m.title.eq_ignore_ascii_case(&lib.name))
+                .map(|m| (medium, m))
+        })
+    };
+    // 3. Track-number fallback, any medium. On a multi-disc release every
+    // disc has a track N, so without a disc number the title decides
+    // first: taking the first disc's track N filed disc 2 track 1 as (and
+    // on top of) disc 1 track 1. The first hit stands only when no title
+    // matches either.
     if let Some(n) = lib.track_number {
-        for medium in media {
-            if let Some(m) = medium.tracks.iter().find(|m| m.position == Some(n)) {
-                return Some((medium, m));
+        let mut hits = media.iter().filter_map(|medium| {
+            medium
+                .tracks
+                .iter()
+                .find(|m| m.position == Some(n))
+                .map(|m| (medium, m))
+        });
+        if let Some(first) = hits.next() {
+            if hits.next().is_none() {
+                return Some(first);
             }
+            return by_title().or(Some(first));
         }
     }
     // 4. Title fallback.
-    for medium in media {
-        if let Some(m) = medium
-            .tracks
-            .iter()
-            .find(|m| m.title.eq_ignore_ascii_case(&lib.name))
-        {
-            return Some((medium, m));
-        }
-    }
-    None
+    by_title()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -456,7 +487,7 @@ fn build_track_fields(
         Some(lib.album.clone()),
         Some(release.title.clone()),
     );
-    let album_artist = render_artist_credit(&release.artist_credit);
+    let album_artist = canonical_album_artist(&release.artist_credit);
     push(
         FieldKind::Identity,
         "Album Artist",
@@ -525,11 +556,14 @@ fn build_track_fields(
     let mb_genre = pick_top_genre(release);
     push(FieldKind::Identity, "Genre", lib.genre.clone(), mb_genre);
 
-    // Album Type (Picard MUSICBRAINZ_ALBUMTYPE): "Album" / "Single" / "EP" / ...
+    // Album Type (Picard MUSICBRAINZ_ALBUMTYPE): "album" / "single" / "ep".
+    // MusicBrainz capitalises these; Picard stores them lowercase, and a
+    // Picard-tagged file must not show "single" → "Single" as a change.
     let album_type = release
         .release_group
         .as_ref()
-        .and_then(|rg| rg.primary_type.clone());
+        .and_then(|rg| rg.primary_type.as_deref())
+        .map(str::to_lowercase);
     push(
         FieldKind::Picard,
         "MUSICBRAINZ_ALBUMTYPE",
@@ -547,7 +581,7 @@ fn build_track_fields(
         FieldKind::Picard,
         "MUSICBRAINZ_ALBUMSTATUS",
         extras.musicbrainz_album_status.clone(),
-        release.status.clone(),
+        release.status.as_deref().map(str::to_lowercase),
     );
     push(
         FieldKind::Picard,
@@ -656,18 +690,24 @@ fn build_track_fields(
 
     // -- AcoustID tags --
     //
+    // Both are pushed directly, not through `push`, which would mark them
+    // as release values: they come from this file's audio, and must not
+    // be written to another copy kept in its place.
+    //
     // ACOUSTID_ID is the parent AcoustID UUID — only available when
     // we resolved via the AcoustID fingerprint path. Skipped when the
-    // overlay reached this point through MBID-direct or MB-search.
-    // (Closure-based push first so the &mut fields borrow it captures
-    // ends before the direct fields.push below.)
+    // overlay reached this point through MBID-direct or MB-search. It was
+    // looked up from this file's fingerprint.
     if let Some(uuid) = acoustid_uuid.filter(|s| !s.is_empty()) {
-        push(
-            FieldKind::Picard,
-            "ACOUSTID_ID",
-            None,
-            Some(uuid.to_string()),
-        );
+        let on_disk = extras.acoustid_id.clone().filter(|s| !s.is_empty());
+        let enabled = on_disk.as_deref() != Some(uuid);
+        fields.push(FieldDiff {
+            kind: FieldKind::Picard,
+            name: "ACOUSTID_ID",
+            current: on_disk,
+            proposed: Some(uuid.to_string()),
+            enabled,
+        });
     }
 
     // ACOUSTID_FINGERPRINT is sourced entirely from the library track's
@@ -844,8 +884,15 @@ fn write_track_tags(track: &TrackTagDiff) -> Result<(), String> {
     let tmp = tagtmp_path(src);
     // Clean up a leftover from a prior crash before copying.
     let _ = std::fs::remove_file(&tmp);
-    std::fs::copy(src, &tmp)
-        .map_err(|e| format!("tag-save: copy {} -> {}: {e}", src.display(), tmp.display()))?;
+    if let Err(e) = std::fs::copy(src, &tmp) {
+        // A copy that ran out of disk leaves what it wrote so far.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!(
+            "tag-save: copy {} -> {}: {e}",
+            src.display(),
+            tmp.display()
+        ));
+    }
 
     let result = write_then_swap(&tmp, src, &to_apply);
     if result.is_err() {
@@ -862,7 +909,17 @@ fn write_then_swap(tmp: &Path, src: &Path, to_apply: &[&FieldDiff]) -> Result<()
         other => other,
     };
     if tagged.tag(tag_type).is_none() {
-        tagged.insert_tag(Tag::new(tag_type));
+        let mut fresh = Tag::new(tag_type);
+        // An ID3v1-only MP3. The new ID3v2 becomes the tag every reader
+        // prefers (the scanner included), so it starts from what the file
+        // already says: holding only the edited rows, it hid the title
+        // and artist that were never part of the edit.
+        if let Some(v1) = tagged.tag(TagType::Id3v1) {
+            for item in v1.items() {
+                fresh.insert(item.clone());
+            }
+        }
+        tagged.insert_tag(fresh);
     }
     let tag = tagged
         .tag_mut(tag_type)
@@ -870,9 +927,8 @@ fn write_then_swap(tmp: &Path, src: &Path, to_apply: &[&FieldDiff]) -> Result<()
     for field in to_apply {
         apply_field(tag, field);
     }
-    tagged
-        .save_to_path(tmp, WriteOptions::default())
-        .map_err(|e| format!("lofty save failed on {}: {e}", src.display()))?;
+    let _ = tag;
+    save_tag(&tagged, tag_type, tmp).map_err(|e| format!("{e} (source {})", src.display()))?;
     // fsync the temp's contents before swapping it in — otherwise a power
     // loss between rename and writeback can leave a renamed-but-empty file
     // on ext4/xfs.
@@ -1332,6 +1388,353 @@ mod tests {
             tag.title()
         );
         assert_eq!(tag.album().as_deref(), Some("Album"));
+    }
+
+    #[test]
+    fn apply_release_diff_writes_recording_id_to_id3v2() {
+        // Regression: lofty has no static ID3v2 key for the recording ID
+        // (it becomes a UFID frame at write time), so the checked insert
+        // dropped it and the field came back as a change on every open.
+        let dir = fresh_dir("apply-recording-id");
+        let path = dir.join("song.wav");
+        write_sine_wav(&path, 1);
+        let lib = make_lib_track(&path, "First", 1);
+        let rel = make_release("Album", "Artist");
+        let mut diff = build_release_diff(&[lib], &rel, &dir, DiffScope::Track, None);
+        for f in &mut diff.tracks[0].fields {
+            // Title too: the scanner ignores a tag with no title/artist.
+            f.enabled = matches!(f.name, "MB Recording ID" | "Title");
+        }
+        assert!(diff.has_any_enabled(), "release must carry a recording id");
+
+        let (results, _) = apply_release_diff(&diff);
+        assert!(results[0].is_ok(), "{:?}", results[0]);
+
+        let reread = crate::dirlib::track_from_lofty(&path, 1).expect("tagged file");
+        assert_eq!(reread.mb_recording_id.as_deref(), Some("rec-1"));
+        let again = build_release_diff(&[reread], &rel, &dir, DiffScope::Track, None);
+        let row = again.tracks[0]
+            .fields
+            .iter()
+            .find(|f| f.name == "MB Recording ID")
+            .unwrap();
+        assert!(!row.enabled, "second open must see the id as already set");
+    }
+
+    /// A file whose comment frame carries a null language code. Some
+    /// taggers write `\0\0\0`; lofty refuses to write a tag containing it,
+    /// so a save of ANY field fails until the frame is repaired.
+    fn wav_with_null_language_comment(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        use lofty::config::WriteOptions;
+        use lofty::tag::{Accessor, ItemKey, Tag, TagExt, TagType};
+        let dir = fresh_dir(name);
+        let path = dir.join("song.wav");
+        write_sine_wav(&path, 1);
+        let mut tag = Tag::new(TagType::Id3v2);
+        tag.set_title("First".into());
+        tag.set_artist("Artist".into());
+        tag.insert_text(ItemKey::Comment, "Electro House".into());
+        tag.save_to_path(&path, WriteOptions::default()).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let at = bytes
+            .windows(4)
+            .position(|w| w == b"COMM")
+            .expect("comment frame present");
+        // 10-byte frame header, 1-byte text encoding, then the language.
+        bytes[at + 11..at + 14].copy_from_slice(&[0, 0, 0]);
+        std::fs::write(&path, bytes).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn null_language_repair_never_displaces_a_valid_comment() {
+        use lofty::id3::v2::{CommentFrame, Frame, Id3v2Tag};
+        use lofty::tag::TagExt;
+        use lofty::TextEncoding;
+        let dir = fresh_dir("null-lang-keep");
+        let path = dir.join("song.wav");
+        write_sine_wav(&path, 1);
+        // Two well-formed comments with the same (empty) description, then
+        // one of them gets the null language some taggers write.
+        let mut id3 = Id3v2Tag::default();
+        let comment = |lang: &[u8; 3], text: &str| {
+            Frame::Comment(CommentFrame::new(
+                TextEncoding::UTF8,
+                *lang,
+                String::new(),
+                text.into(),
+            ))
+        };
+        id3.insert(comment(b"eng", "Electro House"));
+        id3.insert(comment(b"XXX", "Purchased at Beatport.com"));
+        id3.set_title("First".into());
+        id3.save_to_path(&path, lofty::config::WriteOptions::default())
+            .unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let electro = bytes
+            .windows(13)
+            .position(|w| w == b"Electro House")
+            .unwrap();
+        let at = bytes[..electro]
+            .windows(4)
+            .rposition(|w| w == b"COMM")
+            .unwrap();
+        assert_eq!(&bytes[at + 11..at + 14], b"eng");
+        bytes[at + 11..at + 14].copy_from_slice(&[0, 0, 0]);
+        std::fs::write(&path, bytes).unwrap();
+
+        let tagged = probe_by_content(&path).unwrap();
+        save_tag(&tagged, TagType::Id3v2, &path).unwrap();
+
+        let after: Vec<(Vec<u8>, String)> = Id3v2Tag::from(
+            probe_by_content(&path)
+                .unwrap()
+                .tag(TagType::Id3v2)
+                .unwrap()
+                .clone(),
+        )
+        .comments()
+        .map(|c| (c.language.to_vec(), c.content.clone()))
+        .collect();
+        assert!(
+            after.iter().all(|(lang, _)| lang == b"XXX"),
+            "every comment is writable now: {after:?}"
+        );
+        assert!(
+            after.iter().any(|(_, c)| c == "Purchased at Beatport.com"),
+            "the valid comment is kept: {after:?}"
+        );
+    }
+
+    #[test]
+    fn apply_release_diff_repairs_a_null_comment_language() {
+        let (dir, path) = wav_with_null_language_comment("null-lang");
+        let mut lib = make_lib_track(&path, "First", 1);
+        lib.album = "Stale".into();
+        let rel = make_release("Album", "Artist");
+        let mut diff = build_release_diff(&[lib], &rel, &dir, DiffScope::Track, None);
+        for f in &mut diff.tracks[0].fields {
+            f.enabled = f.name == "Album";
+        }
+        let (results, _) = apply_release_diff(&diff);
+        assert!(results[0].is_ok(), "{:?}", results[0]);
+        let reread = crate::dirlib::track_from_lofty(&path, 1).unwrap();
+        assert_eq!(reread.album, "Album");
+        assert_eq!(
+            reread.comment.as_deref(),
+            Some("Electro House"),
+            "the comment itself survives the repair"
+        );
+    }
+
+    #[test]
+    fn extras_read_picard_spellings_from_every_container() {
+        use lofty::tag::{ItemKey, ItemValue, Tag, TagItem, TagType};
+        let unknown = |tag: &mut Tag, key: &str, value: &str| {
+            tag.insert_unchecked(TagItem::new(
+                ItemKey::Unknown(key.into()),
+                ItemValue::Text(value.into()),
+            ));
+        };
+        // MP4: freeform atoms come back with the full prefixed key.
+        let mut mp4 = Tag::new(TagType::Mp4Ilst);
+        unknown(
+            &mut mp4,
+            "----:com.apple.iTunes:MusicBrainz Album Type",
+            "single",
+        );
+        unknown(
+            &mut mp4,
+            "----:com.apple.iTunes:MusicBrainz Album Status",
+            "official",
+        );
+        unknown(
+            &mut mp4,
+            "----:com.apple.iTunes:MusicBrainz Album Release Country",
+            "XW",
+        );
+        unknown(
+            &mut mp4,
+            "----:com.apple.iTunes:Acoustid Fingerprint",
+            "AQAD...",
+        );
+        let ex = extras_from_tag(&mp4);
+        assert_eq!(ex.musicbrainz_album_type.as_deref(), Some("single"));
+        assert_eq!(ex.musicbrainz_album_status.as_deref(), Some("official"));
+        assert_eq!(ex.release_country.as_deref(), Some("XW"));
+        assert_eq!(ex.acoustid_fingerprint.as_deref(), Some("AQAD..."));
+
+        // Vorbis: lofty maps SCRIPT to its own key.
+        let mut vorbis = Tag::new(TagType::VorbisComments);
+        vorbis.insert(TagItem::new(
+            ItemKey::Script,
+            ItemValue::Text("Latn".into()),
+        ));
+        assert_eq!(extras_from_tag(&vorbis).script.as_deref(), Some("Latn"));
+    }
+
+    #[test]
+    fn picard_album_type_and_status_compare_lowercase() {
+        let dir = fresh_dir("picard-lowercase");
+        let path = dir.join("song.wav");
+        write_sine_wav(&path, 1);
+        let lib = make_lib_track(&path, "First", 1);
+        let mut rel = make_release("Album", "Artist");
+        rel.status = Some("Official".into());
+        rel.release_group = Some(crate::musicbrainz::ReleaseGroup {
+            id: "rg-1".into(),
+            title: "Album".into(),
+            primary_type: Some("Single".into()),
+            first_release_date: None,
+            genres: vec![],
+        });
+        let diff = build_release_diff(&[lib], &rel, &dir, DiffScope::Track, None);
+        let proposed = |name: &str| {
+            diff.tracks[0]
+                .fields
+                .iter()
+                .find(|f| f.name == name)
+                .and_then(|f| f.proposed.clone())
+        };
+        assert_eq!(proposed("MUSICBRAINZ_ALBUMTYPE").as_deref(), Some("single"));
+        assert_eq!(
+            proposed("MUSICBRAINZ_ALBUMSTATUS").as_deref(),
+            Some("official")
+        );
+    }
+
+    /// Apply a full release to a real file of each container ffmpeg can
+    /// produce here, re-read it, and check nothing is left to change.
+    /// Skipped when ffmpeg is not installed.
+    #[test]
+    fn apply_round_trips_in_every_container() {
+        if std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            eprintln!("ffmpeg not installed; skipping container round trip");
+            return;
+        }
+        let dir = fresh_dir("container-round-trip");
+        let seed = dir.join("seed.wav");
+        write_sine_wav(&seed, 2);
+        let mut rel = make_release("Album", "Artist");
+        rel.country = Some("US".into());
+        rel.status = Some("Official".into());
+        rel.packaging = Some("Jewel Case".into());
+        rel.barcode = Some("074645147529".into());
+        rel.genres = vec![crate::musicbrainz::MbGenre {
+            name: "grunge".into(),
+            count: 5,
+        }];
+        rel.text_representation = Some(crate::musicbrainz::TextRepresentation {
+            language: Some("eng".into()),
+            script: Some("Latn".into()),
+        });
+        rel.release_group = Some(crate::musicbrainz::ReleaseGroup {
+            id: "rg-1".into(),
+            title: "Album".into(),
+            primary_type: Some("Single".into()),
+            first_release_date: Some("1969".into()),
+            genres: vec![],
+        });
+        for (ext, codec) in [
+            ("mp3", "libmp3lame"),
+            ("flac", "flac"),
+            ("m4a", "alac"),
+            ("ogg", "libvorbis"),
+        ] {
+            let root = dir.join(ext);
+            let path = root
+                .join("Artist")
+                .join("Album")
+                .join(format!("01 - First.{ext}"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let status = std::process::Command::new("ffmpeg")
+                .args(["-y", "-loglevel", "error", "-i"])
+                .arg(&seed)
+                .args([
+                    "-c:a",
+                    codec,
+                    "-metadata",
+                    "title=First",
+                    "-metadata",
+                    "artist=Artist",
+                ])
+                .arg(&path)
+                .status()
+                .unwrap();
+            if !status.success() {
+                eprintln!("ffmpeg cannot encode {ext} here; skipping");
+                continue;
+            }
+            let read = || crate::dirlib::track_from_lofty(&path, 1).expect("tagged file");
+            let uuid = Some("9ff43b6a-4f16-427c-93c2-92307ca505e0");
+            let mut diff = build_release_diff(&[read()], &rel, &root, DiffScope::Track, uuid);
+            for f in &mut diff.tracks[0].fields {
+                if f.kind == FieldKind::Filename {
+                    f.enabled = false;
+                }
+            }
+            let (results, _) = apply_release_diff(&diff);
+            assert!(results[0].is_ok(), "{ext}: {:?}", results[0]);
+
+            // The AcoustID UUID sits under the key Picard uses in this
+            // container, and nowhere else.
+            let tagged = lofty::read_from_path(&path).unwrap();
+            let tag = tagged.primary_tag().expect("tag after apply");
+            let acoustid_keys: Vec<&str> = tag
+                .items()
+                .filter(|i| i.value().text() == uuid)
+                .filter_map(|i| match i.key() {
+                    ItemKey::Unknown(k) => Some(k.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let want = match ext {
+                "mp3" => "Acoustid Id",
+                "m4a" => "----:com.apple.iTunes:Acoustid Id",
+                _ => "ACOUSTID_ID",
+            };
+            assert_eq!(acoustid_keys, vec![want], "{ext}");
+
+            let again = build_release_diff(&[read()], &rel, &root, DiffScope::Track, uuid);
+            let left: Vec<String> = again.tracks[0]
+                .fields
+                .iter()
+                .filter(|f| f.enabled && f.kind != FieldKind::Filename)
+                .map(|f| format!("{}: {:?} -> {:?}", f.name, f.current, f.proposed))
+                .collect();
+            assert!(left.is_empty(), "{ext} still proposes {left:#?}");
+        }
+    }
+
+    #[test]
+    fn diff_tracks_are_ordered_by_disc_and_track_number() {
+        // The library hands tracks over in hash order; the overlay must
+        // list them the way the release does.
+        let dir = fresh_dir("diff-order");
+        let rel = make_release("Album", "Artist");
+        let mut lib: Vec<LibTrack> = Vec::new();
+        for (n, title) in [(2u32, "Second"), (1, "First")] {
+            let path = dir.join(format!("{n:02} - {title}.wav"));
+            write_sine_wav(&path, 1);
+            lib.push(make_lib_track(&path, title, n));
+        }
+        let diff = build_release_diff(&lib, &rel, &dir, DiffScope::Album, None);
+        let order: Vec<String> = diff
+            .tracks
+            .iter()
+            .map(|t| {
+                t.src_path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(order, vec!["01 - First.wav", "02 - Second.wav"]);
     }
 
     #[test]
@@ -1912,6 +2315,7 @@ mod tests {
         assert_eq!(id_field.kind, FieldKind::Picard);
         assert_eq!(id_field.proposed.as_deref(), Some("ac-uuid-42"));
         assert!(id_field.current.is_none());
+        assert!(id_field.enabled);
     }
 
     #[test]
@@ -1966,10 +2370,96 @@ mod tests {
                 .and_then(|i| i.value().text().map(str::to_string))
         };
         assert_eq!(
-            find("ACOUSTID_FINGERPRINT").as_deref(),
-            Some("AQADtBR=writeMe")
+            find("Acoustid Fingerprint").as_deref(),
+            Some("AQADtBR=writeMe"),
+            "ID3v2 uses Picard's TXXX description"
         );
-        assert_eq!(find("ACOUSTID_ID").as_deref(), Some("uuid-to-write"));
+        assert_eq!(
+            find("Acoustid Id").as_deref(),
+            Some("uuid-to-write"),
+            "ID3v2 uses Picard's TXXX description"
+        );
+        assert_eq!(
+            find("ACOUSTID_ID"),
+            None,
+            "no second copy under the Vorbis name"
+        );
+    }
+
+    #[test]
+    fn tagging_an_id3v1_only_mp3_keeps_what_it_already_said() {
+        use lofty::config::WriteOptions;
+        use lofty::file::AudioFile;
+        let Some(path) = crate::test_audio::ffmpeg_mp3("id3v1-only-apply") else {
+            return;
+        };
+        // ffmpeg writes an ID3v2 of its own; this file must have none.
+        TagType::Id3v2.remove_from_path(&path).unwrap();
+        let mut tf = lofty::read_from_path(&path).unwrap();
+        let mut v1 = Tag::new(TagType::Id3v1);
+        v1.set_title("Old Title".into());
+        v1.set_artist("Old Artist".into());
+        v1.set_album("Old Album".into());
+        v1.set_genre("Rock".into());
+        v1.set_comment("ripped 2003".into());
+        tf.insert_tag(v1);
+        tf.save_to_path(&path, WriteOptions::default()).unwrap();
+
+        // An edit that touches none of those fields.
+        write_track_tags(&TrackTagDiff {
+            src_path: path.clone(),
+            dest_path: None,
+            library_id: 1,
+            fields: vec![FieldDiff {
+                kind: FieldKind::MbId,
+                name: "MB Release ID",
+                current: None,
+                proposed: Some("rel-1".into()),
+                enabled: true,
+            }],
+        })
+        .unwrap();
+
+        let back = lofty::read_from_path(&path).unwrap();
+        let v1 = back.tag(TagType::Id3v1).expect("ID3v1 survives");
+        assert_eq!(v1.title().as_deref(), Some("Old Title"));
+        assert_eq!(v1.artist().as_deref(), Some("Old Artist"));
+        assert_eq!(v1.album().as_deref(), Some("Old Album"));
+        assert_eq!(v1.genre().as_deref(), Some("Rock"));
+        assert_eq!(v1.comment().as_deref(), Some("ripped 2003"));
+        let v2 = back.tag(TagType::Id3v2).expect("ID3v2 was added");
+        assert_eq!(v2.get_string(&ItemKey::MusicBrainzReleaseId), Some("rel-1"));
+        let scanned = crate::dirlib::track_from_lofty(&path, 1).expect("still tagged");
+        assert_eq!(scanned.name, "Old Title");
+        assert_eq!(scanned.artist, "Old Artist");
+        assert_eq!(scanned.album, "Old Album");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn apply_replaces_a_legacy_acoustid_id_spelling() {
+        // Earlier builds wrote `TXXX:ACOUSTID_ID` into ID3v2. The row reads
+        // it as the current value, and a rewrite leaves one Picard-spelled
+        // copy rather than two.
+        let mut tag = Tag::new(TagType::Id3v2);
+        tag.insert_unchecked(lofty::tag::TagItem::new(
+            ItemKey::Unknown("ACOUSTID_ID".into()),
+            ItemValue::Text("old-uuid".into()),
+        ));
+        assert_eq!(
+            extras_from_tag(&tag).acoustid_id.as_deref(),
+            Some("old-uuid")
+        );
+
+        set_unknown_string(&mut tag, "ACOUSTID_ID", "new-uuid");
+        let copies: Vec<(&str, Option<&str>)> = tag
+            .items()
+            .filter_map(|i| match i.key() {
+                ItemKey::Unknown(k) => Some((k.as_str(), i.value().text())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(copies, vec![("Acoustid Id", Some("new-uuid"))]);
     }
 
     #[test]
@@ -2125,5 +2615,86 @@ mod tests {
             Some("*NSYNC"),
             "Album Artist must come from the release-level credit so dirlib groups under the canonical artist",
         );
+    }
+
+    #[test]
+    fn feat_on_release_credit_files_under_primary_artist() {
+        let dir = fresh_dir("feat-release-folder");
+        let src_dir = dir
+            .join("2Pac featuring the Notorious B.I.G.")
+            .join("All Eyez On Me");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let path = src_dir.join("01 - Track.wav");
+        write_sine_wav(&path, 1);
+
+        let mut rel = make_release("All Eyez On Me", "2Pac");
+        rel.artist_credit = vec![
+            ArtistCredit {
+                name: "2Pac".into(),
+                joinphrase: Some(" featuring ".into()),
+                artist: Some(Artist {
+                    id: "art-2pac".into(),
+                    name: "2Pac".into(),
+                    sort_name: None,
+                }),
+            },
+            ArtistCredit {
+                name: "The Notorious B.I.G.".into(),
+                joinphrase: None,
+                artist: Some(Artist {
+                    id: "art-big".into(),
+                    name: "The Notorious B.I.G.".into(),
+                    sort_name: None,
+                }),
+            },
+        ];
+        rel.media[0].tracks[0].title = "Track".into();
+
+        let lib = make_lib_track(&path, "Track", 1);
+        let diff = build_release_diff(&[lib], &rel, &dir, DiffScope::Track, None);
+        let track = &diff.tracks[0];
+        assert_eq!(
+            track
+                .fields
+                .iter()
+                .find(|f| f.name == "Album Artist")
+                .and_then(|f| f.proposed.as_deref()),
+            Some("2Pac"),
+        );
+        let dest = track.dest_path.as_ref().expect("rename proposed");
+        assert_eq!(
+            dest,
+            &dir.join("2Pac")
+                .join("All Eyez On Me")
+                .join("01 - Track.wav")
+        );
+    }
+
+    #[test]
+    fn multi_disc_pairing_without_disc_numbers_prefers_the_title() {
+        let mut rel = make_release("Album", "Artist");
+        let mut disc2 = rel.media[0].clone();
+        disc2.position = Some(2);
+        disc2.tracks[0].id = "trk-d2-1".into();
+        disc2.tracks[0].title = "Third".into();
+        disc2.tracks[1].id = "trk-d2-2".into();
+        disc2.tracks[1].title = "Fourth".into();
+        rel.media.push(disc2);
+
+        // Disc 2 track 1, tagged with a track number but no disc number.
+        let lib = make_lib_track(Path::new("/m/x.wav"), "Third", 1);
+        let (medium, track) = pair_to_mb_track_across_media(&lib, &rel.media).unwrap();
+        assert_eq!((medium.position, track.title.as_str()), (Some(2), "Third"));
+
+        // No title to go on: the first disc's track N, as before.
+        let lib = make_lib_track(Path::new("/m/y.wav"), "Untitled", 1);
+        let (medium, track) = pair_to_mb_track_across_media(&lib, &rel.media).unwrap();
+        assert_eq!((medium.position, track.title.as_str()), (Some(1), "First"));
+
+        // A single-disc release still pairs by number over title.
+        let single = make_release("Album", "Artist");
+        let lib = make_lib_track(Path::new("/m/z.wav"), "Second", 1);
+        let (_, track) = pair_to_mb_track_across_media(&lib, &single.media).unwrap();
+        assert_eq!(track.title, "First");
     }
 }
