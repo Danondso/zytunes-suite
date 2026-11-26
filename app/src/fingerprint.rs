@@ -18,13 +18,11 @@ use lofty::file::TaggedFileExt;
 use lofty::probe::Probe;
 use lofty::tag::{ItemKey, ItemValue};
 use rusty_chromaprint::{Configuration, FingerprintCompressor, Fingerprinter};
-use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
-use symphonia::core::errors::Error as SymphoniaError;
-use symphonia::core::formats::FormatOptions;
+use symphonia::core::codecs::audio::AudioDecoderOptions;
+use symphonia::core::formats::probe::Hint;
+use symphonia::core::formats::{FormatOptions, TrackType};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
 
 /// Seconds of audio to feed the fingerprinter. Chromaprint's AcoustID-default
 /// (Test2) configuration summarises the first ~2 minutes of a track; decoding
@@ -113,25 +111,24 @@ fn compute_fingerprint_inner(path: &Path) -> Option<String> {
         hint.with_extension(ext);
     }
 
-    let probed = symphonia::default::get_probe()
-        .format(
+    let mut format = symphonia::default::get_probe()
+        .probe(
             &hint,
             mss,
-            &FormatOptions::default(),
-            &MetadataOptions::default(),
+            FormatOptions::default(),
+            MetadataOptions::default(),
         )
         .ok()?;
-    let mut format = probed.format;
 
-    let track = format
-        .tracks()
-        .iter()
-        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)?
-        .clone();
+    let track = format.first_track_known_codec(TrackType::Audio)?;
     let track_id = track.id;
+    let codec_params = track.codec_params.as_ref()?.audio()?;
 
+    // Gapless trimming off: fingerprints are compared against ones computed
+    // before symphonia 0.6 (which never trimmed by default), so the decoder
+    // must hand chromaprint the same untrimmed PCM.
     let mut decoder = symphonia::default::get_codecs()
-        .make(&track.codec_params, &DecoderOptions::default())
+        .make_audio_decoder(codec_params, &AudioDecoderOptions::default().gapless(false))
         .ok()?;
 
     // Initialise chromaprint lazily from the first decoded packet's spec, not
@@ -142,19 +139,12 @@ fn compute_fingerprint_inner(path: &Path) -> Option<String> {
     let mut fp: Option<Fingerprinter> = None;
     let mut max_samples: u64 = 0;
     let mut samples_seen: u64 = 0;
-    let mut sbuf: Option<SampleBuffer<i16>> = None;
+    let mut samples: Vec<i16> = Vec::new();
 
-    loop {
-        let packet = match format.next_packet() {
-            Ok(p) => p,
-            Err(SymphoniaError::IoError(ref e))
-                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-            {
-                break
-            }
-            Err(_) => break,
-        };
-        if packet.track_id() != track_id {
+    // End of stream (`Ok(None)`) and any read error both end the decode:
+    // fingerprinting is best-effort over whatever audio was readable.
+    while let Ok(Some(packet)) = format.next_packet() {
+        if packet.track_id != track_id {
             continue;
         }
         let decoded = match decoder.decode(&packet) {
@@ -163,36 +153,26 @@ fn compute_fingerprint_inner(path: &Path) -> Option<String> {
         };
 
         if fp.is_none() {
-            let spec = *decoded.spec();
-            let channels = spec.channels.count() as u32;
+            let spec = decoded.spec();
+            let channels = spec.channels().count() as u32;
             if channels == 0 {
                 return None;
             }
             let mut new_fp = Fingerprinter::new(&config);
-            new_fp.start(spec.rate, channels).ok()?;
+            new_fp.start(spec.rate(), channels).ok()?;
             fp = Some(new_fp);
-            max_samples = u64::from(spec.rate) * u64::from(channels) * FINGERPRINT_SECONDS;
+            max_samples = u64::from(spec.rate()) * u64::from(channels) * FINGERPRINT_SECONDS;
         }
 
-        // SampleBuffer must be at least as large as the largest packet's
-        // capacity, otherwise `copy_interleaved_ref` writes past the end.
-        // M4A and other variable-frame containers can produce packets larger
-        // than the first one, so grow the buffer on demand instead of
-        // sizing-once-from-first-packet.
-        let needed = decoded.capacity() as u64;
-        let needs_alloc = sbuf.as_ref().is_none_or(|b| (b.capacity() as u64) < needed);
-        if needs_alloc {
-            sbuf = Some(SampleBuffer::new(needed, *decoded.spec()));
-        }
-        let buf = sbuf.as_mut().expect("sample buffer initialised above");
-        buf.copy_interleaved_ref(decoded);
-        let samples = buf.samples();
+        // Resizes `samples` to this packet's frame count, so variable-size
+        // packets (M4A) never overrun or leave stale samples behind.
+        decoded.copy_to_vec_interleaved(&mut samples);
         if samples.is_empty() {
             continue;
         }
         fp.as_mut()
             .expect("fingerprinter initialised above")
-            .consume(samples);
+            .consume(&samples);
         samples_seen += samples.len() as u64;
         if samples_seen >= max_samples {
             break;
