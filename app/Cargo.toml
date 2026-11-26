@@ -36,7 +36,7 @@ unicode-normalization = "0.1"
 unicode-width = "0.2"
 arboard = { version = "3", default-features = false }
 ureq = { version = "2", default-features = false, features = ["tls", "gzip"] }
-sha1 = "0.10"
+sha1 = "0.11"
 discid = "0.7"
 
 [features]

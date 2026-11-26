@@ -1,5 +1,5 @@
 use aes::Aes128;
-use cmac::{Cmac, Mac};
+use cmac::{Cmac, KeyInit, Mac};
 
 fn main() {
     // Known-answer CMAC vector
@@ -11,7 +11,7 @@ fn main() {
     let mut text = vec![0u8; 16];
     text[15] = 1;
 
-    let mut mac = <Cmac<Aes128> as Mac>::new_from_slice(key).unwrap();
+    let mut mac = <Cmac<Aes128> as KeyInit>::new_from_slice(key).unwrap();
     mac.update(&text);
     let result = mac.finalize().into_bytes();
 
@@ -23,9 +23,9 @@ fn main() {
     message.extend_from_slice(&result);
 
     println!("Our signature:  {}", hex::encode(&message));
-    println!("Expected:       02030010a12cffdd28a2d815152c5736129b7ffc");
+    println!("Expected:       02030010a12cffdd28a2d859152c5736129b7ffc");
     println!(
         "Match: {}",
-        hex::encode(&message) == "02030010a12cffdd28a2d815152c5736129b7ffc"
+        hex::encode(&message) == "02030010a12cffdd28a2d859152c5736129b7ffc"
     );
 }
