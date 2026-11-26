@@ -11,7 +11,7 @@
 //! spelling never matched what Picard-tagged files actually hold — so the
 //! rows came back as changes on every open.
 
-use lofty::tag::TagType;
+use lofty::tag::{ItemKey, TagType};
 
 /// A field stored under a format-specific "unknown" key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,6 +20,9 @@ pub enum PicardField {
     AlbumStatus,
     AlbumPackaging,
     ReleaseCountry,
+    /// The release's script (`Latn`). Unlike the rest, lofty has a key
+    /// for it in Vorbis and MP4; only ID3v2 needs Picard's `TXXX:SCRIPT`.
+    Script,
     AcoustidFingerprint,
     AcoustidId,
 }
@@ -34,11 +37,12 @@ pub fn strip_freeform_prefix(key: &str) -> &str {
 }
 
 impl PicardField {
-    pub const ALL: [PicardField; 6] = [
+    pub const ALL: [PicardField; 7] = [
         PicardField::AlbumType,
         PicardField::AlbumStatus,
         PicardField::AlbumPackaging,
         PicardField::ReleaseCountry,
+        PicardField::Script,
         PicardField::AcoustidFingerprint,
         PicardField::AcoustidId,
     ];
@@ -50,6 +54,7 @@ impl PicardField {
             PicardField::AlbumStatus => "MUSICBRAINZ_ALBUMSTATUS",
             PicardField::AlbumPackaging => "MUSICBRAINZ_ALBUMPACKAGING",
             PicardField::ReleaseCountry => "RELEASECOUNTRY",
+            PicardField::Script => "SCRIPT",
             PicardField::AcoustidFingerprint => "ACOUSTID_FINGERPRINT",
             PicardField::AcoustidId => "ACOUSTID_ID",
         }
@@ -62,6 +67,7 @@ impl PicardField {
             PicardField::AlbumStatus => "MusicBrainz Album Status",
             PicardField::AlbumPackaging => "MusicBrainz Album Packaging",
             PicardField::ReleaseCountry => "MusicBrainz Album Release Country",
+            PicardField::Script => "SCRIPT",
             PicardField::AcoustidFingerprint => "Acoustid Fingerprint",
             PicardField::AcoustidId => "Acoustid Id",
         }
@@ -79,6 +85,16 @@ impl PicardField {
             TagType::Id3v2 => self.spaced().to_string(),
             TagType::Mp4Ilst => format!("----:com.apple.iTunes:{}", self.spaced()),
             _ => self.canonical().to_string(),
+        }
+    }
+
+    /// The lofty key to write for `tag_type`: lofty's own key where it has
+    /// one (SCRIPT outside ID3v2), otherwise [`Self::key_for`] as
+    /// `ItemKey::Unknown`.
+    pub fn item_key(self, tag_type: TagType) -> ItemKey {
+        match (self, tag_type) {
+            (PicardField::Script, t) if t != TagType::Id3v2 => ItemKey::Script,
+            _ => ItemKey::Unknown(self.key_for(tag_type)),
         }
     }
 
@@ -123,6 +139,27 @@ mod tests {
         assert_eq!(
             PicardField::AcoustidId.key_for(TagType::Mp4Ilst),
             "----:com.apple.iTunes:Acoustid Id"
+        );
+    }
+
+    #[test]
+    fn script_uses_lofty_key_except_in_id3v2() {
+        assert_eq!(
+            PicardField::Script.item_key(TagType::Id3v2),
+            ItemKey::Unknown("SCRIPT".into())
+        );
+        assert_eq!(
+            PicardField::Script.item_key(TagType::Mp4Ilst),
+            ItemKey::Script
+        );
+        assert_eq!(
+            PicardField::Script.item_key(TagType::VorbisComments),
+            ItemKey::Script
+        );
+        assert!(PicardField::Script.matches("----:com.apple.iTunes:SCRIPT"));
+        assert_eq!(
+            PicardField::AlbumType.item_key(TagType::Id3v2),
+            ItemKey::Unknown("MusicBrainz Album Type".into())
         );
     }
 

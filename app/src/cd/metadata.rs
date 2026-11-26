@@ -38,6 +38,7 @@ use lofty::tag::{ItemKey, ItemValue, Tag, TagExt, TagItem, TagType};
 use crate::musicbrainz::{
     canonical_album_artist, render_artist_credit, Medium, Release, Track as MbTrack,
 };
+use crate::picard_keys::PicardField;
 
 /// One-line summary of the tags `tag_ripped_file` + `tag_ripped_fingerprint`
 /// embed. Lofty handles container-specific encoding (ID3v2 for MP3/WAV,
@@ -171,6 +172,10 @@ pub fn tag_ripped_file(
 /// up to date with the edited ID3v2 (see [`merged_id3v1`]) so a reader that
 /// falls back to it does not see the pre-edit title; no ID3v1 is added
 /// where there was none.
+///
+/// Only fields present in the ID3v2 overwrite their ID3v1 slot, so removing
+/// a field from the ID3v2 leaves the old ID3v1 value in place: a future
+/// "clear field" operation must clear it in the ID3v1 tag as well.
 pub(crate) fn save_tag(tagged: &TaggedFile, tag_type: TagType, path: &Path) -> Result<(), String> {
     let saved = match tagged.tag(tag_type) {
         Some(tag) if tag_type == TagType::Id3v2 => {
@@ -189,7 +194,8 @@ pub(crate) fn save_tag(tagged: &TaggedFile, tag_type: TagType, path: &Path) -> R
 
 /// The file's ID3v1 tag with the edited ID3v2's values laid over it.
 ///
-/// Only a field the ID3v2 carries is overwritten. Rebuilding the ID3v1
+/// Only a field the ID3v2 carries is overwritten — an absent ID3v2 field
+/// never clears its ID3v1 slot (see [`save_tag`]). Rebuilding the ID3v1
 /// from the ID3v2 alone erased whatever the ID3v2 lacked: a comment or
 /// genre held only in ID3v1, or every field of an ID3v1-only file whose
 /// new ID3v2 held just the rows the edit touched.
@@ -229,13 +235,16 @@ fn merged_id3v1(existing: &Tag, edited: &Tag) -> lofty::id3::v1::Id3v1Tag {
 /// ID3v2 requires three ASCII letters; some taggers write `\0\0\0`.
 /// lofty reads such a frame back fine but refuses to write a tag that
 /// contains it, so every save of every field failed with "Invalid frame
-/// language" until the file was fixed by hand. `XXX` is the spec's own
-/// "unknown language" value. A malformed frame never displaces a valid
-/// one: if the file already has an `XXX` frame with the same description
-/// the malformed copy is dropped instead.
+/// language" until the file was fixed by hand.
+///
+/// A repaired frame moves to `XXX` (the spec's "unknown language"). Two
+/// frames of one kind may not share a language and description, so when
+/// that slot is already held the frame tries `und` (ISO 639-2
+/// "undetermined"), then `XXX` with a numbered description. Text is never
+/// dropped: the only frame discarded is one whose text is identical to the
+/// frame already in the slot it lands on.
 fn repair_frame_languages(id3: &mut Id3v2Tag) {
     use lofty::id3::v2::Frame;
-    const UNKNOWN: [u8; 3] = *b"XXX";
     let bad_lang = |lang: &[u8; 3]| lang.iter().any(|b| !b.is_ascii_alphabetic());
     let needs_repair = |f: &Frame<'_>| match f {
         Frame::Comment(c) => bad_lang(&c.language),
@@ -252,20 +261,46 @@ fn repair_frame_languages(id3: &mut Id3v2Tag) {
     }
     id3.retain(|f| !needs_repair(f));
     for mut frame in broken {
-        let taken = match &mut frame {
-            Frame::Comment(c) => {
-                c.language = UNKNOWN;
-                id3.comments()
-                    .any(|have| have.language == UNKNOWN && have.description == c.description)
-            }
-            Frame::UnsynchronizedText(u) => {
-                u.language = UNKNOWN;
-                id3.unsync_text()
-                    .any(|have| have.language == UNKNOWN && have.description == u.description)
-            }
-            _ => true,
+        let (language, description, content, is_comment) = match &mut frame {
+            Frame::Comment(c) => (&mut c.language, &mut c.description, c.content.clone(), true),
+            Frame::UnsynchronizedText(u) => (
+                &mut u.language,
+                &mut u.description,
+                u.content.clone(),
+                false,
+            ),
+            _ => continue,
         };
-        if !taken {
+        // The text already stored under (lang, desc), for this frame kind.
+        let held = |lang: &[u8; 3], desc: &str| -> Option<String> {
+            if is_comment {
+                id3.comments()
+                    .find(|h| &h.language == lang && h.description == desc)
+                    .map(|h| h.content.clone())
+            } else {
+                id3.unsync_text()
+                    .find(|h| &h.language == lang && h.description == desc)
+                    .map(|h| h.content.clone())
+            }
+        };
+        let original = description.clone();
+        let mut slots = [*b"XXX", *b"und"]
+            .into_iter()
+            .map(|lang| (lang, original.clone()))
+            .chain((2..).map(|n| (*b"XXX", format!("{original} ({n})"))));
+        let duplicate = loop {
+            let (lang, desc) = slots.next().expect("unbounded slot sequence");
+            match held(&lang, &desc) {
+                Some(text) if text == content => break true,
+                Some(_) => continue,
+                None => {
+                    *language = lang;
+                    *description = desc;
+                    break false;
+                }
+            }
+        };
+        if !duplicate {
             id3.insert(frame);
         }
     }
@@ -308,10 +343,10 @@ fn write_release_identifiers(
 
     if let Some(tr) = release.text_representation.as_ref() {
         // Script has no ID3v2 enum-variant mapping — Picard writes it as
-        // a TXXX:SCRIPT user-defined text frame, which `set_unknown_string`
+        // a TXXX:SCRIPT user-defined text frame, which `set_picard_field`
         // emits via the `Unknown` path that bypasses the format check.
         if let Some(script) = tr.script.as_deref() {
-            set_unknown_string(tag, "SCRIPT", script);
+            set_picard_field(tag, PicardField::Script, script);
         }
         if let Some(lang) = tr.language.as_deref() {
             set_string(tag, ItemKey::Language, lang);
@@ -331,20 +366,20 @@ fn write_release_identifiers(
     // Picard stores status and type lowercase ("official", "single");
     // matching it keeps the tag-manager diff quiet on ripped files.
     if let Some(status) = release.status.as_deref() {
-        set_unknown_string(tag, "MUSICBRAINZ_ALBUMSTATUS", &status.to_lowercase());
+        set_picard_field(tag, PicardField::AlbumStatus, &status.to_lowercase());
     }
     if let Some(album_type) = release
         .release_group
         .as_ref()
         .and_then(|rg| rg.primary_type.as_deref())
     {
-        set_unknown_string(tag, "MUSICBRAINZ_ALBUMTYPE", &album_type.to_lowercase());
+        set_picard_field(tag, PicardField::AlbumType, &album_type.to_lowercase());
     }
     if let Some(country) = release.country.as_deref() {
-        set_unknown_string(tag, "RELEASECOUNTRY", country);
+        set_picard_field(tag, PicardField::ReleaseCountry, country);
     }
     if let Some(packaging) = release.packaging.as_deref() {
-        set_unknown_string(tag, "MUSICBRAINZ_ALBUMPACKAGING", packaging);
+        set_picard_field(tag, PicardField::AlbumPackaging, packaging);
     }
 }
 
@@ -365,51 +400,28 @@ pub(crate) fn set_string(tag: &mut Tag, key: ItemKey, value: &str) {
     }
 }
 
-/// Write one of the Picard-style fields that lofty has no key for.
+/// Write one of the Picard-style fields (see [`crate::picard_keys`]).
 ///
-/// `name` is the canonical (Vorbis) spelling; the key actually written
-/// follows the container (see [`crate::picard_keys`]), and every other
+/// The key actually written follows the container, and every other
 /// spelling of the same field is removed first so a Picard-tagged MP3
 /// does not end up with two differently named copies. `SCRIPT` has a
-/// lofty key in every container and goes through that.
+/// lofty key outside ID3v2 and goes through that.
 ///
 /// `Tag::insert` verifies a static ItemKey↔TagType mapping exists and
 /// silently drops `ItemKey::Unknown`; `insert_unchecked` skips the check
 /// and lofty's per-format writer routes the item through TXXX (ID3v2) /
 /// the named comment (Vorbis) / the freeform atom (MP4).
-pub(crate) fn set_unknown_string(tag: &mut Tag, name: &str, value: &str) {
-    use crate::picard_keys::{strip_freeform_prefix, PicardField};
+pub(crate) fn set_picard_field(tag: &mut Tag, field: PicardField, value: &str) {
     if value.is_empty() {
         return;
     }
-    if name.eq_ignore_ascii_case("SCRIPT") {
-        tag.retain(|i| {
-            !matches!(i.key(), ItemKey::Unknown(k) if strip_freeform_prefix(k).eq_ignore_ascii_case("SCRIPT"))
-        });
-        // lofty maps SCRIPT in Vorbis and MP4 but has no ID3v2 mapping;
-        // there it is Picard's `TXXX:SCRIPT`.
-        if tag.tag_type() == TagType::Id3v2 {
-            tag.insert_unchecked(TagItem::new(
-                ItemKey::Unknown("SCRIPT".into()),
-                ItemValue::Text(value.to_string()),
-            ));
-        } else {
-            set_string(tag, ItemKey::Script, value);
-        }
-        return;
-    }
-    let Some(field) = PicardField::from_canonical(name) else {
-        tag.insert_unchecked(TagItem::new(
-            ItemKey::Unknown(name.to_string()),
-            ItemValue::Text(value.to_string()),
-        ));
-        return;
-    };
     tag.retain(|i| !matches!(i.key(), ItemKey::Unknown(k) if field.matches(k)));
-    tag.insert_unchecked(TagItem::new(
-        ItemKey::Unknown(field.key_for(tag.tag_type())),
-        ItemValue::Text(value.to_string()),
-    ));
+    match field.item_key(tag.tag_type()) {
+        key @ ItemKey::Unknown(_) => {
+            tag.insert_unchecked(TagItem::new(key, ItemValue::Text(value.to_string())));
+        }
+        key => set_string(tag, key, value),
+    }
 }
 
 /// Write a Chromaprint fingerprint into the file's tag as `ACOUSTID_FINGERPRINT`.
@@ -439,7 +451,7 @@ pub fn tag_ripped_fingerprint(path: &Path, fingerprint: &str) -> Result<(), Stri
         .tag_mut(tag_type)
         .ok_or_else(|| "lofty refused to attach a tag".to_string())?;
 
-    set_unknown_string(tag, "ACOUSTID_FINGERPRINT", fingerprint);
+    set_picard_field(tag, PicardField::AcoustidFingerprint, fingerprint);
 
     let _ = tag;
     save_tag(&tagged, tag_type, path)
