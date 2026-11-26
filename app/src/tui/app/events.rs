@@ -142,6 +142,15 @@ impl App {
             BgEvent::MbReleaseLoaded { token, result } => {
                 self.handle_mb_release_loaded(token, result);
             }
+            BgEvent::TrackIdsUnsaved(why) => {
+                self.sync.log.push(format!(
+                    "tag-manager: the files were filed, but their track IDs could not be saved ({why}); playlists and play counts will not follow them"
+                ));
+                self.set_toast(
+                    "Filed, but track IDs could not be saved: playlists and play counts will not follow, see log (L)".into(),
+                    true,
+                );
+            }
             BgEvent::TagsApplied {
                 token,
                 results,
