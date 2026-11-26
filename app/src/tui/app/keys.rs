@@ -1,11 +1,12 @@
 //! Keyboard dispatch for the TUI.
 //!
 //! `App::handle_key` is the single-source-of-truth dispatcher the run
-//! loop feeds every [`KeyEvent`] through. Modals are tried first, in
-//! priority order — each has a `handle_*_key` method that returns `true`
-//! when its modal is open (an open modal consumes every key, so the
-//! global map below never sees it). Only when no modal claims the event
-//! does `handle_global_key` run the global key map.
+//! loop feeds every [`KeyEvent`] through. Modals are tried first, in the
+//! priority order of the `MODALS` table — each pairs an open predicate
+//! with a `handle_*_key` method that returns `true` when it consumed the
+//! key (an open modal consumes every key, so the global map below never
+//! sees it). Only when no modal claims the event does `handle_global_key`
+//! run the global key map.
 
 use std::sync::mpsc;
 
@@ -18,12 +19,90 @@ use super::{
 use crate::audio::AudioCommand;
 use crate::background::BgCommand;
 
+/// A modal's "is it open" predicate and its key handler. The handler
+/// returns `true` when it consumed the key.
+type ModalHandler = fn(&mut App, KeyEvent, &mpsc::Sender<BgCommand>) -> bool;
+struct Modal {
+    open: fn(&App) -> bool,
+    handle: ModalHandler,
+}
+
+/// Every modal, in key priority order: the one list both
+/// [`App::handle_key`] and [`App::modal_open`] read, so a new modal is
+/// added once. A modal claims every key while open, except the CD import
+/// overlay, which lets some fall through (Ctrl-C, so the quit hatch still
+/// works) to the modals and global map after it.
+const MODALS: &[Modal] = &[
+    Modal {
+        open: |a| a.import_overlay.is_some(),
+        handle: |a, k, _| a.handle_import_overlay_key(k),
+    },
+    Modal {
+        open: |a| a.playlist_name_input.is_some(),
+        handle: |a, k, _| a.handle_playlist_name_input_key(k),
+    },
+    Modal {
+        open: |a| a.generation_form.is_some(),
+        handle: |a, k, _| a.handle_generation_form_key(k),
+    },
+    Modal {
+        open: |a| a.add_to_playlist_picker.is_some(),
+        handle: |a, k, _| a.handle_add_to_playlist_picker_key(k),
+    },
+    Modal {
+        open: |a| a.pending_playlist_delete.is_some(),
+        handle: |a, k, _| a.handle_playlist_delete_key(k),
+    },
+    Modal {
+        open: |a| a.search_active,
+        handle: |a, k, _| a.handle_search_key(k),
+    },
+    Modal {
+        open: |a| a.show_theme_picker,
+        handle: |a, k, _| a.handle_theme_picker_key(k),
+    },
+    Modal {
+        open: |a| a.stem_panel.is_some(),
+        handle: |a, k, _| a.handle_stem_panel_key(k),
+    },
+    Modal {
+        open: |a| a.pending_cache_clear,
+        handle: |a, k, _| a.handle_cache_clear_key(k),
+    },
+    Modal {
+        open: |a| a.stems.consent.is_some(),
+        handle: |a, k, _| a.handle_stem_consent_key(k),
+    },
+    Modal {
+        open: |a| a.stem_bulk_confirm.is_some(),
+        handle: |a, k, _| a.handle_stem_bulk_confirm_key(k),
+    },
+    Modal {
+        open: |a| a.pending_removal.is_some(),
+        handle: |a, k, tx| a.handle_removal_confirm_key(k, tx),
+    },
+    Modal {
+        open: |a| a.show_help,
+        handle: |a, k, _| a.handle_help_key(k),
+    },
+    Modal {
+        open: |a| a.tag_manager.is_some(),
+        handle: |a, k, tx| {
+            a.handle_tag_manager_key(k, tx);
+            true
+        },
+    },
+    Modal {
+        open: |a| a.show_track_info,
+        handle: |a, k, _| a.handle_track_info_key(k),
+    },
+];
+
 impl App {
     /// Single-source-of-truth keyboard dispatcher for the TUI.
     ///
-    /// Handles the same modal-then-global cascade the run loop used to inline:
-    /// search, theme picker, cache-clear confirm, removal confirm, help, and
-    /// track-info popup are all gated before the global match. Returns
+    /// Tries each open modal in [`MODALS`] in priority order, then the
+    /// stem strip's digit keys, then the global map. Returns
     /// `KeyOutcome::Quit` for `q` / `Ctrl+C` so the run loop can break.
     pub fn handle_key(
         &mut self,
@@ -31,37 +110,10 @@ impl App {
         cmd_tx: &mpsc::Sender<BgCommand>,
         audio_tx: &mpsc::Sender<AudioCommand>,
     ) -> KeyOutcome {
-        // CD import overlay. Takes priority over every other modal so the
-        // user can dismiss with Esc and reach the rest of the TUI again.
-        // (Unlike the modals below it deliberately lets some keys fall
-        // through — e.g. Ctrl-C so the quit hatch still works.)
-        if self.import_overlay.is_some() && self.handle_import_overlay_key(key) {
-            return KeyOutcome::Continue;
-        }
-
-        if self.handle_playlist_name_input_key(key)
-            || self.handle_generation_form_key(key)
-            || self.handle_add_to_playlist_picker_key(key)
-            || self.handle_playlist_delete_key(key)
-            || self.handle_search_key(key)
-            || self.handle_theme_picker_key(key)
-            || self.handle_stem_panel_key(key)
-            || self.handle_cache_clear_key(key)
-            || self.handle_stem_consent_key(key)
-            || self.handle_stem_bulk_confirm_key(key)
-            || self.handle_removal_confirm_key(key, cmd_tx)
-            || self.handle_help_key(key)
-        {
-            return KeyOutcome::Continue;
-        }
-
-        if self.tag_manager.is_some() {
-            self.handle_tag_manager_key(key, cmd_tx);
-            return KeyOutcome::Continue;
-        }
-
-        if self.handle_track_info_key(key) {
-            return KeyOutcome::Continue;
+        for modal in MODALS {
+            if (modal.open)(self) && (modal.handle)(self, key, cmd_tx) {
+                return KeyOutcome::Continue;
+            }
         }
 
         if self.handle_stem_key(key) {
@@ -71,27 +123,11 @@ impl App {
         self.handle_global_key(key, cmd_tx, audio_tx)
     }
 
-    /// Some modal or text input currently claims the keyboard. Mirrors the
-    /// guards of the `handle_*_key` cascade in [`Self::handle_key`] — a new
-    /// modal added there belongs here too. Anything that opens an overlay
-    /// on its own (the inbox poll) checks this first, so it never lands
-    /// under the user's fingers mid-keystroke.
+    /// Some modal or text input currently claims the keyboard. Anything
+    /// that opens an overlay on its own (the inbox poll) checks this
+    /// first, so it never lands under the user's fingers mid-keystroke.
     pub(crate) fn modal_open(&self) -> bool {
-        self.import_overlay.is_some()
-            || self.playlist_name_input.is_some()
-            || self.generation_form.is_some()
-            || self.add_to_playlist_picker.is_some()
-            || self.pending_playlist_delete.is_some()
-            || self.search_active
-            || self.show_theme_picker
-            || self.stem_panel.is_some()
-            || self.pending_cache_clear
-            || self.stems.consent.is_some()
-            || self.stem_bulk_confirm.is_some()
-            || self.pending_removal.is_some()
-            || self.show_help
-            || self.tag_manager.is_some()
-            || self.show_track_info
+        MODALS.iter().any(|modal| (modal.open)(self))
     }
 
     /// Engine-install consent overlay (opened by `M` when no stem engine
