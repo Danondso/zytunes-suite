@@ -1644,6 +1644,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Known answer: the SHA-1 of the MP3 transcoded from a generated stereo
+    /// tune at the default quality. LAME is deterministic, so this pins the
+    /// decoded PCM handed to it (sample conversion, silence hold-back, flush)
+    /// across decoder upgrades. If this fails, the transcoder's output moved.
+    #[test]
+    fn transcode_known_answer() {
+        use sha1::{Digest, Sha1};
+        let dir = std::env::temp_dir().join("zytunes-test-transcode-known-answer");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("tune.wav");
+        crate::test_audio::write_tune_wav(&wav, 5);
+
+        let mp3 = transcode_to_mp3(wav.to_str().unwrap(), &dir, None).unwrap();
+        let digest = Sha1::digest(std::fs::read(&mp3).unwrap());
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, KNOWN_TUNE_MP3_SHA1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const KNOWN_TUNE_MP3_SHA1: &str = "de2ede79567d3546583ae690fabe407a82307c44";
+
     #[test]
     fn transcode_paths_parallel_same_stem_does_not_clobber() {
         let dir = std::env::temp_dir().join("zytunes-test-transcode-parallel-stem");

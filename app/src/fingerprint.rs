@@ -219,7 +219,7 @@ pub fn fingerprint_for(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_audio::{write_silence_wav, write_sine_wav};
+    use crate::test_audio::{write_silence_wav, write_sine_wav, write_tune_wav};
     use std::fs;
 
     /// Per-test scratch dir under one shared `zytunes-fp-tests/` parent so
@@ -278,6 +278,22 @@ mod tests {
         assert_eq!(a, b, "same file must produce identical fingerprints");
         let _ = fs::remove_dir_all(&dir);
     }
+
+    /// Known answer: the exact fingerprint of a generated stereo tune. The
+    /// AcoustID match and the library's duplicate detection compare these
+    /// strings, so a decoder upgrade (symphonia) or a change to the sample
+    /// conversion must not move them. If this fails, decoded PCM changed.
+    #[test]
+    fn compute_fingerprint_known_answer() {
+        let dir = fresh_dir("known-answer");
+        let path = dir.join("tune.wav");
+        write_tune_wav(&path, 20);
+        let fp = compute_fingerprint(&path).expect("tune must fingerprint");
+        assert_eq!(fp, KNOWN_TUNE_FINGERPRINT);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    const KNOWN_TUNE_FINGERPRINT: &str = "AQAAjEkiJUmYNEXzou-gD01n9KKFdtKD5jMOPTuaUBJuItUFnmiu4yqeHsyPJlePo2GI3uhvNMeDHk0fG1_RPFGK8KzQ5OiTbdB7VEeYay-uofrR_IB_SrjIFTeD5uiPklECK9aRsCQHZg1FPEd1NC-ka0ePhhMt_EHzo79waKkyVD9xBWEOcj6a63hegw-cH5eKGv7RW2iO9seD2jOai0f5UPAz5LrQxNqGZ9CR5g-OH2aWExd6mhIaecSJ5mNRH30UNPqOHOLVBTeLM0cTF_2ha2iOXjx6HQ354oe-CM11VI8R0oMVMKl04S9-NDl69eCH5keLXkbz4znuwceXo082IUzFgkl-gbHCDTp6hMlfHBWnozl--LdwncW3LGgAYJAAQi1BBQBEGkYUAU4bga0SDAgjBAKAIOAAAkYgoZgyCgAACCTAEGUJgIgAYoAR0BFjERAWMCAEMgoJGQhhwgosALJAGGQEEUIIQqwgQBGCgMEAAUCMJc4CxBgUBgiCCFSWGkEEQAA";
 
     #[test]
     fn compute_fingerprint_returns_none_for_non_audio() {
