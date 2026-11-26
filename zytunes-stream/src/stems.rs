@@ -328,6 +328,11 @@ impl StemHub {
                 clear_job_if(&inner, &cancel);
                 return;
             }
+            if let Err(e) = separator.preflight() {
+                *error.lock().unwrap_or_else(|e| e.into_inner()) = Some(e);
+                clear_job_if(&inner, &cancel);
+                return;
+            }
             let work_dir = settings
                 .cache_dir
                 .join("work")
