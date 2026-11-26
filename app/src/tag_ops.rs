@@ -1315,10 +1315,9 @@ fn write_then_swap(tmp: &Path, src: &Path, to_apply: &[&FieldDiff]) -> Result<()
     save_tag(&tagged, tag_type, tmp).map_err(|e| format!("{e} (source {})", src.display()))?;
     // fsync the temp's contents before swapping it in — otherwise a power
     // loss between rename and writeback can leave a renamed-but-empty file
-    // on ext4/xfs.
-    if let Ok(f) = std::fs::OpenOptions::new().read(true).open(tmp) {
-        let _ = f.sync_all();
-    }
+    // on ext4/xfs. A failed flush is a failed save: swapping in a temp
+    // that may not be on disk is the very risk the temp exists to avoid.
+    sync_file(tmp).map_err(|e| format!("tag-save: fsync {}: {e}", tmp.display()))?;
     std::fs::rename(tmp, src).map_err(|e| {
         format!(
             "tag-save: rename {} -> {}: {e}",
@@ -1689,7 +1688,9 @@ fn move_to_free_name_with(
 /// is taken) and only then unlinked from `src`, so an existing file is
 /// never replaced. Where that cannot be done (another filesystem, one
 /// without hard links) the bytes are copied beside `dest` and flushed to
-/// disk before `src` is removed.
+/// disk before `src` is removed. Either way the dest folder is flushed
+/// too before `src` goes: until then the new name itself may exist only
+/// in memory, and a power cut would lose the only copy.
 fn move_no_replace(src: &Path, dest: &Path) -> Result<(), MoveFailure> {
     move_no_replace_with(src, dest, &hard_link)
 }
@@ -1698,11 +1699,52 @@ fn move_no_replace(src: &Path, dest: &Path) -> Result<(), MoveFailure> {
 /// that has none.
 type LinkFn<'a> = &'a dyn Fn(&Path, &Path) -> std::io::Result<()>;
 
+/// A folder-flush function, swappable so a test can see when it runs.
+type SyncDirFn<'a> = &'a dyn Fn(&Path) -> std::io::Result<()>;
+
 fn hard_link(from: &Path, to: &Path) -> std::io::Result<()> {
     std::fs::hard_link(from, to)
 }
 
+/// Flush `path`'s contents (and its metadata, the mtime included) to disk.
+fn sync_file(path: &Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+/// Flush the entries of the folder `dir`, so a name made in it survives
+/// a power cut. A filesystem that cannot flush a folder on its own
+/// (some FUSE and network mounts answer `EINVAL`) has nothing more to
+/// give, and is not a failed move.
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    match std::fs::File::open(dir)?.sync_all() {
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            Ok(())
+        }
+        other => other,
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
+}
+
 fn move_no_replace_with(src: &Path, dest: &Path, link: LinkFn) -> Result<(), MoveFailure> {
+    move_no_replace_io(src, dest, link, &sync_dir)
+}
+
+fn move_no_replace_io(
+    src: &Path,
+    dest: &Path,
+    link: LinkFn,
+    sync_dir: SyncDirFn,
+) -> Result<(), MoveFailure> {
     use std::io::ErrorKind;
     let fail = |what: &str, e: std::io::Error| {
         MoveFailure::Failed(format!(
@@ -1720,13 +1762,20 @@ fn move_no_replace_with(src: &Path, dest: &Path, link: LinkFn) -> Result<(), Mov
         Err(e) if e.kind() == ErrorKind::AlreadyExists => return Err(MoveFailure::Taken),
         Err(_) => copy_no_replace_with(src, dest, link)?,
     }
-    // The file is now at both names. If `src` cannot be removed the move
-    // did not happen: take the new name back out, so there is not a
-    // second file the library has no record of.
-    std::fs::remove_file(src).map_err(|e| {
+    // The file is now at both names. If the new name cannot be made
+    // durable, or `src` cannot be removed, the move did not happen: take
+    // the new name back out, so there is not a second file the library
+    // has no record of. On the copy path `src` is on another volume, so
+    // nothing orders its removal after the dest folder's writeback but
+    // this flush.
+    let undo = |what: &str, e: std::io::Error| {
         let _ = std::fs::remove_file(dest);
-        fail("rename cleanup of", e)
-    })
+        fail(what, e)
+    };
+    if let Some(parent) = dest.parent() {
+        sync_dir(parent).map_err(|e| undo("fsync dest folder for", e))?;
+    }
+    std::fs::remove_file(src).map_err(|e| undo("rename cleanup of", e))
 }
 
 /// [`move_no_replace`] without hard links: copy to a staged name beside
@@ -1748,9 +1797,7 @@ fn copy_no_replace_with(src: &Path, dest: &Path, link: LinkFn) -> Result<(), Mov
     std::fs::copy(src, &staged).map_err(fail)?;
     // Without this the data can still be in memory when `src` goes, and
     // a power cut leaves a short file under the final name.
-    std::fs::File::open(&staged)
-        .and_then(|f| f.sync_all())
-        .map_err(fail)?;
+    sync_file(&staged).map_err(fail)?;
     // Link, not rename: a rename would replace a file that turned up
     // while the copy ran. A volume with no hard links at all (FAT) gets
     // the rename, after a last look at the name.
@@ -1771,12 +1818,13 @@ fn copy_no_replace_with(src: &Path, dest: &Path, link: LinkFn) -> Result<(), Mov
     // the library scan fingerprint a file by (mtime, size), so a moved
     // file with a new mtime would be separated and rescanned again. Done
     // after the file has its name: until then the staged name's age is
-    // what `sweep_stale_staged` goes by.
+    // what `sweep_stale_staged` goes by. Flushed with it, so the mtime is
+    // as durable as the bytes by the time `src` goes.
     if let Ok(modified) = std::fs::metadata(src).and_then(|m| m.modified()) {
         let _ = std::fs::OpenOptions::new()
             .write(true)
             .open(dest)
-            .and_then(|f| f.set_modified(modified));
+            .and_then(|f| f.set_modified(modified).and_then(|()| f.sync_all()));
     }
     Ok(())
 }
@@ -4457,6 +4505,67 @@ mod tests {
         assert!(copy_no_replace_with(&src, &dest, &link).is_ok());
 
         assert_eq!(seen.get(), want);
+    }
+
+    #[test]
+    fn a_cross_device_move_flushes_the_dest_folder_before_the_source_goes() {
+        // On the copy path the source is on another volume: once it is
+        // unlinked, the dest folder's entry is the only record of the
+        // file. It has to be on disk first, mtime and all.
+        let dir = fresh_dir("cross-device-dirsync");
+        let (src, dest) = (dir.join("a.wav"), dir.join("sub").join("b.wav"));
+        write_sine_wav(&src, 1);
+        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(86_400 * 30);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&src)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+        let synced = std::cell::RefCell::new(Vec::new());
+        let sync = |d: &Path| {
+            let dest_mtime = std::fs::metadata(&dest).and_then(|m| m.modified()).ok();
+            synced
+                .borrow_mut()
+                .push((d.to_path_buf(), src.exists(), dest_mtime));
+            Ok(())
+        };
+
+        assert!(move_no_replace_io(&src, &dest, &no_hard_links, &sync).is_ok());
+
+        let synced = synced.into_inner();
+        assert_eq!(synced.len(), 1, "{synced:?}");
+        let (folder, src_still_there, dest_mtime) = &synced[0];
+        assert_eq!(folder, &dir.join("sub"));
+        assert!(
+            src_still_there,
+            "the source went before the dest was flushed"
+        );
+        let drift = dest_mtime
+            .expect("the dest has its name when its folder is flushed")
+            .duration_since(long_ago)
+            .unwrap_or_else(|e| e.duration());
+        assert!(
+            drift < std::time::Duration::from_secs(2),
+            "mtime set after the flush: {drift:?}"
+        );
+        assert!(!src.exists());
+    }
+
+    #[test]
+    fn a_dest_folder_that_cannot_be_flushed_keeps_the_source() {
+        let dir = fresh_dir("dirsync-fails");
+        let (src, dest) = (dir.join("a.wav"), dir.join("b.wav"));
+        write_sine_wav(&src, 1);
+        let bytes = std::fs::read(&src).unwrap();
+        let sync = |_: &Path| Err(std::io::Error::other("disk gone"));
+
+        for link in [&hard_link as LinkFn, &no_hard_links] {
+            let out = move_no_replace_io(&src, &dest, link, &sync);
+            assert!(matches!(out, Err(MoveFailure::Failed(ref e)) if e.contains("disk gone")));
+            assert_eq!(std::fs::read(&src).unwrap(), bytes);
+            assert!(!dest.exists(), "no second, unrecorded copy is left");
+        }
     }
 
     #[test]
