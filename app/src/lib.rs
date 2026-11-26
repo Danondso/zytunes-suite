@@ -19,6 +19,7 @@ pub mod local_plays;
 pub mod mtp;
 pub mod musicbrainz;
 pub mod paths;
+pub mod picard_keys;
 pub mod playlist;
 pub mod playlist_store;
 pub mod recommender;
