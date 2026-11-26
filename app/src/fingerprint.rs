@@ -263,6 +263,9 @@ mod tests {
     /// AcoustID match and the library's duplicate detection compare these
     /// strings, so a decoder upgrade (symphonia) or a change to the sample
     /// conversion must not move them. If this fails, decoded PCM changed.
+    /// Exact equality is deliberate: chromaprint's FFT runs in floats, but
+    /// its output is quantised to coarse bits, and this string matches on
+    /// x86_64 and arm64 CI; a stored fingerprint that drifts is the bug.
     #[test]
     fn compute_fingerprint_known_answer() {
         let dir = fresh_dir("known-answer");

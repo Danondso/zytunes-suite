@@ -627,6 +627,12 @@ fn encode_pcm(
     if samples.is_empty() {
         return Ok(());
     }
+    #[cfg(test)]
+    tests::ENCODER_PCM_TAP.with_borrow_mut(|tap| {
+        if let Some(tap) = tap {
+            tap.extend_from_slice(samples);
+        }
+    });
     let frames = samples.len() / channels;
     output.reserve(mp3lame_encoder::max_required_buffer_size(frames));
     let res = match channels {
@@ -1681,10 +1687,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Known answer: the SHA-1 of the MP3 transcoded from a generated stereo
-    /// tune at the default quality. LAME is deterministic, so this pins the
-    /// decoded PCM handed to it (sample conversion, silence hold-back, flush)
-    /// across decoder upgrades. If this fails, the transcoder's output moved.
+    thread_local! {
+        /// Test seam: while `Some`, `encode_pcm` appends every sample it hands
+        /// to LAME. Thread-local, so parallel tests never see each other's PCM.
+        pub(super) static ENCODER_PCM_TAP: std::cell::RefCell<Option<Vec<f32>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Known answer: the exact PCM the transcoder hands to LAME for a
+    /// generated stereo tune (decode, sample conversion, silence hold-back),
+    /// as sample count plus a SHA-1 of the f32 bit patterns, and the format of
+    /// the MP3 it produces. The MP3 bytes themselves are not pinned: LAME's
+    /// float paths differ by architecture (arm64 vs x86_64). 16-bit WAV to f32
+    /// is exact everywhere, so this is a portable guard on the decoder: the
+    /// same value came out of symphonia 0.5 and 0.6.
     #[test]
     fn transcode_known_answer() {
         use sha1::{Digest, Sha1};
@@ -1694,14 +1710,33 @@ mod tests {
         let wav = dir.join("tune.wav");
         crate::test_audio::write_tune_wav(&wav, 5);
 
+        ENCODER_PCM_TAP.set(Some(Vec::new()));
         let mp3 = transcode_to_mp3(wav.to_str().unwrap(), &dir, None).unwrap();
-        let digest = Sha1::digest(std::fs::read(&mp3).unwrap());
-        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(hex, KNOWN_TUNE_MP3_SHA1);
+        let pcm = ENCODER_PCM_TAP.take().unwrap();
+
+        let mut hasher = Sha1::new();
+        for s in &pcm {
+            hasher.update(s.to_bits().to_le_bytes());
+        }
+        let hex: String = hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!((pcm.len(), hex.as_str()), KNOWN_TUNE_PCM);
+
+        // MPEG-1 Layer III header: 44.1 kHz (bits 3-2 of byte 2 = 00) and
+        // a stereo-family channel mode (byte 3 bits 7-6 != 11).
+        let data = std::fs::read(&mp3).unwrap();
+        let (start, _) = mp3_stream_bounds(&data);
+        assert_eq!(&data[start..start + 2], &[0xff, 0xfb], "MPEG-1 Layer III");
+        assert_eq!((data[start + 2] >> 2) & 0b11, 0b00, "44.1 kHz");
+        assert_ne!(data[start + 3] >> 6, 0b11, "stereo, not mono");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    const KNOWN_TUNE_MP3_SHA1: &str = "de2ede79567d3546583ae690fabe407a82307c44";
+    /// (interleaved sample count, SHA-1 of their little-endian f32 bits).
+    const KNOWN_TUNE_PCM: (usize, &str) = (441000, "b3d9e555acb4a635ec186e9181454d364dc0e4c5");
 
     #[test]
     fn transcode_paths_parallel_same_stem_does_not_clobber() {
