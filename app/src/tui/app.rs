@@ -12129,20 +12129,12 @@ mod tests {
 
     #[test]
     fn zero_cycles_through_every_group_then_collapses() {
-        use zytunes::stems::StemKind;
-        static LAYOUT: [StemKind; 7] = [
-            StemKind::LeadVocals,
-            StemKind::BackingVocals,
-            StemKind::Kick,
-            StemKind::Snare,
-            StemKind::Toms,
-            StemKind::Cymbals,
-            StemKind::Bass,
-        ];
+        // The real 14-stem full layout: Vocals (lead, male, female),
+        // Drums (six parts), then Bass, Guitar, Piano, Other, Crowd.
         let mut app = stem_playing_app("/lib/song.mp3");
         app.stems.status = StemStatus::Active;
-        app.stems.layout = Some(&LAYOUT);
-        app.stems.gains = Some(zytunes::stems::new_stem_gains(&[true; 7]));
+        app.stems.layout = Some(zytunes::stems::FULL_STEM_LAYOUT);
+        app.stems.gains = Some(zytunes::stems::new_stem_gains(&[true; 14]));
         app.stems.enabled = [true; zytunes::stems::MAX_STEMS];
 
         let mut seen = vec![app.stems.expanded];
@@ -12152,12 +12144,22 @@ mod tests {
         }
         assert_eq!(seen, [None, Some(0), Some(1), None]);
 
-        // Drums open: key 4 is the fourth drum part (cymbals, index 5).
+        // Collapsed, key 7 is the crowd (layout index 13).
+        assert!(app.press_stem_digit(6));
+        assert!(!app.stems.enabled[13], "crowd muted");
+        assert!(!app.press_stem_digit(7), "only seven cells");
+
+        // Vocals open: key 3 is female backing (index 2).
         app.cycle_stem_group();
+        assert!(app.press_stem_digit(2));
+        assert!(!app.stems.enabled[2]);
+        assert!(!app.press_stem_digit(3), "vocals have three parts");
+
+        // Drums open: key 6 is the crash (index 8).
         app.cycle_stem_group();
-        assert!(app.press_stem_digit(3));
-        assert!(!app.stems.enabled[5]);
-        assert!(!app.press_stem_digit(4), "drums have four parts");
+        assert!(app.press_stem_digit(5));
+        assert!(!app.stems.enabled[8]);
+        assert!(!app.press_stem_digit(6), "drums have six parts");
     }
 
     #[test]
