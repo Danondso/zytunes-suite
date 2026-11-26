@@ -432,12 +432,15 @@ fn lock_registry_file(file: &Path, log: &Logger) -> Option<std::fs::File> {
 }
 
 /// Rewrite the registry of `root` as a newer build would have, so this
-/// build cannot use it. Tests stand in for the bad day.
-#[cfg(test)]
-pub(crate) fn mark_newer_schema(root: &str) {
+/// build cannot use it. Tests stand in for the bad day. Public only so
+/// the TUI binary's tests can reach it; does nothing without a HOME.
+#[doc(hidden)]
+pub fn mark_newer_schema(root: &str) {
     let _guard = registry_lock();
     let root = normalised_root(root);
-    let file = registry_path(&root).expect("HOME set");
+    let Some(file) = registry_path(&root) else {
+        return;
+    };
     let ids = std::fs::read(&file)
         .ok()
         .and_then(|data| serde_json::from_slice::<OnDisk>(&data).ok())
@@ -448,14 +451,17 @@ pub(crate) fn mark_newer_schema(root: &str) {
         root,
         ids,
     };
-    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-    std::fs::write(&file, serde_json::to_vec(&newer).unwrap()).unwrap();
+    if let (Some(parent), Ok(data)) = (file.parent(), serde_json::to_vec(&newer)) {
+        let _ = std::fs::create_dir_all(parent);
+        let _ = std::fs::write(&file, data);
+    }
 }
 
 /// Delete the registry of `root`. Tests reuse temp-dir names across runs,
 /// and a registry left by an earlier run would hand out that run's IDs.
-#[cfg(test)]
-pub(crate) fn forget(root: &str) {
+/// Public only so the TUI binary's tests can reach it.
+#[doc(hidden)]
+pub fn forget(root: &str) {
     let _guard = registry_lock();
     if let Some(file) = registry_path(&normalised_root(root)) {
         let _ = std::fs::remove_dir(file.with_extension("json.tmp"));

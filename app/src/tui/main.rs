@@ -178,10 +178,11 @@ fn run_loop(
         while let Ok(ev) = event_rx.try_recv() {
             app.handle_bg_event(ev);
         }
-        // Poll for CDs: throttled to ~5s by `maybe_request_cd_detect`.
-        // Called every tick so a disc insert is noticed within one poll
-        // interval without the worker needing its own timer thread.
+        // Poll for CDs and the Automatically Add to Music inbox: throttled
+        // to ~5s. Called every tick so a disc insert or drop is noticed
+        // within one poll interval without the worker needing a timer.
         app.maybe_request_cd_detect();
+        app.maybe_request_inbox_scan();
         // Flush any pending background commands queued during event handling.
         for cmd in app.pending_bg_commands.drain(..) {
             let _ = cmd_tx.send(cmd);

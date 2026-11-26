@@ -149,6 +149,29 @@ pub(super) fn truncate_hard(s: &str, max: usize) -> String {
     out
 }
 
+/// Break `s` into rows of at most `width` display columns, cutting between
+/// characters wherever the row fills (no word boundaries: the callers wrap
+/// paths). A character wider than `width` still gets a row of its own, so
+/// nothing is dropped.
+pub(super) fn wrap_hard(s: &str, width: usize) -> Vec<String> {
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut used = 0usize;
+    for ch in s.chars() {
+        let cw = char_disp_width(ch);
+        if used + cw > width && !row.is_empty() {
+            rows.push(std::mem::take(&mut row));
+            used = 0;
+        }
+        row.push(ch);
+        used += cw;
+    }
+    if !row.is_empty() {
+        rows.push(row);
+    }
+    rows
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,6 +190,20 @@ mod tests {
     #[test]
     fn marquee_short_text_no_scroll() {
         assert_eq!(marquee("Hi", 10, 0), "Hi");
+    }
+
+    #[test]
+    fn wrap_hard_fills_rows_by_display_width_and_drops_nothing() {
+        assert_eq!(wrap_hard("abcdefg", 3), vec!["abc", "def", "g"]);
+        // Wide chars are 2 columns each: three fit in 7, not seven.
+        let s = "坂本龍一/曲 already exists";
+        let rows = wrap_hard(s, 7);
+        assert!(rows.iter().all(|r| r.width() <= 7), "{rows:?}");
+        assert_eq!(rows.concat(), s);
+        assert_eq!(rows[0], "坂本龍");
+        // Narrower than one wide char: a row each rather than a loop or a loss.
+        assert_eq!(wrap_hard("坂本", 1), vec!["坂", "本"]);
+        assert!(wrap_hard("", 5).is_empty());
     }
 
     #[test]
