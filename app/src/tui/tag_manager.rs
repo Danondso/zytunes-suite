@@ -211,10 +211,12 @@ impl TagManagerOverlay {
 
     /// Key hint for the diff-preview title bar.
     pub fn diff_preview_hint(&self) -> &'static str {
-        if self.tags_already_match() {
-            "j/k · c fold · Enter close · s search · Esc"
-        } else {
-            "j/k · Space · a/n · c fold · Enter apply · s search · Esc"
+        // Esc on a filing diff skips the album; on a retag it goes back.
+        match (self.tags_already_match(), self.filing) {
+            (true, false) => "j/k · c fold · Enter close · s search · Esc",
+            (true, true) => "j/k · c fold · Enter close · s search · Esc skip",
+            (false, false) => "j/k · Space · a/n · c fold · Enter apply · s search · Esc",
+            (false, true) => "j/k · Space · a/n · c fold · Enter apply · s search · Esc skip",
         }
     }
 

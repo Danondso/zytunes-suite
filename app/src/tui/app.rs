@@ -1101,7 +1101,7 @@ pub struct InboxState {
     pub last_request: Option<Instant>,
     pub scan_in_flight: bool,
     /// Remaining album clusters waiting for the tag-manager overlay.
-    pub queue: VecDeque<zytunes::library_layout::AlbumCluster>,
+    pub queue: VecDeque<QueuedCluster>,
     /// Inbox locations the user dismissed this session. Filtered out of
     /// later scans until the TUI restarts. Shared with each scan command
     /// rather than copied per poll; add through
@@ -1127,6 +1127,176 @@ impl Default for InboxState {
             hold_until_library: false,
             dir_requested: false,
         }
+    }
+}
+
+/// An album cluster waiting for the filing overlay, and who asked for it.
+pub struct QueuedCluster {
+    pub cluster: zytunes::library_layout::AlbumCluster,
+    /// Queued by `F`, so its overlay takes the first Enter. An inbox drop
+    /// opens without being asked for, under keys typed for something
+    /// else, and ignores its first Enter.
+    pub user_initiated: bool,
+}
+
+#[cfg(test)]
+impl QueuedCluster {
+    fn inbox(cluster: zytunes::library_layout::AlbumCluster) -> Self {
+        Self {
+            cluster,
+            user_initiated: false,
+        }
+    }
+}
+
+impl std::ops::Deref for QueuedCluster {
+    type Target = zytunes::library_layout::AlbumCluster;
+    fn deref(&self) -> &Self::Target {
+        &self.cluster
+    }
+}
+
+impl std::ops::DerefMut for QueuedCluster {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.cluster
+    }
+}
+
+/// Where the file at `loc` is after an apply, or `None` when it did not
+/// move.
+fn moved_location(
+    loc: &str,
+    rename_map: &std::collections::HashMap<PathBuf, PathBuf>,
+) -> Option<String> {
+    let old = std::path::Path::new(loc);
+    let new = zytunes::tag_ops::moved_path(old, rename_map);
+    (new != old).then(|| new.to_string_lossy().into_owned())
+}
+
+/// Point `loc` at where its file is after an apply. True when it moved.
+fn follow_move(loc: &mut String, rename_map: &std::collections::HashMap<PathBuf, PathBuf>) -> bool {
+    match moved_location(loc, rename_map) {
+        Some(new) => {
+            *loc = new;
+            true
+        }
+        None => false,
+    }
+}
+
+/// The toast after an apply: which files were filed as numbered copies
+/// beside a track already in the library (the first by name, "+N more"
+/// for the rest), and how many tracks failed when nothing else lists them.
+fn numbered_copy_toast(copies: &[String], unlisted_failures: usize) -> Option<String> {
+    let copies = match copies {
+        [] => None,
+        [one] => Some(format!("already in the library: filed {one} beside it")),
+        [first, rest @ ..] => Some(format!(
+            "already in the library: filed {first} beside it (+{} more)",
+            rest.len()
+        )),
+    };
+    let failures = (unlisted_failures > 0).then(|| {
+        format!(
+            "{unlisted_failures} track{} failed to write",
+            if unlisted_failures == 1 { "" } else { "s" }
+        )
+    });
+    let body = match (failures, copies) {
+        (None, None) => return None,
+        (Some(f), None) => f,
+        (None, Some(mut c)) => {
+            c[..1].make_ascii_uppercase();
+            c
+        }
+        (Some(f), Some(c)) => format!("{f}; {c}"),
+    };
+    Some(format!("{body}, see log (L)"))
+}
+
+/// Device presence per artist and album, counted over every spelling of
+/// a name that the `/` search fold ([`search_key`]) treats as one
+/// (`PORTISHEAD` and `Portishead`, `𝐺𝑂𝑅𝐸` and `Gore`), since a sidebar
+/// row stands for all of them. Keyed by the library's own spellings, so
+/// the renderer looks a row up without folding its name every frame.
+#[derive(Default)]
+pub struct DevicePresenceIndex {
+    /// Each artist spelling → its folded group.
+    groups: HashMap<String, usize>,
+    /// Per group: the artist's presence (`None` when nothing is on the
+    /// device), and each album spelling's.
+    status: Vec<(DevicePresence, HashMap<String, DevicePresence>)>,
+}
+
+impl DevicePresenceIndex {
+    fn build<'a>(
+        tracks: impl Iterator<Item = &'a Track>,
+        on_device: impl Fn(&Track) -> bool,
+    ) -> Self {
+        // Folded artist → group; per group, folded album → counts, and
+        // the spellings that fold to it.
+        let mut group_of: HashMap<String, usize> = HashMap::new();
+        let mut groups: HashMap<String, usize> = HashMap::new();
+        let mut artist_counts: Vec<(usize, usize)> = Vec::new();
+        type AlbumCounts = HashMap<String, ((usize, usize), HashSet<String>)>;
+        let mut album_counts: Vec<AlbumCounts> = Vec::new();
+        for t in tracks {
+            let group = match groups.get(&t.artist) {
+                Some(&g) => g,
+                None => {
+                    let next = artist_counts.len();
+                    let g = *group_of.entry(search_key(&t.artist)).or_insert(next);
+                    if g == next {
+                        artist_counts.push((0, 0));
+                        album_counts.push(HashMap::new());
+                    }
+                    groups.insert(t.artist.clone(), g);
+                    g
+                }
+            };
+            let on = usize::from(on_device(t));
+            let (album, spellings) = album_counts[group].entry(search_key(&t.album)).or_default();
+            for counts in [&mut artist_counts[group], album] {
+                counts.0 += on;
+                counts.1 += 1;
+            }
+            if !spellings.contains(&t.album) {
+                spellings.insert(t.album.clone());
+            }
+        }
+        let status = artist_counts
+            .into_iter()
+            .zip(album_counts)
+            .map(|((on, total), albums)| {
+                let albums = albums
+                    .into_values()
+                    .flat_map(|((on, total), spellings)| {
+                        let presence = presence_from_counts(on, total);
+                        spellings.into_iter().map(move |s| (s, presence))
+                    })
+                    .collect();
+                (presence_from_counts(on, total), albums)
+            })
+            .collect();
+        Self { groups, status }
+    }
+
+    /// Something of the library is on the device.
+    pub fn any(&self) -> bool {
+        self.status.iter().any(|(p, _)| *p != DevicePresence::None)
+    }
+
+    fn artist(&self, artist: &str) -> Option<DevicePresence> {
+        let (presence, _) = &self.status[*self.groups.get(artist)?];
+        (*presence != DevicePresence::None).then_some(*presence)
+    }
+
+    fn album(&self, artist: &str, album: &str) -> Option<DevicePresence> {
+        let (_, albums) = &self.status[*self.groups.get(artist)?];
+        albums
+            .get(album)
+            .copied()
+            .filter(|p| *p != DevicePresence::None)
     }
 }
 
@@ -1243,10 +1413,10 @@ pub struct App {
     /// `tracks_by_name` linear scan on every ~50 ms tick while the popup is
     /// visible. `None` when the popup is closed or no library row matched.
     pub track_info_lib: Option<Track>,
-    /// Per-artist device presence for sidebar indicators (Library browse mode).
-    pub artist_device_status: BTreeMap<String, DevicePresence>,
-    /// Per-(artist, album) device presence for album-list indicators.
-    pub album_device_status: BTreeMap<(String, String), DevicePresence>,
+    /// Device presence for the sidebar and album-list indicators (Library
+    /// browse mode). Read through [`App::artist_presence`] and
+    /// [`App::album_presence`].
+    pub device_presence: DevicePresenceIndex,
     /// Cached album art extracted from embedded tags (any lofty-supported
     /// format — MP3 / FLAC / ALAC / OGG / WMA).
     pub album_art: Option<DynamicImage>,
@@ -1552,8 +1722,7 @@ impl App {
             track_info_scroll: 0,
             track_info_lib: None,
             theme_before_picker: all_themes()[0],
-            artist_device_status: BTreeMap::new(),
-            album_device_status: BTreeMap::new(),
+            device_presence: DevicePresenceIndex::default(),
             album_art: None,
             album_art_key: String::new(),
             album_art_cache: None,
@@ -2474,38 +2643,20 @@ impl App {
     /// Re-sort and enrich the current Library selection the way Apple Music
     /// files a drop: MusicBrainz lookup, tag-manager diff, then rename into
     /// `{AlbumArtist}/{Album}/`. Sidebar artist queues every album.
+    ///
+    /// The `F` key arm gates this on Library mode with a library loaded.
     pub fn start_file_and_enrich(&mut self, cmd_tx: &mpsc::Sender<BgCommand>) {
         if self.tag_manager.is_some() {
             return;
         }
-        if self.browse_mode != BrowseMode::Library {
-            self.set_toast("File into library is a Library-mode action".into(), true);
+        let Some(lib) = self.library.as_ref() else {
             return;
-        }
-        if self.library.is_none() {
-            return;
-        }
-
+        };
         let tracks: Vec<Track> = match self.active_panel {
             Panel::Library => match self.sidebar_items.get(self.sidebar_selected) {
-                Some(SidebarEntry::Artist(name)) => {
-                    let name = name.clone();
-                    self.library
-                        .as_ref()
-                        .unwrap()
-                        .artist_tracks(&name)
-                        .cloned()
-                        .collect()
-                }
+                Some(SidebarEntry::Artist(name)) => lib.artist_tracks(name).cloned().collect(),
                 Some(SidebarEntry::Album { artist, album }) => {
-                    let artist = artist.clone();
-                    let album = album.clone();
-                    self.library
-                        .as_ref()
-                        .unwrap()
-                        .album_tracks_by_artist(&artist, &album)
-                        .cloned()
-                        .collect()
+                    lib.album_tracks_by_artist(artist, album).cloned().collect()
                 }
                 _ => {
                     self.set_toast("Select an artist or album to file".into(), true);
@@ -2516,12 +2667,7 @@ impl App {
                 let Some(info) = self.album_list.get(self.album_selected) else {
                     return;
                 };
-                let artist = info.artist.clone();
-                let album = info.name.clone();
-                self.library
-                    .as_ref()
-                    .unwrap()
-                    .album_tracks_by_artist(&artist, &album)
+                lib.album_tracks_by_artist(&info.artist, &info.name)
                     .cloned()
                     .collect()
             }
@@ -2532,7 +2678,6 @@ impl App {
                 // The row carries the TRACK artist, but albums are keyed
                 // by the grouping (album) artist. Resolve the library track
                 // so a feat or compilation row finds its own album.
-                let lib = self.library.as_ref().unwrap();
                 let resolved = t.library_id.and_then(|id| lib.track_by_id(id)).or_else(|| {
                     lib.tracks_by_name(&t.name).find(|lt| {
                         lt.artist.eq_ignore_ascii_case(&t.artist)
@@ -2557,11 +2702,14 @@ impl App {
         );
     }
 
+    /// Open the first of `clusters` and queue the rest. `user_initiated`
+    /// (`F`) arms Enter on every album of the run; an inbox drop's
+    /// overlays ignore their first Enter.
     fn enqueue_file_clusters(
         &mut self,
         mut clusters: Vec<zytunes::library_layout::AlbumCluster>,
         cmd_tx: Option<&mpsc::Sender<BgCommand>>,
-        enter_armed: bool,
+        user_initiated: bool,
     ) {
         // An album whose files are all waiting in the queue already (`F`
         // pressed twice on one artist) is not queued a second time: the
@@ -2583,8 +2731,21 @@ impl App {
             return;
         }
         let first = clusters.remove(0);
-        self.inbox.queue.extend(clusters);
-        self.open_filing_cluster(first, cmd_tx, enter_armed);
+        self.queue_file_clusters(clusters, user_initiated);
+        self.open_filing_cluster(first, cmd_tx, user_initiated);
+    }
+
+    fn queue_file_clusters(
+        &mut self,
+        clusters: Vec<zytunes::library_layout::AlbumCluster>,
+        user_initiated: bool,
+    ) {
+        self.inbox
+            .queue
+            .extend(clusters.into_iter().map(|cluster| QueuedCluster {
+                cluster,
+                user_initiated,
+            }));
     }
 
     fn open_filing_cluster(
@@ -2610,10 +2771,10 @@ impl App {
         if self.tag_manager.is_some() {
             return;
         }
-        let Some(cluster) = self.inbox.queue.pop_front() else {
+        let Some(queued) = self.inbox.queue.pop_front() else {
             return;
         };
-        self.open_filing_cluster(cluster, cmd_tx, false);
+        self.open_filing_cluster(queued.cluster, cmd_tx, queued.user_initiated);
     }
 
     /// Shared overlay open: library retag (`source_tracks = None`) or
@@ -2786,7 +2947,7 @@ impl App {
             .inbox
             .queue
             .drain(..)
-            .flat_map(|c| c.tracks)
+            .flat_map(|c| c.cluster.tracks)
             .filter_map(|t| t.location)
             .collect();
         self.snooze_inbox_paths(queued);
@@ -2822,20 +2983,22 @@ impl App {
         // so the next cluster must not open against it. The reread
         // failure also holds the queue against the poll.
         let applied = matches!(overlay.phase, TagManagerPhase::Done) && overlay.error.is_none();
-        // Snooze every source that is still where it was. A path in the
+        // Snooze every source that is still where it was. A source in the
         // rename map did move, including when the reread failed and the
         // screen is Error rather than Done, so a file dropped there again
-        // this session still opens.
+        // this session still opens. The apply remaps the sources, so a
+        // moved one is found by its new path (a map value).
+        let moved: HashSet<&std::path::Path> = overlay
+            .last_rename_map
+            .iter()
+            .flat_map(|(old, new)| [old.as_path(), new.as_path()])
+            .collect();
         let still_there: Vec<String> = overlay
             .source_tracks
             .iter()
             .flatten()
             .filter_map(|t| t.location.as_ref())
-            .filter(|loc| {
-                !overlay
-                    .last_rename_map
-                    .contains_key(std::path::Path::new(loc.as_str()))
-            })
+            .filter(|loc| !moved.contains(std::path::Path::new(loc.as_str())))
             .cloned()
             .collect();
         self.snooze_inbox_paths(still_there);
@@ -3161,15 +3324,27 @@ impl App {
     /// queued. Left alone, the sync would fail every track an apply moved,
     /// as a missing file.
     fn remap_queued_sync(&mut self, rename_map: &std::collections::HashMap<PathBuf, PathBuf>) {
-        if rename_map.is_empty() {
-            return;
+        for item in self.sync.queue.iter_mut().flat_map(|q| q.tracks.iter_mut()) {
+            follow_move(&mut item.location, rename_map);
         }
-        for item in &mut self.sync.queue {
-            for track in &mut item.tracks {
-                let new =
-                    zytunes::tag_ops::moved_path(std::path::Path::new(&track.location), rename_map);
-                track.location = new.to_string_lossy().into_owned();
-            }
+    }
+
+    /// Queued filing clusters, and the open overlay's own source tracks,
+    /// hold the paths they were read at. The overlay rebuilds its diff
+    /// from `source_tracks` when the user goes back to pick another
+    /// release, so stale paths there would file files that are gone.
+    fn remap_filing_sources(&mut self, rename_map: &std::collections::HashMap<PathBuf, PathBuf>) {
+        let queued = self
+            .inbox
+            .queue
+            .iter_mut()
+            .flat_map(|c| c.tracks.iter_mut());
+        let open = self
+            .tag_manager
+            .iter_mut()
+            .flat_map(|o| o.source_tracks.iter_mut().flatten());
+        for loc in queued.chain(open).filter_map(|t| t.location.as_mut()) {
+            follow_move(loc, rename_map);
         }
     }
 
@@ -3193,100 +3368,115 @@ impl App {
         }
     }
 
+    /// Everything that holds a file path and outlives an apply follows
+    /// the moves: the playing session, then the stem jobs (a re-requested
+    /// split looks the playing track's ID up by its new path).
+    fn follow_moved_files(&mut self, rename_map: &std::collections::HashMap<PathBuf, PathBuf>) {
+        if rename_map.is_empty() {
+            return;
+        }
+        self.remap_filing_sources(rename_map);
+        self.remap_queued_sync(rename_map);
+        self.retarget_now_playing(rename_map);
+        self.retarget_stem_split(rename_map);
+        self.retarget_stem_batch(rename_map);
+    }
+
     /// The playing session holds a snapshot taken before the apply: every
     /// queued row's file path. Left alone, next/prev would ask for a path
     /// that is gone. The audio thread keeps the inode open across the
     /// rename; [`AudioCommand::Retarget`] tells it which path the next
-    /// scrub should reopen, and stem exit follows `stems.for_path`. The
-    /// playing track's ID is untouched: a move does not change it, and
-    /// neither does the stem cache entry keyed on it.
-    fn follow_moved_now_playing(
-        &mut self,
-        rename_map: &std::collections::HashMap<PathBuf, PathBuf>,
-    ) {
-        let moved = |loc: &str| {
-            let old = std::path::Path::new(loc);
-            let new = zytunes::tag_ops::moved_path(old, rename_map);
-            (new != old).then_some(new)
-        };
-        let playing_retarget = self.now_playing.as_ref().and_then(|np| {
-            let old = np
-                .playlist
-                .get(np.track_index)
-                .and_then(|t| t.location.clone())?;
-            let new = moved(&old)?;
-            Some((old, new.to_string_lossy().into_owned()))
-        });
-        if let Some(old) = self.stems.for_path.clone() {
-            if let Some(new) = moved(&old) {
-                if matches!(self.stems.status, StemStatus::Separating { .. }) {
-                    // The worker still has the old path. Its store stats
-                    // that path, fails after the rename, and the split is
-                    // thrown away. Cancel it; the late event is stale.
-                    self.stems.job_gen += 1;
-                    self.stems.reset();
-                    self.pending_bg_commands.push(BgCommand::CancelSeparation);
-                    self.sync.log.push(
-                        "[stems] split cancelled because the file moved; press M again".into(),
-                    );
-                } else {
-                    self.stems.for_path = Some(new.to_string_lossy().into_owned());
-                }
-            }
-        }
-        // A split waiting on the engine install has not started. It is
-        // dropped, not pointed at the new path.
-        if self.stems.pending_path.as_deref().and_then(moved).is_some() {
-            self.stems.pending_path = None;
-            self.sync
-                .log
-                .push("[stems] the track waiting to be split was moved; press M again".into());
-        }
-        if let Some(mut batch) = self.stems_batch.take() {
-            let mut retargeted = 0usize;
-            for track in &mut batch.tracks {
-                if let Some(new) = moved(&track.path) {
-                    track.path = new.to_string_lossy().into_owned();
-                    retargeted += 1;
-                }
-            }
-            if retargeted > 0 {
-                self.sync.log.push(format!(
-                    "[stems] {retargeted} moved track(s) in \"{}\" will be separated at their new paths",
-                    batch.album
-                ));
-            }
-            // A running worker already has the old list. A new dispatch
-            // supersedes it. A suspended batch has no worker; resume
-            // sends the paths updated here.
-            if retargeted > 0 && !batch.suspended {
-                self.dispatch_stem_batch(
-                    batch.album,
-                    batch.tracks,
-                    batch.recipe,
-                    batch.separated_so_far,
-                );
-            } else {
-                self.stems_batch = Some(batch);
-            }
-        }
-        if let Some((old, new)) = playing_retarget {
-            self.pending_audio_commands
-                .push(crate::audio::AudioCommand::Retarget { old, new });
-        }
+    /// scrub should reopen. The playing track's ID is untouched: a move
+    /// does not change it, and neither does the stem cache entry keyed on
+    /// it.
+    fn retarget_now_playing(&mut self, rename_map: &std::collections::HashMap<PathBuf, PathBuf>) {
         let Some(np) = self.now_playing.as_mut() else {
             return;
         };
         let mut rows = np.playlist.to_vec();
         let mut changed = false;
-        for loc in rows.iter_mut().filter_map(|t| t.location.as_mut()) {
-            if let Some(new) = moved(loc) {
-                *loc = new.to_string_lossy().into_owned();
+        let mut playing = None;
+        for (i, row) in rows.iter_mut().enumerate() {
+            let Some(loc) = row.location.as_mut() else {
+                continue;
+            };
+            let old = loc.clone();
+            if follow_move(loc, rename_map) {
                 changed = true;
+                if i == np.track_index {
+                    playing = Some((old, loc.clone()));
+                }
             }
         }
         if changed {
             np.playlist = Arc::from(rows);
+        }
+        if let Some((old, new)) = playing {
+            self.pending_audio_commands
+                .push(crate::audio::AudioCommand::Retarget { old, new });
+        }
+    }
+
+    /// The interactive split follows its file. Active stems keep playing
+    /// (the stem files are in the cache) and leaving stem mode reopens the
+    /// file where it is now. A running split cannot be left to finish: its
+    /// store stats the old path, fails after the rename, and the split is
+    /// thrown away. It is re-requested at the new path instead, which
+    /// supersedes the old job worker-side, so a suspended album batch
+    /// stays suspended until the new job ends and then resumes. A split
+    /// waiting on the engine install is pointed at the new path.
+    fn retarget_stem_split(&mut self, rename_map: &std::collections::HashMap<PathBuf, PathBuf>) {
+        if let Some(pending) = self.stems.pending_path.as_mut() {
+            follow_move(pending, rename_map);
+        }
+        let Some(new) = self
+            .stems
+            .for_path
+            .as_deref()
+            .and_then(|old| moved_location(old, rename_map))
+        else {
+            return;
+        };
+        if matches!(self.stems.status, StemStatus::Separating { .. }) {
+            self.sync.log.push(format!(
+                "[stems] the file being split moved; splitting {new} instead"
+            ));
+            let recipe = self.stems_recipe();
+            self.dispatch_separation(new, recipe);
+        } else {
+            self.stems.for_path = Some(new);
+        }
+    }
+
+    /// A running album batch is re-dispatched at the new paths: the worker
+    /// already has the old list, and a new dispatch supersedes it. A
+    /// suspended batch has no worker; its resume sends the paths updated
+    /// here.
+    fn retarget_stem_batch(&mut self, rename_map: &std::collections::HashMap<PathBuf, PathBuf>) {
+        let Some(mut batch) = self.stems_batch.take() else {
+            return;
+        };
+        let retargeted = batch
+            .tracks
+            .iter_mut()
+            .map(|t| follow_move(&mut t.path, rename_map))
+            .filter(|&moved| moved)
+            .count();
+        if retargeted > 0 {
+            self.sync.log.push(format!(
+                "[stems] {retargeted} moved track(s) in \"{}\" will be separated at their new paths",
+                batch.album
+            ));
+        }
+        if retargeted > 0 && !batch.suspended {
+            self.dispatch_stem_batch(
+                batch.album,
+                batch.tracks,
+                batch.recipe,
+                batch.separated_so_far,
+            );
+        } else {
+            self.stems_batch = Some(batch);
         }
     }
 
@@ -3297,23 +3487,9 @@ impl App {
         rename_map: std::collections::HashMap<PathBuf, PathBuf>,
     ) {
         // The files moved on disk whether or not this overlay is still
-        // open, so queued clusters are remapped even for a stale token.
-        if !rename_map.is_empty() {
-            let queued = self
-                .inbox
-                .queue
-                .iter_mut()
-                .flat_map(|c| c.tracks.iter_mut());
-            for loc in queued.filter_map(|t| t.location.as_mut()) {
-                let moved =
-                    zytunes::tag_ops::moved_path(std::path::Path::new(loc.as_str()), &rename_map);
-                *loc = moved.to_string_lossy().into_owned();
-            }
-        }
-        self.remap_queued_sync(&rename_map);
-        if !rename_map.is_empty() {
-            self.follow_moved_now_playing(&rename_map);
-        }
+        // open, so everything holding a path follows even for a stale
+        // token.
+        self.follow_moved_files(&rename_map);
         // Per-track failures are surfaced via the sync log so the user sees
         // *which* tracks failed without sifting through the diff view. We log
         // them even on a stale token (the writes happened — the user
@@ -3354,43 +3530,27 @@ impl App {
                 });
             }
         }
-        // With the overlay open, its Done screen names each failed track
-        // and stays until a key is pressed; a toast would only cover that
-        // list for its five seconds. Without one (closed mid-apply), the
-        // toast is the only notice besides the log.
         // A dest that was already held is never replaced: the file was
-        // filed beside it under a numbered name. The log names each one.
-        let beside = live_diff.map_or(0, |d| {
-            d.tracks
-                .iter()
-                .filter(|t| {
-                    let landed = rename_map.get(&t.src_path);
-                    // Numbered copies only: the folder part of a dest is
-                    // already the one on disk.
-                    landed
-                        .zip(t.dest_path.as_ref())
-                        .is_some_and(|(landed, dest)| landed.file_name() != dest.file_name())
-                })
-                .count()
-        });
+        // filed beside it under a numbered name. The log names each one;
+        // the toast names the first.
+        let copies: Vec<String> = live_diff
+            .into_iter()
+            .flat_map(|d| d.tracks.iter())
+            .filter_map(|t| {
+                let landed = rename_map.get(&t.src_path)?.file_name()?;
+                // Numbered copies only: the folder part of a dest is
+                // already the one on disk.
+                (Some(landed) != t.dest_path.as_ref()?.file_name())
+                    .then(|| landed.to_string_lossy().into_owned())
+            })
+            .collect();
+        // With the overlay open, its Done screen names each failed track
+        // and stays until a key is pressed, so the toast leaves failures
+        // to it. Without one (closed mid-apply), the toast is the only
+        // notice besides the log.
         let listed = failures.len() == failed;
-        if failed == 0 && beside > 0 {
-            self.set_toast(
-                format!(
-                    "{beside} track{} already in the library: filed beside as a numbered copy, see log (L)",
-                    if beside == 1 { " was" } else { "s were" }
-                ),
-                false,
-            );
-        }
-        if failed > 0 && !listed {
-            self.set_toast(
-                format!(
-                    "{failed} track{} failed to write, see log (L)",
-                    if failed == 1 { "" } else { "s" }
-                ),
-                true,
-            );
+        if let Some(toast) = numbered_copy_toast(&copies, if listed { 0 } else { failed }) {
+            self.set_toast(toast, failed > 0 && !listed);
         }
         if let Some(overlay) = self.tag_manager.as_mut() {
             if overlay.accepts_token(token) {
@@ -3626,11 +3786,8 @@ impl App {
             }
             return;
         }
-        let arm_enter = matches!(key.code, KeyCode::Enter) && !overlay.enter_armed;
-        if arm_enter {
+        if matches!(key.code, KeyCode::Enter) && !overlay.enter_armed {
             overlay.enter_armed = true;
-        }
-        if arm_enter {
             self.set_toast("Press Enter to continue".into(), false);
             return;
         }
@@ -3782,6 +3939,8 @@ impl App {
             AlreadyMatches,
             /// Changes exist but the user disabled every row.
             NothingEnabled,
+            /// Esc on a filing diff: close and snooze this album.
+            Skip,
             Apply,
         }
         let outcome = {
@@ -3789,6 +3948,9 @@ impl App {
                 return;
             };
             match key.code {
+                // Filing: Esc skips this album for the session (`s` still
+                // goes back to search). Retag: back one phase.
+                KeyCode::Esc if overlay.filing => Outcome::Skip,
                 KeyCode::Esc => {
                     overlay.phase = if overlay.search_hits.is_empty() {
                         TagManagerPhase::SearchInput
@@ -3866,6 +4028,7 @@ impl App {
         };
         match outcome {
             Outcome::Stay => {}
+            Outcome::Skip => self.close_tag_manager(),
             Outcome::AlreadyMatches => {
                 self.close_tag_manager_with(Some(cmd_tx), true);
                 self.set_toast("Tags already match MusicBrainz".into(), false);
@@ -5110,8 +5273,7 @@ impl App {
     /// Compute per-artist and per-album device presence (None/Partial/Full)
     /// by checking every track in the library against the device.
     pub fn rebuild_artist_device_status(&mut self) {
-        self.artist_device_status.clear();
-        self.album_device_status.clear();
+        self.device_presence = DevicePresenceIndex::default();
         let lib = match &self.library {
             Some(l) => l,
             None => return,
@@ -5119,49 +5281,20 @@ impl App {
         if self.device.status != DeviceStatus::Connected || self.device.track_set.is_empty() {
             return;
         }
-        let mut artist_counts: BTreeMap<String, (usize, usize)> = BTreeMap::new();
-        let mut album_counts: BTreeMap<(String, String), (usize, usize)> = BTreeMap::new();
-        for t in lib.all_tracks() {
-            // Keyed ASCII-case-insensitively: a sidebar row stands for
-            // every spelling of its name, so it counts all their tracks.
-            let (artist_key, album_key) =
-                (t.artist.to_ascii_lowercase(), t.album.to_ascii_lowercase());
-            let artist_entry = artist_counts.entry(artist_key.clone()).or_default();
-            artist_entry.1 += 1;
-            let album_entry = album_counts.entry((artist_key, album_key)).or_default();
-            album_entry.1 += 1;
-            if is_on_device(&t.artist, &t.name, &self.device) {
-                artist_entry.0 += 1;
-                album_entry.0 += 1;
-            }
-        }
-        for (artist, (on_device, total)) in artist_counts {
-            let status = presence_from_counts(on_device, total);
-            if status != DevicePresence::None {
-                self.artist_device_status.insert(artist, status);
-            }
-        }
-        for (key, (on_device, total)) in album_counts {
-            let status = presence_from_counts(on_device, total);
-            if status != DevicePresence::None {
-                self.album_device_status.insert(key, status);
-            }
-        }
+        self.device_presence = DevicePresenceIndex::build(lib.all_tracks(), |t| {
+            is_on_device(&t.artist, &t.name, &self.device)
+        });
     }
 
     /// Device presence of the sidebar row for `artist`, whatever the case
-    /// of the tags behind it.
+    /// or Unicode styling of the tags behind it.
     pub fn artist_presence(&self, artist: &str) -> Option<DevicePresence> {
-        self.artist_device_status
-            .get(&artist.to_ascii_lowercase())
-            .copied()
+        self.device_presence.artist(artist)
     }
 
     /// [`Self::artist_presence`] for an album.
     pub fn album_presence(&self, artist: &str, album: &str) -> Option<DevicePresence> {
-        self.album_device_status
-            .get(&(artist.to_ascii_lowercase(), album.to_ascii_lowercase()))
-            .copied()
+        self.device_presence.album(artist, album)
     }
 
     pub fn clear_device_index(&mut self) {
@@ -5177,8 +5310,7 @@ impl App {
         self.device.track_metadata.clear();
         self.device.artist_track_names.clear();
         self.device.acquired_items = 0;
-        self.artist_device_status.clear();
-        self.album_device_status.clear();
+        self.device_presence = DevicePresenceIndex::default();
         if self.browse_mode == BrowseMode::Device {
             self.browse_mode = BrowseMode::Library;
             self.refresh_sidebar();
@@ -6582,7 +6714,7 @@ impl App {
         // (it carries fingerprints that took seconds per file) and let the
         // next poll open it once the modal closes.
         if self.modal_open() || self.inbox.hold_until_library {
-            self.inbox.queue.extend(clusters);
+            self.queue_file_clusters(clusters, false);
             return;
         }
         self.enqueue_file_clusters(clusters, None, false);
@@ -10345,8 +10477,8 @@ mod tests {
         app.rebuild_artist_device_status();
 
         assert_eq!(
-            app.artist_device_status.get("radiohead"),
-            Some(&DevicePresence::Partial),
+            app.artist_presence("Radiohead"),
+            Some(DevicePresence::Partial),
             "Radiohead should be Partial (3 of 4 on device)",
         );
         // A sidebar row stands for every spelling of its name, so the
@@ -10363,25 +10495,24 @@ mod tests {
                 "{artist}"
             );
         }
-        assert!(
-            !app.artist_device_status.contains_key("bjork"),
+        assert_eq!(
+            app.artist_presence("Bjork"),
+            None,
             "Bjork should have no entry (nothing on device)",
         );
         assert_eq!(
-            app.album_device_status
-                .get(&("radiohead".into(), "ok computer".into())),
-            Some(&DevicePresence::Full),
+            app.album_presence("Radiohead", "OK Computer"),
+            Some(DevicePresence::Full),
             "OK Computer should be Full",
         );
         assert_eq!(
-            app.album_device_status
-                .get(&("radiohead".into(), "kid a".into())),
-            Some(&DevicePresence::Partial),
+            app.album_presence("Radiohead", "Kid A"),
+            Some(DevicePresence::Partial),
             "Kid A should be Partial",
         );
-        assert!(
-            !app.album_device_status
-                .contains_key(&("bjork".into(), "post".into())),
+        assert_eq!(
+            app.album_presence("Bjork", "Post"),
+            None,
             "Post should not be tracked (nothing on device)",
         );
     }
@@ -15333,9 +15464,8 @@ mod tests {
     fn done_with_a_failure_and_a_queued_cluster(reread: Result<(), &str>) -> App {
         let src = PathBuf::from("/inbox/01 Song.wav");
         let mut app = filing_overlay_with_rename(&src, std::path::Path::new("/m/01 - Song.wav"));
-        app.inbox
-            .queue
-            .push_back(zytunes::library_layout::AlbumCluster {
+        app.inbox.queue.push_back(QueuedCluster::inbox(
+            zytunes::library_layout::AlbumCluster {
                 artist: "Alice In Chains".into(),
                 album: "Facelift".into(),
                 tracks: vec![Track {
@@ -15346,7 +15476,8 @@ mod tests {
                     location: Some("/inbox/next/01.wav".into()),
                     ..Default::default()
                 }],
-            });
+            },
+        ));
         app.handle_tags_applied(0, vec![Err("rename collision".into())], HashMap::new());
         match reread {
             Ok(()) => app.tag_manager.as_mut().unwrap().phase = TagManagerPhase::Done,
@@ -15539,9 +15670,8 @@ mod tests {
             location: Some(src.display().to_string()),
             ..Default::default()
         }]);
-        app.inbox
-            .queue
-            .push_back(zytunes::library_layout::AlbumCluster {
+        app.inbox.queue.push_back(QueuedCluster::inbox(
+            zytunes::library_layout::AlbumCluster {
                 artist: "Alice In Chains".into(),
                 album: "Facelift".into(),
                 tracks: vec![Track {
@@ -15553,7 +15683,8 @@ mod tests {
                     acoustic_id: Some("FP".into()),
                     ..Default::default()
                 }],
-            });
+            },
+        ));
         app.close_tag_manager();
         assert!(app.tag_manager.is_none());
         assert!(
@@ -15587,9 +15718,8 @@ mod tests {
         let queued = "/inbox/c.wav".to_string();
         let mut app = filing_overlay_with_rename(&src, std::path::Path::new("/m/b.wav"));
         app.tag_manager.as_mut().unwrap().phase = phase;
-        app.inbox
-            .queue
-            .push_back(zytunes::library_layout::AlbumCluster {
+        app.inbox.queue.push_back(QueuedCluster::inbox(
+            zytunes::library_layout::AlbumCluster {
                 artist: "Alice In Chains".into(),
                 album: "Facelift".into(),
                 tracks: vec![Track {
@@ -15600,7 +15730,8 @@ mod tests {
                     location: Some(queued.clone()),
                     ..Default::default()
                 }],
-            });
+            },
+        ));
         (app, queued)
     }
 
@@ -15815,7 +15946,7 @@ mod tests {
     }
 
     #[test]
-    fn a_waiting_split_is_dropped_and_a_running_batch_follows_the_move() {
+    fn a_waiting_split_and_a_running_batch_follow_the_move() {
         let moved = "/m/alice in chains/Dirt/01 Them Bones.flac";
         let stays = "/m/Tool/Lateralus/01 The Grudge.flac";
         let moved_to = "/m/Alice in Chains/Dirt/01 Them Bones.flac";
@@ -15833,7 +15964,11 @@ mod tests {
         );
         app.pending_bg_commands.clear();
         app.handle_tags_applied(0, vec![Ok(())], rename_map.clone());
-        assert_eq!(app.stems.pending_path, None);
+        assert_eq!(
+            app.stems.pending_path.as_deref(),
+            Some(moved_to),
+            "the install's follow-on split opens the file where it is now"
+        );
         let followed = vec![stem_track(1, moved_to), stem_track(2, stays)];
         assert_eq!(
             app.stems_batch.as_ref().unwrap().tracks,
@@ -15871,9 +16006,8 @@ mod tests {
         let queued = "/inbox/c.wav".to_string();
         let mut app = filing_overlay_with_rename(&src, std::path::Path::new("/m/b.wav"));
         app.tag_manager.as_mut().unwrap().filing = false;
-        app.inbox
-            .queue
-            .push_back(zytunes::library_layout::AlbumCluster {
+        app.inbox.queue.push_back(QueuedCluster::inbox(
+            zytunes::library_layout::AlbumCluster {
                 artist: "Alice In Chains".into(),
                 album: "Facelift".into(),
                 tracks: vec![Track {
@@ -15884,7 +16018,8 @@ mod tests {
                     location: Some(queued.clone()),
                     ..Default::default()
                 }],
-            });
+            },
+        ));
         let (tx, _rx) = mpsc::channel::<BgCommand>();
         app.handle_tag_manager_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), &tx);
         assert!(app.tag_manager.is_none(), "q still closes the overlay");
@@ -15991,27 +16126,74 @@ mod tests {
     }
 
     #[test]
-    fn filing_while_a_split_is_running_cancels_it() {
+    fn filing_while_a_split_is_running_splits_the_moved_file() {
         let old = PathBuf::from("/m/alice/01.flac");
         let new = PathBuf::from("/m/Alice/01 - Song.flac");
         let mut app = App::new();
         app.stems.status = StemStatus::Separating { pct: None };
         app.stems.for_path = Some(old.to_string_lossy().into_owned());
         app.stems.job_gen = 4;
-        app.handle_tags_applied(0, vec![Ok(())], HashMap::from([(old, new)]));
+        app.handle_tags_applied(0, vec![Ok(())], HashMap::from([(old, new.clone())]));
         assert_eq!(
             app.stems.job_gen, 5,
-            "the late result is a stale generation"
+            "the old job's late result is a stale generation"
         );
+        assert!(matches!(app.stems.status, StemStatus::Separating { .. }));
+        assert_eq!(app.stems.for_path.as_deref(), new.to_str());
         assert!(
-            matches!(app.stems.status, StemStatus::Off),
-            "the UI does not stay on Separating"
+            app.pending_bg_commands.iter().any(|c| matches!(
+                c,
+                BgCommand::SeparateStems { gen: 5, track_path, .. } if Some(track_path.as_str()) == new.to_str()
+            )),
+            "the split is re-requested at the new path, superseding the old job"
         );
+    }
+
+    #[test]
+    fn a_batch_suspended_under_a_moved_split_resumes_when_the_new_split_ends() {
+        // The batch resumes from the interactive job's terminal event. The
+        // old job's events are stale after the move, so without a new job
+        // the batch would never resume.
+        let old = "/m/alice/01.flac";
+        let new = "/m/Alice/01 - Song.flac";
+        let other = "/m/alice/02.flac";
+        let mut app = App::new();
+        app.dispatch_stem_batch(
+            "Dirt".into(),
+            vec![stem_track(1, old), stem_track(2, other)],
+            zytunes::stems::RecipeKind::Demucs,
+            0,
+        );
+        app.dispatch_separation(old.into(), zytunes::stems::RecipeKind::Demucs);
+        assert!(app.stems_batch.as_ref().unwrap().suspended);
+        app.pending_bg_commands.clear();
+
+        app.handle_tags_applied(
+            0,
+            vec![Ok(())],
+            HashMap::from([(PathBuf::from(old), PathBuf::from(new))]),
+        );
+        let gen = app.stems.job_gen;
         assert!(
-            app.pending_bg_commands
-                .iter()
-                .any(|c| matches!(c, BgCommand::CancelSeparation)),
-            "the worker is told to stop"
+            app.stems_batch.as_ref().unwrap().suspended,
+            "the batch waits for the re-requested split"
+        );
+
+        app.handle_bg_event(BgEvent::StemsFailed {
+            gen,
+            track_path: new.into(),
+            error: "boom".into(),
+            cancelled: false,
+        });
+        let batch = app.stems_batch.as_ref().expect("batch survives");
+        assert!(!batch.suspended, "the new split's end resumes the batch");
+        assert!(
+            app.pending_bg_commands.iter().any(|c| matches!(
+                c,
+                BgCommand::SeparateStemsBatch { tracks, .. }
+                    if tracks == &vec![stem_track(1, new), stem_track(2, other)]
+            )),
+            "resumed at the new paths"
         );
     }
 
@@ -16184,13 +16366,13 @@ mod tests {
                 ..Default::default()
             },
         ]);
-        app.inbox
-            .queue
-            .push_back(zytunes::library_layout::AlbumCluster {
+        app.inbox.queue.push_back(QueuedCluster::inbox(
+            zytunes::library_layout::AlbumCluster {
                 artist: "Next".into(),
                 album: "Album".into(),
                 tracks: vec![],
-            });
+            },
+        ));
         app.handle_tags_applied(
             0,
             vec![Err("rename collision".into())],
@@ -16407,9 +16589,8 @@ mod tests {
                 error: "rename collision".into(),
             }];
         }
-        app.inbox
-            .queue
-            .push_back(zytunes::library_layout::AlbumCluster {
+        app.inbox.queue.push_back(QueuedCluster::inbox(
+            zytunes::library_layout::AlbumCluster {
                 artist: "Next".into(),
                 album: "Album".into(),
                 tracks: vec![zytunes::library::Track {
@@ -16417,7 +16598,8 @@ mod tests {
                     location: Some("/inbox/next.wav".into()),
                     ..Default::default()
                 }],
-            });
+            },
+        ));
         app.handle_tag_manager_key(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::NONE), &tx);
         assert!(
             app.tag_manager.is_some(),
@@ -16581,7 +16763,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        app.inbox.queue.push_back(next);
+        app.inbox.queue.push_back(QueuedCluster::inbox(next));
         app.handle_tag_manager_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
         let overlay = app
             .tag_manager
@@ -16802,8 +16984,8 @@ mod tests {
         app.handle_tags_applied(0, vec![Ok(())], HashMap::from([(src, landed)]));
         let toast = app.toast_message.as_ref().map(|t| t.0.as_str());
         assert!(
-            toast.is_some_and(|t| t.contains("filed beside")),
-            "{toast:?}"
+            toast.is_some_and(|t| t.contains("01 - Song (2).wav")),
+            "the toast names the numbered copy: {toast:?}"
         );
 
         // A file that reached the dest it was bound for says nothing.
@@ -16811,6 +16993,64 @@ mod tests {
         let mut app = filing_overlay_with_rename(&src, &dest);
         app.handle_tags_applied(0, vec![Ok(())], HashMap::from([(src, dest)]));
         assert!(app.toast_message.is_none());
+    }
+
+    #[test]
+    fn numbered_copy_toast_names_the_first_and_counts_the_rest() {
+        let copies = ["01 - A (2).flac".to_string(), "02 - B (2).flac".to_string()];
+        assert_eq!(
+            numbered_copy_toast(&copies, 0).as_deref(),
+            Some("Already in the library: filed 01 - A (2).flac beside it (+1 more), see log (L)")
+        );
+        // Failures nothing else lists share the one toast with the copies.
+        assert_eq!(
+            numbered_copy_toast(&copies[..1], 2).as_deref(),
+            Some(
+                "2 tracks failed to write; already in the library: \
+                 filed 01 - A (2).flac beside it, see log (L)"
+            )
+        );
+        assert_eq!(
+            numbered_copy_toast(&[], 1).as_deref(),
+            Some("1 track failed to write, see log (L)")
+        );
+        assert_eq!(numbered_copy_toast(&[], 0), None);
+    }
+
+    #[test]
+    fn a_numbered_copy_is_announced_when_another_track_failed() {
+        // The Done screen lists the failure; the copy has no other notice
+        // than the log, so the toast still names it.
+        use zytunes::tag_ops::{FieldDiff, FieldKind, TrackTagDiff};
+        let src = PathBuf::from("/inbox/01 Song.wav");
+        let dest = PathBuf::from("/m/2Pac/Album/01 - Song.wav");
+        let landed = PathBuf::from("/m/2Pac/Album/01 - Song (2).wav");
+        let mut app = filing_overlay_with_rename(&src, &dest);
+        let failing = PathBuf::from("/inbox/02 Other.wav");
+        let diff = app.tag_manager.as_mut().unwrap().diff.as_mut().unwrap();
+        diff.tracks.push(TrackTagDiff {
+            src_path: failing.clone(),
+            dest_path: Some(PathBuf::from("/m/2Pac/Album/02 - Other.wav")),
+            library_id: 2,
+            fields: vec![FieldDiff {
+                kind: FieldKind::Filename,
+                name: "Filename",
+                current: Some(failing.display().to_string()),
+                proposed: Some("/m/2Pac/Album/02 - Other.wav".into()),
+                enabled: true,
+            }],
+        });
+        app.handle_tags_applied(
+            0,
+            vec![Ok(()), Err("disk full".into())],
+            HashMap::from([(src, landed)]),
+        );
+        let toast = app.toast_message.as_ref().map(|t| t.0.as_str());
+        assert!(
+            toast.is_some_and(|t| t.contains("01 - Song (2).wav") && !t.contains("failed")),
+            "the failure is on the Done screen; the toast names the copy: {toast:?}"
+        );
+        assert_eq!(app.tag_manager.as_ref().unwrap().apply_failures.len(), 1);
     }
 
     #[test]
@@ -17035,7 +17275,9 @@ mod tests {
         // A queued cluster whose file an apply renamed would otherwise open
         // later on a path that was gone.
         let mut app = App::new();
-        app.inbox.queue.push_back(queued_cluster("/m/a/old.wav"));
+        app.inbox
+            .queue
+            .push_back(QueuedCluster::inbox(queued_cluster("/m/a/old.wav")));
         let rename_map: std::collections::HashMap<PathBuf, PathBuf> = [(
             PathBuf::from("/m/a/old.wav"),
             PathBuf::from("/m/A/01 - New.wav"),
@@ -17051,7 +17293,9 @@ mod tests {
     #[test]
     fn filing_the_same_albums_twice_queues_them_once() {
         let mut app = App::new();
-        app.inbox.queue.push_back(queued_cluster("/m/a/b.wav"));
+        app.inbox
+            .queue
+            .push_back(QueuedCluster::inbox(queued_cluster("/m/a/b.wav")));
         app.enqueue_file_clusters(
             vec![
                 queued_cluster("/m/a/first.wav"),
@@ -17114,5 +17358,149 @@ mod tests {
             .pending_bg_commands
             .iter()
             .any(|c| matches!(c, BgCommand::LoadLibrary { .. })));
+    }
+
+    #[test]
+    fn the_open_overlay_rebuilds_its_diff_from_the_moved_paths() {
+        // After an apply whose library reread failed, Esc goes back to
+        // search and a new pick rebuilds the diff from `source_tracks`.
+        // Those must name the files where they are now, not where they were.
+        let src = PathBuf::from("/inbox/01 Song.wav");
+        let dest = PathBuf::from("/m/2Pac/Album/01 - Song.wav");
+        let mut app = filing_overlay_with_rename(&src, &dest);
+        app.tag_manager.as_mut().unwrap().source_tracks = Some(vec![Track {
+            id: 1,
+            name: "Song".into(),
+            artist: "2Pac".into(),
+            album: "Album".into(),
+            location: Some(src.display().to_string()),
+            ..Default::default()
+        }]);
+        app.handle_tags_applied(0, vec![Ok(())], HashMap::from([(src, dest.clone())]));
+        let sources = app.tag_manager.as_ref().unwrap().source_tracks.as_ref();
+        assert_eq!(
+            sources.unwrap()[0].location.as_deref(),
+            dest.to_str(),
+            "the next diff is built from the file where it is now"
+        );
+    }
+
+    #[test]
+    fn esc_on_a_filing_diff_skips_the_album_for_the_session() {
+        let src = PathBuf::from("/inbox/01 Song.wav");
+        let mut app =
+            filing_overlay_with_rename(&src, std::path::Path::new("/m/2Pac/Album/01 - Song.wav"));
+        app.tag_manager.as_mut().unwrap().source_tracks = Some(vec![Track {
+            id: 1,
+            name: "Song".into(),
+            artist: "2Pac".into(),
+            album: "Album".into(),
+            location: Some(src.display().to_string()),
+            ..Default::default()
+        }]);
+        let (tx, _rx) = mpsc::channel::<BgCommand>();
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        app.handle_tag_manager_key(esc, &tx);
+        assert!(app.tag_manager.is_none(), "Esc closes the filing diff");
+        assert!(
+            app.inbox.dismissed.contains(src.to_str().unwrap()),
+            "and the album does not reopen this session"
+        );
+
+        // On a plain retag, Esc goes back one phase as before.
+        let mut app =
+            filing_overlay_with_rename(&src, std::path::Path::new("/m/2Pac/Album/01 - Song.wav"));
+        app.tag_manager.as_mut().unwrap().filing = false;
+        app.handle_tag_manager_key(esc, &tx);
+        assert_eq!(
+            app.tag_manager.as_ref().map(|o| o.phase),
+            Some(TagManagerPhase::SearchInput)
+        );
+    }
+
+    #[test]
+    fn every_album_of_an_f_run_takes_the_first_enter_and_inbox_albums_do_not() {
+        let track = |album: &str, loc: &str| zytunes::library::Track {
+            name: "Song".into(),
+            artist: "Artist X".into(),
+            album: album.into(),
+            location: Some(loc.into()),
+            ..Default::default()
+        };
+        let open_second = |app: &mut App| {
+            app.tag_manager.as_mut().unwrap().phase = TagManagerPhase::Done;
+            app.close_tag_manager();
+            app.tag_manager
+                .as_ref()
+                .expect("the next album opens")
+                .enter_armed
+        };
+
+        let (tx, _rx) = mpsc::channel::<BgCommand>();
+        let mut app = make_app_with_library_for_tagmgr();
+        app.active_panel = Panel::Library;
+        app.sidebar_items = vec![SidebarEntry::Artist("Artist X".into())];
+        app.library = Some(Box::new(VecLibrary {
+            tracks: vec![track("Album A", "/m/a.wav"), track("Album B", "/m/b.wav")],
+        }));
+        app.start_file_and_enrich(&tx);
+        assert!(app.tag_manager.as_ref().unwrap().enter_armed);
+        assert!(open_second(&mut app), "the user asked for the whole run");
+
+        let mut app = make_app_with_library_for_tagmgr();
+        app.on_inbox_scanned(vec![
+            track("Album A", "/inbox/a.wav"),
+            track("Album B", "/inbox/b.wav"),
+        ]);
+        assert!(!app.tag_manager.as_ref().unwrap().enter_armed);
+        assert!(!open_second(&mut app), "an inbox album opens unprompted");
+    }
+
+    #[test]
+    fn f_outside_library_mode_opens_nothing() {
+        let (tx, _rx) = mpsc::channel::<BgCommand>();
+        let (atx, _arx) = mpsc::channel::<AudioCommand>();
+        let mut app = make_app_with_library_for_tagmgr();
+        app.active_panel = Panel::Albums;
+        app.browse_mode = BrowseMode::Device;
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('F'), KeyModifiers::SHIFT),
+            &tx,
+            &atx,
+        );
+        assert!(app.tag_manager.is_none());
+    }
+
+    #[test]
+    fn device_presence_matches_a_stylised_artist_name() {
+        let track = |id: u64, artist: &str, name: &str| zytunes::library::Track {
+            id,
+            name: name.into(),
+            artist: artist.into(),
+            album: "Mean Machine".into(),
+            ..Default::default()
+        };
+        let tracks = [
+            track(1, "\u{1D43A}\u{1D442}\u{1D445}\u{1D438}", "Hazy"),
+            track(2, "Gore", "Loner"),
+            track(3, "Elsewhere", "Other"),
+        ];
+        let index = DevicePresenceIndex::build(tracks.iter(), |t| t.name == "Loner");
+        // `𝐺𝑂𝑅𝐸` and `Gore` are one sidebar row: one of its two tracks is
+        // on the device, whichever spelling the row shows.
+        for artist in ["\u{1D43A}\u{1D442}\u{1D445}\u{1D438}", "Gore"] {
+            assert_eq!(
+                index.artist(artist),
+                Some(DevicePresence::Partial),
+                "{artist}"
+            );
+            assert_eq!(
+                index.album(artist, "Mean Machine"),
+                Some(DevicePresence::Partial),
+                "{artist}"
+            );
+        }
+        assert_eq!(index.artist("Elsewhere"), None);
+        assert!(index.any());
     }
 }

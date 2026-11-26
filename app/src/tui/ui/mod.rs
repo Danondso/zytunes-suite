@@ -618,7 +618,7 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
     // Artists (keyed by artist name) and Albums (keyed by "artist — album").
     let show_device_status = app.browse_mode == BrowseMode::Library
         && (matches!(app.sidebar_mode, SidebarMode::Artists | SidebarMode::Albums))
-        && (!app.artist_device_status.is_empty() || !app.album_device_status.is_empty());
+        && app.device_presence.any();
 
     let items: Vec<ListItem> = app
         .sidebar_items
