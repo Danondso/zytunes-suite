@@ -134,5 +134,6 @@ fn label(cmd: &BgCommand) -> &'static str {
         BgCommand::SyncVideos { .. } => "SyncVideos",
         BgCommand::CancelSync => "CancelSync",
         BgCommand::LoadAlbumArt { .. } => "LoadAlbumArt",
+        _ => "other",
     }
 }

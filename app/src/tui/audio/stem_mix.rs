@@ -110,7 +110,7 @@ impl<S: Source> Iterator for StemMixerSource<S> {
                 };
             }
         }
-        self.channel_pos = (self.channel_pos + 1) % self.channels.get();
+        self.channel_pos = (self.channel_pos + 1) % self.channels;
 
         // Exhausted stems contribute silence; the mix ends only when every
         // stem has ended so a short stem never truncates the track.

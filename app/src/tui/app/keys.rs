@@ -1,11 +1,12 @@
 //! Keyboard dispatch for the TUI.
 //!
 //! `App::handle_key` is the single-source-of-truth dispatcher the run
-//! loop feeds every [`KeyEvent`] through. Modals are tried first, in
-//! priority order — each has a `handle_*_key` method that returns `true`
-//! when its modal is open (an open modal consumes every key, so the
-//! global map below never sees it). Only when no modal claims the event
-//! does `handle_global_key` run the global key map.
+//! loop feeds every [`KeyEvent`] through. Modals are tried first, in the
+//! priority order of the `MODALS` table — each pairs an open predicate
+//! with a `handle_*_key` method that returns `true` when it consumed the
+//! key (an open modal consumes every key, so the global map below never
+//! sees it). Only when no modal claims the event does `handle_global_key`
+//! run the global key map.
 
 use std::sync::mpsc;
 
@@ -18,12 +19,90 @@ use super::{
 use crate::audio::AudioCommand;
 use crate::background::BgCommand;
 
+/// A modal's "is it open" predicate and its key handler. The handler
+/// returns `true` when it consumed the key.
+type ModalHandler = fn(&mut App, KeyEvent, &mpsc::Sender<BgCommand>) -> bool;
+struct Modal {
+    open: fn(&App) -> bool,
+    handle: ModalHandler,
+}
+
+/// Every modal, in key priority order: the one list both
+/// [`App::handle_key`] and [`App::modal_open`] read, so a new modal is
+/// added once. A modal claims every key while open, except the CD import
+/// overlay, which lets some fall through (Ctrl-C, so the quit hatch still
+/// works) to the modals and global map after it.
+const MODALS: &[Modal] = &[
+    Modal {
+        open: |a| a.import_overlay.is_some(),
+        handle: |a, k, _| a.handle_import_overlay_key(k),
+    },
+    Modal {
+        open: |a| a.playlist_name_input.is_some(),
+        handle: |a, k, _| a.handle_playlist_name_input_key(k),
+    },
+    Modal {
+        open: |a| a.generation_form.is_some(),
+        handle: |a, k, _| a.handle_generation_form_key(k),
+    },
+    Modal {
+        open: |a| a.add_to_playlist_picker.is_some(),
+        handle: |a, k, _| a.handle_add_to_playlist_picker_key(k),
+    },
+    Modal {
+        open: |a| a.pending_playlist_delete.is_some(),
+        handle: |a, k, _| a.handle_playlist_delete_key(k),
+    },
+    Modal {
+        open: |a| a.search_active,
+        handle: |a, k, _| a.handle_search_key(k),
+    },
+    Modal {
+        open: |a| a.show_theme_picker,
+        handle: |a, k, _| a.handle_theme_picker_key(k),
+    },
+    Modal {
+        open: |a| a.stem_panel.is_some(),
+        handle: |a, k, _| a.handle_stem_panel_key(k),
+    },
+    Modal {
+        open: |a| a.pending_cache_clear,
+        handle: |a, k, _| a.handle_cache_clear_key(k),
+    },
+    Modal {
+        open: |a| a.stems.consent.is_some(),
+        handle: |a, k, _| a.handle_stem_consent_key(k),
+    },
+    Modal {
+        open: |a| a.stem_bulk_confirm.is_some(),
+        handle: |a, k, _| a.handle_stem_bulk_confirm_key(k),
+    },
+    Modal {
+        open: |a| a.pending_removal.is_some(),
+        handle: |a, k, tx| a.handle_removal_confirm_key(k, tx),
+    },
+    Modal {
+        open: |a| a.show_help,
+        handle: |a, k, _| a.handle_help_key(k),
+    },
+    Modal {
+        open: |a| a.tag_manager.is_some(),
+        handle: |a, k, tx| {
+            a.handle_tag_manager_key(k, tx);
+            true
+        },
+    },
+    Modal {
+        open: |a| a.show_track_info,
+        handle: |a, k, _| a.handle_track_info_key(k),
+    },
+];
+
 impl App {
     /// Single-source-of-truth keyboard dispatcher for the TUI.
     ///
-    /// Handles the same modal-then-global cascade the run loop used to inline:
-    /// search, theme picker, cache-clear confirm, removal confirm, help, and
-    /// track-info popup are all gated before the global match. Returns
+    /// Tries each open modal in [`MODALS`] in priority order, then the
+    /// stem strip's digit keys, then the global map. Returns
     /// `KeyOutcome::Quit` for `q` / `Ctrl+C` so the run loop can break.
     pub fn handle_key(
         &mut self,
@@ -31,37 +110,10 @@ impl App {
         cmd_tx: &mpsc::Sender<BgCommand>,
         audio_tx: &mpsc::Sender<AudioCommand>,
     ) -> KeyOutcome {
-        // CD import overlay. Takes priority over every other modal so the
-        // user can dismiss with Esc and reach the rest of the TUI again.
-        // (Unlike the modals below it deliberately lets some keys fall
-        // through — e.g. Ctrl-C so the quit hatch still works.)
-        if self.import_overlay.is_some() && self.handle_import_overlay_key(key) {
-            return KeyOutcome::Continue;
-        }
-
-        if self.handle_playlist_name_input_key(key)
-            || self.handle_generation_form_key(key)
-            || self.handle_add_to_playlist_picker_key(key)
-            || self.handle_playlist_delete_key(key)
-            || self.handle_search_key(key)
-            || self.handle_theme_picker_key(key)
-            || self.handle_stem_panel_key(key)
-            || self.handle_cache_clear_key(key)
-            || self.handle_stem_consent_key(key)
-            || self.handle_stem_bulk_confirm_key(key)
-            || self.handle_removal_confirm_key(key, cmd_tx)
-            || self.handle_help_key(key)
-        {
-            return KeyOutcome::Continue;
-        }
-
-        if self.tag_manager.is_some() {
-            self.handle_tag_manager_key(key, cmd_tx);
-            return KeyOutcome::Continue;
-        }
-
-        if self.handle_track_info_key(key) {
-            return KeyOutcome::Continue;
+        for modal in MODALS {
+            if (modal.open)(self) && (modal.handle)(self, key, cmd_tx) {
+                return KeyOutcome::Continue;
+            }
         }
 
         if self.handle_stem_key(key) {
@@ -69,6 +121,13 @@ impl App {
         }
 
         self.handle_global_key(key, cmd_tx, audio_tx)
+    }
+
+    /// Some modal or text input currently claims the keyboard. Anything
+    /// that opens an overlay on its own (the inbox poll) checks this
+    /// first, so it never lands under the user's fingers mid-keystroke.
+    pub(crate) fn modal_open(&self) -> bool {
+        MODALS.iter().any(|modal| (modal.open)(self))
     }
 
     /// Engine-install consent overlay (opened by `M` when no stem engine
@@ -107,32 +166,24 @@ impl App {
         true
     }
 
-    /// While stem playback is Active, digit keys `1..=layout.len()` (6 or
-    /// 7 per the active recipe layout) toggle stems — they normally
-    /// switch sidebar modes / jump panels. Everything else falls through:
-    /// digits beyond the layout (key `7` under six-stem layouts) keep
-    /// their global meaning, and `M` in the global map exits stem mode.
-    /// Claiming is additionally gated on the strip being visible: with
-    /// the player panel hidden (`P` force-hidden, or a terminal too short
-    /// for it), `1`/`2` silently mutating invisible stems read as the
-    /// sidebar keys going dead.
+    /// While stem playback is Active, digit keys toggle the stem strip's
+    /// cells — they normally switch sidebar modes / jump panels. `1..=9`
+    /// address the top-level cells (a split source like lead/backing
+    /// vocals is one cell), or the parts of the group `0` expanded; `0`
+    /// cycles which group is expanded. Everything else falls through:
+    /// a digit with no cell behind it keeps its global meaning, `0` does
+    /// too when the layout has no groups, and `M` in the global map
+    /// exits stem mode. Claiming is additionally gated on the strip
+    /// being visible: with the player panel hidden (`P` force-hidden, or
+    /// a terminal too short for it), `1`/`2` silently mutating invisible
+    /// stems read as the sidebar keys going dead.
     fn handle_stem_key(&mut self, key: KeyEvent) -> bool {
         if self.stems.status != super::StemStatus::Active || !self.stem_strip_visible() {
             return false;
         }
         match key.code {
-            KeyCode::Char(c @ '1'..='8') => {
-                // Claim only digits inside the active layout: key 7
-                // toggles the harmony layout's 7th stem but must fall
-                // through to global handling under a six-stem layout.
-                let index = c as usize - '1' as usize;
-                if index < self.stems.layout.map_or(0, |l| l.len()) {
-                    self.toggle_stem(index);
-                    true
-                } else {
-                    false
-                }
-            }
+            KeyCode::Char('0') => self.cycle_stem_group(),
+            KeyCode::Char(c @ '1'..='9') => self.press_stem_digit(c as usize - '1' as usize),
             _ => false,
         }
     }
@@ -519,6 +570,11 @@ impl App {
             {
                 self.open_tag_manager(cmd_tx);
             }
+            KeyCode::Char('F')
+                if self.browse_mode == BrowseMode::Library && self.library.is_some() =>
+            {
+                self.start_file_and_enrich(cmd_tx);
+            }
             KeyCode::Char('M') => {
                 // On an album sidebar entry (Library browse), M means
                 // "pre-warm this whole album" — or cancels the batch
@@ -819,7 +875,7 @@ impl App {
 
     /// `L` — dump the sync log to `/tmp/zytunes-log.txt` and copy the
     /// path to the system clipboard.
-    fn dump_log_to_file(&mut self) {
+    pub(crate) fn dump_log_to_file(&mut self) {
         let path = std::path::PathBuf::from("/tmp/zytunes-log.txt");
         let content = self.sync.log.join("\n");
         match std::fs::write(&path, &content) {

@@ -6,10 +6,9 @@
 //! miss; the resulting FLACs land in the cache via [`store_stems`].
 //!
 //! A [`RecipeKind`] names a pipeline: `demucs` (single [`DemucsCli`]
-//! pass), or the audio-separator recipes `hq` / `sw` / `hq-harmony` (a
-//! [`CascadeSeparator`] executing [`RecipePass`] slices — Roformer
-//! vocals + demucs band, a single 6-stem Roformer, or the karaoke
-//! lead/backing split). Each recipe declares an ordered stem *layout*
+//! pass), or the audio-separator recipes `sw` / `hq-harmony` (a
+//! [`CascadeSeparator`] executing [`RecipePass`] slices — a single 6-stem
+//! Roformer, optionally followed by the karaoke lead/backing split). Each recipe declares an ordered stem *layout*
 //! that drives filenames, UI cells, digit keys, and gain indices alike.
 //!
 //! Shelling out mirrors the ffmpeg precedent (video-sync, CD rip): the
@@ -32,8 +31,9 @@ use process::{run_engine_process, EngineHooks, EngineOutcome};
 
 /// Capacity ceiling for per-stem state (gains, enabled flags). Fixed so
 /// the lock-free `[AtomicU32; MAX_STEMS]` gains array never reallocates;
-/// recipes occupy `layout().len()` slots and the rest idle muted.
-pub const MAX_STEMS: usize = 8;
+/// recipes occupy `layout().len()` slots and the rest idle muted. 16
+/// leaves headroom over the largest layout (`full`'s fourteen).
+pub const MAX_STEMS: usize = 16;
 
 /// A named, versioned separation pipeline — the unit `[stems] recipe`
 /// selects. A recipe decides which engine runs ([`RecipeKind::engine`]),
@@ -44,16 +44,17 @@ pub const MAX_STEMS: usize = 8;
 pub enum RecipeKind {
     /// The original single-pass demucs separation (default).
     Demucs,
-    /// BS-Roformer vocals + `htdemucs_6s` band cascade via
-    /// audio-separator — same six stems, audibly better vocals.
-    Hq,
     /// Single-pass jarredou BS-RoFormer-SW via audio-separator — same
-    /// six stems as `demucs`/`hq`, stronger guitar/piano than
-    /// `htdemucs_6s`.
+    /// six stems as `demucs`, better on every one. Also what the retired
+    /// `hq` config value now selects (see [`FromStr`](std::str::FromStr)).
     Sw,
-    /// The `hq` cascade plus a Mel-Roformer karaoke pass splitting the
+    /// BS-RoFormer-SW plus a Mel-Roformer karaoke pass splitting its
     /// vocals into lead + backing (seven stems).
     HqHarmony,
+    /// BS-RoFormer-SW with the crowd pulled out first, its vocals split
+    /// into lead + male / female backing, and its drums into six parts —
+    /// fourteen stems, five passes ([`full_recipe_passes`]).
+    Full,
 }
 
 impl RecipeKind {
@@ -61,7 +62,7 @@ impl RecipeKind {
     pub fn engine(self) -> provision::EngineKind {
         match self {
             RecipeKind::Demucs => provision::EngineKind::Demucs,
-            RecipeKind::Hq | RecipeKind::Sw | RecipeKind::HqHarmony => {
+            RecipeKind::Sw | RecipeKind::HqHarmony | RecipeKind::Full => {
                 provision::EngineKind::AudioSeparator
             }
         }
@@ -75,9 +76,9 @@ impl RecipeKind {
     pub fn cache_id(self, demucs_model: &str) -> String {
         match self {
             RecipeKind::Demucs => demucs_model.to_string(),
-            RecipeKind::Hq => "hq/v1".to_string(),
             RecipeKind::Sw => "sw/v1".to_string(),
-            RecipeKind::HqHarmony => "hq-harmony/v1".to_string(),
+            RecipeKind::HqHarmony => "hq-harmony/v2".to_string(),
+            RecipeKind::Full => "full/v2".to_string(),
         }
     }
 
@@ -85,8 +86,22 @@ impl RecipeKind {
     /// truth for UI cells, digit keys, gain indices, and stem filenames.
     pub fn layout(self) -> &'static [StemKind] {
         match self {
-            RecipeKind::Demucs | RecipeKind::Hq | RecipeKind::Sw => SIX_STEM_LAYOUT,
+            RecipeKind::Demucs | RecipeKind::Sw => SIX_STEM_LAYOUT,
             RecipeKind::HqHarmony => HARMONY_STEM_LAYOUT,
+            RecipeKind::Full => FULL_STEM_LAYOUT,
+        }
+    }
+
+    /// The audio-separator passes this recipe runs, in order; `None` for
+    /// the demucs recipe, which drives the demucs CLI instead. Exhaustive
+    /// on purpose: a new recipe must say which passes it runs rather
+    /// than silently inheriting another recipe's.
+    pub fn passes(self) -> Option<&'static [RecipePass]> {
+        match self {
+            RecipeKind::Demucs => None,
+            RecipeKind::Sw => Some(sw_recipe_passes()),
+            RecipeKind::HqHarmony => Some(hq_harmony_recipe_passes()),
+            RecipeKind::Full => Some(full_recipe_passes()),
         }
     }
 
@@ -94,9 +109,9 @@ impl RecipeKind {
     pub fn config_value(self) -> &'static str {
         match self {
             RecipeKind::Demucs => "demucs",
-            RecipeKind::Hq => "hq",
             RecipeKind::Sw => "sw",
             RecipeKind::HqHarmony => "hq-harmony",
+            RecipeKind::Full => "full",
         }
     }
 }
@@ -104,9 +119,9 @@ impl RecipeKind {
 /// Every recipe, in the order the settings panel lists them.
 pub const ALL_RECIPES: [RecipeKind; 4] = [
     RecipeKind::Demucs,
-    RecipeKind::Hq,
     RecipeKind::Sw,
     RecipeKind::HqHarmony,
+    RecipeKind::Full,
 ];
 
 impl std::fmt::Display for RecipeKind {
@@ -121,9 +136,12 @@ impl std::str::FromStr for RecipeKind {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "demucs" => Ok(RecipeKind::Demucs),
-            "hq" => Ok(RecipeKind::Hq),
-            "sw" => Ok(RecipeKind::Sw),
+            // `hq` was the ep_317 → htdemucs_6s cascade until SW beat it on
+            // every stem; it now resolves to the recipe that replaced it so
+            // existing configs keep working.
+            "sw" | "hq" => Ok(RecipeKind::Sw),
             "hq-harmony" => Ok(RecipeKind::HqHarmony),
+            "full" => Ok(RecipeKind::Full),
             other => Err(other.to_string()),
         }
     }
@@ -144,11 +162,111 @@ pub enum StemKind {
     LeadVocals,
     /// Backing vocals / harmonies.
     BackingVocals,
+    /// Backing vocals split by voice, for recipes that split
+    /// [`StemKind::BackingVocals`] further.
+    BackingMale,
+    BackingFemale,
     Drums,
+    /// Drum parts, for recipes that split [`StemKind::Drums`] further.
+    Kick,
+    Snare,
+    Toms,
+    HiHat,
+    Ride,
+    Crash,
     Bass,
     Guitar,
     Piano,
     Other,
+    /// Audience noise pulled out of a live recording.
+    Crowd,
+}
+
+/// The fourteen-stem `full` order: vocals split into lead + male and
+/// female backing, drums into kick / snare / toms / hi-hat / ride /
+/// crash, then the band, then the crowd. Each group's parts stay
+/// adjacent so [`strip_cells`] folds them into one cell; the collapsed
+/// strip has seven cells.
+pub const FULL_STEM_LAYOUT: &[StemKind] = &[
+    StemKind::LeadVocals,
+    StemKind::BackingMale,
+    StemKind::BackingFemale,
+    StemKind::Kick,
+    StemKind::Snare,
+    StemKind::Toms,
+    StemKind::HiHat,
+    StemKind::Ride,
+    StemKind::Crash,
+    StemKind::Bass,
+    StemKind::Guitar,
+    StemKind::Piano,
+    StemKind::Other,
+    StemKind::Crowd,
+];
+
+/// A source a recipe split into parts. On the stem strip a group's
+/// parts fold into one top-level cell (toggling all of them at once)
+/// that `0` expands so the digits reach each part — see
+/// [`strip_cells`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StemGroup {
+    Vocals,
+    Drums,
+}
+
+impl StemGroup {
+    /// Three-character label for the group's collapsed strip cell —
+    /// the same label the unsplit stem uses, so a split recipe's
+    /// collapsed strip reads exactly like the six-stem one.
+    pub fn short_label(self) -> &'static str {
+        match self {
+            StemGroup::Vocals => StemKind::Vocals.short_label(),
+            StemGroup::Drums => StemKind::Drums.short_label(),
+        }
+    }
+}
+
+/// One top-level cell of the stem strip, addressed by its digit key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StemCell {
+    /// A stem that stands alone, by layout index.
+    Single(usize),
+    /// A group's parts, a contiguous run of layout indices.
+    Group {
+        group: StemGroup,
+        members: std::ops::Range<usize>,
+    },
+}
+
+impl StemCell {
+    /// The layout indices this cell toggles.
+    pub fn members(&self) -> std::ops::Range<usize> {
+        match self {
+            StemCell::Single(i) => *i..*i + 1,
+            StemCell::Group { members, .. } => members.clone(),
+        }
+    }
+}
+
+/// Fold a layout into top-level strip cells: consecutive stems of the
+/// same [`StemGroup`] become one [`StemCell::Group`], everything else a
+/// [`StemCell::Single`]. Layouts keep each group's parts adjacent
+/// (pinned by a test), so a group is always one contiguous range.
+pub fn strip_cells(layout: &[StemKind]) -> Vec<StemCell> {
+    let mut cells: Vec<StemCell> = Vec::new();
+    for (i, kind) in layout.iter().enumerate() {
+        match (kind.group(), cells.last_mut()) {
+            (Some(g), Some(StemCell::Group { group, members })) if *group == g => {
+                members.end = i + 1;
+            }
+            (Some(group), _) => cells.push(StemCell::Group {
+                group,
+                members: i..i + 1,
+            }),
+            (None, _) => cells.push(StemCell::Single(i)),
+        }
+    }
+    cells
 }
 
 /// The classic six-source order every demucs-family separation uses.
@@ -174,17 +292,47 @@ pub const HARMONY_STEM_LAYOUT: &[StemKind] = &[
 ];
 
 impl StemKind {
+    /// Every kind, for lookups that invert the tables below.
+    pub const ALL: [StemKind; 17] = [
+        StemKind::Vocals,
+        StemKind::LeadVocals,
+        StemKind::BackingVocals,
+        StemKind::BackingMale,
+        StemKind::BackingFemale,
+        StemKind::Drums,
+        StemKind::Kick,
+        StemKind::Snare,
+        StemKind::Toms,
+        StemKind::HiHat,
+        StemKind::Ride,
+        StemKind::Crash,
+        StemKind::Bass,
+        StemKind::Guitar,
+        StemKind::Piano,
+        StemKind::Other,
+        StemKind::Crowd,
+    ];
+
     /// The filename (sans extension) this stem is stored as.
     pub fn file_stem(self) -> &'static str {
         match self {
             StemKind::Vocals => "vocals",
             StemKind::LeadVocals => "lead",
             StemKind::BackingVocals => "backing",
+            StemKind::BackingMale => "backing_male",
+            StemKind::BackingFemale => "backing_female",
             StemKind::Drums => "drums",
+            StemKind::Kick => "kick",
+            StemKind::Snare => "snare",
+            StemKind::Toms => "toms",
+            StemKind::HiHat => "hihat",
+            StemKind::Ride => "ride",
+            StemKind::Crash => "crash",
             StemKind::Bass => "bass",
             StemKind::Guitar => "guitar",
             StemKind::Piano => "piano",
             StemKind::Other => "other",
+            StemKind::Crowd => "crowd",
         }
     }
 
@@ -194,11 +342,20 @@ impl StemKind {
             StemKind::Vocals => "Vocals",
             StemKind::LeadVocals => "Lead Vocals",
             StemKind::BackingVocals => "Backing Vocals",
+            StemKind::BackingMale => "Backing Vocals (male)",
+            StemKind::BackingFemale => "Backing Vocals (female)",
             StemKind::Drums => "Drums",
+            StemKind::Kick => "Kick",
+            StemKind::Snare => "Snare",
+            StemKind::Toms => "Toms",
+            StemKind::HiHat => "Hi-hat",
+            StemKind::Ride => "Ride",
+            StemKind::Crash => "Crash",
             StemKind::Bass => "Bass",
             StemKind::Guitar => "Guitar",
             StemKind::Piano => "Piano",
             StemKind::Other => "Other",
+            StemKind::Crowd => "Crowd",
         }
     }
 
@@ -209,28 +366,46 @@ impl StemKind {
             StemKind::Vocals => "Voc",
             StemKind::LeadVocals => "LdV",
             StemKind::BackingVocals => "BkV",
+            StemKind::BackingMale => "BkM",
+            StemKind::BackingFemale => "BkF",
             StemKind::Drums => "Drm",
+            StemKind::Kick => "Kck",
+            StemKind::Snare => "Snr",
+            StemKind::Toms => "Tom",
+            StemKind::HiHat => "Hat",
+            StemKind::Ride => "Rde",
+            StemKind::Crash => "Crs",
             StemKind::Bass => "Bas",
             StemKind::Guitar => "Gtr",
             StemKind::Piano => "Pno",
             StemKind::Other => "Oth",
+            StemKind::Crowd => "Crd",
+        }
+    }
+
+    /// The group this stem is a part of, if a recipe split its source.
+    /// The unsplit [`StemKind::Vocals`] / [`StemKind::Drums`] are
+    /// standalone cells, not groups.
+    pub fn group(self) -> Option<StemGroup> {
+        match self {
+            StemKind::LeadVocals
+            | StemKind::BackingVocals
+            | StemKind::BackingMale
+            | StemKind::BackingFemale => Some(StemGroup::Vocals),
+            StemKind::Kick
+            | StemKind::Snare
+            | StemKind::Toms
+            | StemKind::HiHat
+            | StemKind::Ride
+            | StemKind::Crash => Some(StemGroup::Drums),
+            _ => None,
         }
     }
 
     /// Inverse of [`StemKind::file_stem`] — the URL slug / cache filename
     /// without extension (`"lead"` → `LeadVocals`).
     pub fn from_file_stem(name: &str) -> Option<Self> {
-        match name {
-            "vocals" => Some(StemKind::Vocals),
-            "lead" => Some(StemKind::LeadVocals),
-            "backing" => Some(StemKind::BackingVocals),
-            "drums" => Some(StemKind::Drums),
-            "bass" => Some(StemKind::Bass),
-            "guitar" => Some(StemKind::Guitar),
-            "piano" => Some(StemKind::Piano),
-            "other" => Some(StemKind::Other),
-            _ => None,
-        }
+        Self::ALL.into_iter().find(|k| k.file_stem() == name)
     }
 }
 
@@ -360,6 +535,28 @@ pub trait StemSeparator {
         progress: &dyn Fn(u8),
         on_line: &dyn Fn(&str),
     ) -> Result<StemSet, StemError>;
+
+    /// Host prerequisites a real separation needs beyond the engine
+    /// itself, checked only on a cache miss (cached stems play without
+    /// any of them). The `Err` string is shown to the user verbatim.
+    /// Default: none.
+    fn preflight(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// Both engines shell out to ffmpeg: audio-separator decodes and writes
+/// every format through it, and demucs ≥ 4.1 writes `--flac` output
+/// through it. Without it the engine dies minutes into a run with a
+/// Python traceback; this turns that into one clear message up front.
+fn require_ffmpeg() -> Result<(), String> {
+    if crate::transcode::check_ffmpeg_available() {
+        Ok(())
+    } else {
+        Err("ffmpeg not found on PATH — stem separation needs it. \
+             Install ffmpeg and press M again."
+            .to_string())
+    }
 }
 
 /// Shell-out to the `demucs` CLI (or a compatible fork — the binary and
@@ -428,6 +625,10 @@ impl StemSeparator for DemucsCli {
         probe_engine(&self.command, "--help")
     }
 
+    fn preflight(&self) -> Result<(), String> {
+        require_ffmpeg()
+    }
+
     fn separate(
         &self,
         src: &Path,
@@ -470,11 +671,8 @@ impl StemSeparator for DemucsCli {
     }
 }
 
-/// The demucs 6-source model as audio-separator names it.
-pub const AUDIO_SEPARATOR_HTDEMUCS_MODEL: &str = "htdemucs_6s.yaml";
-
 /// Shell-out to `python-audio-separator`'s `audio-separator` CLI — the
-/// engine behind the `hq`/`sw`/`hq-harmony` recipes. One invocation per model
+/// engine behind the `sw`/`hq-harmony` recipes. One invocation per model
 /// pass; `--custom_output_names` makes every pass emit our canonical
 /// stem filenames directly into `--output_dir`, so there is no
 /// engine-layout dance like demucs' model/track subdirectories.
@@ -498,18 +696,19 @@ pub fn default_model_file_dir() -> Option<PathBuf> {
 /// Every model file a current recipe can reference. Derived from the same
 /// pinned constants the recipes are built on, so a checkpoint swap
 /// automatically retires the old file for [`prune_model_cache`].
-pub fn pinned_model_files() -> [&'static str; 4] {
+pub fn pinned_model_files() -> [&'static str; 5] {
     [
-        AUDIO_SEPARATOR_HTDEMUCS_MODEL,
-        BS_ROFORMER_VOCALS_MODEL,
         MEL_ROFORMER_KARAOKE_MODEL,
         BS_ROFORMER_SW_MODEL,
+        MDX23C_DRUMSEP_MODEL,
+        MEL_ROFORMER_CROWD_MODEL,
+        BS_ROFORMER_CHORUS_MALE_FEMALE_MODEL,
     ]
 }
 
 /// Evict retired model checkpoints from `model_dir`.
 ///
-/// A checkpoint swap (bumping [`BS_ROFORMER_VOCALS_MODEL`] etc.) orphans
+/// A checkpoint swap (bumping [`MEL_ROFORMER_KARAOKE_MODEL`] etc.) orphans
 /// the previous 0.2–1 GB file forever — nothing else walks this dir. The
 /// policy is pinned-set cleanup rather than LRU: Roformer checkpoints are
 /// pinned constants, not user config, so a `.ckpt` whose filename is not
@@ -520,11 +719,19 @@ pub fn pinned_model_files() -> [&'static str; 4] {
 /// (demucs weight segments, registry json, download locks) whose names
 /// we don't control, and deleting those would force silent re-downloads.
 ///
-/// Retirement only covers `.ckpt` models. If the yaml-named
-/// [`AUDIO_SEPARATOR_HTDEMUCS_MODEL`] is ever swapped, the old yaml and
-/// its hash-named demucs weight segments are NOT reclaimed — hash-named
-/// weights can't be attributed to a model by this policy, so a future
-/// model bump must clean those up by other means.
+/// Retirement only covers `.ckpt` models. The yaml-named `htdemucs_6s`
+/// model the retired `hq` cascade used is NOT reclaimed: its yaml and
+/// hash-named demucs weight segments can't be attributed to a model by
+/// this policy, so they stay (tens of MB) until the user clears the
+/// model cache.
+///
+/// Also sweeps abandoned downloads. audio-separator (≥ 0.48.0) streams a
+/// checkpoint to `{file}.{pid}.partial` and renames it into place; its
+/// own cleanup is a Python `finally`, which never runs when a cancel
+/// SIGKILLs the engine's process group — so a 0.2–1.7 GB partial would
+/// otherwise leak forever. Only partials idle for
+/// [`PARTIAL_DOWNLOAD_GRACE`] go: a live download (another job, or
+/// `zytunes-serve` sharing the dir) keeps touching its file.
 pub fn prune_model_cache(model_dir: &Path, pinned: &[&str], log: &Logger) {
     let Ok(entries) = std::fs::read_dir(model_dir) else {
         return;
@@ -540,6 +747,30 @@ pub fn prune_model_cache(model_dir: &Path, pinned: &[&str], log: &Logger) {
             .and_then(|e| e.to_str())
             .is_some_and(|e| e.eq_ignore_ascii_case(ext))
     };
+    let evict = |path: &Path, what: &str| {
+        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        match std::fs::remove_file(path) {
+            Ok(()) => log(&format!(
+                "model cache: evicted {what} {} ({:.1} MB)",
+                path.display(),
+                size as f64 / (1024.0 * 1024.0)
+            )),
+            Err(e) => log(&format!(
+                "model cache: failed to evict {}: {e}",
+                path.display()
+            )),
+        }
+    };
+
+    for path in files.iter().filter(|p| has_ext(p, "partial")) {
+        let idle = std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok());
+        if idle.is_some_and(|d| d >= PARTIAL_DOWNLOAD_GRACE) {
+            evict(path, "abandoned download");
+        }
+    }
 
     // Stems owned by pinned files are never retire-able: a stray
     // non-pinned `htdemucs_6s.ckpt` beside the pinned `htdemucs_6s.yaml`
@@ -589,25 +820,24 @@ pub fn prune_model_cache(model_dir: &Path, pinned: &[&str], log: &Logger) {
         {
             continue;
         }
-        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        match std::fs::remove_file(path) {
-            Ok(()) => log(&format!(
-                "model cache: evicted retired {} ({:.1} MB)",
-                path.display(),
-                size as f64 / (1024.0 * 1024.0)
-            )),
-            Err(e) => log(&format!(
-                "model cache: failed to evict {}: {e}",
-                path.display()
-            )),
-        }
+        evict(path, "retired");
     }
 }
+
+/// How long an audio-separator `*.partial` download must sit untouched
+/// before [`prune_model_cache`] treats it as abandoned. A live download
+/// rewrites its file continuously, so ten idle minutes means the
+/// writer is gone (cancelled, crashed, or the machine slept mid-fetch
+/// and the next run starts a fresh `{pid}` partial anyway).
+pub const PARTIAL_DOWNLOAD_GRACE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 /// Build the audio-separator argv for one model pass. `output_names`
 /// maps the model's stem names (e.g. `"Vocals"`) to the file stems we
 /// want on disk (e.g. `"vocals"`), serialized as the JSON
 /// `--custom_output_names` expects. FLAC output matches [`STEM_EXT`].
+///
+/// Every pass also pins [`MDXC_OVERLAP`] rather than inheriting the
+/// checkpoint's YAML default.
 pub fn build_audio_separator_args(
     model: &str,
     out_dir: &Path,
@@ -631,29 +861,63 @@ pub fn build_audio_separator_args(
         model_file_dir.to_string_lossy().into_owned(),
         "--custom_output_names".into(),
         serde_json::Value::Object(names).to_string(),
+        "--mdxc_overlap".into(),
+        MDXC_OVERLAP.to_string(),
     ]
 }
 
-/// The BS-Roformer vocals/instrumental checkpoint the `hq` recipes pin.
-/// Community-consensus best vocal model; also audio-separator's own
-/// default. Swapping it requires bumping the recipe version in
-/// [`RecipeKind::cache_id`] so cached mixes re-separate.
-pub const BS_ROFORMER_VOCALS_MODEL: &str = "model_bs_roformer_ep_317_sdr_12.9755.ckpt";
+/// Overlapping prediction windows for Roformer (MDXC-arch) passes.
+///
+/// Since audio-separator 0.47.0 an unset `--mdxc_overlap` falls back to
+/// each checkpoint's YAML `inference.num_overlap` (`step = chunk_size /
+/// overlap`). Our karaoke checkpoint declares 4 (as did the retired
+/// ep_317 vocals model), which upstream's own README notes costs
+/// several times the forward passes of 0.46.x — on CPU that made the
+/// harmony recipe markedly slower when we pinned 0.47.0. Upstream's
+/// suggested escape is 2; published community scores put the quality
+/// cost at a few hundredths of a dB. BS-RoFormer-SW already declares 2.
+///
+/// Not part of [`RecipeKind::cache_id`]: entries separated at the old
+/// overlap are at least as good, so they stay valid.
+pub const MDXC_OVERLAP: u8 = 2;
 
 /// The Mel-Roformer karaoke checkpoint (aufr33/viperx) that splits an
 /// isolated vocal take into lead + backing. Fed pass 1's full vocals —
 /// on vocals-only input its "Instrumental" output IS the backing
-/// vocals. Candidate for an A/B swap against the becruily karaoke model
-/// once live listening tests run; swapping bumps the recipe version.
+/// vocals. Swap candidate: `bs_roformer_karaoke_frazer_becruily.ckpt`
+/// (204 MB, ~+0.7 dB lead SDR on full mixes), pending a listening test
+/// on vocals-only input; swapping bumps the recipe version.
 pub const MEL_ROFORMER_KARAOKE_MODEL: &str =
     "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt";
 
 /// The jarredou BS-RoFormer-SW 6-stem checkpoint. One pass produces
-/// the same six stems as demucs/`hq`, with stronger guitar/piano than
-/// `htdemucs_6s`. audio-separator's registry name (not the upstream
-/// `BS-Rofo-SW-Fixed.ckpt` filename). Swapping it bumps
+/// the same six stems as demucs, better on every published score than
+/// `htdemucs_6s` and the retired ep_317 → htdemucs cascade. The name
+/// is audio-separator's registry name, not the upstream
+/// `BS-Rofo-SW-Fixed.ckpt` filename. Swapping it bumps
 /// [`RecipeKind::cache_id`].
 pub const BS_ROFORMER_SW_MODEL: &str = "BS-Roformer-SW.ckpt";
+
+/// The aufr33/jarredou MDX23C drum-part checkpoint (438 MB): drums in,
+/// kick / snare / toms / hh / ride / crash out (its registry stem
+/// names). DrumSep5 leaderboard: kick 14.53, snare 9.78, toms 10.59,
+/// hi-hat 3.18 dB SDR — the cymbals bleed into each other, so expect
+/// hi-hat, ride, and crash to be rougher than the shells.
+pub const MDX23C_DRUMSEP_MODEL: &str = "MDX23C-DrumSep-aufr33-jarredou.ckpt";
+
+/// The aufr33/viperx Mel-Roformer crowd checkpoint: a mix in, `crowd`
+/// and `other` (everything else) out. 8.71 dB SDR on its own test set.
+/// Runs first in the `full` recipe so every later pass works on the
+/// crowd-free mix; on studio tracks the crowd stem is near-silent.
+pub const MEL_ROFORMER_CROWD_MODEL: &str = "mel_band_roformer_crowd_aufr33_viperx_sdr_8.7144.ckpt";
+
+/// Sucial's BS-Roformer chorus model: a multi-voice vocal in, `male`
+/// and `female` out. Trained on choruses, which is what the karaoke
+/// pass's backing output is; aufr33's general male/female model
+/// (`bs_roformer_male_female_by_aufr33_sdr_7.2889.ckpt`) is the swap
+/// candidate. Single-gender backing leaves the other stem near-silent.
+pub const BS_ROFORMER_CHORUS_MALE_FEMALE_MODEL: &str =
+    "model_chorus_bs_roformer_ep_267_sdr_24.1275.ckpt";
 
 /// What feeds a [`RecipePass`]: the original source track, or a file an
 /// earlier pass produced into the work dir (named by file stem).
@@ -681,78 +945,108 @@ pub struct RecipePass {
     pub label: &'static str,
 }
 
-/// The `hq` recipe: BS-Roformer pulls vocals off the source, then
-/// htdemucs_6s separates the band from the devocalized instrumental —
-/// the community-standard cascade. Pass 2's own vocals output is
-/// near-silence by construction and maps to a discard name so it can't
-/// clobber the real vocals stem.
-pub fn hq_recipe_passes() -> &'static [RecipePass] {
+/// The `hq-harmony` recipe: BS-RoFormer-SW over the source with its
+/// vocals routed to an intermediate, then split into lead + backing by
+/// the karaoke model. SW beats the old ep_317 → htdemucs_6s cascade on
+/// every published stem (vocals, bass, drums, guitar, piano) in one
+/// pass instead of two — see `docs/stem-model-updates-research.md`.
+/// Window weights assume the SW pass dominates on CPU; tune against
+/// live timings.
+pub fn hq_harmony_recipe_passes() -> &'static [RecipePass] {
     static PASSES: [RecipePass; 2] = [
         RecipePass {
-            model: BS_ROFORMER_VOCALS_MODEL,
+            model: BS_ROFORMER_SW_MODEL,
             input: PassInput::Source,
-            output_names: &[("Vocals", "vocals"), ("Instrumental", "instrumental")],
-            window: (0, 45),
-            label: "vocals (BS-Roformer)",
-        },
-        RecipePass {
-            model: AUDIO_SEPARATOR_HTDEMUCS_MODEL,
-            input: PassInput::Produced("instrumental"),
             output_names: &[
-                ("Vocals", "band_vocals"),
+                ("Vocals", "vocals_full"),
                 ("Drums", "drums"),
                 ("Bass", "bass"),
                 ("Guitar", "guitar"),
                 ("Piano", "piano"),
                 ("Other", "other"),
             ],
-            window: (45, 100),
-            label: "band (htdemucs_6s over the instrumental)",
-        },
-    ];
-    &PASSES
-}
-
-/// The `hq-harmony` recipe: the hq cascade with the vocal take routed
-/// to an intermediate, then split into lead + backing by the karaoke
-/// model. Window weights assume the two Roformer passes dominate on
-/// CPU; tune against live timings.
-pub fn hq_harmony_recipe_passes() -> &'static [RecipePass] {
-    static PASSES: [RecipePass; 3] = [
-        RecipePass {
-            model: BS_ROFORMER_VOCALS_MODEL,
-            input: PassInput::Source,
-            output_names: &[("Vocals", "vocals_full"), ("Instrumental", "instrumental")],
-            window: (0, 35),
-            label: "vocals (BS-Roformer)",
-        },
-        RecipePass {
-            model: AUDIO_SEPARATOR_HTDEMUCS_MODEL,
-            input: PassInput::Produced("instrumental"),
-            output_names: &[
-                ("Vocals", "band_vocals"),
-                ("Drums", "drums"),
-                ("Bass", "bass"),
-                ("Guitar", "guitar"),
-                ("Piano", "piano"),
-                ("Other", "other"),
-            ],
-            window: (35, 70),
-            label: "band (htdemucs_6s over the instrumental)",
+            window: (0, 60),
+            label: "6-stem (BS-RoFormer-SW)",
         },
         RecipePass {
             model: MEL_ROFORMER_KARAOKE_MODEL,
             input: PassInput::Produced("vocals_full"),
             output_names: &[("Vocals", "lead"), ("Instrumental", "backing")],
-            window: (70, 100),
+            window: (60, 100),
             label: "lead/backing split (Mel-Roformer karaoke)",
         },
     ];
     &PASSES
 }
 
+/// The `full` recipe, five passes into fourteen stems:
+///
+/// 1. crowd model over the source → `crowd` + a crowd-free mix
+/// 2. BS-RoFormer-SW over the crowd-free mix → six stems
+/// 3. karaoke over SW's vocals → lead + backing
+/// 4. chorus male/female over the backing → male + female backing
+/// 5. DrumSep over SW's drums → kick / snare / toms / hi-hat / ride / crash
+///
+/// SW's vocals and drums and the full backing take are intermediates —
+/// the full layout has none of them as a stem of its own. SW dominates
+/// on CPU; the later passes run on single-source input.
+pub fn full_recipe_passes() -> &'static [RecipePass] {
+    static PASSES: [RecipePass; 5] = [
+        RecipePass {
+            model: MEL_ROFORMER_CROWD_MODEL,
+            input: PassInput::Source,
+            output_names: &[("crowd", "crowd"), ("other", "no_crowd")],
+            window: (0, 15),
+            label: "crowd (Mel-Roformer crowd)",
+        },
+        RecipePass {
+            model: BS_ROFORMER_SW_MODEL,
+            input: PassInput::Produced("no_crowd"),
+            output_names: &[
+                ("Vocals", "vocals_full"),
+                ("Drums", "drums_full"),
+                ("Bass", "bass"),
+                ("Guitar", "guitar"),
+                ("Piano", "piano"),
+                ("Other", "other"),
+            ],
+            window: (15, 55),
+            label: "6-stem (BS-RoFormer-SW)",
+        },
+        RecipePass {
+            model: MEL_ROFORMER_KARAOKE_MODEL,
+            input: PassInput::Produced("vocals_full"),
+            output_names: &[("Vocals", "lead"), ("Instrumental", "backing_full")],
+            window: (55, 70),
+            label: "lead/backing split (Mel-Roformer karaoke)",
+        },
+        RecipePass {
+            model: BS_ROFORMER_CHORUS_MALE_FEMALE_MODEL,
+            input: PassInput::Produced("backing_full"),
+            output_names: &[("male", "backing_male"), ("female", "backing_female")],
+            window: (70, 80),
+            label: "male/female backing (BS-Roformer chorus)",
+        },
+        RecipePass {
+            model: MDX23C_DRUMSEP_MODEL,
+            input: PassInput::Produced("drums_full"),
+            output_names: &[
+                ("kick", "kick"),
+                ("snare", "snare"),
+                ("toms", "toms"),
+                ("hh", "hihat"),
+                ("ride", "ride"),
+                ("crash", "crash"),
+            ],
+            window: (80, 100),
+            label: "drum parts (MDX23C DrumSep)",
+        },
+    ];
+    &PASSES
+}
+
 /// The `sw` recipe: jarredou BS-RoFormer-SW over the source in one
-/// pass. Same six-stem layout as `demucs`/`hq`; any extra engine
+/// pass. Same six-stem layout as `demucs`; any extra engine
 /// output (e.g. an Instrumental mix) is left in the work dir and
 /// discarded with it.
 pub fn sw_recipe_passes() -> &'static [RecipePass] {
@@ -829,7 +1123,7 @@ pub struct CascadeSeparator {
 }
 
 /// Build the separator a recipe drives: `DemucsCli` for the demucs
-/// recipe, a `CascadeSeparator` over audio-separator for the hq recipes.
+/// recipe, a `CascadeSeparator` over audio-separator for the Roformer recipes.
 /// `Err` carries a user-visible message. Shared by the TUI worker and
 /// `zytunes-serve` so a checkpoint / layout change cannot drift.
 pub fn recipe_separator(
@@ -843,19 +1137,18 @@ pub fn recipe_separator(
             model: demucs_model.to_string(),
             layout: recipe.layout(),
         }),
-        RecipeKind::Hq | RecipeKind::Sw | RecipeKind::HqHarmony => {
+        RecipeKind::Sw | RecipeKind::HqHarmony | RecipeKind::Full => {
             let model_file_dir = default_model_file_dir()
                 .ok_or_else(|| "cannot resolve $HOME for the model cache".to_string())?;
+            let passes = recipe
+                .passes()
+                .expect("every audio-separator recipe declares its passes");
             Box::new(CascadeSeparator {
                 engine: AudioSeparatorCli {
                     command,
                     model_file_dir,
                 },
-                passes: match recipe {
-                    RecipeKind::HqHarmony => hq_harmony_recipe_passes(),
-                    RecipeKind::Sw => sw_recipe_passes(),
-                    _ => hq_recipe_passes(),
-                },
+                passes,
                 layout: recipe.layout(),
             })
         }
@@ -865,6 +1158,10 @@ pub fn recipe_separator(
 impl StemSeparator for CascadeSeparator {
     fn available(&self) -> Result<(), String> {
         self.engine.available()
+    }
+
+    fn preflight(&self) -> Result<(), String> {
+        require_ffmpeg()
     }
 
     fn separate(
@@ -930,8 +1227,9 @@ impl StemSeparator for CascadeSeparator {
 /// its own file mtime is the LRU clock for [`prune_stem_cache`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StemCacheMeta {
-    /// Absolute path of the source track (diagnostic only — the entry is
-    /// keyed by its hash, so collisions resolve via fingerprint mismatch).
+    /// Absolute path of the source track when it was separated
+    /// (diagnostic only — the entry is keyed by the track's ID and
+    /// validated by fingerprint, so the file may have moved since).
     pub source_path: String,
     pub fingerprint: FileFingerprint,
     pub model: String,
@@ -948,18 +1246,29 @@ pub fn default_stem_cache_dir() -> Option<PathBuf> {
     Some(crate::paths::zytunes_cache_root()?.join("stems"))
 }
 
-/// Cache entry directory name for a `(source path, recipe cache id)`
-/// pair — the path hashed with the same `DefaultHasher` scheme the
-/// dirlib cache uses for scan roots, suffixed with the sanitised cache
-/// id. Keying on the pair (rather than the path alone) lets recipes
-/// coexist per-track: flipping `[stems] recipe` for an A/B comparison
-/// hits both ways instead of paying a full re-separation on every flip.
-pub fn stem_cache_key(source_path: &str, cache_id: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    source_path.hash(&mut hasher);
-    format!("{:016x}-{}", hasher.finish(), sanitize_cache_id(cache_id))
+/// A track to separate: where its file is, and the ID its cache entry is
+/// keyed on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StemTrack {
+    /// The library track ID (see [`crate::track_ids`]). A file with no
+    /// library track uses [`crate::dirlib::hash_path`] of its path.
+    pub id: u64,
+    pub path: String,
+}
+
+/// Cache entry directory name for a `(track ID, recipe cache id)` pair.
+///
+/// The ID, not the path: a track keeps its ID when its file moves, so a
+/// filed or retitled track still finds its split and the entry dir stays
+/// put under a mixer that has it open. A track's first ID is the hash of
+/// its first path, which is what entries were keyed on before, so older
+/// entries are found as they are.
+///
+/// Keying on the pair (rather than the track alone) lets recipes coexist
+/// per-track: flipping `[stems] recipe` for an A/B comparison hits both
+/// ways instead of paying a full re-separation on every flip.
+pub fn stem_cache_key(track_id: u64, cache_id: &str) -> String {
+    format!("{track_id:016x}-{}", sanitize_cache_id(cache_id))
 }
 
 /// Filesystem-safe form of a recipe cache id (`"hq/v1"` → `"hq-v1"`).
@@ -972,7 +1281,7 @@ pub fn stem_cache_key(source_path: &str, cache_id: &str) -> String {
 /// just wrote. No shipped cache id contains a dot, so nothing regresses.
 ///
 /// The mapping is lossy, so distinct raw ids can share a dirname (a
-/// demucs `model = "hq-v1"` collides with the `hq` recipe's `"hq/v1"`).
+/// demucs `model = "sw-v1"` collides with the `sw` recipe's `"sw/v1"`).
 /// That is thrash, not corruption: `cached_stems` checks the raw
 /// `meta.model`, so the colliding configs evict each other on every flip
 /// but the wrong stems are never served.
@@ -995,7 +1304,7 @@ fn is_legacy_key(name: &str) -> bool {
 }
 
 /// Lossless migration of pre-recipe-key cache entries to the
-/// `{path_hash}-{cache_id}` naming. A legacy entry's own meta sidecar
+/// `{track_id}-{cache_id}` naming. A legacy entry's own meta sidecar
 /// already records its cache id (`meta.model`), so migration is a
 /// rename — no re-separation. A legacy dir whose new-key twin already
 /// exists (the track was re-separated before migration ran) is dead
@@ -1049,11 +1358,12 @@ pub fn migrate_legacy_stem_entries(cache_dir: &Path, log: &Logger) {
 /// bulk-confirm estimate must not count as use.
 pub fn stem_cache_contains(
     cache_dir: &Path,
+    track_id: u64,
     source: &Path,
     model: &str,
     layout: &'static [StemKind],
 ) -> bool {
-    let entry_dir = cache_dir.join(stem_cache_key(&source.to_string_lossy(), model));
+    let entry_dir = cache_dir.join(stem_cache_key(track_id, model));
     let Some(meta) = read_meta(&entry_dir) else {
         return false;
     };
@@ -1065,9 +1375,14 @@ pub fn stem_cache_contains(
         && StemSet::from_layout(&entry_dir, STEM_EXT, layout).all_exist()
 }
 
-/// Rough on-disk size of one separated track (six/seven FLACs) for the
-/// bulk-confirm projection — real entries run ~150-250 MB.
-pub const EST_STEM_BYTES_PER_TRACK: u64 = 220 * 1024 * 1024;
+/// Rough on-disk size of one track's stems under `layout`, for the
+/// bulk-confirm projection: ~33 MB per FLAC stem of a typical track
+/// (six-stem entries run ~150–250 MB), so a fourteen-stem `full` split
+/// projects proportionally larger instead of undercounting.
+pub fn est_stem_bytes_per_track(layout: &[StemKind]) -> u64 {
+    const PER_STEM: u64 = 33 * 1024 * 1024;
+    PER_STEM * layout.len() as u64
+}
 
 /// Total bytes of regular files under `dir`, recursively. Used by the
 /// stem settings panel (cache-size display), the uninstall flow's
@@ -1129,7 +1444,8 @@ fn write_meta(entry_dir: &Path, meta: &StemCacheMeta) -> Result<(), String> {
     crate::paths::atomic_write_json(&entry_dir.join(META_NAME), &data)
 }
 
-/// Look up cached stems for `source` under `cache_dir`.
+/// Look up cached stems for the track `track_id`, whose file is at
+/// `source`, under `cache_dir`.
 ///
 /// A hit requires the meta sidecar to parse, its fingerprint to match the
 /// source file's current `(mtime, size)`, its model to match `model`
@@ -1139,12 +1455,13 @@ fn write_meta(entry_dir: &Path, meta: &StemCacheMeta) -> Result<(), String> {
 /// replaces the entry).
 pub fn cached_stems(
     cache_dir: &Path,
+    track_id: u64,
     source: &Path,
     model: &str,
     layout: &'static [StemKind],
     log: &Logger,
 ) -> Option<StemSet> {
-    let entry_dir = cache_dir.join(stem_cache_key(&source.to_string_lossy(), model));
+    let entry_dir = cache_dir.join(stem_cache_key(track_id, model));
     let meta = read_meta(&entry_dir)?;
     let current = FileFingerprint::from_path(source)?;
     if meta.fingerprint != current || meta.model != model {
@@ -1177,6 +1494,7 @@ pub fn cached_stems(
 /// smaller than one track still plays (it gets evicted by the next store).
 pub fn store_stems(
     cache_dir: &Path,
+    track_id: u64,
     source: &Path,
     model: &str,
     produced: &StemSet,
@@ -1185,7 +1503,7 @@ pub fn store_stems(
 ) -> Result<StemSet, String> {
     let fingerprint = FileFingerprint::from_path(source)
         .ok_or_else(|| format!("cannot stat source {}", source.display()))?;
-    let key = stem_cache_key(&source.to_string_lossy(), model);
+    let key = stem_cache_key(track_id, model);
     let entry_dir = cache_dir.join(&key);
     let stage_dir = cache_dir.join(format!("{key}.tmp"));
 
@@ -1308,6 +1626,12 @@ mod tests {
     use super::*;
     use crate::cache::default_logger;
 
+    /// The track ID a file with no registry entry gets, the key every
+    /// cache test stores and looks its source up under.
+    fn id_of(source: &Path) -> u64 {
+        crate::dirlib::hash_path(source)
+    }
+
     fn temp_root(tag: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
             "zytunes-stems-{tag}-{}-{}",
@@ -1339,14 +1663,18 @@ mod tests {
     fn recipe_parses_config_values_and_rejects_unknown() {
         for (value, kind) in [
             ("demucs", RecipeKind::Demucs),
-            ("hq", RecipeKind::Hq),
             ("sw", RecipeKind::Sw),
             ("hq-harmony", RecipeKind::HqHarmony),
+            ("full", RecipeKind::Full),
         ] {
             assert_eq!(value.parse::<RecipeKind>(), Ok(kind));
             // Display round-trips to the config value.
             assert_eq!(kind.to_string(), value);
         }
+        // The retired `hq` cascade resolves to the recipe that replaced it,
+        // so an existing `recipe = "hq"` config keeps working; it is never
+        // written back (Display gives "sw").
+        assert_eq!("hq".parse::<RecipeKind>(), Ok(RecipeKind::Sw));
         assert!("roformer".parse::<RecipeKind>().is_err());
         assert!("".parse::<RecipeKind>().is_err());
     }
@@ -1355,9 +1683,17 @@ mod tests {
     fn recipe_engine_mapping() {
         use crate::stems::provision::EngineKind;
         assert_eq!(RecipeKind::Demucs.engine(), EngineKind::Demucs);
-        assert_eq!(RecipeKind::Hq.engine(), EngineKind::AudioSeparator);
         assert_eq!(RecipeKind::Sw.engine(), EngineKind::AudioSeparator);
         assert_eq!(RecipeKind::HqHarmony.engine(), EngineKind::AudioSeparator);
+        assert_eq!(RecipeKind::Full.engine(), EngineKind::AudioSeparator);
+        // Exactly the audio-separator recipes declare passes.
+        for recipe in ALL_RECIPES {
+            assert_eq!(
+                recipe.passes().is_some(),
+                recipe.engine() == EngineKind::AudioSeparator,
+                "{recipe}"
+            );
+        }
     }
 
     #[test]
@@ -1368,23 +1704,20 @@ mod tests {
         assert_eq!(RecipeKind::Demucs.cache_id("htdemucs_6s"), "htdemucs_6s");
         assert_eq!(RecipeKind::Demucs.cache_id("htdemucs"), "htdemucs");
         // Multi-pass recipes carry an explicit version so a checkpoint
-        // swap can force re-separation by bumping it.
-        assert_eq!(RecipeKind::Hq.cache_id("htdemucs_6s"), "hq/v1");
+        // swap can force re-separation by bumping it. hq-harmony is v2:
+        // its band and vocals now come from SW, not the ep_317 cascade.
         assert_eq!(RecipeKind::Sw.cache_id("htdemucs_6s"), "sw/v1");
         assert_eq!(
             RecipeKind::HqHarmony.cache_id("htdemucs_6s"),
-            "hq-harmony/v1"
+            "hq-harmony/v2"
         );
+        // v2: crowd pass first, male/female backing, separate cymbals.
+        assert_eq!(RecipeKind::Full.cache_id("htdemucs_6s"), "full/v2");
         // Distinct recipes must never collide in the cache.
-        let ids = [
-            RecipeKind::Demucs.cache_id("htdemucs_6s"),
-            RecipeKind::Hq.cache_id("htdemucs_6s"),
-            RecipeKind::Sw.cache_id("htdemucs_6s"),
-            RecipeKind::HqHarmony.cache_id("htdemucs_6s"),
-        ];
+        let ids = ALL_RECIPES.map(|r| r.cache_id("htdemucs_6s"));
         assert_eq!(
             ids.iter().collect::<std::collections::HashSet<_>>().len(),
-            4
+            ALL_RECIPES.len()
         );
     }
 
@@ -1442,12 +1775,12 @@ mod tests {
 
     #[test]
     fn cache_key_embeds_recipe_and_sanitizes_slashes() {
-        let a = stem_cache_key("/music/a.mp3", "htdemucs_6s");
-        assert_eq!(a, stem_cache_key("/music/a.mp3", "htdemucs_6s"));
-        assert_ne!(a, stem_cache_key("/music/b.mp3", "htdemucs_6s"));
+        let a = stem_cache_key(1, "htdemucs_6s");
+        assert_eq!(a, stem_cache_key(1, "htdemucs_6s"));
+        assert_ne!(a, stem_cache_key(2, "htdemucs_6s"));
         // Same track, different recipe → different entry, so recipe flips
         // don't evict each other.
-        let b = stem_cache_key("/music/a.mp3", "hq/v1");
+        let b = stem_cache_key(1, "hq/v1");
         assert_ne!(a, b);
         // Versioned cache ids carry a '/', which cannot appear in a
         // directory name.
@@ -1460,7 +1793,7 @@ mod tests {
         assert!(a.ends_with("htdemucs_6s"), "cache id readable in dirname");
         // Dots are mapped away: an entry name ending in `.tmp` would be
         // indistinguishable from a stage dir and swept by the prune.
-        let dotted = stem_cache_key("/music/a.mp3", "foo.tmp");
+        let dotted = stem_cache_key(1, "foo.tmp");
         assert!(!dotted.contains('.'), "no dots survive into the key");
         assert!(dotted.ends_with("foo-tmp"));
     }
@@ -1473,6 +1806,7 @@ mod tests {
         let (source, produced_demucs) = fake_separation(&root, b"mp3data");
         store_stems(
             &cache,
+            id_of(&source),
             &source,
             "htdemucs_6s",
             &produced_demucs,
@@ -1490,17 +1824,111 @@ mod tests {
         for p in &produced_hq.paths {
             std::fs::write(p, b"hqflac").unwrap();
         }
-        store_stems(&cache, &source, "hq/v1", &produced_hq, u64::MAX, &log).unwrap();
+        store_stems(
+            &cache,
+            id_of(&source),
+            &source,
+            "hq/v1",
+            &produced_hq,
+            u64::MAX,
+            &log,
+        )
+        .unwrap();
 
-        let demucs_hit = cached_stems(&cache, &source, "htdemucs_6s", SIX_STEM_LAYOUT, &log)
-            .expect("demucs entry survives the hq store");
-        let hq_hit =
-            cached_stems(&cache, &source, "hq/v1", SIX_STEM_LAYOUT, &log).expect("hq entry hits");
+        let demucs_hit = cached_stems(
+            &cache,
+            id_of(&source),
+            &source,
+            "htdemucs_6s",
+            SIX_STEM_LAYOUT,
+            &log,
+        )
+        .expect("demucs entry survives the hq store");
+        let hq_hit = cached_stems(
+            &cache,
+            id_of(&source),
+            &source,
+            "hq/v1",
+            SIX_STEM_LAYOUT,
+            &log,
+        )
+        .expect("hq entry hits");
         assert_ne!(demucs_hit.paths[0], hq_hit.paths[0]);
         assert_eq!(std::fs::read(&demucs_hit.paths[0]).unwrap(), b"flacdata");
         assert_eq!(std::fs::read(&hq_hit.paths[0]).unwrap(), b"hqflac");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Store a six-stem entry for `source` whose stem files all hold
+    /// `marker`, so a later hit can be told apart from another track's.
+    fn store_marked(cache: &Path, root: &Path, id: u64, source: &Path, model: &str, marker: &[u8]) {
+        let produced_dir = root.join("produced-marked");
+        std::fs::create_dir_all(&produced_dir).unwrap();
+        let produced = StemSet::from_layout(&produced_dir, STEM_EXT, SIX_STEM_LAYOUT);
+        for p in &produced.paths {
+            std::fs::write(p, marker).unwrap();
+        }
+        store_stems(
+            cache,
+            id,
+            source,
+            model,
+            &produced,
+            u64::MAX,
+            &default_logger(),
+        )
+        .unwrap();
+    }
+
+    fn hit_marker(cache: &Path, id: u64, source: &Path, model: &str) -> Option<Vec<u8>> {
+        let hit = cached_stems(cache, id, source, model, SIX_STEM_LAYOUT, &default_logger())?;
+        Some(std::fs::read(&hit.paths[0]).unwrap())
+    }
+
+    #[test]
+    fn a_split_is_still_a_hit_after_its_source_moves() {
+        // Entries are keyed on the track's ID, which a move does not
+        // change, so filing a track never touches the stem cache.
+        let root = temp_root("moved-source");
+        let cache = root.join("cache");
+        let (a, a_new) = (root.join("a.mp3"), root.join("Artist - a.mp3"));
+        std::fs::write(&a, b"track a").unwrap();
+        store_marked(&cache, &root, 7, &a, "htdemucs_6s", b"a-demucs");
+        store_marked(&cache, &root, 7, &a, "hq/v1", b"a-hq");
+        let entry = cache.join(stem_cache_key(7, "htdemucs_6s"));
+        assert!(entry.is_dir());
+
+        std::fs::rename(&a, &a_new).unwrap();
+
+        assert_eq!(
+            hit_marker(&cache, 7, &a_new, "htdemucs_6s").as_deref(),
+            Some(&b"a-demucs"[..])
+        );
+        assert_eq!(
+            hit_marker(&cache, 7, &a_new, "hq/v1").as_deref(),
+            Some(&b"a-hq"[..])
+        );
+        assert!(
+            entry.is_dir(),
+            "the entry stays where a live mixer has its files open"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_first_seen_id_finds_an_entry_keyed_before_ids_were_stable() {
+        // Entries used to be keyed on a hash of the path string. A track's
+        // first ID is `hash_path` of that same path, so every entry
+        // already on disk is found with no migration.
+        use std::hash::{Hash, Hasher};
+        let path = "/music/Artist/Album/01 - Song.flac";
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        path.hash(&mut hasher);
+        assert_eq!(
+            stem_cache_key(crate::dirlib::hash_path(Path::new(path)), "htdemucs_6s"),
+            format!("{:016x}-htdemucs_6s", hasher.finish())
+        );
     }
 
     #[test]
@@ -1512,7 +1940,7 @@ mod tests {
 
         // Simulate a pre-recipe-key entry: bare 16-hex dirname holding a
         // valid meta + full six-stem file set.
-        let new_key = stem_cache_key(&source.to_string_lossy(), "htdemucs_6s");
+        let new_key = stem_cache_key(id_of(&source), "htdemucs_6s");
         let legacy_name = &new_key[..16];
         let legacy_dir = cache.join(legacy_name);
         std::fs::create_dir_all(&legacy_dir).unwrap();
@@ -1533,8 +1961,15 @@ mod tests {
         migrate_legacy_stem_entries(&cache, &log);
         assert!(!legacy_dir.exists(), "legacy dirname retired");
         assert!(cache.join(&new_key).exists(), "renamed, not re-separated");
-        let hit = cached_stems(&cache, &source, "htdemucs_6s", SIX_STEM_LAYOUT, &log)
-            .expect("migrated entry is a hit under the new key");
+        let hit = cached_stems(
+            &cache,
+            id_of(&source),
+            &source,
+            "htdemucs_6s",
+            SIX_STEM_LAYOUT,
+            &log,
+        )
+        .expect("migrated entry is a hit under the new key");
         assert_eq!(std::fs::read(&hit.paths[0]).unwrap(), b"oldflac");
 
         let _ = std::fs::remove_dir_all(&root);
@@ -1554,8 +1989,17 @@ mod tests {
         // A legacy entry whose new-key twin already exists (the track was
         // re-separated before migration ran) is dead bytes — removed.
         let (source, produced) = fake_separation(&root, b"mp3data");
-        store_stems(&cache, &source, "m", &produced, u64::MAX, &log).unwrap();
-        let new_key = stem_cache_key(&source.to_string_lossy(), "m");
+        store_stems(
+            &cache,
+            id_of(&source),
+            &source,
+            "m",
+            &produced,
+            u64::MAX,
+            &log,
+        )
+        .unwrap();
+        let new_key = stem_cache_key(id_of(&source), "m");
         let superseded = cache.join(&new_key[..16]);
         std::fs::create_dir_all(&superseded).unwrap();
         write_meta(
@@ -1583,14 +2027,29 @@ mod tests {
         let (source, produced) = fake_separation(&root, b"mp3data");
         let log = default_logger();
 
-        let stored = store_stems(&cache, &source, "htdemucs_6s", &produced, u64::MAX, &log)
-            .expect("store succeeds");
+        let stored = store_stems(
+            &cache,
+            id_of(&source),
+            &source,
+            "htdemucs_6s",
+            &produced,
+            u64::MAX,
+            &log,
+        )
+        .expect("store succeeds");
         assert!(stored.all_exist());
         // The produced files were moved, not copied.
         assert!(!produced.paths[0].exists());
 
-        let hit =
-            cached_stems(&cache, &source, "htdemucs_6s", SIX_STEM_LAYOUT, &log).expect("cache hit");
+        let hit = cached_stems(
+            &cache,
+            id_of(&source),
+            &source,
+            "htdemucs_6s",
+            SIX_STEM_LAYOUT,
+            &log,
+        )
+        .expect("cache hit");
         assert_eq!(hit, stored);
 
         let _ = std::fs::remove_dir_all(&root);
@@ -1602,16 +2061,41 @@ mod tests {
         let cache = root.join("cache");
         let (source, produced) = fake_separation(&root, b"mp3data");
         let log = default_logger();
-        store_stems(&cache, &source, "htdemucs_6s", &produced, u64::MAX, &log).unwrap();
+        store_stems(
+            &cache,
+            id_of(&source),
+            &source,
+            "htdemucs_6s",
+            &produced,
+            u64::MAX,
+            &log,
+        )
+        .unwrap();
 
         // Different model → miss. Under per-recipe keying this lookup
         // targets a different (nonexistent) entry dir, so it misses at
         // the key level before the meta comparison is reached.
-        assert!(cached_stems(&cache, &source, "htdemucs", SIX_STEM_LAYOUT, &log).is_none());
+        assert!(cached_stems(
+            &cache,
+            id_of(&source),
+            &source,
+            "htdemucs",
+            SIX_STEM_LAYOUT,
+            &log
+        )
+        .is_none());
 
         // Re-written source with a different size → fingerprint miss.
         std::fs::write(&source, b"mp3data-but-longer").unwrap();
-        assert!(cached_stems(&cache, &source, "htdemucs_6s", SIX_STEM_LAYOUT, &log).is_none());
+        assert!(cached_stems(
+            &cache,
+            id_of(&source),
+            &source,
+            "htdemucs_6s",
+            SIX_STEM_LAYOUT,
+            &log
+        )
+        .is_none());
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1625,19 +2109,44 @@ mod tests {
         let cache = root.join("cache");
         let (source, produced) = fake_separation(&root, b"mp3data");
         let log = default_logger();
-        store_stems(&cache, &source, "hq/v1", &produced, u64::MAX, &log).unwrap();
+        store_stems(
+            &cache,
+            id_of(&source),
+            &source,
+            "hq/v1",
+            &produced,
+            u64::MAX,
+            &log,
+        )
+        .unwrap();
 
         assert_eq!(
-            stem_cache_key(&source.to_string_lossy(), "hq/v1"),
-            stem_cache_key(&source.to_string_lossy(), "hq-v1"),
+            stem_cache_key(id_of(&source), "hq/v1"),
+            stem_cache_key(id_of(&source), "hq-v1"),
             "precondition: the two ids collide on one dirname"
         );
         assert!(
-            cached_stems(&cache, &source, "hq-v1", SIX_STEM_LAYOUT, &log).is_none(),
+            cached_stems(
+                &cache,
+                id_of(&source),
+                &source,
+                "hq-v1",
+                SIX_STEM_LAYOUT,
+                &log
+            )
+            .is_none(),
             "same dirname, different raw id must miss"
         );
         assert!(
-            cached_stems(&cache, &source, "hq/v1", SIX_STEM_LAYOUT, &log).is_some(),
+            cached_stems(
+                &cache,
+                id_of(&source),
+                &source,
+                "hq/v1",
+                SIX_STEM_LAYOUT,
+                &log
+            )
+            .is_some(),
             "the id that stored the entry still hits"
         );
 
@@ -1650,11 +2159,27 @@ mod tests {
         let cache = root.join("cache");
         let (source, produced) = fake_separation(&root, b"mp3data");
         let log = default_logger();
-        let stored =
-            store_stems(&cache, &source, "htdemucs_6s", &produced, u64::MAX, &log).unwrap();
+        let stored = store_stems(
+            &cache,
+            id_of(&source),
+            &source,
+            "htdemucs_6s",
+            &produced,
+            u64::MAX,
+            &log,
+        )
+        .unwrap();
 
         std::fs::remove_file(&stored.paths[3]).unwrap();
-        assert!(cached_stems(&cache, &source, "htdemucs_6s", SIX_STEM_LAYOUT, &log).is_none());
+        assert!(cached_stems(
+            &cache,
+            id_of(&source),
+            &source,
+            "htdemucs_6s",
+            SIX_STEM_LAYOUT,
+            &log
+        )
+        .is_none());
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1674,8 +2199,17 @@ mod tests {
         let mut keys = Vec::new();
         for name in ["a.mp3", "b.mp3", "c.mp3"] {
             let (source, produced) = fake_separation(&temp_root(name), b"x");
-            store_stems(&cache, &source, "m", &produced, u64::MAX, &log).unwrap();
-            keys.push(stem_cache_key(&source.to_string_lossy(), "m"));
+            store_stems(
+                &cache,
+                id_of(&source),
+                &source,
+                "m",
+                &produced,
+                u64::MAX,
+                &log,
+            )
+            .unwrap();
+            keys.push(stem_cache_key(id_of(&source), "m"));
             std::thread::sleep(std::time::Duration::from_millis(1100));
         }
 
@@ -1699,14 +2233,16 @@ mod tests {
 
     #[test]
     fn pinned_model_files_names_every_recipe_checkpoint() {
+        // Derived from the recipes themselves: a model a pass references
+        // but the pinned set forgets would be evicted as "retired" after
+        // every run and silently re-downloaded on the next.
         let pinned = pinned_model_files();
-        for name in [
-            AUDIO_SEPARATOR_HTDEMUCS_MODEL,
-            BS_ROFORMER_VOCALS_MODEL,
-            MEL_ROFORMER_KARAOKE_MODEL,
-            BS_ROFORMER_SW_MODEL,
-        ] {
-            assert!(pinned.contains(&name), "{name} must be in the pinned set");
+        for pass in ALL_RECIPES.iter().filter_map(|r| r.passes()).flatten() {
+            assert!(
+                pinned.contains(&pass.model),
+                "{} must be in the pinned set",
+                pass.model
+            );
         }
     }
 
@@ -1716,10 +2252,10 @@ mod tests {
         let dir = root.join("models");
         std::fs::create_dir_all(&dir).unwrap();
         // Currently pinned checkpoint + its engine-downloaded config.
-        std::fs::write(dir.join(BS_ROFORMER_VOCALS_MODEL), b"pinned").unwrap();
+        std::fs::write(dir.join(BS_ROFORMER_SW_MODEL), b"pinned").unwrap();
         let pinned_yaml = format!(
             "{}.yaml",
-            Path::new(BS_ROFORMER_VOCALS_MODEL)
+            Path::new(BS_ROFORMER_SW_MODEL)
                 .file_stem()
                 .unwrap()
                 .to_str()
@@ -1738,7 +2274,7 @@ mod tests {
 
         prune_model_cache(&dir, &pinned_model_files(), &default_logger());
 
-        assert!(dir.join(BS_ROFORMER_VOCALS_MODEL).exists(), "pinned stays");
+        assert!(dir.join(BS_ROFORMER_SW_MODEL).exists(), "pinned stays");
         assert!(dir.join(&pinned_yaml).exists(), "pinned sidecar stays");
         assert!(
             !dir.join("old_roformer_sdr_1.0.ckpt").exists(),
@@ -1780,29 +2316,27 @@ mod tests {
 
     #[test]
     fn prune_model_cache_never_retires_a_pinned_stem() {
-        // AUDIO_SEPARATOR_HTDEMUCS_MODEL is pinned by its *yaml* name. A
+        // A model pinned by its *yaml* name (as htdemucs_6s once was). A
         // stray non-pinned same-stem .ckpt must not mark that stem
         // retired — the sweep would otherwise take the live model's
         // sidecars with it, forcing a silent re-download. Leaking the
         // stray file is the safe outcome.
+        const YAML_PINNED: &str = "htdemucs_6s.yaml";
         let root = temp_root("model-prune-pinned-stem");
         let dir = root.join("models");
         std::fs::create_dir_all(&dir).unwrap();
-        let stem = Path::new(AUDIO_SEPARATOR_HTDEMUCS_MODEL)
+        let stem = Path::new(YAML_PINNED)
             .file_stem()
             .unwrap()
             .to_str()
             .unwrap();
-        std::fs::write(dir.join(AUDIO_SEPARATOR_HTDEMUCS_MODEL), b"pinned").unwrap();
+        std::fs::write(dir.join(YAML_PINNED), b"pinned").unwrap();
         std::fs::write(dir.join(format!("{stem}.ckpt")), b"stray").unwrap();
         std::fs::write(dir.join(format!("{stem}.json")), b"engine-cfg").unwrap();
 
-        prune_model_cache(&dir, &pinned_model_files(), &default_logger());
+        prune_model_cache(&dir, &[YAML_PINNED], &default_logger());
 
-        assert!(
-            dir.join(AUDIO_SEPARATOR_HTDEMUCS_MODEL).exists(),
-            "pinned yaml stays"
-        );
+        assert!(dir.join(YAML_PINNED).exists(), "pinned yaml stays");
         assert!(
             dir.join(format!("{stem}.ckpt")).exists(),
             "stray same-stem ckpt is leaked, not retired"
@@ -1810,6 +2344,40 @@ mod tests {
         assert!(
             dir.join(format!("{stem}.json")).exists(),
             "live model's sidecar survives"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prune_model_cache_sweeps_only_stale_partial_downloads() {
+        // A SIGKILLed download leaves `{file}.{pid}.partial` behind; a
+        // live one (another job, zytunes-serve) is still being written.
+        let root = temp_root("model-prune-partial");
+        let dir = root.join("models");
+        std::fs::create_dir_all(&dir).unwrap();
+        let stale = dir.join(format!("{BS_ROFORMER_SW_MODEL}.4242.partial"));
+        let live = dir.join(format!("{MEL_ROFORMER_KARAOKE_MODEL}.4343.partial"));
+        std::fs::write(&stale, b"half a checkpoint").unwrap();
+        std::fs::write(&live, b"still downloading").unwrap();
+        std::fs::write(dir.join(BS_ROFORMER_SW_MODEL), b"pinned").unwrap();
+        let past = std::time::SystemTime::now()
+            - PARTIAL_DOWNLOAD_GRACE
+            - std::time::Duration::from_secs(1);
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+
+        prune_model_cache(&dir, &pinned_model_files(), &default_logger());
+
+        assert!(!stale.exists(), "abandoned partial evicted");
+        assert!(live.exists(), "in-flight partial left alone");
+        assert!(
+            dir.join(BS_ROFORMER_SW_MODEL).exists(),
+            "the completed checkpoint it would have become stays"
         );
 
         let _ = std::fs::remove_dir_all(&root);
@@ -1845,7 +2413,16 @@ mod tests {
         let cache = root.join("cache");
         let log = default_logger();
         let (source, produced) = fake_separation(&root, b"v1");
-        store_stems(&cache, &source, "m", &produced, u64::MAX, &log).unwrap();
+        store_stems(
+            &cache,
+            id_of(&source),
+            &source,
+            "m",
+            &produced,
+            u64::MAX,
+            &log,
+        )
+        .unwrap();
 
         // Source re-tagged → new fingerprint, fresh separation, re-store.
         std::fs::write(&source, b"v2-longer").unwrap();
@@ -1855,12 +2432,21 @@ mod tests {
         for p in &produced2.paths {
             std::fs::write(p, b"newflac").unwrap();
         }
-        let stored = store_stems(&cache, &source, "m", &produced2, u64::MAX, &log).unwrap();
+        let stored = store_stems(
+            &cache,
+            id_of(&source),
+            &source,
+            "m",
+            &produced2,
+            u64::MAX,
+            &log,
+        )
+        .unwrap();
         assert!(stored.all_exist());
         assert_eq!(std::fs::read(&stored.paths[0]).unwrap(), b"newflac");
 
-        let hit =
-            cached_stems(&cache, &source, "m", SIX_STEM_LAYOUT, &log).expect("fresh entry hits");
+        let hit = cached_stems(&cache, id_of(&source), &source, "m", SIX_STEM_LAYOUT, &log)
+            .expect("fresh entry hits");
         assert_eq!(hit, stored);
 
         let _ = std::fs::remove_dir_all(&root);
@@ -1882,6 +2468,10 @@ mod tests {
             ("--output_dir", "/tmp/out"),
             ("--output_format", "flac"),
             ("--model_file_dir", "/cache/models"),
+            // Pinned cost knob: dropping it silently reverts to the
+            // checkpoint's YAML overlap (4 on the karaoke model),
+            // multiplying CPU separation time.
+            ("--mdxc_overlap", "2"),
         ] {
             assert!(
                 args.windows(2).any(|w| w[0] == flag && w[1] == value),
@@ -1920,7 +2510,6 @@ mod tests {
         assert!(HARMONY_STEM_LAYOUT.len() <= MAX_STEMS);
 
         assert_eq!(RecipeKind::Demucs.layout(), SIX_STEM_LAYOUT);
-        assert_eq!(RecipeKind::Hq.layout(), SIX_STEM_LAYOUT);
         assert_eq!(RecipeKind::Sw.layout(), SIX_STEM_LAYOUT);
         assert_eq!(RecipeKind::HqHarmony.layout(), HARMONY_STEM_LAYOUT);
 
@@ -1934,28 +2523,92 @@ mod tests {
         }
         assert_eq!(seen.len(), 8, "8 distinct kinds across both layouts");
         assert!(StemKind::from_file_stem("vocals-lead").is_none());
+
+        // Every kind, used in a layout yet or not, round-trips its slug
+        // and fits the strip's 3-char cell.
+        let mut slugs = std::collections::HashSet::new();
+        for kind in StemKind::ALL {
+            assert_eq!(kind.short_label().chars().count(), 3, "{kind:?}");
+            assert_eq!(StemKind::from_file_stem(kind.file_stem()), Some(kind));
+            assert!(slugs.insert(kind.file_stem()), "{kind:?} slug unique");
+        }
+    }
+
+    #[test]
+    fn strip_cells_fold_group_parts_into_one_cell() {
+        // No groups: one cell per stem, in layout order.
+        assert_eq!(
+            strip_cells(SIX_STEM_LAYOUT),
+            (0..6).map(StemCell::Single).collect::<Vec<_>>()
+        );
+
+        // Harmony: lead + backing fold into one Vocals cell, so the
+        // collapsed strip has the same six cells as the unsplit layout.
+        let cells = strip_cells(HARMONY_STEM_LAYOUT);
+        assert_eq!(cells.len(), 6);
+        assert_eq!(
+            cells[0],
+            StemCell::Group {
+                group: StemGroup::Vocals,
+                members: 0..2
+            }
+        );
+        assert_eq!(cells[1], StemCell::Single(2), "drums follow the group");
+
+        // Two groups, one standalone between them.
+        let layout = [
+            StemKind::LeadVocals,
+            StemKind::BackingVocals,
+            StemKind::Kick,
+            StemKind::Snare,
+            StemKind::Toms,
+            StemKind::HiHat,
+            StemKind::Bass,
+        ];
+        let cells = strip_cells(&layout);
+        assert_eq!(cells.len(), 3);
+        assert_eq!(cells[1].members(), 2..6);
+        assert_eq!(cells[2], StemCell::Single(6));
+        assert_eq!(cells[2].members(), 6..7);
+    }
+
+    #[test]
+    fn recipe_layouts_keep_group_parts_adjacent() {
+        // strip_cells assumes a group's parts are contiguous; a layout
+        // that interleaved them would split one group into two cells.
+        for recipe in ALL_RECIPES {
+            let layout = recipe.layout();
+            let mut seen = std::collections::HashSet::new();
+            for cell in strip_cells(layout) {
+                if let StemCell::Group { group, .. } = cell {
+                    assert!(seen.insert(group), "{recipe}: {group:?} split in two");
+                }
+            }
+            assert!(layout.len() <= MAX_STEMS, "{recipe} exceeds MAX_STEMS");
+        }
     }
 
     #[test]
     fn harmony_passes_produce_exactly_the_harmony_layout() {
         let passes = hq_harmony_recipe_passes();
-        assert_eq!(passes.len(), 3, "vocals, band, karaoke");
+        assert_eq!(passes.len(), 2, "SW 6-stem, then karaoke");
 
-        // Pass 1 extracts the full vocal take to an INTERMEDIATE name —
-        // the harmony layout has no plain "vocals" stem to collide with.
+        // Pass 1 is SW over the source; its vocals go to an INTERMEDIATE
+        // name — the harmony layout has no plain "vocals" stem.
         assert!(matches!(passes[0].input, PassInput::Source));
+        assert_eq!(passes[0].model, BS_ROFORMER_SW_MODEL);
         assert!(passes[0]
             .output_names
             .iter()
-            .any(|(_, v)| *v == "vocals_full"));
+            .any(|(k, v)| *k == "Vocals" && *v == "vocals_full"));
 
-        // Pass 3 splits that take into lead + backing with the pinned
+        // Pass 2 splits that take into lead + backing with the pinned
         // karaoke checkpoint.
         assert!(matches!(
-            passes[2].input,
+            passes[1].input,
             PassInput::Produced("vocals_full")
         ));
-        assert_eq!(passes[2].model, MEL_ROFORMER_KARAOKE_MODEL);
+        assert_eq!(passes[1].model, MEL_ROFORMER_KARAOKE_MODEL);
 
         // Union of outputs covers the harmony layout exactly once.
         for kind in HARMONY_STEM_LAYOUT {
@@ -1970,8 +2623,7 @@ mod tests {
         // Windows tile 0..=100.
         assert_eq!(passes[0].window.0, 0);
         assert_eq!(passes[0].window.1, passes[1].window.0);
-        assert_eq!(passes[1].window.1, passes[2].window.0);
-        assert_eq!(passes[2].window.1, 100);
+        assert_eq!(passes[1].window.1, 100);
     }
 
     #[test]
@@ -2008,71 +2660,42 @@ mod tests {
         }
         let log = default_logger();
 
-        let stored = store_stems(&cache, &source, "hq-harmony/v1", &produced, u64::MAX, &log)
-            .expect("store succeeds");
+        let stored = store_stems(
+            &cache,
+            id_of(&source),
+            &source,
+            "hq-harmony/v1",
+            &produced,
+            u64::MAX,
+            &log,
+        )
+        .expect("store succeeds");
         assert_eq!(stored.paths.len(), 7);
         assert!(stored.all_exist());
 
-        let hit = cached_stems(&cache, &source, "hq-harmony/v1", HARMONY_STEM_LAYOUT, &log)
-            .expect("cache hit");
+        let hit = cached_stems(
+            &cache,
+            id_of(&source),
+            &source,
+            "hq-harmony/v1",
+            HARMONY_STEM_LAYOUT,
+            &log,
+        )
+        .expect("cache hit");
         assert_eq!(hit, stored);
 
         // The same entry looked up under the six-stem layout misses:
         // there is no vocals.flac in a harmony entry.
-        assert!(cached_stems(&cache, &source, "hq-harmony/v1", SIX_STEM_LAYOUT, &log).is_none());
+        assert!(cached_stems(
+            &cache,
+            id_of(&source),
+            &source,
+            "hq-harmony/v1",
+            SIX_STEM_LAYOUT,
+            &log
+        )
+        .is_none());
         let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn hq_passes_produce_exactly_the_six_canonical_stems() {
-        let passes = hq_recipe_passes();
-        assert_eq!(passes.len(), 2, "vocals pass + band pass");
-
-        // Pass 1: BS-Roformer over the source, producing the vocals stem
-        // and the intermediate the band pass consumes.
-        assert!(matches!(passes[0].input, PassInput::Source));
-        assert_eq!(passes[0].model, BS_ROFORMER_VOCALS_MODEL);
-        assert!(passes[0]
-            .output_names
-            .iter()
-            .any(|(k, v)| *k == "Vocals" && *v == "vocals"));
-        assert!(passes[0]
-            .output_names
-            .iter()
-            .any(|(_, v)| *v == "instrumental"));
-
-        // Pass 2: htdemucs_6s over pass 1's instrumental.
-        assert!(matches!(
-            passes[1].input,
-            PassInput::Produced("instrumental")
-        ));
-        assert_eq!(passes[1].model, AUDIO_SEPARATOR_HTDEMUCS_MODEL);
-        // Its vocals output is residue (the input is already devocalized)
-        // and must NOT overwrite pass 1's real vocals stem.
-        let band_vocals = passes[1]
-            .output_names
-            .iter()
-            .find(|(k, _)| *k == "Vocals")
-            .expect("pass 2 must name its vocals output somewhere");
-        assert_ne!(
-            band_vocals.1, "vocals",
-            "residue may not clobber the real stem"
-        );
-
-        // Union of all pass outputs covers every canonical stem exactly once.
-        for kind in SIX_STEM_LAYOUT {
-            let count = passes
-                .iter()
-                .flat_map(|p| p.output_names.iter())
-                .filter(|(_, v)| *v == kind.file_stem())
-                .count();
-            assert_eq!(count, 1, "{kind:?} must be produced exactly once");
-        }
-
-        // Progress windows tile 0..=100 without gaps or overlap.
-        assert_eq!(passes[0].window.0, 0);
-        assert_eq!(passes[0].window.1, passes[1].window.0);
-        assert_eq!(passes[1].window.1, 100);
     }
 
     #[test]
@@ -2138,8 +2761,8 @@ mod tests {
                 command: write_stub_audio_separator(&root),
                 model_file_dir: root.join("models"),
             },
-            passes: hq_recipe_passes(),
-            layout: SIX_STEM_LAYOUT,
+            passes: hq_harmony_recipe_passes(),
+            layout: HARMONY_STEM_LAYOUT,
         };
         let ticks = std::sync::Mutex::new(Vec::new());
         let lines = std::sync::Mutex::new(Vec::new());
@@ -2153,14 +2776,14 @@ mod tests {
             )
             .expect("stub cascade succeeds");
         assert!(set.all_exist());
-        assert_eq!(set.paths[0], out_dir.join("vocals.flac"));
+        assert_eq!(set.paths[0], out_dir.join("lead.flac"));
 
-        // The stub emits a 50% tick per pass: windowed into (0,45) that
-        // is 22, into (45,100) it is 72. Ticks must be monotone within
+        // The stub emits a 50% tick per pass: windowed into (0,60) that
+        // is 30, into (60,100) it is 80. Ticks must be monotone within
         // the run and end at 100.
         let ticks = ticks.into_inner().unwrap();
-        assert!(ticks.contains(&22), "pass-1 windowed tick: {ticks:?}");
-        assert!(ticks.contains(&72), "pass-2 windowed tick: {ticks:?}");
+        assert!(ticks.contains(&30), "pass-1 windowed tick: {ticks:?}");
+        assert!(ticks.contains(&80), "pass-2 windowed tick: {ticks:?}");
         assert_eq!(*ticks.last().unwrap(), 100);
         assert!(
             ticks.windows(2).all(|w| w[0] <= w[1]),
@@ -2175,6 +2798,98 @@ mod tests {
     }
 
     #[test]
+    fn full_recipe_produces_exactly_the_full_layout() {
+        let passes = full_recipe_passes();
+        assert_eq!(passes.len(), 5, "crowd, SW, karaoke, chorus, DrumSep");
+        assert_eq!(passes[0].model, MEL_ROFORMER_CROWD_MODEL);
+        assert!(matches!(passes[0].input, PassInput::Source));
+        // Everything downstream works on the crowd-free mix.
+        assert!(matches!(passes[1].input, PassInput::Produced("no_crowd")));
+        assert_eq!(passes[1].model, BS_ROFORMER_SW_MODEL);
+        assert!(matches!(
+            passes[2].input,
+            PassInput::Produced("vocals_full")
+        ));
+        assert_eq!(passes[2].model, MEL_ROFORMER_KARAOKE_MODEL);
+        assert!(matches!(
+            passes[3].input,
+            PassInput::Produced("backing_full")
+        ));
+        assert_eq!(passes[3].model, BS_ROFORMER_CHORUS_MALE_FEMALE_MODEL);
+        assert!(matches!(passes[4].input, PassInput::Produced("drums_full")));
+        assert_eq!(passes[4].model, MDX23C_DRUMSEP_MODEL);
+
+        // Every Produced input is written by an EARLIER pass.
+        for (n, pass) in passes.iter().enumerate() {
+            if let PassInput::Produced(stem) = pass.input {
+                assert!(
+                    passes[..n]
+                        .iter()
+                        .any(|p| p.output_names.iter().any(|(_, f)| *f == stem)),
+                    "pass {n} reads {stem} before anything writes it"
+                );
+            }
+        }
+
+        // Pass outputs cover the layout exactly once.
+        for kind in FULL_STEM_LAYOUT {
+            let count = passes
+                .iter()
+                .flat_map(|p| p.output_names.iter())
+                .filter(|(_, f)| *f == kind.file_stem())
+                .count();
+            assert_eq!(count, 1, "{kind:?} must be produced exactly once");
+        }
+        assert_eq!(RecipeKind::Full.layout(), FULL_STEM_LAYOUT);
+        assert_eq!(FULL_STEM_LAYOUT.len(), 14);
+
+        // Collapsed strip: Vocals (3), Drums (6), Bass, Guitar, Piano,
+        // Other, Crowd — seven cells, so keys 1–7.
+        let cells = strip_cells(FULL_STEM_LAYOUT);
+        assert_eq!(cells.len(), 7);
+        assert_eq!(cells[0].members(), 0..3);
+        assert_eq!(cells[1].members(), 3..9);
+        assert_eq!(cells[6], StemCell::Single(13), "crowd stands alone");
+
+        // Windows tile 0..=100.
+        assert_eq!(passes[0].window.0, 0);
+        for w in passes.windows(2) {
+            assert_eq!(w[0].window.1, w[1].window.0);
+        }
+        assert_eq!(passes[4].window.1, 100);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn full_cascade_runs_all_five_passes() {
+        let _lock = process::lock_driver_tests();
+        let root = temp_root("cascade-full");
+        let src = root.join("song.flac");
+        std::fs::write(&src, b"flac").unwrap();
+        let out_dir = root.join("work");
+        let sep = CascadeSeparator {
+            engine: AudioSeparatorCli {
+                command: write_stub_audio_separator(&root),
+                model_file_dir: root.join("models"),
+            },
+            passes: full_recipe_passes(),
+            layout: FULL_STEM_LAYOUT,
+        };
+        let lines = std::sync::Mutex::new(Vec::new());
+        let set = sep
+            .separate(&src, &out_dir, &|| false, &|_| {}, &|l: &str| {
+                lines.lock().unwrap().push(l.to_string())
+            })
+            .expect("stub full cascade succeeds");
+        assert!(set.all_exist(), "all fourteen stems on disk");
+        assert_eq!(set.paths[6], out_dir.join("hihat.flac"));
+        assert_eq!(set.paths[13], out_dir.join("crowd.flac"));
+        let lines = lines.into_inner().unwrap();
+        assert!(lines.iter().any(|l| l.contains("pass 5/5")), "{lines:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     #[cfg(unix)]
     fn cascade_missing_intermediate_is_missing_output_error() {
         use std::os::unix::fs::PermissionsExt;
@@ -2183,7 +2898,7 @@ mod tests {
         let src = root.join("song.flac");
         std::fs::write(&src, b"flac").unwrap();
         // Stub writes nothing: pass 1 "succeeds" but produces no
-        // instrumental, so pass 2's input is missing — the error must
+        // vocals_full, so pass 2's input is missing — the error must
         // name that file, not a generic engine failure.
         let script = root.join("audio-separator");
         std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
@@ -2193,8 +2908,8 @@ mod tests {
                 command: script,
                 model_file_dir: root.join("models"),
             },
-            passes: hq_recipe_passes(),
-            layout: SIX_STEM_LAYOUT,
+            passes: hq_harmony_recipe_passes(),
+            layout: HARMONY_STEM_LAYOUT,
         };
         let err = sep
             .separate(&src, &root.join("work"), &|| false, &|_| {}, &|_| {})
@@ -2202,7 +2917,7 @@ mod tests {
         match err {
             StemError::MissingOutput(p) => {
                 assert!(
-                    p.to_string_lossy().contains("instrumental"),
+                    p.to_string_lossy().contains("vocals_full"),
                     "should name the missing intermediate: {p:?}"
                 )
             }

@@ -142,6 +142,15 @@ impl App {
             BgEvent::MbReleaseLoaded { token, result } => {
                 self.handle_mb_release_loaded(token, result);
             }
+            BgEvent::TrackIdsUnsaved(why) => {
+                self.sync.log.push(format!(
+                    "tag-manager: the files were filed, but their track IDs could not be saved ({why}); playlists and play counts will not follow them"
+                ));
+                self.set_toast(
+                    "Filed, but track IDs could not be saved: playlists and play counts will not follow, see log (L)".into(),
+                    true,
+                );
+            }
             BgEvent::TagsApplied {
                 token,
                 results,
@@ -158,6 +167,7 @@ impl App {
             BgEvent::MbRecordingReleases { token, result } => {
                 self.handle_mb_recording_releases(token, result);
             }
+            BgEvent::InboxScanned { tracks } => self.on_inbox_scanned(tracks),
             BgEvent::StemEngineProgress(line) => {
                 self.sync.log.push(format!("[stems] {line}"));
             }
@@ -444,6 +454,7 @@ impl App {
             return;
         }
 
+        self.stems.expanded = None;
         self.stems.enabled = [true; zytunes::stems::MAX_STEMS];
         let gains = zytunes::stems::new_stem_gains(&self.stems.enabled[..stems.layout.len()]);
         self.stems.layout = Some(stems.layout);
@@ -458,10 +469,15 @@ impl App {
         });
         self.stems.gains = Some(gains);
         self.stems.status = StemStatus::Active;
+        let cells = self.stem_cells();
+        let groups = cells
+            .iter()
+            .any(|c| matches!(c, zytunes::stems::StemCell::Group { .. }));
         self.set_toast(
             format!(
-                "Stem mode — 1-{} toggle stems, M exits",
-                self.stems.layout.map_or(6, |l| l.len())
+                "Stem mode — 1-{} toggle stems{}, M exits",
+                cells.len(),
+                if groups { ", 0 opens split parts" } else { "" }
             ),
             false,
         );
@@ -513,6 +529,7 @@ impl App {
         match result {
             Ok(lib) => {
                 self.library = Some(lib);
+                self.inbox.hold_until_library = false;
                 // Re-resolve the popup's cached lib `Track` against
                 // the new library *before* `refresh_sidebar` clears
                 // `track_list` — closed popups drop the cache, open
