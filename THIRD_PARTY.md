@@ -60,9 +60,8 @@ managed install) and invoked by path.
   managed-install vehicle. Bootstrapped from Astral's official install
   script only after explicit user consent in the TUI.
 
-The Roformer model checkpoints the `hq`/`sw` recipes reference (BS-Roformer
-`ep_317` by viperx; jarredou BS-RoFormer-SW; the Mel-Roformer karaoke model
-by aufr33/viperx) are community-trained weights fetched by audio-separator
+The Roformer model checkpoints the `sw`/`hq-harmony` recipes reference
+(jarredou BS-RoFormer-SW; the Mel-Roformer karaoke model by aufr33/viperx) are community-trained weights fetched by audio-separator
 from its model registry on first separation — zytunes never distributes
 them, and every download happens behind the same explicit consent as the
 engine install.

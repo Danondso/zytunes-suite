@@ -162,7 +162,7 @@ use super::process::is_executable;
 ///
 /// The engine match matters because `[stems] command` is one shared
 /// config field written back by whichever engine last installed:
-/// honoring a demucs path while the hq recipe asks for audio-separator
+/// honoring a demucs path while the sw recipe asks for audio-separator
 /// would drive the wrong binary with the wrong argv AND suppress the
 /// install consent prompt for the engine actually needed.
 pub fn find_engine_with(

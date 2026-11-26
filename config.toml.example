@@ -150,7 +150,8 @@
 # Stem-cache directory. Default ~/.cache/zytunes/stems (or {cache_dir}/stems).
 # cache_dir = "/Users/you/.cache/zytunes/stems"
 
-# "demucs" (default, six stems) | "hq" | "hq-harmony" (seven stems, lead/backing).
+# "demucs" (default, six stems) | "sw" (six stems, BS-RoFormer-SW) |
+# "hq-harmony" (seven stems: sw + lead/backing). Legacy "hq" runs "sw".
 # Unknown values log and fall back to demucs. Cache is per (track, recipe).
 # recipe = "demucs"
 

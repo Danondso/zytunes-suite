@@ -2391,9 +2391,8 @@ fn recipe_cost_hint(recipe: zytunes::stems::RecipeKind) -> &'static str {
     use zytunes::stems::RecipeKind;
     match recipe {
         RecipeKind::Demucs => "1 pass — fastest on CPU",
-        RecipeKind::Hq => "2 passes, Roformer vocals — slow on CPU",
         RecipeKind::Sw => "1 pass, 6-stem Roformer — slow on CPU",
-        RecipeKind::HqHarmony => "3 passes + 2 checkpoints on first use — slow on CPU",
+        RecipeKind::HqHarmony => "2 passes + 2 checkpoints on first use — slow on CPU",
     }
 }
 
@@ -2508,12 +2507,7 @@ fn draw_stem_panel(f: &mut Frame, app: &App, panel: &crate::app::StemPanel) {
         lines.push(Line::from(Span::styled(
             format!(
                 " Pinned models: {}",
-                [
-                    zytunes::stems::AUDIO_SEPARATOR_HTDEMUCS_MODEL,
-                    zytunes::stems::BS_ROFORMER_VOCALS_MODEL,
-                    zytunes::stems::MEL_ROFORMER_KARAOKE_MODEL,
-                ]
-                .join(", ")
+                zytunes::stems::pinned_model_files().join(", ")
             ),
             t.modal_dim(),
         )));
