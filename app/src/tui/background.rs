@@ -32,6 +32,37 @@ fn spawn_acoustic_backfill(gen: u64, dir: String, event_tx: mpsc::Sender<BgEvent
     }
 }
 
+/// Chromaprint inbox drops off the worker thread. The tracks are handed
+/// over only after `spawn` succeeds so a failure still delivers
+/// `InboxScanned` and the poll does not stay in flight.
+fn spawn_inbox_fingerprints(
+    tracks: Vec<zytunes::library::Track>,
+    event_tx: &mpsc::Sender<BgEvent>,
+) {
+    let (work_tx, work_rx) = mpsc::channel();
+    let tx = event_tx.clone();
+    let spawned = thread::Builder::new()
+        .name("inbox-fingerprint".into())
+        .spawn(move || {
+            let Ok(tracks) = work_rx.recv() else {
+                return;
+            };
+            let tracks = zytunes::library_layout::fingerprint_missing(tracks);
+            let _ = tx.send(BgEvent::InboxScanned { tracks });
+        });
+    match spawned {
+        Ok(_) => {
+            let _ = work_tx.send(tracks);
+        }
+        Err(e) => {
+            let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                "inbox: fingerprint thread failed to start: {e}"
+            )));
+            let _ = event_tx.send(BgEvent::InboxScanned { tracks });
+        }
+    }
+}
+
 /// True when `err` indicates the MTP session is effectively dead and no
 /// further bulk ops on this session will succeed — only a physical replug
 /// recovers.
@@ -418,6 +449,21 @@ pub enum BgCommand {
         /// default). `None` only when `$HOME` can't be resolved.
         cache_dir: Option<PathBuf>,
     },
+    /// Scan the Automatically Add to Music inbox (sibling of `music_dir`).
+    /// When `fingerprint` is set, Chromaprint runs on a side thread and
+    /// [`BgEvent::InboxScanned`] arrives after those ids are filled. The
+    /// worker itself only reads tags.
+    ScanInbox {
+        inbox: PathBuf,
+        /// Locations dismissed this session. Dropped before the tag read
+        /// and the fingerprint decode, not after the scan returns.
+        dismissed: std::sync::Arc<std::collections::HashSet<String>>,
+        fingerprint: bool,
+        /// Create the inbox folder before scanning. Set on the first scan
+        /// of a session only: the folder exists by default, but a parent
+        /// that refuses the mkdir must not log every poll.
+        create_dir: bool,
+    },
 }
 
 /// Payload for [`BgCommand::RipAndImport`]. Constructed by the TUI from
@@ -675,6 +721,11 @@ pub enum BgEvent {
         skipped: usize,
         failed: usize,
         cancelled: bool,
+    },
+    /// Inbox scan finished. Tracks are settled audio files (possibly
+    /// fingerprinted); the TUI clusters them and opens the tag manager.
+    InboxScanned {
+        tracks: Vec<zytunes::library::Track>,
     },
 }
 
@@ -2389,6 +2440,33 @@ pub fn spawn(event_tx: mpsc::Sender<BgEvent>, mp3_quality: Mp3Quality) -> mpsc::
                         }
                     }
                     let _ = event_tx.send(BgEvent::MbRecordingReleases { token, result });
+                }
+                BgCommand::ScanInbox {
+                    inbox,
+                    dismissed,
+                    fingerprint,
+                    create_dir,
+                } => {
+                    if create_dir {
+                        if let Err(e) = std::fs::create_dir_all(&inbox) {
+                            let _ = event_tx.send(BgEvent::SyncMessage(format!(
+                                "inbox: could not create {} ({e}); create it by hand to drop music there",
+                                inbox.display()
+                            )));
+                        }
+                    }
+                    // Tag read only. Chromaprint stays off this thread — the
+                    // worker also serves Connect, sync, and CD detection.
+                    let tracks = zytunes::library_layout::scan_inbox(&inbox, &dismissed, false);
+                    let needs_fp = fingerprint
+                        && tracks
+                            .iter()
+                            .any(|t| t.acoustic_id.is_none() && t.location.is_some());
+                    if needs_fp {
+                        spawn_inbox_fingerprints(tracks, &event_tx);
+                    } else {
+                        let _ = event_tx.send(BgEvent::InboxScanned { tracks });
+                    }
                 }
             }
         }
