@@ -1,5 +1,13 @@
 name: Release
 
+# Tag-only releases. main is protected (changes go through a squash-merged
+# PR with CI), and a push made with GITHUB_TOKEN can neither bypass that nor
+# open a PR that runs CI. So the version-bump commit never lands on main: it
+# is made on top of the main commit being released, tagged `v<version>`, and
+# only the tag is pushed (the tag ruleset allows creating tags). The tags,
+# not app/Cargo.toml on main, are the source of truth for the version; the
+# binaries are built from the tagged commit, so they report it.
+
 on:
   push:
     branches: [main]
@@ -7,18 +15,19 @@ on:
 permissions:
   contents: write
 
+# Two merges in quick succession must not both compute the same next tag.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   check-version:
-    # The release job pushes a chore version-bump commit back to main,
-    # which would re-enter this workflow. There are no tags yet, so the
-    # range is the whole history and every re-entry would try to cut
-    # another release. Skip the bot's own pushes.
-    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     outputs:
       bump: ${{ steps.bump.outputs.bump }}
       new_version: ${{ steps.bump.outputs.new_version }}
-      old_version: ${{ steps.bump.outputs.old_version }}
+      prev_tag: ${{ steps.bump.outputs.prev_tag }}
+      base: ${{ steps.bump.outputs.base }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -27,21 +36,28 @@ jobs:
       - name: Determine version bump from commits
         id: bump
         run: |
-          # Get the latest tag, or use initial commit if none exists.
-          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
-          if [ -z "$LATEST_TAG" ]; then
+          # Release tags sit on bump commits off main, so `git describe`
+          # (which only sees tags reachable from HEAD) cannot find them.
+          # Take the highest v* tag; the main commit it released is its
+          # parent, and everything on main after that is unreleased.
+          PREV_TAG=$(git tag --list 'v*' --sort=-v:refname | head -1)
+          if [ -z "$PREV_TAG" ]; then
+            BASE=""
             RANGE="HEAD"
+            # First tagged release: start from the hand-set version.
+            OLD_VERSION=$(grep '^version' app/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
           else
-            RANGE="${LATEST_TAG}..HEAD"
+            BASE=$(git rev-parse "${PREV_TAG}^")
+            RANGE="${BASE}..HEAD"
+            OLD_VERSION="${PREV_TAG#v}"
           fi
+          echo "prev_tag=$PREV_TAG" >> "$GITHUB_OUTPUT"
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
 
-          # Read current version from app/Cargo.toml. The project ships as an
-          # alpha (single-user, not battle-tested), so the stored version has
-          # a "-alpha" pre-release suffix. Strip it for arithmetic and re-
-          # apply it when writing the new version.
-          OLD_VERSION=$(grep '^version' app/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          # The project ships as an alpha (single-user, not battle-tested),
+          # so versions carry a "-alpha" pre-release suffix. Strip it for
+          # arithmetic and re-apply it when writing the new version.
           OLD_CORE="${OLD_VERSION%-*}"
-          echo "old_version=$OLD_VERSION" >> "$GITHUB_OUTPUT"
 
           # Analyze conventional commits to determine bump type.
           # `tformat:` (not `format:`) terminates every line with `\n` so
@@ -68,8 +84,6 @@ jobs:
             exit 0
           fi
 
-          # Calculate new version. Split the core x.y.z (no suffix), bump,
-          # then re-attach the -alpha suffix.
           IFS='.' read -r MAJOR MINOR PATCH <<< "$OLD_CORE"
           case "$BUMP" in
             major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
@@ -78,7 +92,6 @@ jobs:
           esac
           NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}-alpha"
 
-          # Skip if tag already exists.
           if git rev-parse "v${NEW_VERSION}" >/dev/null 2>&1; then
             echo "Tag v${NEW_VERSION} already exists. Skipping."
             echo "bump=" >> "$GITHUB_OUTPUT"
@@ -90,8 +103,32 @@ jobs:
           echo "new_version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
           echo "Bump: $BUMP ($OLD_VERSION -> $NEW_VERSION)"
 
-  build:
+  tag:
     needs: check-version
+    if: needs.check-version.outputs.bump != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Commit the version bump off main and push its tag
+        env:
+          NEW: ${{ needs.check-version.outputs.new_version }}
+        run: |
+          # Set the package version outright (main's Cargo.toml may lag the
+          # tags), and the matching Cargo.lock entry so `--locked` builds.
+          sed -i "0,/^version = \".*\"/s//version = \"$NEW\"/" app/Cargo.toml
+          sed -i "/^name = \"zytunes\"$/{n;s/^version = \".*\"/version = \"$NEW\"/}" Cargo.lock
+          grep -q "^version = \"$NEW\"" app/Cargo.toml
+          grep -A1 '^name = "zytunes"$' Cargo.lock | grep -q "^version = \"$NEW\""
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -am "chore: release v$NEW"
+          git tag "v$NEW"
+          git push origin "v$NEW"
+
+  build:
+    needs: [check-version, tag]
     if: needs.check-version.outputs.bump != ''
     strategy:
       matrix:
@@ -105,6 +142,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: v${{ needs.check-version.outputs.new_version }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -146,26 +185,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Bump version in Cargo.toml files
-        run: |
-          OLD="${{ needs.check-version.outputs.old_version }}"
-          NEW="${{ needs.check-version.outputs.new_version }}"
-          sed -i "0,/version = \"$OLD\"/s//version = \"$NEW\"/" app/Cargo.toml
-          sed -i "s/version = \"$OLD\"/version = \"$NEW\"/" zune-mtp/Cargo.toml
-
-      - name: Commit version bump
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add app/Cargo.toml zune-mtp/Cargo.toml
-          git commit -m "chore: bump version to v${{ needs.check-version.outputs.new_version }}"
-          git push
-
-      - name: Create tag
-        run: |
-          git tag "v${{ needs.check-version.outputs.new_version }}"
-          git push origin "v${{ needs.check-version.outputs.new_version }}"
-
       - name: Download artifacts
         uses: actions/download-artifact@v8
         with:
@@ -174,29 +193,35 @@ jobs:
 
       - name: Generate release notes
         id: notes
+        env:
+          BASE: ${{ needs.check-version.outputs.base }}
+          PREV_TAG: ${{ needs.check-version.outputs.prev_tag }}
+          NEW: ${{ needs.check-version.outputs.new_version }}
         run: |
-          LATEST_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
-          if [ -z "$LATEST_TAG" ]; then
-            RANGE="HEAD"
+          # The commits merged to main since the previous release, up to the
+          # main commit this run released (not the bump commit on the tag).
+          if [ -z "$BASE" ]; then
+            RANGE="$GITHUB_SHA"
           else
-            RANGE="${LATEST_TAG}..HEAD"
+            RANGE="${BASE}..${GITHUB_SHA}"
           fi
           {
             echo "notes<<RELEASE_EOF"
             echo "## What's Changed"
             echo ""
             git log "$RANGE" --pretty=tformat:"- %s" | grep -E "^- (feat|fix|perf|refactor|docs)" || true
-            echo ""
-            echo ""
-            echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${LATEST_TAG}...v${{ needs.check-version.outputs.new_version }}"
+            if [ -n "$PREV_TAG" ]; then
+              echo ""
+              echo ""
+              echo "**Full Changelog**: https://github.com/${GITHUB_REPOSITORY}/compare/${PREV_TAG}...v${NEW}"
+            fi
             echo "RELEASE_EOF"
           } >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEW: ${{ needs.check-version.outputs.new_version }}
+          NOTES: ${{ steps.notes.outputs.notes }}
         run: |
-          gh release create "v${{ needs.check-version.outputs.new_version }}" \
-            --title "v${{ needs.check-version.outputs.new_version }}" \
-            --notes "${{ steps.notes.outputs.notes }}" \
-            dist/*
+          gh release create "v$NEW" --verify-tag --title "v$NEW" --notes "$NOTES" dist/*

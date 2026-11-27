@@ -143,7 +143,7 @@ Treat a missing or stale README entry for a shipped control as a bug in the chan
 
 ## Commit Convention
 
-This project uses **Conventional Commits** to drive automatic releases. The release workflow (`.github/workflows/release.yml`) analyzes commit messages on `main` to determine version bumps. Always use the correct prefix:
+This project uses **Conventional Commits** to drive automatic releases. The release workflow (`.github/workflows/release.yml`) analyzes commit messages on `main` since the last `v*` tag to determine version bumps. Releases are tag-only: `main` is protected, so the workflow commits the version bump on top of the released main commit (off `main`), tags it, and builds and publishes from the tag. The tags are the source of truth for the version; `app/Cargo.toml` on `main` keeps its last hand-set version and is not bumped. Always use the correct prefix:
 
 | Prefix | Bump | Example |
 |--------|------|---------|
