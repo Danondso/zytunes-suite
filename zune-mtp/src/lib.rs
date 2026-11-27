@@ -87,7 +87,7 @@ pub mod session;
 pub mod transport;
 
 pub use mtpz::MtpzKeys;
-pub use session::{MtpSession, ObjectInfo};
+pub use session::{build_object_info, MtpSession, ObjectInfo};
 
 #[cfg(test)]
 mod tests {

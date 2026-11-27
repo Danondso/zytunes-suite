@@ -266,8 +266,17 @@ impl MtpSession {
         let cmd = build_command(OperationCode::SendObjectInfo, tid, &[storage_id, parent]);
         self.transport.write(&cmd)?;
 
+        // Data-out: send the container header and payload as SEPARATE bulk
+        // writes. The Zune's MTP responder parses the dataset only when they
+        // arrive split (a single combined write yields 0x2015 No_Valid_
+        // ObjectInfo) — the same Microsoft requirement send_object honours.
         let data_container = build_data(OperationCode::SendObjectInfo, tid, info_dataset);
-        self.transport.write(&data_container)?;
+        self.transport
+            .write(&data_container[..CONTAINER_HEADER_SIZE])?;
+        if !info_dataset.is_empty() {
+            self.transport
+                .write(&data_container[CONTAINER_HEADER_SIZE..])?;
+        }
 
         let resp = self.transport.read_container()?;
         let hdr = ContainerHeader::parse(&resp).ok_or(MtpError::Protocol(
@@ -884,6 +893,66 @@ fn read_mtp_string(data: &[u8], offset: &mut usize) -> String {
     String::from_utf16_lossy(&chars)
 }
 
+/// Write a null-terminated UCS-2LE string in MTP ObjectInfo form:
+/// `[u8 num_chars incl. terminator] [u16 chars...] [u16 0x0000]`. An empty
+/// string is encoded as a single `0x00` count byte (no terminator), matching
+/// how `read_mtp_string` and real responders treat empty fields.
+fn write_mtp_string(out: &mut Vec<u8>, s: &str) {
+    if s.is_empty() {
+        out.push(0);
+        return;
+    }
+    let chars: Vec<u16> = s.encode_utf16().take(254).collect();
+    out.push((chars.len() + 1) as u8); // +1 for the null terminator
+    for ch in chars {
+        out.extend_from_slice(&ch.to_le_bytes());
+    }
+    out.extend_from_slice(&0u16.to_le_bytes()); // terminator
+}
+
+/// Build a classic MTP ObjectInfo dataset for `SendObjectInfo` (the auth-free
+/// upload path, as opposed to the MTPZ-gated `SendObjectPropList`). Mirrors the
+/// 52-byte fixed header that `parse_object_info` reads, followed by the
+/// filename and two empty date strings.
+///
+/// `format` is the ObjectFormatCode (`0x3001` association for a folder, or an
+/// audio format such as `0x3009` MP3). `size` is the object's byte length (0
+/// for a folder). `association_type` is `0x0001` (generic folder) for a folder,
+/// `0x0000` otherwise.
+pub fn build_object_info(
+    storage_id: u32,
+    format: u16,
+    size: u32,
+    parent: u32,
+    association_type: u16,
+    filename: &str,
+) -> Vec<u8> {
+    let mut d = Vec::with_capacity(64 + filename.len() * 2);
+    d.extend_from_slice(&storage_id.to_le_bytes()); // 0:  StorageID
+    d.extend_from_slice(&format.to_le_bytes()); //     4:  ObjectFormat
+    d.extend_from_slice(&0u16.to_le_bytes()); //       6:  ProtectionStatus
+    d.extend_from_slice(&size.to_le_bytes()); //       8:  ObjectCompressedSize
+    d.extend_from_slice(&0u16.to_le_bytes()); //       12: ThumbFormat
+    d.extend_from_slice(&0u32.to_le_bytes()); //       14: ThumbCompressedSize
+    d.extend_from_slice(&0u32.to_le_bytes()); //       18: ThumbPixWidth
+    d.extend_from_slice(&0u32.to_le_bytes()); //       22: ThumbPixHeight
+    d.extend_from_slice(&0u32.to_le_bytes()); //       26: ImagePixWidth
+    d.extend_from_slice(&0u32.to_le_bytes()); //       30: ImagePixHeight
+    d.extend_from_slice(&0u32.to_le_bytes()); //       34: ImageBitDepth
+    d.extend_from_slice(&parent.to_le_bytes()); //     38: ParentObject
+    d.extend_from_slice(&association_type.to_le_bytes()); // 42: AssociationType
+    d.extend_from_slice(&0u32.to_le_bytes()); //       44: AssociationDesc
+    d.extend_from_slice(&0u32.to_le_bytes()); //       48: SequenceNumber
+    debug_assert_eq!(d.len(), 52, "ObjectInfo fixed header must be 52 bytes");
+    write_mtp_string(&mut d, filename); //             52: Filename
+    write_mtp_string(&mut d, ""); //                   CaptureDate
+    write_mtp_string(&mut d, ""); //                   ModificationDate
+    write_mtp_string(&mut d, ""); //                   Keywords (4th string — a
+                                  //   responder that requires all four ObjectInfo strings rejects a dataset
+                                  //   missing it with 0x2015 No_Valid_ObjectInfo)
+    d
+}
+
 /// Parse the MTP ObjectInfo dataset.
 fn parse_object_info(data: &[u8]) -> Result<ObjectInfo, MtpError> {
     if data.len() < 52 {
@@ -972,6 +1041,41 @@ mod tests {
         let mut offset = 0;
         assert_eq!(read_mtp_string(&data, &mut offset), "");
         assert_eq!(offset, 1);
+    }
+
+    #[test]
+    fn build_object_info_file_round_trips() {
+        // A built file ObjectInfo must parse back into the same fields that a
+        // real responder's GetObjectInfo would yield, so the auth-free upload
+        // path stays wire-compatible with parse_object_info.
+        let dataset = build_object_info(0x10001, 0x3009, 4_200, 0x2a, 0x0000, "01 - Intro.mp3");
+        let info = parse_object_info(&dataset).unwrap();
+        assert_eq!(info.storage_id, 0x10001);
+        assert_eq!(info.object_format, 0x3009);
+        assert_eq!(info.compressed_size, 4_200);
+        assert_eq!(info.association_type, 0x0000);
+        assert_eq!(info.filename, "01 - Intro.mp3");
+        assert_eq!(info.capture_date, "");
+        assert_eq!(info.modification_date, "");
+    }
+
+    #[test]
+    fn build_object_info_folder_is_association() {
+        let dataset = build_object_info(0x10001, 0x3001, 0, 0xFFFF_FFFF, 0x0001, "Soundgarden");
+        let info = parse_object_info(&dataset).unwrap();
+        assert_eq!(info.object_format, 0x3001);
+        assert_eq!(info.compressed_size, 0);
+        assert_eq!(info.association_type, 0x0001);
+        assert_eq!(info.filename, "Soundgarden");
+    }
+
+    #[test]
+    fn build_object_info_empty_filename_fixed_header() {
+        // Empty filename -> a single 0x00 count byte; the 52-byte fixed header
+        // must be intact so field offsets never shift.
+        let dataset = build_object_info(1, 0x3009, 0, 0, 0, "");
+        assert_eq!(dataset[52], 0); // filename count byte
+        assert_eq!(&dataset[0..4], &1u32.to_le_bytes());
     }
 
     #[test]
