@@ -185,7 +185,7 @@ fn stem_settings(cache_dir: PathBuf) -> StemSettings {
     }
 }
 
-fn populate_stem_cache(cache_dir: &Path, source: &Path) {
+fn populate_stem_cache(cache_dir: &Path, id: u64, source: &Path) {
     fs::create_dir_all(cache_dir).unwrap();
     let work = cache_dir.join("produced");
     fs::create_dir_all(&work).unwrap();
@@ -194,7 +194,7 @@ fn populate_stem_cache(cache_dir: &Path, source: &Path) {
         fs::write(p, format!("stem-{i}")).unwrap();
     }
     let log = zytunes::cache::default_logger();
-    store_stems(cache_dir, source, "htdemucs_6s", &set, u64::MAX, &log).unwrap();
+    store_stems(cache_dir, id, source, "htdemucs_6s", &set, u64::MAX, &log).unwrap();
 }
 
 fn app_with_stems(lib: TestLib, hub: StemHub) -> axum::Router {
@@ -574,7 +574,7 @@ async fn stems_ready_and_stream_cached_files() {
     let dir = scratch("stems-ready");
     let cache = dir.join("stem-cache");
     let (lib, id, wav) = fixture_lib(&dir);
-    populate_stem_cache(&cache, &wav);
+    populate_stem_cache(&cache, id, &wav);
     let app = app_with_stems(lib, StemHub::new(stem_settings(cache)));
 
     let resp = app
@@ -667,7 +667,7 @@ async fn stems_post_when_cached_is_ready() {
     let dir = scratch("stems-post-hit");
     let cache = dir.join("stem-cache");
     let (lib, id, wav) = fixture_lib(&dir);
-    populate_stem_cache(&cache, &wav);
+    populate_stem_cache(&cache, id, &wav);
     let app = app_with_stems(lib, StemHub::new(stem_settings(cache)));
     let resp = app
         .oneshot(

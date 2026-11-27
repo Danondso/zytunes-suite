@@ -20,21 +20,30 @@
 //!   the user later re-scans. The library `Track` struct has a seventh
 //!   field (`mb_work_id`) but MB doesn't surface it on release lookup,
 //!   so we don't write it here.
-//! - Picard-compatible Unknown-keyed tags (no lofty enum variant):
-//!   MUSICBRAINZ_ALBUMSTATUS, MUSICBRAINZ_ALBUMTYPE, RELEASECOUNTRY,
-//!   MUSICBRAINZ_ALBUMPACKAGING, SCRIPT. ASIN is skipped — see comment
-//!   in `write_release_identifiers`.
+//! - Picard's user-defined fields, spelled per container (see
+//!   `crate::picard_keys`): album status and type (`RELEASESTATUS` /
+//!   `RELEASETYPE` in Vorbis comments), RELEASECOUNTRY, SCRIPT, and our own
+//!   MUSICBRAINZ_ALBUMPACKAGING (Picard has no packaging tag). ASIN is skipped —
+//!   see comment in `write_release_identifiers`.
 //!
 //! The exact tag container is chosen by lofty based on the file extension.
 
 use std::path::Path;
 
+use lofty::ape::ApeTag;
 use lofty::config::{ParseOptions, WriteOptions};
-use lofty::file::{AudioFile, TaggedFileExt};
+use lofty::file::{AudioFile, TaggedFile, TaggedFileExt};
+use lofty::id3::v2::Id3v2Tag;
+use lofty::iff::wav::RiffInfoList;
+use lofty::ogg::tag::VorbisComments;
 use lofty::probe::Probe;
-use lofty::tag::{ItemKey, ItemValue, Tag, TagItem, TagType};
+use lofty::tag::{ItemKey, ItemValue, Tag, TagExt, TagItem, TagType};
 
-use crate::musicbrainz::{render_artist_credit, Medium, Release, Track as MbTrack};
+use crate::library_layout::sanitise_filename_component;
+use crate::musicbrainz::{
+    canonical_album_artist, render_artist_credit, Medium, Release, Track as MbTrack,
+};
+use crate::picard_keys::PicardField;
 
 /// One-line summary of the tags `tag_ripped_file` + `tag_ripped_fingerprint`
 /// embed. Lofty handles container-specific encoding (ID3v2 for MP3/WAV,
@@ -65,7 +74,7 @@ pub fn tag_ripped_file(
     let mut tagged = probe_by_content(path)?;
 
     // Promote WAV's primary from RIFF INFO to ID3v2. RIFF INFO uses 4-char
-    // FourCC keys and silently drops both Unknown-keyed Picard tags and
+    // FourCC keys and has no slot for Picard's user-defined fields or for
     // several ItemKey variants (ISRC, Barcode, etc.). Picard does the
     // same promotion for its own WAV writes.
     let tag_type = match tagged.primary_tag_type() {
@@ -87,7 +96,10 @@ pub fn tag_ripped_file(
         &render_artist_credit(&track.artist_credit),
     );
 
-    let album_artist = render_artist_credit(&release.artist_credit);
+    // Same spelling as the `{AlbumArtist}/` folder the rip lands in, so
+    // the sidebar groups the rip where the file is and a later `m` has
+    // nothing to propose. Featuring credits stay on the track artist.
+    let album_artist = canonical_album_artist(&release.artist_credit);
     if !album_artist.is_empty() {
         set_string(tag, ItemKey::AlbumArtist, &album_artist);
     }
@@ -151,12 +163,166 @@ pub fn tag_ripped_file(
 
     write_release_identifiers(tag, release, track, medium);
 
-    // Drop the borrow before save_to_path takes &self.
+    // Drop the borrow before the save takes &self.
     let _ = tag;
-    tagged
-        .save_to_path(path, WriteOptions::default())
-        .map_err(|e| format!("lofty save failed on {}: {e}", path.display()))?;
-    Ok(())
+    save_tag(&tagged, tag_type, path)
+}
+
+/// Write the edited tag of `tagged` back to `path`.
+///
+/// ID3v2 goes through the concrete `Id3v2Tag` so its comment and lyrics
+/// frames can be repaired before the write (see
+/// [`repair_frame_languages`]). A file that also carries an ID3v1 tag gets that tag brought
+/// up to date with the edited ID3v2 (see [`merged_id3v1`]) so a reader that
+/// falls back to it does not see the pre-edit title; no ID3v1 is added
+/// where there was none.
+///
+/// Only fields present in the ID3v2 overwrite their ID3v1 slot, so removing
+/// a field from the ID3v2 leaves the old ID3v1 value in place: a future
+/// "clear field" operation must clear it in the ID3v1 tag as well.
+pub(crate) fn save_tag(tagged: &TaggedFile, tag_type: TagType, path: &Path) -> Result<(), String> {
+    let saved = match tagged.tag(tag_type) {
+        Some(tag) if tag_type == TagType::Id3v2 => {
+            let mut id3 = Id3v2Tag::from(tag.clone());
+            repair_frame_languages(&mut id3);
+            id3.save_to_path(path, WriteOptions::default())
+                .and_then(|()| match tagged.tag(TagType::Id3v1) {
+                    Some(v1) => merged_id3v1(v1, tag).save_to_path(path, WriteOptions::default()),
+                    None => Ok(()),
+                })
+        }
+        // lofty keeps the fields it has no key for (Picard's
+        // `RELEASESTATUS`, any other tagger's custom comment) in
+        // a companion of the generic tag, and its generic Vorbis, APE and
+        // RIFF INFO writers skip that companion: saving the generic tag
+        // erased every such field from the file. The concrete tag carries
+        // them. ID3v2 (above) and MP4 writers include the companion.
+        Some(tag) if tag_type == TagType::VorbisComments => {
+            VorbisComments::from(tag.clone()).save_to_path(path, WriteOptions::default())
+        }
+        Some(tag) if tag_type == TagType::Ape => {
+            ApeTag::from(tag.clone()).save_to_path(path, WriteOptions::default())
+        }
+        Some(tag) if tag_type == TagType::RiffInfo => {
+            RiffInfoList::from(tag.clone()).save_to_path(path, WriteOptions::default())
+        }
+        _ => tagged.save_to_path(path, WriteOptions::default()),
+    };
+    saved.map_err(|e| format!("lofty save failed on {}: {e}", path.display()))
+}
+
+/// The file's ID3v1 tag with the edited ID3v2's values laid over it.
+///
+/// Only a field the ID3v2 carries is overwritten — an absent ID3v2 field
+/// never clears its ID3v1 slot (see [`save_tag`]). Rebuilding the ID3v1
+/// from the ID3v2 alone erased whatever the ID3v2 lacked: a comment or
+/// genre held only in ID3v1, or every field of an ID3v1-only file whose
+/// new ID3v2 held just the rows the edit touched.
+fn merged_id3v1(existing: &Tag, edited: &Tag) -> lofty::id3::v1::Id3v1Tag {
+    use lofty::id3::v1::Id3v1Tag;
+    // ID3v1 stores genre as an index into a fixed list. An ID3v2 genre
+    // outside that list clears the slot instead of leaving a stale one.
+    let edited_has_genre = edited.get_string(ItemKey::Genre).is_some();
+    let edited = Id3v1Tag::from(edited.clone());
+    let mut v1 = Id3v1Tag::from(existing.clone());
+    if edited.title.is_some() {
+        v1.title = edited.title;
+    }
+    if edited.artist.is_some() {
+        v1.artist = edited.artist;
+    }
+    if edited.album.is_some() {
+        v1.album = edited.album;
+    }
+    if edited.year.is_some() {
+        v1.year = edited.year;
+    }
+    if edited.comment.is_some() {
+        v1.comment = edited.comment;
+    }
+    if edited.track_number.is_some() {
+        v1.track_number = edited.track_number;
+    }
+    if edited_has_genre {
+        v1.genre = edited.genre;
+    }
+    v1
+}
+
+/// Give comment and lyrics frames a writable language code.
+///
+/// ID3v2 requires three ASCII letters; some taggers write `\0\0\0`.
+/// lofty reads such a frame back fine but refuses to write a tag that
+/// contains it, so every save of every field failed with "Invalid frame
+/// language" until the file was fixed by hand.
+///
+/// A repaired frame moves to `XXX` (the spec's "unknown language"). Two
+/// frames of one kind may not share a language and description, so when
+/// that slot is already held the frame tries `und` (ISO 639-2
+/// "undetermined"), then `XXX` with a numbered description. Text is never
+/// dropped: the only frame discarded is one whose text is identical to the
+/// frame already in the slot it lands on.
+fn repair_frame_languages(id3: &mut Id3v2Tag) {
+    use lofty::id3::v2::Frame;
+    let bad_lang = |lang: &[u8; 3]| lang.iter().any(|b| !b.is_ascii_alphabetic());
+    let needs_repair = |f: &Frame<'_>| match f {
+        Frame::Comment(c) => bad_lang(&c.language),
+        Frame::UnsynchronizedText(u) => bad_lang(&u.language),
+        _ => false,
+    };
+    let broken: Vec<Frame<'static>> = (&*id3)
+        .into_iter()
+        .filter(|f| needs_repair(f))
+        .cloned()
+        .collect();
+    if broken.is_empty() {
+        return;
+    }
+    id3.retain(|f| !needs_repair(f));
+    for mut frame in broken {
+        let (language, description, content, is_comment) = match &mut frame {
+            Frame::Comment(c) => (&mut c.language, &mut c.description, c.content.clone(), true),
+            Frame::UnsynchronizedText(u) => (
+                &mut u.language,
+                &mut u.description,
+                u.content.clone(),
+                false,
+            ),
+            _ => continue,
+        };
+        // The text already stored under (lang, desc), for this frame kind.
+        let held = |lang: &[u8; 3], desc: &str| -> Option<String> {
+            if is_comment {
+                id3.comments()
+                    .find(|h| &h.language == lang && h.description == desc)
+                    .map(|h| h.content.to_string())
+            } else {
+                id3.unsync_text()
+                    .find(|h| &h.language == lang && h.description == desc)
+                    .map(|h| h.content.to_string())
+            }
+        };
+        let original = description.to_string();
+        let mut slots = [*b"XXX", *b"und"]
+            .into_iter()
+            .map(|lang| (lang, original.clone()))
+            .chain((2..).map(|n| (*b"XXX", format!("{original} ({n})"))));
+        let duplicate = loop {
+            let (lang, desc) = slots.next().expect("unbounded slot sequence");
+            match held(&lang, &desc) {
+                Some(text) if text == content => break true,
+                Some(_) => continue,
+                None => {
+                    *language = lang;
+                    *description = desc.into();
+                    break false;
+                }
+            }
+        };
+        if !duplicate {
+            id3.insert(frame);
+        }
+    }
 }
 
 /// Write release-level identifiers + Picard-compatible Unknown-keyed tags.
@@ -195,11 +361,11 @@ fn write_release_identifiers(
     }
 
     if let Some(tr) = release.text_representation.as_ref() {
-        // Script has no ID3v2 enum-variant mapping — Picard writes it as
-        // a TXXX:SCRIPT user-defined text frame, which `set_unknown_string`
-        // emits via the `Unknown` path that bypasses the format check.
+        // Script has no ID3v2 mapping in lofty — Picard writes it as a
+        // TXXX:SCRIPT user-defined text frame, which `set_picard_field`
+        // emits.
         if let Some(script) = tr.script.as_deref() {
-            set_unknown_string(tag, "SCRIPT", script);
+            set_picard_field(tag, PicardField::Script, script);
         }
         if let Some(lang) = tr.language.as_deref() {
             set_string(tag, ItemKey::Language, lang);
@@ -210,27 +376,27 @@ fn write_release_identifiers(
     // Writing under these names so a user opening the ripped file in
     // Picard sees populated fields and Picard does not re-fetch.
     //
-    // Limitation: lofty's abstract `Tag::insert_unchecked` parses any
-    // exactly-4-char `ItemKey::Unknown` name as a literal ID3v2 frame ID,
-    // which it then rejects if the name isn't a known frame. That makes
-    // it impossible to write Picard's `TXXX:ASIN` via this path — Picard
-    // reaches `Id3v2Tag::insert_user_text` directly. We skip ASIN; our
-    // library scanner doesn't read it, and Picard can re-fetch from MB.
+    // ASIN is skipped: our library scanner doesn't read it, and Picard can
+    // re-fetch it from MB. (It was first skipped because lofty 0.22 read a
+    // 4-char unknown key as an ID3v2 frame ID; `PicardField::write` goes
+    // through `TXXX` directly and would not hit that.)
+    // Picard stores status and type lowercase ("official", "single");
+    // matching it keeps the tag-manager diff quiet on ripped files.
     if let Some(status) = release.status.as_deref() {
-        set_unknown_string(tag, "MUSICBRAINZ_ALBUMSTATUS", status);
+        set_picard_field(tag, PicardField::AlbumStatus, &status.to_lowercase());
     }
     if let Some(album_type) = release
         .release_group
         .as_ref()
         .and_then(|rg| rg.primary_type.as_deref())
     {
-        set_unknown_string(tag, "MUSICBRAINZ_ALBUMTYPE", album_type);
+        set_picard_field(tag, PicardField::AlbumType, &album_type.to_lowercase());
     }
     if let Some(country) = release.country.as_deref() {
-        set_unknown_string(tag, "RELEASECOUNTRY", country);
+        set_picard_field(tag, PicardField::ReleaseCountry, country);
     }
     if let Some(packaging) = release.packaging.as_deref() {
-        set_unknown_string(tag, "MUSICBRAINZ_ALBUMPACKAGING", packaging);
+        set_picard_field(tag, PicardField::AlbumPackaging, packaging);
     }
 }
 
@@ -238,22 +404,21 @@ pub(crate) fn set_string(tag: &mut Tag, key: ItemKey, value: &str) {
     if value.is_empty() {
         return;
     }
+    // The checked insert drops a key the container has no mapping for.
+    // The MusicBrainz recording ID maps in every container lofty writes
+    // here (ID3v2 stores it as Picard's `UFID` frame).
     tag.insert(TagItem::new(key, ItemValue::Text(value.to_string())));
 }
 
-pub(crate) fn set_unknown_string(tag: &mut Tag, name: &str, value: &str) {
-    if value.is_empty() {
-        return;
-    }
-    // `Tag::insert` verifies a static ItemKey↔TagType mapping exists and
-    // silently drops `ItemKey::Unknown`. `insert_unchecked` skips the
-    // check; lofty's per-format writer then routes the Unknown item
-    // through TXXX (ID3v2) / generic user-defined keys (Vorbis Comments,
-    // MP4 freeform) by description. See lofty::tag::Tag::insert docs.
-    tag.insert_unchecked(TagItem::new(
-        ItemKey::Unknown(name.to_string()),
-        ItemValue::Text(value.to_string()),
-    ));
+/// Write one of the Picard-style fields (see [`crate::picard_keys`]).
+///
+/// The key actually written follows the container (TXXX in ID3v2, the
+/// named comment in Vorbis, the freeform atom in MP4), and every other
+/// spelling of the same field is removed first so a Picard-tagged MP3
+/// does not end up with two differently named copies. See
+/// [`PicardField::write`].
+pub(crate) fn set_picard_field(tag: &mut Tag, field: PicardField, value: &str) {
+    field.write(tag, value);
 }
 
 /// Write a Chromaprint fingerprint into the file's tag as `ACOUSTID_FINGERPRINT`.
@@ -283,13 +448,10 @@ pub fn tag_ripped_fingerprint(path: &Path, fingerprint: &str) -> Result<(), Stri
         .tag_mut(tag_type)
         .ok_or_else(|| "lofty refused to attach a tag".to_string())?;
 
-    set_unknown_string(tag, "ACOUSTID_FINGERPRINT", fingerprint);
+    set_picard_field(tag, PicardField::AcoustidFingerprint, fingerprint);
 
     let _ = tag;
-    tagged
-        .save_to_path(path, WriteOptions::default())
-        .map_err(|e| format!("lofty save failed on {}: {e}", path.display()))?;
-    Ok(())
+    save_tag(&tagged, tag_type, path)
 }
 
 /// Open `path` for tag I/O using content-based format detection.
@@ -330,38 +492,11 @@ pub fn ripped_track_destination(
     track_position: u32,
     extension: &str,
 ) -> std::path::PathBuf {
-    let artist = sanitise_filename_component(&render_artist_credit(&release.artist_credit));
+    let artist = sanitise_filename_component(&canonical_album_artist(&release.artist_credit));
     let album = sanitise_filename_component(&release.title);
     let title = sanitise_filename_component(&track.title);
     let filename = format!("{track_position:02} - {title}.{extension}");
     dest_dir.join(artist).join(album).join(filename)
-}
-
-/// Replace filesystem-hostile characters in a filename component. Keeps
-/// the result identifiable (doesn't aggressively transliterate) while
-/// ensuring it can land on macOS/Linux/Windows-via-network mounts.
-fn sanitise_filename_component(s: &str) -> String {
-    let trimmed = s.trim();
-    if trimmed.is_empty() {
-        return "Unknown".to_string();
-    }
-    let mut out = String::with_capacity(trimmed.len());
-    for c in trimmed.chars() {
-        match c {
-            '/' | '\\' | '\0' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => out.push('_'),
-            c if (c as u32) < 0x20 => {} // strip controls
-            c => out.push(c),
-        }
-    }
-    // Trailing dots/spaces break Windows path resolution on shared mounts.
-    while out.ends_with('.') || out.ends_with(' ') {
-        out.pop();
-    }
-    if out.is_empty() {
-        "Unknown".to_string()
-    } else {
-        out
-    }
 }
 
 #[cfg(test)]
@@ -438,37 +573,43 @@ mod tests {
     }
 
     #[test]
-    fn sanitise_filename_replaces_path_separators() {
-        assert_eq!(sanitise_filename_component("AC/DC"), "AC_DC");
-        assert_eq!(sanitise_filename_component("a:b"), "a_b");
-        assert_eq!(sanitise_filename_component("Foo?Bar*"), "Foo_Bar_");
+    fn dest_path_feat_release_uses_primary_artist() {
+        let mut rel = release("All Eyez On Me", "2Pac", None);
+        rel.artist_credit = vec![
+            ArtistCredit {
+                name: "2Pac".into(),
+                joinphrase: Some(" featuring ".into()),
+                artist: None,
+            },
+            ArtistCredit {
+                name: "The Notorious B.I.G.".into(),
+                joinphrase: None,
+                artist: None,
+            },
+        ];
+        let dest = ripped_track_destination(Path::new("/m"), &rel, &mb_track("Track", 1), 1, "mp3");
+        assert_eq!(dest, Path::new("/m/2Pac/All Eyez On Me/01 - Track.mp3"));
     }
 
     #[test]
-    fn sanitise_filename_strips_controls() {
-        assert_eq!(sanitise_filename_component("a\x01b\x02c"), "abc");
-    }
-
-    #[test]
-    fn sanitise_filename_falls_back_for_empty_input() {
-        assert_eq!(sanitise_filename_component(""), "Unknown");
-        assert_eq!(sanitise_filename_component("   "), "Unknown");
-        // Input that decays to empty after stripping (only control chars).
-        assert_eq!(sanitise_filename_component("\x01\x02\x03"), "Unknown");
-    }
-
-    #[test]
-    fn sanitise_filename_replaces_but_keeps_slash_only_input() {
-        // "///" becomes "___" — the caller's input was nonsense but we
-        // preserve the structural shape rather than wiping to "Unknown".
-        assert_eq!(sanitise_filename_component("///"), "___");
-    }
-
-    #[test]
-    fn sanitise_filename_strips_trailing_dots_and_spaces() {
-        // Windows network mounts choke on these.
-        assert_eq!(sanitise_filename_component("Foo..."), "Foo");
-        assert_eq!(sanitise_filename_component("Foo   "), "Foo");
+    fn dest_path_uses_musicbrainz_spelling_not_existing_folder_case() {
+        let dir = fresh_dir("dest-mb-spelling");
+        std::fs::create_dir_all(dir.join("Alice in Chains").join("Dirt")).unwrap();
+        let dest = ripped_track_destination(
+            &dir,
+            &release("Dirt", "Alice In Chains", None),
+            &mb_track("Them Bones", 1),
+            1,
+            "flac",
+        );
+        assert_eq!(
+            dest,
+            dir.join("Alice In Chains")
+                .join("Dirt")
+                .join("01 - Them Bones.flac"),
+            "MusicBrainz spelling must win so F consolidates into one folder"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // -------------------- Phase B tag-write tests --------------------
@@ -502,24 +643,20 @@ mod tests {
     fn read_text(path: &Path, key: &ItemKey) -> Option<String> {
         let tagged = lofty::probe::read_from_path(path).unwrap();
         let tag = tagged.tag(TagType::Id3v2)?;
-        tag.get(key)
+        tag.get(*key)
             .and_then(|i| i.value().text())
             .map(|s| s.to_string())
     }
 
+    /// A user-defined field (TXXX description in these WAV tests) by its
+    /// exact spelling.
     fn read_unknown(path: &Path, name: &str) -> Option<String> {
         let tagged = lofty::probe::read_from_path(path).unwrap();
         let tag = tagged.tag(TagType::Id3v2)?;
-        for item in tag.items() {
-            if let ItemKey::Unknown(k) = item.key() {
-                if k == name {
-                    if let ItemValue::Text(v) = item.value() {
-                        return Some(v.clone());
-                    }
-                }
-            }
-        }
-        None
+        crate::picard_keys::user_fields(tag)
+            .into_iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v)
     }
 
     fn medium_with(position: u32, format: &str) -> Medium {
@@ -552,6 +689,39 @@ mod tests {
 
         assert_eq!(read_text(&path, &ItemKey::DiscNumber).as_deref(), Some("1"));
         assert_eq!(read_text(&path, &ItemKey::DiscTotal).as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn tags_album_artist_with_the_same_canonical_name_as_the_folder() {
+        let path = write_test_wav("feat-album-artist");
+        let mut rel = release("All Eyez On Me", "2Pac", None);
+        rel.artist_credit = vec![
+            ArtistCredit {
+                name: "2Pac".into(),
+                joinphrase: Some(" featuring ".into()),
+                artist: None,
+            },
+            ArtistCredit {
+                name: "The Notorious B.I.G.".into(),
+                joinphrase: None,
+                artist: None,
+            },
+        ];
+        let mut track = mb_track("T", 1);
+        track.artist_credit = rel.artist_credit.clone();
+        tag_ripped_file(&path, &rel, &track, 1, Some(1), None, None).unwrap();
+        // The file lands under 2Pac/; the sidebar groups by ALBUMARTIST,
+        // so the tag has to agree or the rip shows up under the feat name
+        // and m immediately proposes the canonical one.
+        assert_eq!(
+            read_text(&path, &ItemKey::AlbumArtist).as_deref(),
+            Some("2Pac")
+        );
+        assert_eq!(
+            read_text(&path, &ItemKey::TrackArtist).as_deref(),
+            Some("2Pac featuring The Notorious B.I.G."),
+            "the featuring credit stays on the track artist"
+        );
     }
 
     #[test]
@@ -613,6 +783,112 @@ mod tests {
             Some("GBAYE6900001"),
             "should take the first ISRC from the recording"
         );
+    }
+
+    #[test]
+    fn tags_recording_id_survives_id3v2() {
+        // Regression: the recording ID reached the file only as a UFID
+        // frame, which the generic-tag save path never produced.
+        let path = write_test_wav("recording-id");
+        let mut track = mb_track("T", 1);
+        track.recording = Some(Recording {
+            id: "b1a9c0de-0000-4000-8000-000000000001".into(),
+            title: "T".into(),
+            length: None,
+            artist_credit: vec![],
+            isrcs: vec![],
+        });
+        let rel = release("Album", "Artist", None);
+        tag_ripped_file(&path, &rel, &track, 1, Some(1), None, None).unwrap();
+
+        assert_eq!(
+            read_text(&path, &ItemKey::MusicBrainzRecordingId).as_deref(),
+            Some("b1a9c0de-0000-4000-8000-000000000001")
+        );
+    }
+
+    #[test]
+    fn save_tag_keeps_an_existing_id3v1_in_step_with_id3v2() {
+        use lofty::tag::Accessor;
+        let Some(path) = crate::test_audio::ffmpeg_mp3("id3v1-in-step") else {
+            return;
+        };
+        // An older rip carrying both tags, as many do.
+        let mut tf = lofty::read_from_path(&path).unwrap();
+        for tt in [TagType::Id3v2, TagType::Id3v1] {
+            let mut t = Tag::new(tt);
+            t.set_title("Old Title".into());
+            t.set_artist("Old Artist".into());
+            tf.insert_tag(t);
+        }
+        tf.save_to_path(&path, WriteOptions::default()).unwrap();
+
+        let mut tf = lofty::read_from_path(&path).unwrap();
+        tf.tag_mut(TagType::Id3v2)
+            .unwrap()
+            .set_title("New Title".into());
+        save_tag(&tf, TagType::Id3v2, &path).unwrap();
+
+        let back = lofty::read_from_path(&path).unwrap();
+        assert_eq!(
+            back.tag(TagType::Id3v1).and_then(|t| t.title()).as_deref(),
+            Some("New Title"),
+            "a player reading ID3v1 must not see the pre-edit title"
+        );
+        assert_eq!(
+            back.tag(TagType::Id3v1).and_then(|t| t.artist()).as_deref(),
+            Some("Old Artist")
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_tag_keeps_id3v1_fields_the_id3v2_does_not_carry() {
+        use lofty::tag::Accessor;
+        let Some(path) = crate::test_audio::ffmpeg_mp3("id3v1-extra-fields") else {
+            return;
+        };
+        let mut tf = lofty::read_from_path(&path).unwrap();
+        let mut v2 = Tag::new(TagType::Id3v2);
+        v2.set_title("Old Title".into());
+        tf.insert_tag(v2);
+        let mut v1 = Tag::new(TagType::Id3v1);
+        v1.set_title("Old Title".into());
+        v1.set_album("Old Album".into());
+        v1.set_genre("Rock".into());
+        v1.set_comment("ripped 2003".into());
+        tf.insert_tag(v1);
+        tf.save_to_path(&path, WriteOptions::default()).unwrap();
+
+        let mut tf = lofty::read_from_path(&path).unwrap();
+        tf.tag_mut(TagType::Id3v2)
+            .unwrap()
+            .set_title("New Title".into());
+        save_tag(&tf, TagType::Id3v2, &path).unwrap();
+
+        let back = lofty::read_from_path(&path).unwrap();
+        let v1 = back.tag(TagType::Id3v1).expect("ID3v1 survives");
+        assert_eq!(v1.title().as_deref(), Some("New Title"));
+        assert_eq!(v1.album().as_deref(), Some("Old Album"));
+        assert_eq!(v1.genre().as_deref(), Some("Rock"));
+        assert_eq!(v1.comment().as_deref(), Some("ripped 2003"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_tag_does_not_add_an_id3v1_where_there_was_none() {
+        use lofty::tag::Accessor;
+        let Some(path) = crate::test_audio::ffmpeg_mp3("no-id3v1") else {
+            return;
+        };
+        let mut tf = lofty::read_from_path(&path).unwrap();
+        let mut t = Tag::new(TagType::Id3v2);
+        t.set_title("Title".into());
+        tf.insert_tag(t);
+        save_tag(&tf, TagType::Id3v2, &path).unwrap();
+        let back = lofty::read_from_path(&path).unwrap();
+        assert!(back.tag(TagType::Id3v1).is_none());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -678,8 +954,10 @@ mod tests {
             read_text(&path, &ItemKey::CatalogNumber).as_deref(),
             Some("SHVL 804")
         );
+        // ID3v2 keeps label and publisher in one frame, TPUB, which lofty
+        // 0.25 reads back as `Publisher` (0.22 reported it as `Label`).
         assert_eq!(
-            read_text(&path, &ItemKey::Label).as_deref(),
+            read_text(&path, &ItemKey::Publisher).as_deref(),
             Some("Harvest")
         );
     }
@@ -692,8 +970,9 @@ mod tests {
         tag_ripped_file(&path, &rel, &mb_track("T", 1), 1, Some(1), None, None).unwrap();
 
         assert_eq!(
-            read_unknown(&path, "MUSICBRAINZ_ALBUMSTATUS").as_deref(),
-            Some("Official")
+            read_unknown(&path, "MusicBrainz Album Status").as_deref(),
+            Some("official"),
+            "Picard's ID3 spelling and lowercase value"
         );
     }
 
@@ -704,7 +983,10 @@ mod tests {
         rel.country = Some("GB".into());
         tag_ripped_file(&path, &rel, &mb_track("T", 1), 1, Some(1), None, None).unwrap();
 
-        assert_eq!(read_unknown(&path, "RELEASECOUNTRY").as_deref(), Some("GB"));
+        assert_eq!(
+            read_unknown(&path, "MusicBrainz Album Release Country").as_deref(),
+            Some("GB")
+        );
     }
 
     #[test]
@@ -722,21 +1004,19 @@ mod tests {
         tag_ripped_file(&path, &rel, &mb_track("T", 1), 1, Some(1), None, None).unwrap();
 
         assert_eq!(
-            read_unknown(&path, "MUSICBRAINZ_ALBUMTYPE").as_deref(),
-            Some("Album")
+            read_unknown(&path, "MusicBrainz Album Type").as_deref(),
+            Some("album")
         );
         assert_eq!(
-            read_unknown(&path, "MUSICBRAINZ_ALBUMPACKAGING").as_deref(),
+            read_unknown(&path, "MusicBrainz Album Packaging").as_deref(),
             Some("Gatefold Cover")
         );
     }
 
     #[test]
-    fn tags_skips_asin_due_to_lofty_4char_unknown_limitation() {
-        // ASIN is exactly 4 chars — lofty parses ItemKey::Unknown("ASIN")
-        // as a literal ID3v2 frame ID and rejects on save. Documenting the
-        // skip with a test so a future lofty upgrade or refactor doesn't
-        // silently re-introduce broken ASIN writes.
+    fn tags_skips_asin() {
+        // ASIN is deliberately not written (see write_release_identifiers):
+        // the scanner never reads it and Picard can re-fetch it.
         let path = write_test_wav("asin-skipped");
         let mut rel = release("Album", "Artist", None);
         rel.asin = Some("B000002UAS".into());
@@ -812,21 +1092,21 @@ mod tests {
             .tag(TagType::Id3v2)
             .expect("id3v2 tag landed on the .part file");
         assert_eq!(
-            tag.get(&ItemKey::TrackTitle)
+            tag.get(ItemKey::TrackTitle)
                 .and_then(|i| i.value().text())
                 .map(str::to_string)
                 .as_deref(),
             Some("T")
         );
         assert_eq!(
-            tag.get(&ItemKey::AlbumTitle)
+            tag.get(ItemKey::AlbumTitle)
                 .and_then(|i| i.value().text())
                 .map(str::to_string)
                 .as_deref(),
             Some("Album")
         );
         assert_eq!(
-            tag.get(&ItemKey::MusicBrainzTrackId)
+            tag.get(ItemKey::MusicBrainzTrackId)
                 .and_then(|i| i.value().text())
                 .map(str::to_string)
                 .as_deref(),
@@ -875,7 +1155,7 @@ mod tests {
         tag_ripped_fingerprint(&path, "AQADtIqYRYmS_AeOJUuOK0d6_FcOpcePZkePI8eRJD8q5FdyZP9hHB-OH_2P_DhxJEdy_DhyHEdy_NCPI9eR/zhxnEcePOmRH8mPHzmS_ChyHEdy_PiP/8jx48iRHTny47i").unwrap();
 
         assert!(
-            read_unknown(&path, "ACOUSTID_FINGERPRINT").is_some_and(|v| v.starts_with("AQAD")),
+            read_unknown(&path, "Acoustid Fingerprint").is_some_and(|v| v.starts_with("AQAD")),
             "ACOUSTID_FINGERPRINT tag should be present and carry the written value"
         );
         // Pre-existing MB tags must still be there — the fingerprint write
@@ -908,7 +1188,7 @@ mod tests {
         // the caller from accidentally clearing a previously-written tag.
         let path = write_test_wav("acoustid-fp-empty");
         tag_ripped_fingerprint(&path, "").unwrap();
-        assert!(read_unknown(&path, "ACOUSTID_FINGERPRINT").is_none());
+        assert!(read_unknown(&path, "Acoustid Fingerprint").is_none());
     }
 
     #[test]

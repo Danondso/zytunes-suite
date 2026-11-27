@@ -50,7 +50,7 @@ impl Waveform {
             return Vec::new();
         }
         let mut out = vec![0u8; centers.len()];
-        for i in 0..BINS {
+        for (i, bin) in self.bins.iter().enumerate() {
             let hz = bin_hz(i);
             let mut best = 0usize;
             let mut best_d = f32::MAX;
@@ -61,7 +61,7 @@ impl Waveform {
                     best = j;
                 }
             }
-            let v = self.bins[i].load(Ordering::Relaxed);
+            let v = bin.load(Ordering::Relaxed);
             if v > out[best] {
                 out[best] = v;
             }
@@ -81,14 +81,11 @@ impl Waveform {
         for (c, slot) in out.iter_mut().enumerate() {
             let start = c * BINS / n;
             let end = ((c + 1) * BINS / n).max(start + 1).min(BINS);
-            let mut m = 0u8;
-            for i in start..end {
-                let v = self.bins[i].load(Ordering::Relaxed);
-                if v > m {
-                    m = v;
-                }
-            }
-            *slot = m;
+            *slot = self.bins[start..end]
+                .iter()
+                .map(|bin| bin.load(Ordering::Relaxed))
+                .max()
+                .unwrap_or(0);
         }
         out
     }

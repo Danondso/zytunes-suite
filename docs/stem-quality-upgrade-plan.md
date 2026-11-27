@@ -45,7 +45,9 @@ The implementation departed from this plan in a few deliberate ways:
 `demucs` CLI — but it is also the end of its line:
 
 - **Demucs is unmaintained.** The repo is archived; no new models are
-  coming. The `_6s` guitar and piano sources shipped as experimental —
+  coming. *(Update, Nov 2026: `facebookresearch/demucs` is archived, but
+  maintenance resumed at `adefossez/demucs` — 4.1.0 shipped July 2026 —
+  with no new models. See `docs/stem-model-updates-research.md`.)* The `_6s` guitar and piano sources shipped as experimental —
   guitar is passable, piano bleeds badly — and never improved.
 - **The field moved to Roformer architectures.** BS-Roformer / Mel-Band
   Roformer checkpoints beat htdemucs on vocals by ~2–4 dB SDR depending

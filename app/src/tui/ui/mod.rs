@@ -4,6 +4,7 @@ mod util;
 pub use metadata::{format_metadata_pairs, MetadataRow};
 use util::{
     center_pad, char_disp_width, compute_scroll, disp_width, marquee, pad_right_to_width, truncate,
+    wrap_hard,
 };
 
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -266,9 +267,11 @@ pub fn draw(f: &mut Frame, app: &App) {
         draw_stem_bulk_confirm(f, app, confirm);
     }
 
-    // Toast overlay.
-    if let Some((ref msg, _, is_error)) = app.toast_message {
-        draw_toast(f, app, msg, is_error);
+    // Toast overlay. While the tag manager is open the toast is drawn
+    // after it instead (see below).
+    let toast = app.toast_message.as_ref();
+    if let (Some((msg, _, is_error)), None) = (toast, &app.tag_manager) {
+        draw_toast(f, app, msg, *is_error);
     }
 
     // Help overlay.
@@ -289,8 +292,16 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     // Tag-manager overlay. Drawn on top of the track-info popup because the
     // `m` key dispatcher routes around the track-info guard.
+    //
+    // The toast goes on top of it. An apply reports failed tracks through
+    // a toast while the overlay stays open, and both are centered rects:
+    // drawn first, the toast was fully covered and the failure reached
+    // only the log.
     if app.tag_manager.is_some() {
         draw_tag_manager_overlay(f, app);
+        if let Some((msg, _, is_error)) = toast {
+            draw_toast(f, app, msg, *is_error);
+        }
     }
 
     // CD import overlay — drawn last so it sits on top of everything.
@@ -607,7 +618,7 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
     // Artists (keyed by artist name) and Albums (keyed by "artist — album").
     let show_device_status = app.browse_mode == BrowseMode::Library
         && (matches!(app.sidebar_mode, SidebarMode::Artists | SidebarMode::Albums))
-        && (!app.artist_device_status.is_empty() || !app.album_device_status.is_empty());
+        && app.device_presence.any();
 
     let items: Vec<ListItem> = app
         .sidebar_items
@@ -629,11 +640,8 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
             let name = entry.display();
             let (icon, icon_style) = if show_device_status {
                 let presence = match entry {
-                    SidebarEntry::Artist(artist) => app.artist_device_status.get(artist).copied(),
-                    SidebarEntry::Album { artist, album } => app
-                        .album_device_status
-                        .get(&(artist.clone(), album.clone()))
-                        .copied(),
+                    SidebarEntry::Artist(artist) => app.artist_presence(artist),
+                    SidebarEntry::Album { artist, album } => app.album_presence(artist, album),
                     // Playlists never show device-presence indicators —
                     // they're library-side state. (`show_device_status` is
                     // also gated on `BrowseMode::Library` above.)
@@ -743,10 +751,7 @@ fn draw_album_browser(f: &mut Frame, app: &App, area: Rect) {
         let is_selected = i == app.album_selected;
         let prefix = if is_selected { "> " } else { "  " };
         let prefix_w = disp_width(prefix);
-        let icon = match app
-            .album_device_status
-            .get(&(album.artist.clone(), album.name.clone()))
-        {
+        let icon = match app.album_presence(&album.artist, &album.name) {
             Some(DevicePresence::Full) => "✓ ",
             Some(DevicePresence::Partial) => "◐ ",
             _ => "",
@@ -2263,11 +2268,8 @@ fn draw_now_playing(f: &mut Frame, app: &App, np: &NowPlaying, area: Rect, art_w
     }
 }
 
-/// One-line stem status for the now-playing panel. `Active` renders one
-/// toggle cell per stem in the active layout (`[1 Voc ●]`, filled =
-/// audible / hollow = muted), dropping the labels when the strip is
-/// narrower than the full form needs (66 cols for six stems, 76 for
-/// seven).
+/// One-line stem status for the now-playing panel: install / separating
+/// progress, or the Active toggle cells ([`stem_strip_cells`]).
 fn stem_strip_line(app: &App, width: u16) -> Paragraph<'static> {
     let t = app.theme();
     let header = Span::styled(
@@ -2289,34 +2291,99 @@ fn stem_strip_line(app: &App, width: u16) -> Paragraph<'static> {
             },
             Style::default().fg(t.progress_bar),
         )),
-        StemStatus::Active => {
-            let layout = app.stems.layout.unwrap_or(zytunes::stems::SIX_STEM_LAYOUT);
-            // The wide form is the 7-cell " STEMS " header plus one
-            // 10-cell `[N Lbl ●] ` per stem, minus the last trailing
-            // space: 6 + 10·len (66 for six stems — the pre-layout
-            // constant — and 76 for harmony's seven).
-            let wide = width >= 6 + 10 * layout.len() as u16;
-            for (i, kind) in layout.iter().enumerate() {
-                let on = app.stems.enabled[i];
-                let dot = if on { "●" } else { "○" };
-                let cell = if wide {
-                    format!("[{} {} {}] ", i + 1, kind.short_label(), dot)
-                } else {
-                    format!("[{}{}]", i + 1, dot)
-                };
-                let style = if on {
-                    Style::default()
-                        .fg(t.success_text)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(t.dim_text)
-                };
-                spans.push(Span::styled(cell, style));
-            }
-        }
+        StemStatus::Active => spans.extend(stem_strip_cells(app, width)),
         StemStatus::Off => {}
     }
     Paragraph::new(Line::from(spans))
+}
+
+/// The Active strip's toggle cells. Collapsed, one cell per top-level
+/// [`zytunes::stems::StemCell`] — a split source (lead/backing vocals,
+/// drum parts) shows as its parent's label with a half dot when only
+/// some parts are audible, and a dim `0▸` hint says it can open.
+/// Expanded, the open group's label leads and its parts take the
+/// digits. Each wide cell is `[N Lbl ●] ` (10 cols); the narrow form
+/// drops labels when the strip can't fit them.
+fn stem_strip_cells(app: &App, width: u16) -> Vec<Span<'static>> {
+    use zytunes::stems::StemCell;
+    let t = app.theme();
+    let layout = app.stems.layout.unwrap_or(zytunes::stems::SIX_STEM_LAYOUT);
+    let enabled = &app.stems.enabled;
+    let on_style = Style::default()
+        .fg(t.success_text)
+        .add_modifier(Modifier::BOLD);
+    let off_style = Style::default().fg(t.dim_text);
+
+    // One cell per digit, plus the lead-in and hint around them.
+    struct Cell {
+        label: &'static str,
+        /// Audible parts of `total`.
+        on: usize,
+        total: usize,
+    }
+    let (prefix, cells, hint): (Option<String>, Vec<Cell>, &str) = match app.expanded_stem_cell() {
+        Some(StemCell::Group { group, members }) => (
+            Some(format!("{}▸ ", group.short_label())),
+            members
+                .map(|i| Cell {
+                    label: layout[i].short_label(),
+                    on: enabled[i] as usize,
+                    total: 1,
+                })
+                .collect(),
+            " 0 next",
+        ),
+        _ => {
+            let cells = app.stem_cells();
+            let has_groups = cells.iter().any(|c| matches!(c, StemCell::Group { .. }));
+            let cells = cells
+                .iter()
+                .map(|cell| {
+                    let label = match cell {
+                        StemCell::Single(i) => layout[*i].short_label(),
+                        StemCell::Group { group, .. } => group.short_label(),
+                    };
+                    let parts = cell.members();
+                    Cell {
+                        label,
+                        on: parts.clone().filter(|&i| enabled[i]).count(),
+                        total: parts.len(),
+                    }
+                })
+                .collect();
+            (None, cells, if has_groups { " 0▸ parts" } else { "" })
+        }
+    };
+
+    // The 7-col " STEMS " header plus 10 per cell, minus the last
+    // trailing space: 66 for six cells, the pre-grouping constant.
+    let extras = prefix.as_deref().map_or(0, |p| p.chars().count()) + hint.chars().count();
+    let wide = width as usize >= 6 + 10 * cells.len() + extras;
+
+    let mut spans = Vec::new();
+    if let Some(p) = prefix {
+        spans.push(Span::styled(p, on_style));
+    }
+    for (n, Cell { label, on, total }) in cells.into_iter().enumerate() {
+        let dot = match on {
+            0 => "○",
+            _ if on == total => "●",
+            _ => "◐",
+        };
+        let cell = if wide {
+            format!("[{} {label} {dot}] ", n + 1)
+        } else {
+            format!("[{}{dot}]", n + 1)
+        };
+        spans.push(Span::styled(
+            cell,
+            if on > 0 { on_style } else { off_style },
+        ));
+    }
+    if !hint.is_empty() {
+        spans.push(Span::styled(hint, off_style));
+    }
+    spans
 }
 
 /// Consent modal for the one-time stem-engine install (`M` with no
@@ -2391,9 +2458,9 @@ fn recipe_cost_hint(recipe: zytunes::stems::RecipeKind) -> &'static str {
     use zytunes::stems::RecipeKind;
     match recipe {
         RecipeKind::Demucs => "1 pass — fastest on CPU",
-        RecipeKind::Hq => "2 passes, Roformer vocals — slow on CPU",
         RecipeKind::Sw => "1 pass, 6-stem Roformer — slow on CPU",
-        RecipeKind::HqHarmony => "3 passes + 2 checkpoints on first use — slow on CPU",
+        RecipeKind::HqHarmony => "2 passes + 2 checkpoints on first use — slow on CPU",
+        RecipeKind::Full => "5 passes + 5 checkpoints on first use — GPU recommended",
     }
 }
 
@@ -2508,12 +2575,7 @@ fn draw_stem_panel(f: &mut Frame, app: &App, panel: &crate::app::StemPanel) {
         lines.push(Line::from(Span::styled(
             format!(
                 " Pinned models: {}",
-                [
-                    zytunes::stems::AUDIO_SEPARATOR_HTDEMUCS_MODEL,
-                    zytunes::stems::BS_ROFORMER_VOCALS_MODEL,
-                    zytunes::stems::MEL_ROFORMER_KARAOKE_MODEL,
-                ]
-                .join(", ")
+                zytunes::stems::pinned_model_files().join(", ")
             ),
             t.modal_dim(),
         )));
@@ -2561,7 +2623,7 @@ fn draw_stem_bulk_confirm(f: &mut Frame, app: &App, confirm: &crate::app::StemBu
     let area = f.area();
     let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
 
-    let to_do = confirm.track_paths.len() - confirm.cached;
+    let to_do = confirm.tracks.len() - confirm.cached;
     let mut lines = vec![
         Line::from(""),
         Line::from(format!(
@@ -2571,7 +2633,7 @@ fn draw_stem_bulk_confirm(f: &mut Frame, app: &App, confirm: &crate::app::StemBu
         Line::from(""),
         Line::from(format!(
             " {} track(s): {} to separate, {} already cached",
-            confirm.track_paths.len(),
+            confirm.tracks.len(),
             to_do,
             confirm.cached
         )),
@@ -2765,20 +2827,28 @@ fn draw_help_overlay(f: &mut Frame, app: &App) {
 
     f.render_widget(Clear, rect);
 
-    // The stem digit range tracks the active layout (or, before any split,
-    // the configured recipe's) — a static "1-7" would advertise a key that
-    // falls through to nothing under the six-stem layouts.
-    let stem_count = app
+    // The stem digit range tracks the active layout's strip cells (or,
+    // before any split, the configured recipe's) — advertising a digit
+    // with no cell behind it would name a key that falls through.
+    let stem_layout = app
         .stems
         .layout
-        .map(|l| l.len())
-        .or_else(|| app.stems_cfg.recipe_kind().ok().map(|r| r.layout().len()))
-        .unwrap_or(6);
-    let stem_toggle_line = if stem_count >= 7 {
-        "  1-7         Toggle stems while the strip is on screen"
-    } else {
-        "  1-6         Toggle stems while the strip is on screen"
-    };
+        .or_else(|| app.stems_cfg.recipe_kind().ok().map(|r| r.layout()))
+        .unwrap_or(zytunes::stems::SIX_STEM_LAYOUT);
+    let stem_cells = zytunes::stems::strip_cells(stem_layout);
+    let stem_toggle_line = format!(
+        "  1-{}         Toggle stems while the strip is on screen{}",
+        stem_cells.len(),
+        if stem_cells
+            .iter()
+            .any(|c| matches!(c, zytunes::stems::StemCell::Group { .. }))
+        {
+            "; 0 opens split parts"
+        } else {
+            ""
+        }
+    );
+    let stem_toggle_line = stem_toggle_line.as_str();
     let help_text = vec![
         "",
         "  Navigation",
@@ -2810,6 +2880,7 @@ fn draw_help_overlay(f: &mut Frame, app: &App) {
         "  s           Cycle sort column",
         "  I           Show track info (TrackList panel)",
         "  m           MusicBrainz tag manager (Albums / TrackList)",
+        "  F           File + enrich (inbox / artist / album)",
         "",
         "  Sync",
         "  a           Add track to queue",
@@ -3867,21 +3938,32 @@ fn draw_tag_manager_overlay(f: &mut Frame, app: &App) {
 
     f.render_widget(Clear, rect);
 
+    let noun = if overlay.filing {
+        "File into library"
+    } else {
+        "Tag manager"
+    };
     let title = match overlay.phase {
         TagManagerPhase::SearchInput => {
-            " Tag manager — edit query (Enter to search, Esc to close) "
+            format!(" {noun} — edit query (Enter to search, Esc to close) ")
         }
-        TagManagerPhase::SearchPending => " Tag manager — searching MusicBrainz… ",
+        TagManagerPhase::SearchPending => format!(" {noun} — searching MusicBrainz… "),
         TagManagerPhase::SearchResults => {
-            " Tag manager — ↑↓ select · Enter pick · s edit query · Esc back "
+            format!(" {noun} — ↑↓ select · Enter pick · s edit query · Esc back ")
         }
-        TagManagerPhase::LoadingRelease => " Tag manager — loading release… ",
-        TagManagerPhase::DiffPreview => {
-            " Tag manager — j/k · Space · a/n · c fold · Enter apply · s search · Esc "
+        TagManagerPhase::LoadingRelease => format!(" {noun} — loading release… "),
+        TagManagerPhase::DiffPreview => format!(" {noun} — {} ", overlay.diff_preview_hint()),
+        TagManagerPhase::Applying => format!(" {noun} — applying… "),
+        // `L` and, after a failed reread, Esc do not close this screen.
+        TagManagerPhase::Done if !overlay.apply_failures.is_empty() => {
+            if overlay.error.is_some() {
+                format!(" {noun} — done with errors · L log · Esc search · other keys close ")
+            } else {
+                format!(" {noun} — done with errors · L log · other keys close ")
+            }
         }
-        TagManagerPhase::Applying => " Tag manager — applying… ",
-        TagManagerPhase::Done => " Tag manager — done (any key to close) ",
-        TagManagerPhase::Error => " Tag manager — error (any key to close) ",
+        TagManagerPhase::Done => format!(" {noun} — done (any key to close) "),
+        TagManagerPhase::Error => format!(" {noun} — error (any key to close) "),
     };
     let block = t
         .block()
@@ -3907,6 +3989,9 @@ fn draw_tag_manager_overlay(f: &mut Frame, app: &App) {
         TagManagerPhase::DiffPreview | TagManagerPhase::Applying => {
             draw_tag_manager_diff(f, app, overlay, inner);
         }
+        TagManagerPhase::Done if !overlay.apply_failures.is_empty() => {
+            draw_tag_manager_failures(f, app, overlay, inner);
+        }
         TagManagerPhase::Done => {
             draw_centered_line(f, inner, "Done. Press any key to close.", t.success_text);
         }
@@ -3918,6 +4003,93 @@ fn draw_tag_manager_overlay(f: &mut Frame, app: &App) {
             draw_centered_line(f, inner, &msg, t.error_text);
         }
     }
+}
+
+/// Done screen of an apply that failed on some tracks: each one by file
+/// name, with what became of it and the reason. The log has the same
+/// lines, but the user is looking here, and "see log" does not say which
+/// files are still sitting where they were.
+fn draw_tag_manager_failures(
+    f: &mut Frame,
+    app: &App,
+    overlay: &crate::app::TagManagerOverlay,
+    inner: Rect,
+) {
+    use crate::app::tag_manager::FailedTrack;
+    let t = app.theme();
+    let failures = &overlay.apply_failures;
+    let n = failures.len();
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!(
+                "{n} track{} failed. Everything else was applied.",
+                if n == 1 { "" } else { "s" }
+            ),
+            Style::default().fg(t.error_text),
+        )),
+        Line::default(),
+    ];
+    // Reasons are hard-wrapped here rather than left to the widget, so
+    // the row count is known: errors carry full paths and their point
+    // ("already exists") is often at the end, past the right edge. Wrapped
+    // by display width: a CJK path is twice as wide as its char count.
+    let width = usize::from(inner.width);
+    let reason_width = width.saturating_sub(4).max(1);
+    if let Some(err) = overlay.error.as_deref() {
+        let mut reread: Vec<Line> = wrap_hard(err, width.max(1))
+            .into_iter()
+            .map(|row| Line::from(Span::styled(row, Style::default().fg(t.error_text))))
+            .collect();
+        reread.push(Line::default());
+        lines.splice(0..0, reread);
+    }
+    // Rows left for tracks: below the header rows, above the footer.
+    let mut room = usize::from(inner.height).saturating_sub(lines.len() + 1);
+    let mut shown = 0;
+    for failure in failures {
+        let reason_rows = wrap_hard(&failure.error, reason_width);
+        let rows = 1 + reason_rows.len();
+        // Always show the first track, even in a window too short for it.
+        if rows > room && shown > 0 {
+            break;
+        }
+        room = room.saturating_sub(rows);
+        shown += 1;
+        let name = failure
+            .file
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| failure.file.display().to_string());
+        let outcome = match failure.outcome {
+            FailedTrack::NotMoved => "not moved",
+            FailedTrack::MovedUntagged => "moved, tags not written",
+            FailedTrack::Untagged => "tags not written",
+        };
+        // A long file name gives way, not the outcome: what became of the
+        // file is the point of the row.
+        let name_width = width.saturating_sub(disp_width("✗  — ") + disp_width(outcome));
+        let name = truncate(&name, name_width);
+        lines.push(Line::from(Span::styled(
+            format!("✗ {name} — {outcome}"),
+            Style::default().fg(t.error_text),
+        )));
+        for row in reason_rows {
+            lines.push(Line::from(Span::styled(
+                format!("    {row}"),
+                Style::default().fg(t.dim_text),
+            )));
+        }
+    }
+    let more = if n > shown {
+        format!("+{} more. Full list in the log (L).", n - shown)
+    } else {
+        "Also in the log (L).".to_string()
+    };
+    lines.push(Line::from(Span::styled(
+        more,
+        Style::default().fg(t.dim_text),
+    )));
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_centered_line(f: &mut Frame, area: Rect, msg: &str, color: Color) {
@@ -4129,6 +4301,14 @@ fn draw_tag_manager_diff(
             } else {
                 t.success_text
             }),
+        ),
+        Span::styled(
+            if overlay.tags_already_match() {
+                " · tags already match MusicBrainz"
+            } else {
+                ""
+            },
+            Style::default().fg(t.success_text),
         ),
         Span::raw(" · "),
         Span::styled(
@@ -4378,6 +4558,22 @@ mod tests {
     use super::*;
     use zytunes::tag_ops::{FieldDiff, FieldKind, TrackTagDiff};
 
+    /// What the test terminal shows: one line per row, trailing blanks
+    /// trimmed.
+    fn screen_text(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
+        let buf = term.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn header_track(fields: Vec<FieldDiff>) -> TrackTagDiff {
         TrackTagDiff {
             src_path: std::path::PathBuf::from("/m/A/B/01.mp3"),
@@ -4478,6 +4674,182 @@ mod tests {
         let track = header_track(vec![filename]);
         let label = render_track_header(&track);
         assert!(!label.contains("rename"));
+    }
+
+    #[test]
+    fn a_write_failure_toast_shows_over_the_tag_overlay() {
+        // The apply reports failed tracks through a toast while the
+        // overlay is still open (it goes on to Done). Both are centered,
+        // so the overlay drawn second hid the only on-screen notice.
+        let mut app = App::new();
+        app.tag_manager = Some(crate::app::TagManagerOverlay::new(
+            zytunes::tag_ops::DiffScope::Album,
+            "2Pac".into(),
+            "Album".into(),
+            None,
+            crate::app::SelectionAnchor::default(),
+        ));
+        let msg = "1 track failed to write, see log (L)";
+        app.set_toast(msg.into(), true);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| draw(f, &app)).unwrap();
+        let screen = screen_text(&term);
+        assert!(screen.contains("Tag manager") || screen.contains("File into library"));
+        assert!(screen.contains(msg), "{screen}");
+    }
+
+    #[test]
+    fn done_screen_lists_the_tracks_that_failed() {
+        use crate::app::tag_manager::{ApplyFailure, FailedTrack};
+        let mut app = App::new();
+        let mut overlay = crate::app::TagManagerOverlay::new(
+            zytunes::tag_ops::DiffScope::Album,
+            "2Pac".into(),
+            "Album".into(),
+            None,
+            crate::app::SelectionAnchor::default(),
+        );
+        overlay.filing = true;
+        overlay.phase = crate::app::TagManagerPhase::Done;
+        overlay.apply_failures = vec![
+            ApplyFailure {
+                file: "/inbox/01 Song.wav".into(),
+                outcome: FailedTrack::NotMoved,
+                error: "rename collision: /m/01 - Song.wav already exists".into(),
+            },
+            ApplyFailure {
+                file: "/inbox/02 Other.wav".into(),
+                outcome: FailedTrack::MovedUntagged,
+                error: "lofty save failed: Invalid frame language".into(),
+            },
+        ];
+        app.tag_manager = Some(overlay);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| draw(f, &app)).unwrap();
+        let screen = screen_text(&term);
+        assert!(screen.contains("done with errors"), "{screen}");
+        assert!(screen.contains("2 tracks failed"), "{screen}");
+        assert!(screen.contains("✗ 01 Song.wav — not moved"), "{screen}");
+        assert!(
+            screen.contains("rename collision: /m/01 - Song.wav already exists"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("✗ 02 Other.wav — moved, tags not written"),
+            "{screen}"
+        );
+        assert!(!screen.contains("Done. Press any key"), "{screen}");
+    }
+
+    #[test]
+    fn done_screen_shows_a_reread_error_above_the_track_failures() {
+        use crate::app::tag_manager::{ApplyFailure, FailedTrack};
+        let mut app = App::new();
+        let mut overlay = crate::app::TagManagerOverlay::new(
+            zytunes::tag_ops::DiffScope::Album,
+            "2Pac".into(),
+            "Album".into(),
+            None,
+            crate::app::SelectionAnchor::default(),
+        );
+        overlay.phase = crate::app::TagManagerPhase::Done;
+        // Longer than the overlay is wide; its last character must still
+        // be on screen.
+        overlay.error = Some(format!(
+            "library reread failed: disk {}終",
+            "/a/long/path".repeat(12)
+        ));
+        overlay.apply_failures = vec![ApplyFailure {
+            file: "/inbox/01 Song.wav".into(),
+            outcome: FailedTrack::NotMoved,
+            error: "rename collision".into(),
+        }];
+        app.tag_manager = Some(overlay);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| draw(f, &app)).unwrap();
+        let screen = screen_text(&term);
+        assert!(screen.contains("library reread failed: disk"), "{screen}");
+        assert!(screen.contains('終'), "the error is wrapped: {screen}");
+        assert!(screen.contains("01 Song.wav — not moved"), "{screen}");
+        assert!(
+            screen.contains("L log · Esc search · other keys close"),
+            "the title names the keys that do not close: {screen}"
+        );
+    }
+
+    #[test]
+    fn done_screen_wraps_a_long_reason_and_counts_what_does_not_fit() {
+        use crate::app::tag_manager::{ApplyFailure, FailedTrack};
+        let mut app = App::new();
+        let mut overlay = crate::app::TagManagerOverlay::new(
+            zytunes::tag_ops::DiffScope::Album,
+            "2Pac".into(),
+            "Album".into(),
+            None,
+            crate::app::SelectionAnchor::default(),
+        );
+        overlay.phase = crate::app::TagManagerPhase::Done;
+        // The point of a collision error is at its end, after the path.
+        let long = format!(
+            "rename collision: /m/{}/01 - Song.wav already exists",
+            "x".repeat(90)
+        );
+        overlay.apply_failures = (1..=9)
+            .map(|i| ApplyFailure {
+                file: format!("/inbox/{i:02} Song.wav").into(),
+                outcome: FailedTrack::NotMoved,
+                error: long.clone(),
+            })
+            .collect();
+        app.tag_manager = Some(overlay);
+        // 60x16 terminal: overlay 42 wide, 9 rows of body.
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 16)).unwrap();
+        term.draw(|f| draw(f, &app)).unwrap();
+        let screen = screen_text(&term);
+        assert!(screen.contains("9 tracks failed"), "{screen}");
+        assert!(screen.contains("✗ 01 Song.wav — not moved"), "{screen}");
+        assert!(
+            screen.contains("already exists"),
+            "the end of the reason: {screen}"
+        );
+        assert!(!screen.contains("09 Song.wav"), "{screen}");
+        let more = screen
+            .lines()
+            .find(|l| l.contains("more. Full list in the log (L)."))
+            .unwrap_or_else(|| panic!("the footer survives: {screen}"));
+        let shown = screen.matches("— not moved").count();
+        assert!(more.contains(&format!("+{} more", 9 - shown)), "{screen}");
+    }
+
+    #[test]
+    fn done_screen_keeps_wide_reasons_and_long_names_inside_the_overlay() {
+        use crate::app::tag_manager::{ApplyFailure, FailedTrack};
+        let mut app = App::new();
+        let mut overlay = crate::app::TagManagerOverlay::new(
+            zytunes::tag_ops::DiffScope::Album,
+            "坂本龍一".into(),
+            "Album".into(),
+            None,
+            crate::app::SelectionAnchor::default(),
+        );
+        overlay.phase = crate::app::TagManagerPhase::Done;
+        // Wide glyphs: counted by chars, a row of these ran to twice the
+        // overlay's width and the end of the reason was clipped.
+        overlay.apply_failures = vec![ApplyFailure {
+            file: format!("/inbox/01 {}.flac", "曲".repeat(40)).into(),
+            outcome: FailedTrack::MovedUntagged,
+            // One wide char closes the reason, so no wrap can split it.
+            error: format!("{}終", "坂".repeat(60)),
+        }];
+        app.tag_manager = Some(overlay);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 20)).unwrap();
+        term.draw(|f| draw(f, &app)).unwrap();
+        let screen = screen_text(&term);
+        assert!(screen.contains('終'), "the end of the reason: {screen}");
+        assert!(
+            screen.contains("— moved, tags not written"),
+            "the outcome survives a long name: {screen}"
+        );
     }
 
     #[test]
@@ -4836,5 +5208,45 @@ mod tests {
                 (m.device_width, m.sidebar_width, m.album_width, m.keys_width)
             );
         }
+    }
+
+    #[test]
+    fn stem_strip_folds_groups_and_expands_on_zero() {
+        use crate::app::{App, StemStatus};
+        let strip = |app: &App| -> String {
+            stem_strip_cells(app, 200)
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect()
+        };
+        let mut app = App::new();
+        app.stems.status = StemStatus::Active;
+        app.stems.layout = Some(zytunes::stems::HARMONY_STEM_LAYOUT);
+        app.stems.gains = Some(zytunes::stems::new_stem_gains(&[true; 7]));
+        app.stems.enabled = [true; zytunes::stems::MAX_STEMS];
+
+        // Collapsed: lead + backing read as one Vocals cell, six cells
+        // total, with the hint that 0 opens them.
+        let s = strip(&app);
+        assert!(s.starts_with("[1 Voc ●] [2 Drm ●]"), "{s}");
+        assert!(!s.contains("[7"), "{s}");
+        assert!(s.ends_with("0▸ parts"), "{s}");
+
+        // Backing muted: the group cell is partial.
+        app.stems.enabled[1] = false;
+        assert!(strip(&app).starts_with("[1 Voc ◐]"));
+
+        // Expanded: the group's label leads and its parts take the digits.
+        app.cycle_stem_group();
+        let s = strip(&app);
+        assert!(s.starts_with("Voc▸ [1 LdV ●] [2 BkV ○]"), "{s}");
+        assert!(s.ends_with("0 next"), "{s}");
+
+        // Six-stem layout: no groups, no hint.
+        app.stems.expanded = None;
+        app.stems.layout = Some(zytunes::stems::SIX_STEM_LAYOUT);
+        let s = strip(&app);
+        assert!(s.starts_with("[1 Voc"), "{s}");
+        assert!(!s.contains('▸'), "{s}");
     }
 }

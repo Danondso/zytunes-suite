@@ -627,6 +627,12 @@ fn encode_pcm(
     if samples.is_empty() {
         return Ok(());
     }
+    #[cfg(test)]
+    tests::ENCODER_PCM_TAP.with_borrow_mut(|tap| {
+        if let Some(tap) = tap {
+            tap.extend_from_slice(samples);
+        }
+    });
     let frames = samples.len() / channels;
     output.reserve(mp3lame_encoder::max_required_buffer_size(frames));
     let res = match channels {
@@ -655,12 +661,11 @@ pub fn transcode_to_mp3_with_quality(
     quality: Mp3Quality,
 ) -> Result<String, String> {
     use id3::TagLike;
-    use symphonia::core::audio::SampleBuffer;
-    use symphonia::core::codecs::DecoderOptions;
-    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::codecs::audio::AudioDecoderOptions;
+    use symphonia::core::formats::probe::Hint;
+    use symphonia::core::formats::{FormatOptions, TrackType};
     use symphonia::core::io::MediaSourceStream;
     use symphonia::core::meta::MetadataOptions;
-    use symphonia::core::probe::Hint;
 
     let input_path = Path::new(input);
     let output = prepare_transcode_output(temp_dir, input, "mp3")?;
@@ -676,29 +681,39 @@ pub fn transcode_to_mp3_with_quality(
         hint.with_extension(ext);
     }
 
-    let probed = symphonia::default::get_probe()
-        .format(
+    let mut format = symphonia::default::get_probe()
+        .probe(
             &hint,
             mss,
-            &FormatOptions::default(),
-            &MetadataOptions::default(),
+            FormatOptions::default(),
+            MetadataOptions::default(),
         )
         .map_err(|e| format!("Failed to probe {input}: {e}"))?;
 
-    let mut format = probed.format;
     let track = format
-        .default_track()
-        .ok_or("No audio track found")?
-        .clone();
-
-    let sample_rate = track
+        .default_track(TrackType::Audio)
+        .ok_or("No audio track found")?;
+    let track_id = track.id;
+    let codec_params = track
         .codec_params
-        .sample_rate
-        .ok_or("Unknown sample rate")?;
-    let channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(2);
+        .as_ref()
+        .and_then(|p| p.audio())
+        .ok_or("No audio track found")?;
 
+    let sample_rate = codec_params.sample_rate.ok_or("Unknown sample rate")?;
+    let channels = codec_params
+        .channels
+        .as_ref()
+        .map(|c| c.count())
+        .unwrap_or(2);
+
+    // Gapless trimming on (symphonia 0.6's default): Ogg Vorbis decodes to
+    // exactly the source's length instead of carrying the codec's leading
+    // and trailing padding into LAME. It does nothing for M4A — the isomp4
+    // demuxer still ignores edit lists — so the trailing-zero hold-back below
+    // stays the M4A fix. WAV, AIFF, FLAC and ALAC have no padding to trim.
     let mut decoder = symphonia::default::get_codecs()
-        .make(&track.codec_params, &DecoderOptions::default())
+        .make_audio_decoder(codec_params, &AudioDecoderOptions::default())
         .map_err(|e| format!("Failed to create decoder: {e}"))?;
 
     // 3. Encode to MP3 with LAME
@@ -721,17 +736,20 @@ pub fn transcode_to_mp3_with_quality(
     }
 
     let mut mp3_data = Vec::new();
-    let mut sample_buf: Option<SampleBuffer<f32>> = None;
+    let mut samples: Vec<f32> = Vec::new();
     // Trailing run of zero samples. Held rather than encoded so that digital
     // silence at the tail of the stream is dropped at EOF. symphonia's isomp4
-    // demuxer parses M4A edit-list atoms but does not apply them, so silence
-    // the source's edit list would have trimmed otherwise bleeds into LAME.
+    // demuxer (0.5 and 0.6 alike) parses M4A edit-list atoms but does not
+    // apply them, so silence the source's edit list would have trimmed
+    // otherwise bleeds into LAME.
     let mut trailing_zeros: Vec<f32> = Vec::new();
     let mut encoded_any = false;
 
     loop {
         let packet = match format.next_packet() {
-            Ok(p) => p,
+            Ok(Some(p)) => p,
+            Ok(None) => break,
+            // Some demuxers still surface a truncated tail as an IO EOF.
             Err(symphonia::core::errors::Error::IoError(ref e))
                 if e.kind() == std::io::ErrorKind::UnexpectedEof =>
             {
@@ -740,25 +758,16 @@ pub fn transcode_to_mp3_with_quality(
             Err(e) => return Err(format!("Decode error: {e}")),
         };
 
-        if packet.track_id() != track.id {
+        if packet.track_id != track_id {
             continue;
         }
 
         let decoded = decoder
             .decode(&packet)
             .map_err(|e| format!("Decode packet: {e}"))?;
+        decoded.copy_to_vec_interleaved(&mut samples);
 
-        let spec = *decoded.spec();
-        let duration = decoded.capacity() as u64;
-
-        if sample_buf.is_none() {
-            sample_buf = Some(SampleBuffer::new(duration, spec));
-        }
-        let sbuf = sample_buf.as_mut().unwrap();
-        sbuf.copy_interleaved_ref(decoded);
-
-        let samples = sbuf.samples();
-        let split_at = last_nonzero_frame_end(samples, channels);
+        let split_at = last_nonzero_frame_end(&samples, channels);
         let (audio, trailing) = samples.split_at(split_at);
 
         if !audio.is_empty() {
@@ -1257,42 +1266,38 @@ mod tests {
     }
 
     fn count_mp3_frames(mp3_path: &str) -> u64 {
-        use symphonia::core::codecs::DecoderOptions;
-        use symphonia::core::formats::FormatOptions;
+        use symphonia::core::codecs::audio::AudioDecoderOptions;
+        use symphonia::core::formats::probe::Hint;
+        use symphonia::core::formats::{FormatOptions, TrackType};
         use symphonia::core::io::MediaSourceStream;
         use symphonia::core::meta::MetadataOptions;
-        use symphonia::core::probe::Hint;
 
         let file = std::fs::File::open(mp3_path).unwrap();
         let mss = MediaSourceStream::new(Box::new(file), Default::default());
         let mut hint = Hint::new();
         hint.with_extension("mp3");
-        let probed = symphonia::default::get_probe()
-            .format(
+        let mut format = symphonia::default::get_probe()
+            .probe(
                 &hint,
                 mss,
-                &FormatOptions::default(),
-                &MetadataOptions::default(),
+                FormatOptions::default(),
+                MetadataOptions::default(),
             )
             .unwrap();
-        let mut format = probed.format;
-        let track = format.default_track().unwrap().clone();
+        let track = format.default_track(TrackType::Audio).unwrap();
+        let track_id = track.id;
+        // Untrimmed (as symphonia 0.5 counted): the duration assertions
+        // below were written against the raw decoded frame count.
         let mut decoder = symphonia::default::get_codecs()
-            .make(&track.codec_params, &DecoderOptions::default())
+            .make_audio_decoder(
+                track.codec_params.as_ref().unwrap().audio().unwrap(),
+                &AudioDecoderOptions::default().gapless(false),
+            )
             .unwrap();
 
         let mut total: u64 = 0;
-        loop {
-            let packet = match format.next_packet() {
-                Ok(p) => p,
-                Err(symphonia::core::errors::Error::IoError(ref e))
-                    if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-                {
-                    break;
-                }
-                Err(_) => break,
-            };
-            if packet.track_id() != track.id {
+        while let Ok(Some(packet)) = format.next_packet() {
+            if packet.track_id != track_id {
                 continue;
             }
             let decoded = decoder.decode(&packet).unwrap();
@@ -1496,6 +1501,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Mono ALAC in M4A must come out mono at full length. symphonia 0.5's
+    /// isomp4 demuxer left ALAC's channel count unset, the transcoder fell
+    /// back to stereo, and LAME read the mono PCM as half as many stereo
+    /// frames: a 3 s track became a 1.5 s one. Skips without ffmpeg.
+    #[test]
+    fn transcode_mono_alac_keeps_channels_and_duration() {
+        let dir = std::env::temp_dir().join("zytunes-test-mono-alac");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("tone.wav");
+        make_sine_wav(&wav, 3, 1);
+        let m4a = dir.join("tone.m4a");
+        let encoded = std::process::Command::new("ffmpeg")
+            .args(["-y", "-loglevel", "error", "-i"])
+            .arg(&wav)
+            .args(["-c:a", "alac"])
+            .arg(&m4a)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !encoded {
+            eprintln!("skipping: ffmpeg unavailable");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+
+        let mp3 = transcode_to_mp3(m4a.to_str().unwrap(), &dir, None).unwrap();
+        // MPEG audio frame header, byte 3 bits 7-6: 0b11 is single channel.
+        let data = std::fs::read(&mp3).unwrap();
+        let (start, _) = mp3_stream_bounds(&data);
+        assert_eq!(data[start + 3] >> 6, 0b11, "output should be mono");
+        let secs = count_mp3_frames(&mp3) as f64 / 44_100.0;
+        assert!(
+            (2.9..=3.2).contains(&secs),
+            "3s mono ALAC became {secs:.2}s"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn transcode_preserves_duration_stereo() {
         assert_transcode_duration(2, "stereo");
@@ -1644,6 +1687,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    thread_local! {
+        /// Test seam: while `Some`, `encode_pcm` appends every sample it hands
+        /// to LAME. Thread-local, so parallel tests never see each other's PCM.
+        pub(super) static ENCODER_PCM_TAP: std::cell::RefCell<Option<Vec<f32>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Known answer: the exact PCM the transcoder hands to LAME for a
+    /// generated stereo tune (decode, sample conversion, silence hold-back),
+    /// as sample count plus a SHA-1 of the f32 bit patterns, and the format of
+    /// the MP3 it produces. The MP3 bytes themselves are not pinned: LAME's
+    /// float paths differ by architecture (arm64 vs x86_64). 16-bit WAV to f32
+    /// is exact everywhere, so this is a portable guard on the decoder: the
+    /// same value came out of symphonia 0.5 and 0.6.
+    #[test]
+    fn transcode_known_answer() {
+        use sha1::{Digest, Sha1};
+        let dir = std::env::temp_dir().join("zytunes-test-transcode-known-answer");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("tune.wav");
+        crate::test_audio::write_tune_wav(&wav, 5);
+
+        ENCODER_PCM_TAP.set(Some(Vec::new()));
+        let mp3 = transcode_to_mp3(wav.to_str().unwrap(), &dir, None).unwrap();
+        let pcm = ENCODER_PCM_TAP.take().unwrap();
+
+        let mut hasher = Sha1::new();
+        for s in &pcm {
+            hasher.update(s.to_bits().to_le_bytes());
+        }
+        let hex: String = hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!((pcm.len(), hex.as_str()), KNOWN_TUNE_PCM);
+
+        // MPEG-1 Layer III header: 44.1 kHz (bits 3-2 of byte 2 = 00) and
+        // a stereo-family channel mode (byte 3 bits 7-6 != 11).
+        let data = std::fs::read(&mp3).unwrap();
+        let (start, _) = mp3_stream_bounds(&data);
+        assert_eq!(&data[start..start + 2], &[0xff, 0xfb], "MPEG-1 Layer III");
+        assert_eq!((data[start + 2] >> 2) & 0b11, 0b00, "44.1 kHz");
+        assert_ne!(data[start + 3] >> 6, 0b11, "stereo, not mono");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (interleaved sample count, SHA-1 of their little-endian f32 bits).
+    const KNOWN_TUNE_PCM: (usize, &str) = (441000, "b3d9e555acb4a635ec186e9181454d364dc0e4c5");
+
     #[test]
     fn transcode_paths_parallel_same_stem_does_not_clobber() {
         let dir = std::env::temp_dir().join("zytunes-test-transcode-parallel-stem");
@@ -1750,12 +1844,10 @@ mod tests {
             }
             let tag = tagged.primary_tag_mut().unwrap();
             tag.set_artist("Art Artist".to_string());
-            let pic = Picture::new_unchecked(
-                PictureType::CoverFront,
-                Some(MimeType::Jpeg),
-                None,
-                big_art,
-            );
+            let pic = Picture::unchecked(big_art)
+                .pic_type(PictureType::CoverFront)
+                .mime_type(MimeType::Jpeg)
+                .build();
             tag.push_picture(pic);
             tag.save_to_path(&wav_path, lofty::config::WriteOptions::default())
                 .unwrap();
