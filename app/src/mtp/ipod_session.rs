@@ -149,9 +149,9 @@ impl DeviceSession for IpodSession {
         let total_tracks = tag.and_then(|t| t.track_total().map(|n| n as u16));
         let disc_number = tag.and_then(|t| t.disk().map(|n| n as u16));
         let total_discs = tag.and_then(|t| t.disk_total().map(|n| n as u16));
-        let year = tag.and_then(|t| t.year().map(|y| y as u16));
+        let year = tag.and_then(|t| crate::dirlib::tag_year(t).map(|y| y as u16));
         let album_artist =
-            tag.and_then(|t| t.get_string(&ItemKey::AlbumArtist).map(|s| s.to_string()));
+            tag.and_then(|t| t.get_string(ItemKey::AlbumArtist).map(|s| s.to_string()));
 
         let duration_ms = tag_file
             .as_ref()

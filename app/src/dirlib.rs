@@ -889,6 +889,30 @@ pub(crate) fn track_from_lofty(path: &Path, id: u64) -> Option<Track> {
 /// Reading properties is slow for MP3 VBR files because lofty has to sample
 /// frames across the whole file to compute duration, but the per-file cache
 /// makes sure we only pay that cost once per file per change.
+/// The tag's year: the `Year` item, else the recording date, read as its
+/// first four digits after any leading whitespace ("1983-01-02" → 1983,
+/// "\t 1983\n" → 1983, "83" → none).
+///
+/// lofty 0.22's `Accessor::year`, kept verbatim: lofty 0.25 replaced it
+/// with `Accessor::date`, which prefers the recording date over `Year` and
+/// drops a date its timestamp parser rejects, where this only needs four
+/// leading digits.
+pub(crate) fn tag_year(tag: &lofty::tag::Tag) -> Option<u32> {
+    use lofty::tag::ItemKey;
+    let date = tag
+        .get_string(ItemKey::Year)
+        .or_else(|| tag.get_string(ItemKey::RecordingDate))?;
+    let (num_digits, year) = date
+        .chars()
+        .skip_while(|c| c.is_whitespace())
+        .take_while(char::is_ascii_digit)
+        .take(4)
+        .fold((0usize, 0u32), |(n, year), c| {
+            (n + 1, year * 10 + c.to_digit(10).expect("decimal digit"))
+        });
+    (num_digits == 4).then_some(year)
+}
+
 pub(crate) fn probe_track(path: &Path, id: u64) -> Probed {
     use lofty::config::ParseOptions;
     use lofty::file::{AudioFile, TaggedFileExt};
@@ -959,7 +983,7 @@ pub(crate) fn probe_track(path: &Path, id: u64) -> Probed {
     // Raw string lookup — preserves padding. Used only for free-form text
     // fields (comment, lyrics, description) where whitespace may be
     // intentional. Most callers want the trimmed variant below.
-    let s_raw = |key: ItemKey| tag.get_string(&key).map(|v| v.to_string());
+    let s_raw = |key: ItemKey| tag.get_string(key).map(|v| v.to_string());
     // Trimmed + nil-if-empty lookup. Identity / MBID / numeric-ish fields
     // route through this so a tag of "   " becomes None, not Some("   ").
     let s = |key: ItemKey| trim_opt(s_raw(key));
@@ -974,7 +998,7 @@ pub(crate) fn probe_track(path: &Path, id: u64) -> Probed {
         artist,
         album,
         genre: trim_opt(tag.genre().map(|s| s.to_string())),
-        year: tag.year(),
+        year: tag_year(tag),
         track_number: tag.track(),
         disc_number: tag.disk(),
         total_time_ms: duration_ms(props),
@@ -1200,6 +1224,32 @@ impl MusicLibrary for DirectoryLibrary {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn tag_year_keeps_the_four_leading_digits_and_prefers_year() {
+        use lofty::tag::{ItemKey, Tag, TagType};
+        let year_of = |items: &[(ItemKey, &str)]| {
+            let mut tag = Tag::new(TagType::Ape);
+            for (k, v) in items {
+                tag.insert_text(*k, v.to_string());
+            }
+            tag_year(&tag)
+        };
+        assert_eq!(
+            year_of(&[(ItemKey::RecordingDate, "\t 1983\n")]),
+            Some(1983)
+        );
+        assert_eq!(year_of(&[(ItemKey::RecordingDate, "1983-1")]), Some(1983));
+        assert_eq!(year_of(&[(ItemKey::RecordingDate, "83")]), None);
+        assert_eq!(
+            year_of(&[
+                (ItemKey::RecordingDate, "1990-05-01"),
+                (ItemKey::Year, "1989")
+            ]),
+            Some(1989)
+        );
+        assert_eq!(year_of(&[]), None);
+    }
 
     #[test]
     fn without_the_registry_a_new_file_never_takes_a_cached_tracks_id() {

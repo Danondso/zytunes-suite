@@ -16,7 +16,6 @@ use base64::engine::{general_purpose::URL_SAFE_NO_PAD, Engine};
 use lofty::config::ParseOptions;
 use lofty::file::TaggedFileExt;
 use lofty::probe::Probe;
-use lofty::tag::{ItemKey, ItemValue};
 use rusty_chromaprint::{Configuration, FingerprintCompressor, Fingerprinter};
 use symphonia::core::codecs::audio::AudioDecoderOptions;
 use symphonia::core::formats::probe::Hint;
@@ -57,20 +56,7 @@ pub fn read_embedded_fingerprint(path: &Path) -> Option<String> {
 /// The stored fingerprint under any spelling Picard uses (see
 /// [`crate::picard_keys`]).
 pub fn fingerprint_from_tag(tag: &lofty::tag::Tag) -> Option<String> {
-    for item in tag.items() {
-        let ItemKey::Unknown(name) = item.key() else {
-            continue;
-        };
-        if !crate::picard_keys::PicardField::AcoustidFingerprint.matches(name) {
-            continue;
-        }
-        if let ItemValue::Text(v) = item.value() {
-            if !v.is_empty() {
-                return Some(v.clone());
-            }
-        }
-    }
-    None
+    crate::picard_keys::PicardField::AcoustidFingerprint.read(tag)
 }
 
 /// Compute an acoustic fingerprint for `path`.
@@ -381,12 +367,17 @@ mod tests {
 
     #[test]
     fn fingerprint_is_found_under_the_mp4_freeform_key() {
-        use lofty::tag::{ItemKey, ItemValue, Tag, TagItem, TagType};
-        let mut tag = Tag::new(TagType::Mp4Ilst);
-        tag.insert_unchecked(TagItem::new(
-            ItemKey::Unknown("----:com.apple.iTunes:Acoustid Fingerprint".into()),
-            ItemValue::Text("AQADtHJ0".into()),
+        use lofty::mp4::{Atom, AtomData, AtomIdent, Ilst};
+        use lofty::tag::Tag;
+        let mut ilst = Ilst::default();
+        ilst.insert(Atom::new(
+            AtomIdent::Freeform {
+                mean: "com.apple.iTunes".into(),
+                name: "Acoustid Fingerprint".into(),
+            },
+            AtomData::UTF8("AQADtHJ0".into()),
         ));
+        let tag = Tag::from(ilst);
         assert_eq!(fingerprint_from_tag(&tag).as_deref(), Some("AQADtHJ0"));
     }
 }

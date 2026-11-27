@@ -16,7 +16,7 @@ use lofty::config::ParseOptions;
 use lofty::file::TaggedFileExt;
 use lofty::prelude::ItemKey;
 use lofty::probe::Probe;
-use lofty::tag::{ItemValue, Tag, TagType};
+use lofty::tag::{Tag, TagType};
 
 use crate::cd::metadata::{
     probe_by_content, ripped_track_destination, save_tag, set_picard_field, set_string,
@@ -86,27 +86,22 @@ fn read_on_disk_extras(path: &Path) -> OnDiskExtras {
 /// spelled them as (see [`crate::picard_keys`]).
 fn extras_from_tag(tag: &Tag) -> OnDiskExtras {
     let media = tag
-        .get_string(&ItemKey::OriginalMediaType)
+        .get_string(ItemKey::OriginalMediaType)
         .map(|s| s.to_string());
-    // lofty knows SCRIPT in every container; older files may still carry
-    // it under an unknown key.
-    let mut script = tag.get_string(&ItemKey::Script).map(|s| s.to_string());
+    // lofty knows SCRIPT in Vorbis and MP4; ID3v2 carries it as Picard's
+    // `TXXX:SCRIPT`.
+    let mut script = tag.get_string(ItemKey::Script).map(|s| s.to_string());
     let mut musicbrainz_album_type = None;
     let mut musicbrainz_album_status = None;
     let mut musicbrainz_album_packaging = None;
     let mut release_country = None;
     let mut acoustid_fingerprint = None;
     let mut acoustid_id = None;
-    for item in tag.items() {
-        let ItemKey::Unknown(name) = item.key() else {
-            continue;
-        };
-        let ItemValue::Text(value) = item.value() else {
-            continue;
-        };
+    for (name, value) in crate::picard_keys::user_fields(tag) {
         if value.is_empty() {
             continue;
         }
+        let name = name.as_str();
         let slot = if PicardField::AlbumType.matches(name) {
             &mut musicbrainz_album_type
         } else if PicardField::AlbumStatus.matches(name) {
@@ -125,7 +120,7 @@ fn extras_from_tag(tag: &Tag) -> OnDiskExtras {
             continue;
         };
         if slot.is_none() {
-            *slot = Some(value.to_string());
+            *slot = Some(value);
         }
     }
     OnDiskExtras {
@@ -2328,7 +2323,7 @@ mod tests {
                 TextEncoding::UTF8,
                 **lang,
                 String::new(),
-                (*text).into(),
+                text.to_string(),
             )));
         }
         id3.set_title("First".into());
@@ -2357,7 +2352,7 @@ mod tests {
                 .clone(),
         )
         .comments()
-        .map(|c| (c.language.to_vec(), c.content.clone()))
+        .map(|c| (c.language.to_vec(), c.content.to_string()))
         .collect();
         after.sort();
         let _ = std::fs::remove_dir_all(&dir);
@@ -2430,13 +2425,8 @@ mod tests {
 
     #[test]
     fn extras_read_picard_spellings_from_every_container() {
+        use crate::picard_keys::insert_user_field as unknown;
         use lofty::tag::{ItemKey, ItemValue, Tag, TagItem, TagType};
-        let unknown = |tag: &mut Tag, key: &str, value: &str| {
-            tag.insert_unchecked(TagItem::new(
-                ItemKey::Unknown(key.into()),
-                ItemValue::Text(value.into()),
-            ));
-        };
         // MP4: freeform atoms come back with the full prefixed key.
         let mut mp4 = Tag::new(TagType::Mp4Ilst);
         unknown(
@@ -2585,13 +2575,10 @@ mod tests {
             // container, and nowhere else.
             let tagged = lofty::read_from_path(&path).unwrap();
             let tag = tagged.primary_tag().expect("tag after apply");
-            let acoustid_keys: Vec<&str> = tag
-                .items()
-                .filter(|i| i.value().text() == uuid)
-                .filter_map(|i| match i.key() {
-                    ItemKey::Unknown(k) => Some(k.as_str()),
-                    _ => None,
-                })
+            let acoustid_keys: Vec<String> = crate::picard_keys::user_fields(tag)
+                .into_iter()
+                .filter(|(_, v)| Some(v.as_str()) == uuid)
+                .map(|(k, _)| k)
                 .collect();
             let want = match ext {
                 "mp3" => "Acoustid Id",
@@ -2665,7 +2652,7 @@ mod tests {
             .tag(lofty::tag::TagType::Id3v2)
             .expect("ID3v2 tag should be present");
         let year = tag
-            .get_string(&lofty::tag::ItemKey::RecordingDate)
+            .get_string(lofty::tag::ItemKey::RecordingDate)
             .expect("Year/RecordingDate should have been written");
         assert_eq!(year, "1969");
     }
@@ -3199,12 +3186,10 @@ mod tests {
             .tag(lofty::tag::TagType::Id3v2)
             .expect("ID3v2 tag should exist after apply");
         let find = |name: &str| {
-            id3.items()
-                .find(|i| {
-                    matches!(i.key(),
-                        lofty::prelude::ItemKey::Unknown(s) if s.eq_ignore_ascii_case(name))
-                })
-                .and_then(|i| i.value().text().map(str::to_string))
+            crate::picard_keys::user_fields(id3)
+                .into_iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v)
         };
         assert_eq!(
             find("Acoustid Fingerprint").as_deref(),
@@ -3231,7 +3216,9 @@ mod tests {
             return;
         };
         // ffmpeg writes an ID3v2 of its own; this file must have none.
-        TagType::Id3v2.remove_from_path(&path).unwrap();
+        TagType::Id3v2
+            .remove_from_path(&path, WriteOptions::default())
+            .unwrap();
         let mut tf = lofty::read_from_path(&path).unwrap();
         let mut v1 = Tag::new(TagType::Id3v1);
         v1.set_title("Old Title".into());
@@ -3265,7 +3252,7 @@ mod tests {
         assert_eq!(v1.genre().as_deref(), Some("Rock"));
         assert_eq!(v1.comment().as_deref(), Some("ripped 2003"));
         let v2 = back.tag(TagType::Id3v2).expect("ID3v2 was added");
-        assert_eq!(v2.get_string(&ItemKey::MusicBrainzReleaseId), Some("rel-1"));
+        assert_eq!(v2.get_string(ItemKey::MusicBrainzReleaseId), Some("rel-1"));
         let scanned = crate::dirlib::track_from_lofty(&path, 1).expect("still tagged");
         assert_eq!(scanned.name, "Old Title");
         assert_eq!(scanned.artist, "Old Artist");
@@ -3274,27 +3261,71 @@ mod tests {
     }
 
     #[test]
+    fn a_write_keeps_fields_lofty_has_no_key_for() {
+        // lofty 0.25's generic Vorbis writer drops every comment it has no
+        // `ItemKey` for; `save_tag` must keep another tagger's fields.
+        let dir = fresh_dir("keep-unmodelled-fields");
+        let seed = dir.join("seed.wav");
+        write_sine_wav(&seed, 1);
+        for (ext, codec) in [("flac", "flac"), ("ogg", "libvorbis")] {
+            let path = dir.join(format!("song.{ext}"));
+            let Ok(status) = std::process::Command::new("ffmpeg")
+                .args(["-y", "-loglevel", "error", "-i"])
+                .arg(&seed)
+                .args(["-c:a", codec, "-metadata", "CUSTOM_NOTE=keep me"])
+                .arg(&path)
+                .status()
+            else {
+                eprintln!("ffmpeg not installed; skipping");
+                return;
+            };
+            if !status.success() {
+                eprintln!("ffmpeg cannot encode {ext} here; skipping");
+                continue;
+            }
+            write_track_tags(&TrackTagDiff {
+                src_path: path.clone(),
+                dest_path: None,
+                library_id: 1,
+                fields: vec![FieldDiff {
+                    kind: FieldKind::MbId,
+                    name: "MB Release ID",
+                    current: None,
+                    proposed: Some("rel-1".into()),
+                    enabled: true,
+                }],
+            })
+            .unwrap();
+            let back = lofty::read_from_path(&path).unwrap();
+            let tag = back.primary_tag().unwrap();
+            assert_eq!(tag.get_string(ItemKey::MusicBrainzReleaseId), Some("rel-1"));
+            let custom: Vec<_> = crate::picard_keys::user_fields(tag)
+                .into_iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case("CUSTOM_NOTE"))
+                .collect();
+            assert_eq!(custom.len(), 1, "{ext}: {custom:?}");
+            assert_eq!(custom[0].1, "keep me", "{ext}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn apply_replaces_a_legacy_acoustid_id_spelling() {
         // Earlier builds wrote `TXXX:ACOUSTID_ID` into ID3v2. The row reads
         // it as the current value, and a rewrite leaves one Picard-spelled
         // copy rather than two.
         let mut tag = Tag::new(TagType::Id3v2);
-        tag.insert_unchecked(lofty::tag::TagItem::new(
-            ItemKey::Unknown("ACOUSTID_ID".into()),
-            ItemValue::Text("old-uuid".into()),
-        ));
+        crate::picard_keys::insert_user_field(&mut tag, "ACOUSTID_ID", "old-uuid");
         assert_eq!(
             extras_from_tag(&tag).acoustid_id.as_deref(),
             Some("old-uuid")
         );
 
         set_picard_field(&mut tag, PicardField::AcoustidId, "new-uuid");
-        let copies: Vec<(&str, Option<&str>)> = tag
-            .items()
-            .filter_map(|i| match i.key() {
-                ItemKey::Unknown(k) => Some((k.as_str(), i.value().text())),
-                _ => None,
-            })
+        let copies: Vec<(String, String)> = crate::picard_keys::user_fields(&tag);
+        let copies: Vec<(&str, Option<&str>)> = copies
+            .iter()
+            .map(|(k, v)| (k.as_str(), Some(v.as_str())))
             .collect();
         assert_eq!(copies, vec![("Acoustid Id", Some("new-uuid"))]);
     }
