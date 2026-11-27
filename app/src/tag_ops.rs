@@ -567,7 +567,7 @@ fn build_track_fields(
     let mb_genre = pick_top_genre(release);
     push(FieldKind::Identity, "Genre", lib.genre.clone(), mb_genre);
 
-    // Album Type (Picard MUSICBRAINZ_ALBUMTYPE): "album" / "single" / "ep".
+    // Album Type (Picard `releasetype`; see `PicardField`): "album" / "single" / "ep".
     // MusicBrainz capitalises these; Picard stores them lowercase, and a
     // Picard-tagged file must not show "single" → "Single" as a change.
     let album_type = release

@@ -1,9 +1,10 @@
 //! Names for the MusicBrainz / AcoustID fields that lofty has no
 //! `ItemKey` for, spelled the way Picard writes them in each container.
 //!
-//! Picard's canonical (Vorbis Comment) names are uppercase with
-//! underscores; in ID3v2 the same facts live in `TXXX` frames with spaced
-//! names ("MusicBrainz Album Type"), and in MP4 as freeform iTunes atoms
+//! Picard spells each field per container: Vorbis comments use its
+//! internal tag name uppercased (`RELEASETYPE`), APE keeps the older
+//! `MUSICBRAINZ_ALBUMTYPE` style, ID3v2 uses `TXXX` frames with spaced
+//! names ("MusicBrainz Album Type"), and MP4 uses freeform iTunes atoms
 //! whose full key carries a `----:com.apple.iTunes:` prefix. Writing the
 //! Vorbis spelling everywhere left MP3s with a second, differently named
 //! copy beside Picard's and dropped the value outright on MP4 (lofty's
@@ -52,7 +53,8 @@ impl PicardField {
         PicardField::AcoustidId,
     ];
 
-    /// The Vorbis spelling, also our internal name.
+    /// Our internal name for the field (it names the tag-manager row), and
+    /// its APE spelling.
     pub fn canonical(self) -> &'static str {
         match self {
             PicardField::AlbumType => "MUSICBRAINZ_ALBUMTYPE",
@@ -62,6 +64,17 @@ impl PicardField {
             PicardField::Script => "SCRIPT",
             PicardField::AcoustidFingerprint => "ACOUSTID_FINGERPRINT",
             PicardField::AcoustidId => "ACOUSTID_ID",
+        }
+    }
+
+    /// Picard's Vorbis comment spelling: its internal tag name uppercased.
+    /// Album type and status differ from [`Self::canonical`]; packaging is
+    /// not a Picard tag at all, so it keeps our own name.
+    fn vorbis(self) -> &'static str {
+        match self {
+            PicardField::AlbumType => "RELEASETYPE",
+            PicardField::AlbumStatus => "RELEASESTATUS",
+            other => other.canonical(),
         }
     }
 
@@ -89,15 +102,20 @@ impl PicardField {
         match tag_type {
             TagType::Id3v2 => self.spaced().to_string(),
             TagType::Mp4Ilst => format!("----:com.apple.iTunes:{}", self.spaced()),
+            TagType::VorbisComments => self.vorbis().to_string(),
             _ => self.canonical().to_string(),
         }
     }
 
     /// `key` (as [`user_fields`] reports it, prefix and all) names this
-    /// field in any of its spellings.
+    /// field in any of its spellings. A FLAC or Ogg file tagged before the
+    /// Vorbis spelling was fixed holds `MUSICBRAINZ_ALBUMTYPE`; it still
+    /// reads, and the next write replaces it with `RELEASETYPE`.
     pub fn matches(self, key: &str) -> bool {
         let name = strip_freeform_prefix(key);
-        name.eq_ignore_ascii_case(self.canonical()) || name.eq_ignore_ascii_case(self.spaced())
+        name.eq_ignore_ascii_case(self.canonical())
+            || name.eq_ignore_ascii_case(self.vorbis())
+            || name.eq_ignore_ascii_case(self.spaced())
     }
 
     /// The first non-empty value `tag` holds for this field, under any
@@ -262,6 +280,14 @@ mod tests {
     fn keys_follow_picard_per_container() {
         assert_eq!(
             PicardField::AlbumType.key_for(TagType::VorbisComments),
+            "RELEASETYPE"
+        );
+        assert_eq!(
+            PicardField::AlbumStatus.key_for(TagType::VorbisComments),
+            "RELEASESTATUS"
+        );
+        assert_eq!(
+            PicardField::AlbumType.key_for(TagType::Ape),
             "MUSICBRAINZ_ALBUMTYPE"
         );
         assert_eq!(
@@ -354,10 +380,39 @@ mod tests {
     }
 
     #[test]
+    fn a_vorbis_album_type_in_the_old_spelling_is_replaced_by_picards() {
+        for (field, old, new) in [
+            (
+                PicardField::AlbumType,
+                "MUSICBRAINZ_ALBUMTYPE",
+                "RELEASETYPE",
+            ),
+            (
+                PicardField::AlbumStatus,
+                "MUSICBRAINZ_ALBUMSTATUS",
+                "RELEASESTATUS",
+            ),
+        ] {
+            let mut tag = Tag::new(TagType::VorbisComments);
+            insert_user_field(&mut tag, old, "album");
+            assert_eq!(field.read(&tag).as_deref(), Some("album"), "{old}");
+            field.write(&mut tag, "single");
+            let held: Vec<_> = user_fields(&tag)
+                .into_iter()
+                .filter(|(k, _)| field.matches(k))
+                .collect();
+            assert_eq!(held.len(), 1, "{held:?}");
+            assert!(held[0].0.eq_ignore_ascii_case(new), "{held:?}");
+            assert_eq!(held[0].1, "single");
+        }
+    }
+
+    #[test]
     fn matches_every_spelling_lofty_reports() {
         let f = PicardField::AlbumStatus;
         assert!(f.matches("MUSICBRAINZ_ALBUMSTATUS"));
         assert!(f.matches("musicbrainz_albumstatus"));
+        assert!(f.matches("RELEASESTATUS"));
         assert!(f.matches("MusicBrainz Album Status"));
         assert!(f.matches("----:com.apple.iTunes:MusicBrainz Album Status"));
         assert!(!f.matches("MusicBrainz Album Type"));

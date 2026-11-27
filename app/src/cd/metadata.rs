@@ -21,8 +21,9 @@
 //!   field (`mb_work_id`) but MB doesn't surface it on release lookup,
 //!   so we don't write it here.
 //! - Picard's user-defined fields, spelled per container (see
-//!   `crate::picard_keys`): MUSICBRAINZ_ALBUMSTATUS, MUSICBRAINZ_ALBUMTYPE,
-//!   RELEASECOUNTRY, MUSICBRAINZ_ALBUMPACKAGING, SCRIPT. ASIN is skipped —
+//!   `crate::picard_keys`): album status and type (`RELEASESTATUS` /
+//!   `RELEASETYPE` in Vorbis comments), RELEASECOUNTRY, SCRIPT, and our own
+//!   MUSICBRAINZ_ALBUMPACKAGING (Picard has no packaging tag). ASIN is skipped —
 //!   see comment in `write_release_identifiers`.
 //!
 //! The exact tag container is chosen by lofty based on the file extension.
@@ -191,7 +192,7 @@ pub(crate) fn save_tag(tagged: &TaggedFile, tag_type: TagType, path: &Path) -> R
                 })
         }
         // lofty keeps the fields it has no key for (Picard's
-        // `MUSICBRAINZ_ALBUMSTATUS`, any other tagger's custom comment) in
+        // `RELEASESTATUS`, any other tagger's custom comment) in
         // a companion of the generic tag, and its generic Vorbis, APE and
         // RIFF INFO writers skip that companion: saving the generic tag
         // erased every such field from the file. The concrete tag carries
